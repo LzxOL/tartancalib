@@ -252,12 +252,16 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.outer_detector_config.max_scales_to_try = ParseInt(key, value);
     } else if (key == "scaleCandidates" || key == "scale_candidates") {
       config.outer_detector_config.scale_candidates = ParseIntList(key, value);
+    } else if (key == "scaleDivisors" || key == "scale_divisors") {
+      config.outer_detector_config.scale_divisors = ParseDoubleList(key, value);
     } else if (key == "doOuterSubpixRefinement" || key == "do_outer_subpix_refinement") {
       config.outer_detector_config.do_outer_subpix_refinement =
           Lowercase(value) == "1" || Lowercase(value) == "true" ||
           Lowercase(value) == "yes" || Lowercase(value) == "on";
     } else if (key == "maxOuterRefineDisplacement" || key == "max_outer_refine_displacement") {
       config.outer_detector_config.max_outer_refine_displacement = ParseDouble(key, value);
+    } else if (key == "outerRefineDisplacementScale" || key == "outer_refine_displacement_scale") {
+      config.outer_detector_config.outer_refine_displacement_scale = ParseDouble(key, value);
     } else if (key == "minDetectionQuality" || key == "min_detection_quality") {
       config.outer_detector_config.min_detection_quality = ParseDouble(key, value);
     } else if (key == "blurBeforeDetect" || key == "blur_before_detect") {

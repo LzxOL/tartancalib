@@ -281,15 +281,47 @@ int main(int argc, char** argv) {
     std::cout << "  internal_projection_mode: "
               << ati::ToString(config.internal_projection_mode) << "\n\n";
 
+    std::cout << "Outer wrapper scale plan\n";
+    std::cout << "  original longest-side: "
+              << result.outer_detection.original_longest_side << "\n";
+    std::cout << "  scale mode: "
+              << result.outer_detection.scale_configuration_mode << "\n";
+    if (result.outer_detection.scale_configuration_mode == "scale_divisors") {
+      std::cout << "  divisor -> target:";
+      bool first_divisor = true;
+      for (const auto& debug : result.outer_detection.scale_debug) {
+        if (debug.configured_scale_divisor <= 0.0) {
+          continue;
+        }
+        std::cout << (first_divisor ? " " : ", ")
+                  << "/" << std::fixed << std::setprecision(2)
+                  << debug.configured_scale_divisor
+                  << "->" << debug.target_longest_side;
+        first_divisor = false;
+      }
+      std::cout << "\n";
+    }
+    std::cout << std::defaultfloat << std::setprecision(6);
+    std::cout << "  attempted target longest-sides:";
+    bool first_scale = true;
+    for (const auto& debug : result.outer_detection.scale_debug) {
+      std::cout << (first_scale ? " [" : ", ") << debug.target_longest_side;
+      first_scale = false;
+    }
+    std::cout << (first_scale ? " []\n" : "]\n");
+    std::cout << "\n";
+
     std::cout << "Outer wrapper per-scale debug\n";
     for (const auto& debug : result.outer_detection.scale_debug) {
       std::cout << "  scale longest-side=" << debug.target_longest_side
+                << " divisor=" << debug.configured_scale_divisor
                 << " factor=" << debug.scale_factor
                 << " size=" << debug.scaled_size.width << "x" << debug.scaled_size.height
                 << " raw=" << debug.raw_detection_count
                 << " matching=" << debug.matching_tag_count
                 << " accepted=" << debug.accepted_candidate_count
-                << " refined_success=" << debug.refined_success_count;
+                << " refined_success=" << debug.refined_success_count
+                << " fused=" << (debug.contributed_to_corner_fusion ? "yes" : "no");
       if (!debug.rejection_summary.empty()) {
         std::cout << " rejection=\"" << debug.rejection_summary << "\"";
       }
@@ -302,7 +334,11 @@ int main(int argc, char** argv) {
     std::cout << "  valid observation: " << (result.success ? "yes" : "no") << "\n";
     std::cout << "  outer wrapper success: " << (result.outer_detection.success ? "yes" : "no") << "\n";
     std::cout << "  outer failure reason: " << result.outer_detection.failure_reason_text << "\n";
-    std::cout << "  outer chosen scale: " << result.outer_detection.chosen_scale_longest_side << "\n";
+    std::cout << "  outer scale mode: " << result.outer_detection.scale_configuration_mode << "\n";
+    std::cout << "  outer chosen/reference scale: "
+              << result.outer_detection.chosen_scale_longest_side << "\n";
+    std::cout << "  outer used corner fusion: "
+              << (result.outer_detection.used_corner_fusion ? "yes" : "no") << "\n";
     std::cout << "  outer quality: " << result.outer_detection.quality << "\n";
     std::cout << "  projection mode: " << ati::ToString(result.projection_mode) << "\n";
     std::cout << "  expected visible points: " << result.expected_visible_point_count << "\n";
@@ -313,6 +349,39 @@ int main(int argc, char** argv) {
       std::cout << "  canonical view image: " << canonical_output_path << "\n";
     }
 
+    std::cout << "\nOuter corner multi-scale fusion debug\n";
+    for (const auto& debug : result.outer_detection.corner_fusion_debug) {
+      if (debug.corner_index < 0) {
+        continue;
+      }
+      std::cout << "  corner=" << debug.corner_index
+                << " scales=" << debug.successful_scale_count
+                << " inliers=" << debug.inlier_count
+                << " outliers=" << debug.outlier_count
+                << " reject=" << (debug.used_outlier_rejection ? "yes" : "no")
+                << " stable=" << (debug.stable_after_fusion ? "yes" : "no")
+                << " avg_before=" << debug.average_deviation_before
+                << " max_before=" << debug.max_deviation_before
+                << " avg_after=" << debug.average_deviation_after
+                << " max_after=" << debug.max_deviation_after
+                << " threshold=" << debug.outlier_threshold
+                << " consensus=(" << debug.consensus_corner.x << ", " << debug.consensus_corner.y << ")"
+                << " fused=(" << debug.fused_corner.x << ", " << debug.fused_corner.y << ")"
+                << "\n";
+      if (!debug.scale_observations.empty()) {
+        std::cout << "    observations:";
+        for (const auto& observation : debug.scale_observations) {
+          std::cout << " [" << observation.target_longest_side
+                    << " (" << observation.coarse_corner.x << ", " << observation.coarse_corner.y << ")"
+                    << " dc=" << observation.deviation_from_consensus
+                    << " df=" << observation.deviation_from_fused
+                    << (observation.rejected_as_outlier ? " outlier" : " inlier")
+                    << "]";
+        }
+        std::cout << "\n";
+      }
+    }
+
     std::cout << "\nOuter corner verification debug\n";
     for (const auto& debug : result.outer_detection.corner_verification_debug) {
       if (debug.corner_index < 0) {
@@ -320,6 +389,7 @@ int main(int argc, char** argv) {
       }
       std::cout << "  corner=" << debug.corner_index
                 << " pass=" << (debug.verification_passed ? "yes" : "no")
+                << " refined_valid=" << (debug.refined_valid ? "yes" : "no")
                 << " local_scale=" << debug.local_scale
                 << " roi_radius=" << debug.verification_roi_radius
                 << " candidate_radius=" << debug.candidate_radius
@@ -327,6 +397,10 @@ int main(int argc, char** argv) {
                 << " coarse=(" << debug.coarse_corner.x << ", " << debug.coarse_corner.y << ")"
                 << " verified=(" << debug.verified_corner.x << ", " << debug.verified_corner.y << ")"
                 << " subpix=(" << debug.subpix_corner.x << ", " << debug.subpix_corner.y << ")"
+                << " d_cv=" << debug.coarse_to_verified_displacement
+                << " d_cs=" << debug.coarse_to_subpix_displacement
+                << " d_cr=" << debug.coarse_to_refined_displacement
+                << " refine_gate=" << debug.refine_displacement_limit
                 << " dir=" << debug.direction_consistency_score
                 << " layout=" << debug.local_layout_score
                 << " Q=" << debug.verification_quality;

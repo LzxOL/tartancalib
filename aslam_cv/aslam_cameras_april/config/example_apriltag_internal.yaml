@@ -8,12 +8,17 @@ internal_projection_mode: virtual_pinhole_patch
 
 # Outer-tag detector / Step 1 local structure verification.
 min_border_distance: 4.0
-scale_candidates: [3000, 2400, 1800, 1200, 1000, 800, 600, 500, 400, 300]
+scale_divisors: [1.0, 1.5, 2.0, 2.5, 3.5, 4.5, 6.0, 8.0, 12.0]
+# Legacy alternative. If both are present, scale_divisors takes precedence.
+# scale_candidates: [3000, 2400, 1800, 1200, 1000, 800, 600, 500, 400, 300]
 do_outer_subpix_refinement: true
+# Final coarse->refined displacement gate:
+# max(max_outer_refine_displacement, outer_refine_displacement_scale * local_corner_scale)
 max_outer_refine_displacement: 6.0
+outer_refine_displacement_scale: 0.025
 enable_outer_corner_local_verification: true
 enable_outer_corner_layout_check: false
-outer_corner_verification_roi_scale: 0.035
+outer_corner_verification_roi_scale: 0.05
 outer_corner_verification_roi_min: 12
 outer_corner_verification_roi_max: 48
 outer_corner_candidate_scale: 0.022
