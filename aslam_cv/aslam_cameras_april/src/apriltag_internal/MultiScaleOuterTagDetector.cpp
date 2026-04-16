@@ -37,10 +37,6 @@ constexpr double kOuterLineSubpixAgreementPixels = 6.0;
 constexpr int kVerificationLineMinSupportPoints = 4;
 constexpr int kOuterVerificationCandidateStepPixels = 2;
 constexpr double kOuterDirectionAlignmentFloor = 0.75;
-constexpr double kOuterBranchBalanceMinScore = 0.50;
-constexpr double kOuterIntersectionAgreementMinScore = 0.45;
-constexpr double kOuterSlideDominantAlignmentMin = 0.92;
-constexpr double kOuterSlideSecondaryAlignmentMax = 0.60;
 constexpr double kOuterLayoutContrastFloor = 8.0;
 constexpr double kOuterLayoutContrastRange = 40.0;
 
@@ -98,19 +94,10 @@ struct OuterCornerLocalVerificationResult {
   int verification_roi_radius = 0;
   int candidate_radius = 0;
   int branch_search_radius = 0;
-  double prev_branch_score = 0.0;
-  double next_branch_score = 0.0;
-  double branch_balance_score = 0.0;
-  cv::Point2f branch_intersection{};
-  double branch_intersection_distance = std::numeric_limits<double>::infinity();
-  double intersection_agreement_score = 0.0;
   double direction_consistency_score = 0.0;
   double local_layout_score = 0.0;
   double verification_quality = 0.0;
-  bool branch_intersection_valid = false;
-  bool edge_slide_suspected = false;
   bool verification_passed = false;
-  bool used_coarse_subpix_fallback = false;
   std::string failure_reason;
 };
 
@@ -120,8 +107,6 @@ struct AdaptiveCornerSearchRadii {
   int candidate_radius = 0;
   int branch_search_radius = 0;
 };
-
-bool IntersectLines(const FittedLine& first, const FittedLine& second, cv::Point2f* intersection);
 
 std::string Trim(const std::string& value) {
   const auto begin = value.find_first_not_of(" \t\r\n");
@@ -669,121 +654,6 @@ double ScoreCornerDirectionConsistency(DirectionalEdgeBranch* prev_branch,
   return std::min(prev_branch->score, next_branch->score);
 }
 
-double ScoreBranchBalance(double prev_branch_score, double next_branch_score) {
-  const double strongest_branch_score = std::max(prev_branch_score, next_branch_score);
-  if (strongest_branch_score <= 1e-9) {
-    return 0.0;
-  }
-  return ClampUnit(std::min(prev_branch_score, next_branch_score) / strongest_branch_score);
-}
-
-double ScoreBranchIntersectionAgreement(const cv::Point2f& candidate_corner,
-                                        const DirectionalEdgeBranch& prev_branch,
-                                        const DirectionalEdgeBranch& next_branch,
-                                        const AdaptiveCornerSearchRadii& radii,
-                                        cv::Point2f* branch_intersection,
-                                        double* branch_intersection_distance,
-                                        bool* branch_intersection_valid) {
-  if (branch_intersection == nullptr ||
-      branch_intersection_distance == nullptr ||
-      branch_intersection_valid == nullptr) {
-    throw std::runtime_error("ScoreBranchIntersectionAgreement requires valid output pointers.");
-  }
-
-  *branch_intersection = candidate_corner;
-  *branch_intersection_distance = std::numeric_limits<double>::infinity();
-  *branch_intersection_valid = false;
-
-  if (!prev_branch.valid || !next_branch.valid) {
-    return 0.0;
-  }
-
-  cv::Point2f fitted_intersection;
-  if (!IntersectLines(prev_branch.fitted_line, next_branch.fitted_line, &fitted_intersection)) {
-    return 0.0;
-  }
-
-  *branch_intersection = fitted_intersection;
-  *branch_intersection_distance = Norm(fitted_intersection - candidate_corner);
-  *branch_intersection_valid = true;
-
-  const double max_reasonable_distance =
-      std::max(2.5,
-               std::min(static_cast<double>(radii.candidate_radius) * 0.70,
-                        static_cast<double>(radii.branch_search_radius) * 1.50 + 1.0));
-  return ClampUnit(1.0 - *branch_intersection_distance / max_reasonable_distance);
-}
-
-bool IsEdgeSlideSuspected(const cv::Point2f& coarse_corner,
-                          const cv::Point2f& candidate_corner,
-                          const cv::Point2f& prev_edge,
-                          const cv::Point2f& next_edge,
-                          const AdaptiveCornerSearchRadii& radii,
-                          double branch_balance_score,
-                          bool branch_intersection_valid,
-                          double branch_intersection_distance) {
-  const cv::Point2f displacement = candidate_corner - coarse_corner;
-  const double displacement_norm = Norm(displacement);
-  const double min_slide_displacement =
-      std::max(2.0, static_cast<double>(radii.candidate_radius) * 0.30);
-  if (displacement_norm < min_slide_displacement) {
-    return false;
-  }
-
-  const cv::Point2f displacement_direction = NormalizeVector(displacement);
-  if (Norm(displacement_direction) <= 1e-9) {
-    return false;
-  }
-
-  const double prev_alignment =
-      std::abs(Dot(displacement_direction, NormalizeVector(prev_edge)));
-  const double next_alignment =
-      std::abs(Dot(displacement_direction, NormalizeVector(next_edge)));
-  const double dominant_alignment = std::max(prev_alignment, next_alignment);
-  const double secondary_alignment = std::min(prev_alignment, next_alignment);
-  const double max_reasonable_intersection_distance =
-      std::max(2.5, static_cast<double>(radii.branch_search_radius) * 1.10 + 1.0);
-
-  return dominant_alignment >= kOuterSlideDominantAlignmentMin &&
-         secondary_alignment <= kOuterSlideSecondaryAlignmentMax &&
-         (branch_balance_score < std::max(kOuterBranchBalanceMinScore, 0.60) ||
-          !branch_intersection_valid ||
-          branch_intersection_distance > max_reasonable_intersection_distance);
-}
-
-bool IsVerificationResultBetter(const OuterCornerLocalVerificationResult& candidate,
-                                const OuterCornerLocalVerificationResult& incumbent,
-                                const cv::Point2f& coarse_corner) {
-  if (candidate.verification_quality > incumbent.verification_quality + 1e-9) {
-    return true;
-  }
-  if (candidate.verification_quality + 1e-9 < incumbent.verification_quality) {
-    return false;
-  }
-
-  if (candidate.edge_slide_suspected != incumbent.edge_slide_suspected) {
-    return !candidate.edge_slide_suspected;
-  }
-
-  if (candidate.intersection_agreement_score > incumbent.intersection_agreement_score + 1e-9) {
-    return true;
-  }
-  if (candidate.intersection_agreement_score + 1e-9 < incumbent.intersection_agreement_score) {
-    return false;
-  }
-
-  if (candidate.branch_balance_score > incumbent.branch_balance_score + 1e-9) {
-    return true;
-  }
-  if (candidate.branch_balance_score + 1e-9 < incumbent.branch_balance_score) {
-    return false;
-  }
-
-  const double candidate_displacement = Norm(candidate.verified_corner - coarse_corner);
-  const double incumbent_displacement = Norm(incumbent.verified_corner - coarse_corner);
-  return candidate_displacement + 1e-9 < incumbent_displacement;
-}
-
 double ScoreOuterCornerLocalLayout(const cv::Mat& gray,
                                    const cv::Point2f& candidate_corner,
                                    const cv::Point2f& prev_edge,
@@ -850,19 +720,10 @@ OuterCornerVerificationDebugInfo BuildVerificationDebugInfo(
   debug.verification_roi_radius = verification.verification_roi_radius;
   debug.candidate_radius = verification.candidate_radius;
   debug.branch_search_radius = verification.branch_search_radius;
-  debug.prev_branch_score = verification.prev_branch_score;
-  debug.next_branch_score = verification.next_branch_score;
-  debug.branch_balance_score = verification.branch_balance_score;
-  debug.branch_intersection = verification.branch_intersection;
-  debug.branch_intersection_distance = verification.branch_intersection_distance;
-  debug.intersection_agreement_score = verification.intersection_agreement_score;
   debug.direction_consistency_score = verification.direction_consistency_score;
   debug.local_layout_score = verification.local_layout_score;
   debug.verification_quality = verification.verification_quality;
-  debug.branch_intersection_valid = verification.branch_intersection_valid;
-  debug.edge_slide_suspected = verification.edge_slide_suspected;
   debug.verification_passed = verification.verification_passed;
-  debug.used_coarse_subpix_fallback = verification.used_coarse_subpix_fallback;
   debug.subpix_applied = false;
   debug.failure_reason = verification.failure_reason;
   return debug;
@@ -903,16 +764,9 @@ OuterCornerLocalVerificationResult VerifyOuterCornerLocalStructure(
   best_any.branch_search_radius = radii.branch_search_radius;
 
   if (!config.enable_outer_corner_local_verification) {
-    best_any.prev_branch_score = 1.0;
-    best_any.next_branch_score = 1.0;
-    best_any.branch_balance_score = 1.0;
-    best_any.branch_intersection = coarse_corner;
-    best_any.branch_intersection_distance = 0.0;
-    best_any.intersection_agreement_score = 1.0;
     best_any.direction_consistency_score = 1.0;
     best_any.local_layout_score = 1.0;
     best_any.verification_quality = 1.0;
-    best_any.branch_intersection_valid = true;
     best_any.verification_passed = true;
     best_any.failure_reason = "verification_disabled";
     return best_any;
@@ -953,47 +807,23 @@ OuterCornerLocalVerificationResult VerifyOuterCornerLocalStructure(
       candidate_result.direction_consistency_score =
           ScoreCornerDirectionConsistency(&candidate_result.prev_branch, &candidate_result.next_branch,
                                           prev_edge, next_edge);
-      candidate_result.prev_branch_score = candidate_result.prev_branch.score;
-      candidate_result.next_branch_score = candidate_result.next_branch.score;
-      candidate_result.branch_balance_score =
-          ScoreBranchBalance(candidate_result.prev_branch_score, candidate_result.next_branch_score);
-      candidate_result.intersection_agreement_score =
-          ScoreBranchIntersectionAgreement(candidate_corner, candidate_result.prev_branch,
-                                           candidate_result.next_branch, radii,
-                                           &candidate_result.branch_intersection,
-                                           &candidate_result.branch_intersection_distance,
-                                           &candidate_result.branch_intersection_valid);
       candidate_result.local_layout_score =
           config.enable_outer_corner_layout_check
               ? ScoreOuterCornerLocalLayout(gray, candidate_corner, prev_edge, next_edge, quad_center, radii)
               : 1.0;
-      candidate_result.edge_slide_suspected =
-          IsEdgeSlideSuspected(coarse_corner, candidate_corner, prev_edge, next_edge, radii,
-                               candidate_result.branch_balance_score,
-                               candidate_result.branch_intersection_valid,
-                               candidate_result.branch_intersection_distance);
-      candidate_result.verification_quality =
-          std::min(candidate_result.direction_consistency_score,
-                   std::min(candidate_result.branch_balance_score,
-                            candidate_result.intersection_agreement_score));
+      candidate_result.verification_quality = candidate_result.direction_consistency_score;
       candidate_result.verification_passed =
           candidate_result.direction_consistency_score >= config.outer_corner_min_direction_score &&
-          candidate_result.branch_balance_score >= kOuterBranchBalanceMinScore &&
-          candidate_result.intersection_agreement_score >= kOuterIntersectionAgreementMinScore &&
           (!config.enable_outer_corner_layout_check ||
            candidate_result.local_layout_score >= config.outer_corner_min_layout_score) &&
           candidate_result.prev_branch.valid &&
-          candidate_result.next_branch.valid &&
-          !candidate_result.edge_slide_suspected;
-      candidate_result.used_coarse_subpix_fallback = candidate_result.edge_slide_suspected;
+          candidate_result.next_branch.valid;
 
-      if (best_any.verification_quality < 0.0 ||
-          IsVerificationResultBetter(candidate_result, best_any, coarse_corner)) {
+      if (candidate_result.verification_quality > best_any.verification_quality) {
         best_any = candidate_result;
       }
       if (candidate_result.verification_passed &&
-          (best_passed.verification_quality < 0.0 ||
-           IsVerificationResultBetter(candidate_result, best_passed, coarse_corner))) {
+          candidate_result.verification_quality > best_passed.verification_quality) {
         best_passed = candidate_result;
       }
     }
@@ -1006,21 +836,12 @@ OuterCornerLocalVerificationResult VerifyOuterCornerLocalStructure(
     return final_result;
   }
 
-  if (final_result.edge_slide_suspected) {
-    final_result.failure_reason = "edge_slide";
-  } else if (config.enable_outer_corner_layout_check &&
+  if (config.enable_outer_corner_layout_check &&
       final_result.direction_consistency_score < config.outer_corner_min_direction_score &&
       final_result.local_layout_score < config.outer_corner_min_layout_score) {
     final_result.failure_reason = "dir+layout";
   } else if (final_result.direction_consistency_score < config.outer_corner_min_direction_score) {
     final_result.failure_reason = "dir";
-  } else if (final_result.branch_balance_score < kOuterBranchBalanceMinScore &&
-             final_result.intersection_agreement_score < kOuterIntersectionAgreementMinScore) {
-    final_result.failure_reason = "balance+inter";
-  } else if (final_result.branch_balance_score < kOuterBranchBalanceMinScore) {
-    final_result.failure_reason = "balance";
-  } else if (final_result.intersection_agreement_score < kOuterIntersectionAgreementMinScore) {
-    final_result.failure_reason = "inter";
   } else if (config.enable_outer_corner_layout_check &&
              final_result.local_layout_score < config.outer_corner_min_layout_score) {
     final_result.failure_reason = "layout";
@@ -1418,7 +1239,6 @@ OuterTagDetectionResult MultiScaleOuterTagDetector::Detect(const cv::Mat& image)
 
     std::array<bool, 4> method_valid{{false, false, false, false}};
     std::array<double, 4> method_quality{{0.0, 0.0, 0.0, 0.0}};
-    std::array<bool, 4> allow_line_refinement{{false, false, false, false}};
 
     for (int index = 0; index < 4; ++index) {
       const cv::Point2f coarse_original(
@@ -1445,18 +1265,13 @@ OuterTagDetectionResult MultiScaleOuterTagDetector::Detect(const cv::Mat& image)
                                      verification);
       const bool verification_passed =
           refined_candidate.verification_debug[static_cast<std::size_t>(index)].verification_passed;
-      const bool use_coarse_subpix_fallback =
-          refined_candidate.verification_debug[static_cast<std::size_t>(index)].used_coarse_subpix_fallback;
-      const bool use_verified_seed = verification_passed && !use_coarse_subpix_fallback;
       const cv::Point2f verification_seed =
-          use_verified_seed ? verification.verified_corner
-                            : refined_candidate.coarse_original[static_cast<std::size_t>(index)];
+          verification_passed ? verification.verified_corner
+                              : refined_candidate.coarse_original[static_cast<std::size_t>(index)];
       refined_candidate.refined_original[static_cast<std::size_t>(index)] = verification_seed;
-      method_valid[static_cast<std::size_t>(index)] = verification_passed || use_coarse_subpix_fallback;
+      method_valid[static_cast<std::size_t>(index)] = verification_passed;
       method_quality[static_cast<std::size_t>(index)] =
-          use_verified_seed ? verification.verification_quality
-                            : (use_coarse_subpix_fallback ? 1.0 : 0.0);
-      allow_line_refinement[static_cast<std::size_t>(index)] = use_verified_seed;
+          verification_passed ? verification.verification_quality : 0.0;
       verification_seed_corners[static_cast<std::size_t>(index)] = verification_seed;
       refined_candidate.verification_debug[static_cast<std::size_t>(index)].subpix_corner =
           verification_seed;
@@ -1487,7 +1302,7 @@ OuterTagDetectionResult MultiScaleOuterTagDetector::Detect(const cv::Mat& image)
     }
 
     for (int index = 0; index < 4; ++index) {
-      if (!allow_line_refinement[static_cast<std::size_t>(index)]) {
+      if (!method_valid[static_cast<std::size_t>(index)]) {
         continue;
       }
 
@@ -1694,14 +1509,7 @@ void MultiScaleOuterTagDetector::DrawDetection(const OuterTagDetectionResult& de
     const cv::Point2f verified = verification.verified_corner;
     const cv::Point2f subpix = verification.subpix_corner;
     const cv::Point2f anchor = verified;
-    const cv::Point2f branch_intersection = verification.branch_intersection;
     const float arrow_length = static_cast<float>(18.0 * render_scale);
-    const cv::Scalar verified_color =
-        verification.edge_slide_suspected ? cv::Scalar(0, 140, 255)
-                                          : (verification.verification_passed ? cv::Scalar(0, 255, 0)
-                                                                              : cv::Scalar(0, 0, 255));
-    const cv::Scalar displacement_color =
-        verification.edge_slide_suspected ? cv::Scalar(0, 140, 255) : cv::Scalar(120, 220, 120);
     if (verification.candidate_radius > 0) {
       cv::circle(*output_image, coarse, verification.candidate_radius,
                  cv::Scalar(0, 110, 200), line_thickness);
@@ -1728,30 +1536,20 @@ void MultiScaleOuterTagDetector::DrawDetection(const OuterTagDetectionResult& de
       cv::circle(*output_image, point, std::max(2, line_thickness + 1), branch_colors[1], -1);
     }
 
-    cv::arrowedLine(*output_image, coarse, verified, displacement_color, line_thickness, cv::LINE_AA, 0, 0.18);
+    cv::line(*output_image, coarse, verified, cv::Scalar(120, 220, 120), line_thickness, cv::LINE_AA);
     cv::line(*output_image, verified, subpix, cv::Scalar(255, 220, 0), line_thickness, cv::LINE_AA);
-    if (verification.branch_intersection_valid) {
-      cv::drawMarker(*output_image, branch_intersection, cv::Scalar(255, 0, 255),
-                     cv::MARKER_TILTED_CROSS, verified_radius * 3, line_thickness);
-      if (verification.edge_slide_suspected) {
-        cv::line(*output_image, verified, branch_intersection, cv::Scalar(255, 0, 255),
-                 line_thickness, cv::LINE_AA);
-      }
-    }
     cv::circle(*output_image, coarse, coarse_radius, cv::Scalar(0, 165, 255), line_thickness);
-    cv::circle(*output_image, verified, verified_radius, verified_color, line_thickness);
+    cv::circle(*output_image, verified, verified_radius,
+               verification.verification_passed ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255),
+               line_thickness);
     cv::drawMarker(*output_image, subpix, cv::Scalar(255, 255, 0),
                    cv::MARKER_CROSS, subpix_radius * 3, line_thickness);
 
     std::ostringstream label;
     label << (verification.verification_passed ? "pass" : "fail")
-          << " Q=" << std::fixed << std::setprecision(2) << verification.verification_quality
-          << " dir=" << verification.direction_consistency_score
-          << " bal=" << verification.branch_balance_score
-          << " int=" << verification.intersection_agreement_score;
-    if (verification.edge_slide_suspected) {
-      label << " slide";
-    }
+          << " dir=" << std::fixed << std::setprecision(2) << verification.direction_consistency_score
+          << " lay=" << verification.local_layout_score
+          << " Q=" << verification.verification_quality;
     if (!verification.verification_passed && !verification.failure_reason.empty()) {
       label << " " << verification.failure_reason;
     }
@@ -1759,25 +1557,8 @@ void MultiScaleOuterTagDetector::DrawDetection(const OuterTagDetectionResult& de
                 verified + cv::Point2f(static_cast<float>(6.0 * render_scale),
                                        static_cast<float>(14.0 * render_scale)),
                 cv::FONT_HERSHEY_PLAIN, label_scale,
-                verified_color, line_thickness);
-    std::ostringstream score_label;
-    score_label << "p=" << std::fixed << std::setprecision(2) << verification.prev_branch_score
-                << " n=" << verification.next_branch_score
-                << " dI=";
-    if (verification.branch_intersection_valid &&
-        std::isfinite(verification.branch_intersection_distance)) {
-      score_label << std::setprecision(1) << verification.branch_intersection_distance;
-    } else {
-      score_label << "na";
-    }
-    if (verification.used_coarse_subpix_fallback) {
-      score_label << " coarse->subpix";
-    }
-    cv::putText(*output_image, score_label.str(),
-                verified + cv::Point2f(static_cast<float>(6.0 * render_scale),
-                                       static_cast<float>(30.0 * render_scale)),
-                cv::FONT_HERSHEY_PLAIN, std::max(0.8, 0.6 * render_scale),
-                cv::Scalar(220, 240, 255), line_thickness);
+                verification.verification_passed ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255),
+                line_thickness);
     std::ostringstream adaptive_label;
     adaptive_label << "s=" << std::fixed << std::setprecision(1) << verification.local_scale
                    << " roi=" << verification.verification_roi_radius
@@ -1785,7 +1566,7 @@ void MultiScaleOuterTagDetector::DrawDetection(const OuterTagDetectionResult& de
                    << " br=" << verification.branch_search_radius;
     cv::putText(*output_image, adaptive_label.str(),
                 verified + cv::Point2f(static_cast<float>(6.0 * render_scale),
-                                       static_cast<float>(46.0 * render_scale)),
+                                       static_cast<float>(30.0 * render_scale)),
                 cv::FONT_HERSHEY_PLAIN, std::max(0.8, 0.6 * render_scale),
                 cv::Scalar(200, 255, 200), line_thickness);
     cv::putText(*output_image, "C",
@@ -1795,14 +1576,9 @@ void MultiScaleOuterTagDetector::DrawDetection(const OuterTagDetectionResult& de
     cv::putText(*output_image, "V",
                 verified + cv::Point2f(static_cast<float>(-10.0 * render_scale),
                                        static_cast<float>(-8.0 * render_scale)),
-                cv::FONT_HERSHEY_PLAIN, label_scale, verified_color,
+                cv::FONT_HERSHEY_PLAIN, label_scale,
+                verification.verification_passed ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255),
                 line_thickness);
-    if (verification.branch_intersection_valid) {
-      cv::putText(*output_image, "I",
-                  branch_intersection + cv::Point2f(static_cast<float>(6.0 * render_scale),
-                                                    static_cast<float>(-8.0 * render_scale)),
-                  cv::FONT_HERSHEY_PLAIN, label_scale, cv::Scalar(255, 0, 255), line_thickness);
-    }
     cv::putText(*output_image, "S",
                 subpix + cv::Point2f(static_cast<float>(6.0 * render_scale),
                                      static_cast<float>(-8.0 * render_scale)),

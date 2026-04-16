@@ -320,8 +320,6 @@ int main(int argc, char** argv) {
       }
       std::cout << "  corner=" << debug.corner_index
                 << " pass=" << (debug.verification_passed ? "yes" : "no")
-                << " slide=" << (debug.edge_slide_suspected ? "yes" : "no")
-                << " fallback=" << (debug.used_coarse_subpix_fallback ? "coarse_subpix" : "verified")
                 << " local_scale=" << debug.local_scale
                 << " roi_radius=" << debug.verification_roi_radius
                 << " candidate_radius=" << debug.candidate_radius
@@ -329,17 +327,6 @@ int main(int argc, char** argv) {
                 << " coarse=(" << debug.coarse_corner.x << ", " << debug.coarse_corner.y << ")"
                 << " verified=(" << debug.verified_corner.x << ", " << debug.verified_corner.y << ")"
                 << " subpix=(" << debug.subpix_corner.x << ", " << debug.subpix_corner.y << ")"
-                << " prev_score=" << debug.prev_branch_score
-                << " next_score=" << debug.next_branch_score
-                << " balance=" << debug.branch_balance_score
-                << " inter_score=" << debug.intersection_agreement_score;
-      if (debug.branch_intersection_valid) {
-        std::cout << " inter=(" << debug.branch_intersection.x << ", " << debug.branch_intersection.y << ")"
-                  << " inter_dist=" << debug.branch_intersection_distance;
-      } else {
-        std::cout << " inter=(na)";
-      }
-      std::cout
                 << " dir=" << debug.direction_consistency_score
                 << " layout=" << debug.local_layout_score
                 << " Q=" << debug.verification_quality;
