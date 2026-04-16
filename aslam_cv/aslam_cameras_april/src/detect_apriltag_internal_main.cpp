@@ -306,7 +306,7 @@ int main(int argc, char** argv) {
     std::cout << "  internal_projection_mode: "
               << ati::ToString(config.internal_projection_mode) << "\n\n";
     std::cout << "Outer refinement chain\n";
-    std::cout << "  chain: C-V-S\n";
+    std::cout << "  chain: C-S\n";
     std::cout << "  outer_subpix: "
               << (config.outer_detector_config.do_outer_subpix_refinement ? "on" : "off") << "\n\n";
 
@@ -422,27 +422,15 @@ int main(int argc, char** argv) {
           continue;
         }
         std::cout << "  corner=" << debug.corner_index
-                  << " chain=C-V-S"
-                  << " pass=" << (debug.verification_passed ? "yes" : "no")
+                  << " chain=C-S"
                   << " refined_valid=" << (debug.refined_valid ? "yes" : "no")
                   << " local_scale=" << debug.local_scale
-                  << " roi_radius=" << debug.verification_roi_radius
-                  << " candidate_radius=" << debug.candidate_radius
-                  << " branch_radius=" << debug.branch_search_radius
                   << " coarse=(" << debug.coarse_corner.x << ", " << debug.coarse_corner.y << ")"
-                  << " verified=(" << debug.verified_corner.x << ", " << debug.verified_corner.y << ")"
                   << " subpix=(" << debug.subpix_corner.x << ", " << debug.subpix_corner.y << ")"
-                  << " d_cv=" << debug.coarse_to_verified_displacement
                   << " d_cs=" << debug.coarse_to_subpix_displacement
                   << " d_cr=" << debug.coarse_to_refined_displacement
                   << " subpix_radius=" << debug.subpix_window_radius
-                  << " refine_gate=" << debug.refine_displacement_limit
-                  << " dir=" << debug.direction_consistency_score
-                  << " layout=" << debug.local_layout_score
-                  << " Q=" << debug.verification_quality;
-        if (!debug.failure_reason.empty()) {
-          std::cout << " reason=" << debug.failure_reason;
-        }
+                  << " refine_gate=" << debug.refine_displacement_limit;
         std::cout << "\n";
       }
 

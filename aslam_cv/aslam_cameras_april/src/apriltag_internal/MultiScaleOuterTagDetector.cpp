@@ -356,7 +356,7 @@ MultiScaleOuterTagDetectorConfig ParseConfig(const std::string& yaml_path) {
       config.blur_sigma = ParseDouble(key, value);
     } else if (key == "enableOuterCornerLocalVerification" ||
                key == "enable_outer_corner_local_verification") {
-      // Legacy compatibility: the pipeline is now always C-V-S.
+      // Legacy compatibility: the pipeline is now always C-S.
       (void)ParseBool(key, value);
     } else if (key == "enableOuterCornerLayoutCheck" ||
                key == "enable_outer_corner_layout_check") {
@@ -814,6 +814,40 @@ OuterCornerVerificationDebugInfo BuildVerificationDebugInfo(
   debug.verification_passed = verification.verification_passed;
   debug.subpix_applied = false;
   debug.failure_reason = verification.failure_reason;
+  return debug;
+}
+
+OuterCornerVerificationDebugInfo BuildCoarseOnlyDebugInfo(
+    int corner_index,
+    const std::array<cv::Point2f, 4>& coarse_corners,
+    const cv::Size& image_size,
+    const MultiScaleOuterTagDetectorConfig& config) {
+  OuterCornerVerificationDebugInfo debug;
+  debug.corner_index = corner_index;
+  debug.coarse_corner = coarse_corners[static_cast<std::size_t>(corner_index)];
+  debug.verified_corner = debug.coarse_corner;
+  debug.subpix_corner = debug.coarse_corner;
+  const int prev_index = (corner_index + 3) % 4;
+  const int next_index = (corner_index + 1) % 4;
+  const cv::Point2f prev_edge =
+      coarse_corners[static_cast<std::size_t>(prev_index)] - debug.coarse_corner;
+  const cv::Point2f next_edge =
+      coarse_corners[static_cast<std::size_t>(next_index)] - debug.coarse_corner;
+  debug.prev_edge_direction = NormalizeVector(prev_edge);
+  debug.next_edge_direction = NormalizeVector(next_edge);
+  debug.local_scale = std::min(Norm(prev_edge), Norm(next_edge));
+  const AdaptiveCornerSearchRadii radii =
+      ComputeAdaptiveCornerSearchRadii(debug.local_scale, config);
+  debug.verification_roi_radius = radii.verification_roi_radius;
+  debug.candidate_radius = radii.candidate_radius;
+  debug.branch_search_radius = radii.branch_search_radius;
+  debug.verification_roi =
+      MakeCornerVerificationRoi(debug.coarse_corner, image_size, radii.verification_roi_radius);
+  debug.verification_passed = true;
+  debug.verification_quality = 1.0;
+  debug.direction_consistency_score = 1.0;
+  debug.local_layout_score = 1.0;
+  debug.failure_reason = "cs_only";
   return debug;
 }
 
@@ -1398,41 +1432,29 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
 
   std::array<bool, 4> method_valid{{false, false, false, false}};
   std::array<double, 4> method_quality{{0.0, 0.0, 0.0, 0.0}};
-  std::array<cv::Point2f, 4> verification_seed_corners = coarse_original;
+  std::array<cv::Point2f, 4> subpix_seed_corners = coarse_original;
 
   for (int index = 0; index < 4; ++index) {
-    const OuterCornerLocalVerificationResult verification =
-        VerifyOuterCornerLocalStructure(gray_original, coarse_original, index, config);
     refined_candidate.verification_debug[static_cast<std::size_t>(index)] =
-        BuildVerificationDebugInfo(index,
-                                   coarse_original[static_cast<std::size_t>(index)],
-                                   verification);
-    const bool verification_passed =
-        refined_candidate.verification_debug[static_cast<std::size_t>(index)].verification_passed;
-    const cv::Point2f verification_seed =
-        verification_passed ? verification.verified_corner
-                            : coarse_original[static_cast<std::size_t>(index)];
-    refined_candidate.refined_original[static_cast<std::size_t>(index)] = verification_seed;
-    method_valid[static_cast<std::size_t>(index)] = verification_passed;
-    method_quality[static_cast<std::size_t>(index)] =
-        verification_passed ? verification.verification_quality : 0.0;
-    verification_seed_corners[static_cast<std::size_t>(index)] = verification_seed;
+        BuildCoarseOnlyDebugInfo(index, coarse_original, gray_original.size(), config);
+    refined_candidate.refined_original[static_cast<std::size_t>(index)] =
+        coarse_original[static_cast<std::size_t>(index)];
+    method_valid[static_cast<std::size_t>(index)] = true;
+    method_quality[static_cast<std::size_t>(index)] = 1.0;
     OuterCornerVerificationDebugInfo& debug =
         refined_candidate.verification_debug[static_cast<std::size_t>(index)];
-    debug.subpix_corner = verification_seed;
     const double local_scale =
         debug.local_scale > 0.0 ? debug.local_scale : ComputeCornerLocalScale(coarse_original, index);
     debug.subpix_window_radius =
         ComputeAdaptiveOuterSubpixRadius(local_scale, debug.verification_roi_radius, config);
   }
 
-  std::array<cv::Point2f, 4> subpix_seed_corners = verification_seed_corners;
   if (config.do_outer_subpix_refinement) {
     for (int index = 0; index < 4; ++index) {
       if (!method_valid[static_cast<std::size_t>(index)]) {
         continue;
       }
-      std::vector<cv::Point2f> point_seed{verification_seed_corners[static_cast<std::size_t>(index)]};
+      std::vector<cv::Point2f> point_seed{coarse_original[static_cast<std::size_t>(index)]};
       const int subpix_radius =
           refined_candidate.verification_debug[static_cast<std::size_t>(index)].subpix_window_radius;
       cv::cornerSubPix(
@@ -1449,7 +1471,7 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
   } else {
     for (int index = 0; index < 4; ++index) {
       refined_candidate.verification_debug[static_cast<std::size_t>(index)].subpix_corner =
-          verification_seed_corners[static_cast<std::size_t>(index)];
+          coarse_original[static_cast<std::size_t>(index)];
     }
   }
 
@@ -1953,88 +1975,34 @@ void MultiScaleOuterTagDetector::DrawDetection(const OuterTagDetectionResult& de
         continue;
       }
 
-      const cv::Scalar roi_color =
-          verification.verification_passed ? cv::Scalar(0, 180, 0) : cv::Scalar(0, 0, 255);
-      if (verification.verification_roi.width > 0 && verification.verification_roi.height > 0) {
-        cv::rectangle(*output_image, verification.verification_roi, roi_color, line_thickness);
-      }
-
       const cv::Point2f coarse = verification.coarse_corner;
-      const cv::Point2f verified = verification.verified_corner;
       const cv::Point2f subpix = verification.subpix_corner;
-      const cv::Point2f anchor = verified;
-      const float arrow_length = static_cast<float>(18.0 * render_scale);
-      if (verification.candidate_radius > 0) {
-        cv::circle(*output_image, coarse, verification.candidate_radius,
-                   cv::Scalar(0, 110, 200), line_thickness);
-      }
-      if (verification.branch_search_radius > 0) {
-        cv::circle(*output_image, verified, verification.branch_search_radius,
-                   cv::Scalar(200, 255, 120), line_thickness);
-      }
-      if (Norm(verification.prev_edge_direction) > 1e-6) {
-        cv::arrowedLine(*output_image, anchor,
-                        anchor + verification.prev_edge_direction * arrow_length,
-                        branch_colors[0], line_thickness, cv::LINE_AA, 0, 0.25);
-      }
-      if (Norm(verification.next_edge_direction) > 1e-6) {
-        cv::arrowedLine(*output_image, anchor,
-                        anchor + verification.next_edge_direction * arrow_length,
-                        branch_colors[1], line_thickness, cv::LINE_AA, 0, 0.25);
-      }
-
-      for (const cv::Point2f& point : verification.prev_branch_points) {
-        cv::circle(*output_image, point, std::max(2, line_thickness + 1), branch_colors[0], -1);
-      }
-      for (const cv::Point2f& point : verification.next_branch_points) {
-        cv::circle(*output_image, point, std::max(2, line_thickness + 1), branch_colors[1], -1);
-      }
-
-      cv::line(*output_image, coarse, verified, cv::Scalar(120, 220, 120), line_thickness, cv::LINE_AA);
-      cv::line(*output_image, verified, subpix, cv::Scalar(255, 220, 0), line_thickness, cv::LINE_AA);
+      cv::line(*output_image, coarse, subpix, cv::Scalar(255, 220, 0), line_thickness, cv::LINE_AA);
       cv::circle(*output_image, coarse, coarse_radius, cv::Scalar(0, 165, 255), line_thickness);
-      cv::circle(*output_image, verified, verified_radius,
-                 verification.verification_passed ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255),
-                 line_thickness);
       cv::drawMarker(*output_image, subpix, cv::Scalar(255, 255, 0),
                      cv::MARKER_CROSS, subpix_radius * 3, line_thickness);
 
       std::ostringstream label;
-      label << (verification.verification_passed ? "pass" : "fail")
-            << " dir=" << std::fixed << std::setprecision(2) << verification.direction_consistency_score
-            << " lay=" << verification.local_layout_score
-            << " Q=" << verification.verification_quality;
-      if (!verification.verification_passed && !verification.failure_reason.empty()) {
-        label << " " << verification.failure_reason;
-      }
+      label << "C-S";
       cv::putText(*output_image, label.str(),
-                  verified + cv::Point2f(static_cast<float>(6.0 * render_scale),
-                                         static_cast<float>(14.0 * render_scale)),
+                  coarse + cv::Point2f(static_cast<float>(6.0 * render_scale),
+                                       static_cast<float>(14.0 * render_scale)),
                   cv::FONT_HERSHEY_PLAIN, label_scale,
-                  verification.verification_passed ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255),
+                  cv::Scalar(255, 220, 0),
                   line_thickness);
       std::ostringstream adaptive_label;
       adaptive_label << "scale=" << std::fixed << std::setprecision(1) << verification.local_scale
-                     << " roi=" << verification.verification_roi_radius
-                     << " candidate=" << verification.candidate_radius
-                     << " branch=" << verification.branch_search_radius
                      << " subpix=" << verification.subpix_window_radius
                      << " gate=" << std::setprecision(1) << verification.refine_displacement_limit;
       cv::putText(*output_image, adaptive_label.str(),
-                  verified + cv::Point2f(static_cast<float>(6.0 * render_scale),
-                                         static_cast<float>(30.0 * render_scale)),
+                  coarse + cv::Point2f(static_cast<float>(6.0 * render_scale),
+                                       static_cast<float>(30.0 * render_scale)),
                   cv::FONT_HERSHEY_PLAIN, std::max(0.8, 0.6 * render_scale),
                   cv::Scalar(200, 255, 200), line_thickness);
       cv::putText(*output_image, "C",
                   coarse + cv::Point2f(static_cast<float>(-10.0 * render_scale),
                                        static_cast<float>(-8.0 * render_scale)),
                   cv::FONT_HERSHEY_PLAIN, label_scale, cv::Scalar(0, 165, 255), line_thickness);
-      cv::putText(*output_image, "V",
-                  verified + cv::Point2f(static_cast<float>(-10.0 * render_scale),
-                                         static_cast<float>(-8.0 * render_scale)),
-                  cv::FONT_HERSHEY_PLAIN, label_scale,
-                  verification.verification_passed ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255),
-                  line_thickness);
       cv::putText(*output_image, "S",
                   subpix + cv::Point2f(static_cast<float>(6.0 * render_scale),
                                        static_cast<float>(-8.0 * render_scale)),

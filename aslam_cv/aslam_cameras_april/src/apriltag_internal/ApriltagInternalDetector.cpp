@@ -305,7 +305,7 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.outer_detector_config.blur_sigma = ParseDouble(key, value);
     } else if (key == "enableOuterCornerLocalVerification" ||
                key == "enable_outer_corner_local_verification") {
-      // Legacy compatibility: the outer pipeline now always runs C-V-S.
+      // Legacy compatibility: the outer pipeline now always runs C-S.
       (void)(Lowercase(value) == "1" || Lowercase(value) == "true" ||
              Lowercase(value) == "yes" || Lowercase(value) == "on");
     } else if (key == "enableOuterCornerLayoutCheck" ||

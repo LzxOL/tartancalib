@@ -12,17 +12,17 @@ internal_subpix_window_max: 16
 max_subpix_displacement2: 0.0
 internal_subpix_displacement_scale: 0.25
 max_internal_subpix_displacement: 6.0
-enable_debug_output: false
+enable_debug_output: true
 internal_projection_mode: virtual_pinhole_patch
 
-# Outer-tag detector / fixed C-V-S outer corner pipeline.
+# Outer-tag detector / fixed C-S outer corner pipeline.
 min_border_distance: 4.0
 scale_divisors: [1.0, 1.5, 2.0, 2.5, 3.5, 4.5, 6.0, 8.0, 12.0]
 # Legacy alternative. If both are present, scale_divisors takes precedence.
 # scale_candidates: [3000, 2400, 1800, 1200, 1000, 800, 600, 500, 400, 300]
 do_outer_subpix_refinement: true
 outer_subpix_window_radius: 0
-outer_subpix_window_scale: 0.015
+outer_subpix_window_scale: 0.025
 outer_subpix_window_min: 4
 outer_subpix_window_max: 16
 # Final coarse->refined displacement gate:
