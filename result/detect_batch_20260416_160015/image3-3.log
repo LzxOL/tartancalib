@@ -1,0 +1,108 @@
+Apriltag internal config
+  target_type: apriltag_internal
+  tagFamily: t36h11
+  tagId: 1
+  tagSize: 0.15625
+  blackBorderBits: 2
+  minVisiblePoints: 12
+  internal_projection_mode: virtual_pinhole_patch
+
+Outer wrapper scale plan
+  original longest-side: 4512
+  scale mode: scale_divisors
+  divisor -> target: /1.00->4512, /1.50->3008, /2.00->2256, /2.50->1805, /3.50->1289, /4.50->1003, /6.00->752, /8.00->564, /12.00->376
+  attempted target longest-sides: [4512, 3008, 2256, 1805, 1289, 1003, 752, 564, 376]
+
+Outer wrapper per-scale debug
+  scale longest-side=4512 divisor=1 factor=1 size=4512x4512 raw=0 matching=0 accepted=0 refined_success=0 fused=no
+  scale longest-side=3008 divisor=1.5 factor=0.666667 size=3008x3008 raw=0 matching=0 accepted=0 refined_success=0 fused=no
+  scale longest-side=2256 divisor=2 factor=0.5 size=2256x2256 raw=0 matching=0 accepted=0 refined_success=0 fused=no
+  scale longest-side=1805 divisor=2.5 factor=0.400044 size=1805x1805 raw=1 matching=1 accepted=1 refined_success=1 fused=yes
+  scale longest-side=1289 divisor=3.5 factor=0.285683 size=1289x1289 raw=1 matching=1 accepted=1 refined_success=0 fused=yes
+  scale longest-side=1003 divisor=4.5 factor=0.222296 size=1003x1003 raw=1 matching=1 accepted=1 refined_success=0 fused=yes
+  scale longest-side=752 divisor=6 factor=0.166667 size=752x752 raw=1 matching=1 accepted=1 refined_success=0 fused=yes
+  scale longest-side=564 divisor=8 factor=0.125 size=564x564 raw=1 matching=1 accepted=1 refined_success=0 fused=yes
+  scale longest-side=376 divisor=12 factor=0.0833333 size=376x376 raw=1 matching=1 accepted=1 refined_success=0 fused=yes
+
+Detection summary
+  tag detected: yes
+  valid observation: no
+  outer wrapper success: yes
+  outer failure reason: None
+  outer scale mode: scale_divisors
+  outer chosen/reference scale: 1805
+  outer used corner fusion: yes
+  outer quality: 0.601099
+  projection mode: virtual_pinhole_patch
+  expected visible points: 37
+  valid points: 7
+  valid internal points: 7
+  output image: /Users/linzhaoxian/lzx-ws/project/calibr/tartancalib/result/detect_batch_20260416_160015/image3-3_detected_20260416_1601.png
+  canonical view image: /Users/linzhaoxian/lzx-ws/project/calibr/tartancalib/result/detect_batch_20260416_160015/image3-3_apriltag_internal_canonical_20260416_1601.png
+
+Outer corner multi-scale fusion debug
+  corner=0 scales=6 inliers=5 outliers=1 reject=yes stable=yes avg_before=1.71706 max_before=4.44423 avg_after=1.08216 max_after=2.14671 threshold=3.3484 consensus=(2934.88, 2848.41) fused=(2935.23, 2848.71)
+    observations: [1805 (2936.28, 2849.61) dc=1.84413 df=1.3769 inlier] [1289 (2935.78, 2849.3) dc=1.26664 df=0.801365 inlier] [1003 (2935.32, 2848.71) dc=0.533587 df=0.0865254 inlier] [752 (2934.43, 2848.11) dc=0.533587 df=0.999273 inlier] [564 (2933.67, 2847.24) dc=1.68017 df=2.14671 inlier] [376 (2931.58, 2845.43) dc=4.44423 df=4.91126 outlier]
+  corner=1 scales=6 inliers=5 outliers=1 reject=yes stable=yes avg_before=5.4217 max_before=17.5324 avg_after=3.19832 max_after=6.8284 threshold=10.2766 consensus=(3498.63, 2853.2) fused=(3499.34, 2852.49)
+    observations: [1805 (3516.09, 2854.71) dc=17.5324 df=16.9033 outlier] [1289 (3506, 2854) dc=7.41305 df=6.8284 inlier] [1003 (3498.89, 2853.62) dc=0.499283 df=1.22288 inlier] [752 (3498.36, 2852.78) dc=0.49962 df=1.0204 inlier] [564 (3497.37, 2851.74) dc=1.928 df=2.10734 inlier] [376 (3495.17, 2850.08) dc=4.65786 df=4.81259 inlier]
+  corner=2 scales=6 inliers=5 outliers=1 reject=yes stable=no avg_before=2.27358 max_before=3.95421 avg_after=1.75188 max_after=2.98768 threshold=3.68788 consensus=(3493.01, 2222) fused=(3493.43, 2221.36)
+    observations: [1805 (3489.64, 2224.05) dc=3.95421 df=4.64662 outlier] [1289 (3492.49, 2223.12) dc=1.24162 df=1.9921 inlier] [1003 (3495.07, 2222.41) dc=2.10256 df=1.95511 inlier] [752 (3494.42, 2221.58) dc=1.47058 df=1.01954 inlier] [564 (3493.54, 2220.57) dc=1.52319 df=0.804955 inlier] [376 (3491.74, 2218.9) dc=3.34934 df=2.98768 inlier]
+  corner=3 scales=6 inliers=5 outliers=1 reject=yes stable=yes avg_before=1.88795 max_before=5.14969 avg_after=1.14922 max_after=2.44887 threshold=3.52231 consensus=(2955.25, 2272.78) fused=(2955.56, 2273.1)
+    observations: [1805 (2956.66, 2274.11) dc=1.93459 df=1.49925 inlier] [1289 (2956.16, 2273.68) dc=1.27129 df=0.835515 inlier] [1003 (2955.6, 2273.11) dc=0.478879 df=0.0478665 inlier] [752 (2954.91, 2272.45) dc=0.478879 df=0.91462 inlier] [564 (2953.73, 2271.46) dc=2.01437 df=2.44887 inlier] [376 (2951.77, 2268.99) dc=5.14969 df=5.58559 outlier]
+
+Outer corner verification debug
+  corner=0 pass=yes refined_valid=yes local_scale=564.119 roi_radius=28 candidate_radius=12 branch_radius=6 coarse=(2935.23, 2848.71) verified=(2939.23, 2840.71) subpix=(2939.23, 2840.71) d_cv=8.94427 d_cs=8.94427 d_cr=8.94427 refine_gate=28 dir=0.998963 layout=1 Q=0.998963 reason=pass
+  corner=1 pass=yes refined_valid=yes local_scale=564.119 roi_radius=28 candidate_radius=12 branch_radius=6 coarse=(3499.34, 2852.49) verified=(3495.34, 2856.49) subpix=(3495.34, 2856.49) d_cv=5.65685 d_cs=5.65685 d_cr=5.65685 refine_gate=28 dir=0.997343 layout=1 Q=0.997343 reason=pass
+  corner=2 pass=yes refined_valid=yes local_scale=540.352 roi_radius=27 candidate_radius=12 branch_radius=5 coarse=(3493.43, 2221.36) verified=(3491.43, 2217.36) subpix=(3491.43, 2217.36) d_cv=4.47214 d_cs=4.47214 d_cr=4.47214 refine_gate=27 dir=0.998497 layout=1 Q=0.998497 reason=pass
+  corner=3 pass=yes refined_valid=yes local_scale=540.352 roi_radius=27 candidate_radius=12 branch_radius=5 coarse=(2955.56, 2273.1) verified=(2945.56, 2269.1) subpix=(2945.56, 2269.1) d_cv=10.7703 d_cs=10.7703 d_cr=10.7703 refine_gate=27 dir=0.998388 layout=1 Q=0.998388 reason=pass
+
+Internal corner debug
+  id=26 type=l_corner valid=no image_valid=yes predicted=(3161.74, 2740.59) refined=(3164.04, 2734.15) q_refine=0 template_quality=0.498427 gradient_quality=0.496854 final_quality=0 image_template_quality=0.993101 image_gradient_quality=0.499322 image_centering_quality=0.497868 image_final_quality=0.497868
+  id=27 type=l_corner valid=no image_valid=yes predicted=(3218.52, 2740.35) refined=(3219.87, 2733.76) q_refine=0 template_quality=0.495691 gradient_quality=0.498277 final_quality=0 image_template_quality=0.995922 image_gradient_quality=0.5 image_centering_quality=0.498819 image_final_quality=0.498819
+  id=29 type=l_corner valid=no image_valid=yes predicted=(3333.4, 2737.9) refined=(3333.34, 2730.91) q_refine=0 template_quality=0.482832 gradient_quality=0.480228 final_quality=0 image_template_quality=0.978697 image_gradient_quality=0.490257 image_centering_quality=0.49074 image_final_quality=0.490257
+  id=30 type=l_corner valid=no image_valid=yes predicted=(3391.1, 2735.64) refined=(3388.35, 2728.9) q_refine=0 template_quality=0.489969 gradient_quality=0.492718 final_quality=0 image_template_quality=0.993591 image_gradient_quality=0.49884 image_centering_quality=0.490021 image_final_quality=0.490021
+  id=35 type=l_corner valid=no image_valid=yes predicted=(3053.68, 2681.04) refined=(3055.66, 2674.6) q_refine=0 template_quality=0.497898 gradient_quality=0.495797 final_quality=0 image_template_quality=0.995377 image_gradient_quality=0.499964 image_centering_quality=0.496259 image_final_quality=0.496259
+  id=36 type=l_corner valid=no image_valid=yes predicted=(3109.02, 2681.04) refined=(3110.66, 2674.43) q_refine=0 template_quality=0.496057 gradient_quality=0.496632 final_quality=0 image_template_quality=0.927728 image_gradient_quality=0.509563 image_centering_quality=0.488063 image_final_quality=0.488063
+  id=38 type=l_corner valid=no image_valid=yes predicted=(3222.1, 2679.41) refined=(3223.86, 2672.95) q_refine=0 template_quality=0.482701 gradient_quality=0.490791 final_quality=0 image_template_quality=0.934282 image_gradient_quality=0.503196 image_centering_quality=0.490112 image_final_quality=0.490112
+  id=39 type=l_corner valid=no image_valid=yes predicted=(3279.48, 2677.71) refined=(3280.03, 2671.05) q_refine=0 template_quality=0.495445 gradient_quality=0.499786 final_quality=0 image_template_quality=0.948153 image_gradient_quality=0.50058 image_centering_quality=0.498792 image_final_quality=0.498792
+  id=46 type=l_corner valid=no image_valid=yes predicted=(3056.1, 2622.23) refined=(3058.72, 2615.76) q_refine=0 template_quality=0.500364 gradient_quality=0.500728 final_quality=0 image_template_quality=0.996775 image_gradient_quality=0.50169 image_centering_quality=0.499154 image_final_quality=0.499154
+  id=47 type=x_corner valid=no image_valid=yes predicted=(3111.46, 2621.28) refined=(3114.07, 2614.65) q_refine=0 template_quality=0.993771 gradient_quality=0.987542 final_quality=0 image_template_quality=0.999255 image_gradient_quality=0.998509 image_centering_quality=0.494478 image_final_quality=0.494478
+  id=48 type=l_corner valid=no image_valid=yes predicted=(3167.67, 2619.84) refined=(3170.1, 2613.16) q_refine=0 template_quality=0.497989 gradient_quality=0.495978 final_quality=0 image_template_quality=0.884252 image_gradient_quality=0.588794 image_centering_quality=0.421477 image_final_quality=0.421477
+  id=49 type=l_corner valid=no image_valid=yes predicted=(3224.57, 2617.87) refined=(3226.52, 2611.55) q_refine=0 template_quality=0.488437 gradient_quality=0.476875 final_quality=0 image_template_quality=0.703865 image_gradient_quality=0.601394 image_centering_quality=0.400578 image_final_quality=0.400578
+  id=50 type=l_corner valid=no image_valid=yes predicted=(3281.96, 2615.35) refined=(3282.55, 2609.96) q_refine=0.182567 template_quality=0.496736 gradient_quality=0.493473 final_quality=0.182567 image_template_quality=0.995498 image_gradient_quality=0.499951 image_centering_quality=0.494837 image_final_quality=0.494837
+  id=51 type=l_corner valid=no image_valid=yes predicted=(3339.65, 2612.25) refined=(3339.11, 2607.08) q_refine=0.248041 template_quality=0.496287 gradient_quality=0.497251 final_quality=0.248041 image_template_quality=0.995957 image_gradient_quality=0.501816 image_centering_quality=0.499768 image_final_quality=0.499768
+  id=52 type=l_corner valid=no image_valid=yes predicted=(3397.43, 2608.57) refined=(3394.3, 2604.43) q_refine=0.251519 template_quality=0.497765 gradient_quality=0.495529 final_quality=0.251519 image_template_quality=0.997421 image_gradient_quality=0.496457 image_centering_quality=0.499041 image_final_quality=0.496457
+  id=57 type=l_corner valid=no image_valid=yes predicted=(3057.65, 2563.05) refined=(3060.74, 2555.71) q_refine=0 template_quality=0.497517 gradient_quality=0.495035 final_quality=0 image_template_quality=0.994729 image_gradient_quality=0.499991 image_centering_quality=0.496071 image_final_quality=0.496071
+  id=58 type=l_corner valid=no image_valid=yes predicted=(3112.95, 2561.16) refined=(3115.97, 2554.44) q_refine=0 template_quality=0.495527 gradient_quality=0.491053 final_quality=0 image_template_quality=0.993982 image_gradient_quality=0.499744 image_centering_quality=0.493866 image_final_quality=0.493866
+  id=60 type=l_corner valid=no image_valid=yes predicted=(3225.93, 2555.96) refined=(3227.99, 2550.33) q_refine=0.00187897 template_quality=0.485515 gradient_quality=0.481677 final_quality=0.00187897 image_template_quality=0.889912 image_gradient_quality=0.592156 image_centering_quality=0.408269 image_final_quality=0.408269
+  id=61 type=l_corner valid=no image_valid=yes predicted=(3283.24, 2552.61) refined=(3283.86, 2547.26) q_refine=0.19281 template_quality=0.494592 gradient_quality=0.499063 final_quality=0.19281 image_template_quality=0.991983 image_gradient_quality=0.499984 image_centering_quality=0.49889 image_final_quality=0.49889
+  id=68 type=l_corner valid=no image_valid=yes predicted=(3058.34, 2503.71) refined=(3061.72, 2497.25) q_refine=0 template_quality=0.500722 gradient_quality=0.501444 final_quality=0 image_template_quality=0.995008 image_gradient_quality=0.501599 image_centering_quality=0.498755 image_final_quality=0.498755
+  id=69 type=l_corner valid=no image_valid=yes predicted=(3113.5, 2500.87) refined=(3117.09, 2494.83) q_refine=0 template_quality=0.503217 gradient_quality=0.506434 final_quality=0 image_template_quality=0.993607 image_gradient_quality=0.508092 image_centering_quality=0.765964 image_final_quality=0.508092
+  id=70 type=l_corner valid=no image_valid=yes predicted=(3169.49, 2497.6) refined=(3172.44, 2491.95) q_refine=0 template_quality=0.489563 gradient_quality=0.479126 final_quality=0 image_template_quality=0.982149 image_gradient_quality=0.499917 image_centering_quality=0.481693 image_final_quality=0.481693
+  id=71 type=l_corner valid=no image_valid=yes predicted=(3226.16, 2493.89) refined=(3228.45, 2489.37) q_refine=0.288163 template_quality=0.504606 gradient_quality=0.509213 final_quality=0.288163 image_template_quality=0.883459 image_gradient_quality=0.601102 image_centering_quality=0.421802 image_final_quality=0.421802
+  id=72 type=l_corner valid=yes image_valid=yes predicted=(3283.3, 2489.72) refined=(3284.19, 2485.91) q_refine=0.575573 template_quality=0.483479 gradient_quality=0.481954 final_quality=0.481954 image_template_quality=0.71619 image_gradient_quality=0.611164 image_centering_quality=0.396498 image_final_quality=0.396498
+  id=74 type=l_corner valid=yes image_valid=yes predicted=(3398.23, 2479.99) refined=(3394.59, 2478.09) q_refine=0.532154 template_quality=0.495111 gradient_quality=0.499318 final_quality=0.495111 image_template_quality=0.995623 image_gradient_quality=0.5 image_centering_quality=0.991105 image_final_quality=0.5
+  id=79 type=l_corner valid=no image_valid=yes predicted=(3058.16, 2444.41) refined=(3062.07, 2437.75) q_refine=0 template_quality=0.497045 gradient_quality=0.494091 final_quality=0 image_template_quality=0.994975 image_gradient_quality=0.5 image_centering_quality=0.494452 image_final_quality=0.494452
+  id=80 type=l_corner valid=no image_valid=yes predicted=(3113.09, 2440.63) refined=(3116.79, 2435.12) q_refine=0 template_quality=0.496174 gradient_quality=0.492348 final_quality=0 image_template_quality=0.972201 image_gradient_quality=0.554566 image_centering_quality=0.444878 image_final_quality=0.444878
+  id=84 type=l_corner valid=yes image_valid=yes predicted=(3339.32, 2421.52) refined=(3338.39, 2420.53) q_refine=0.948833 template_quality=0.484963 gradient_quality=0.469927 final_quality=0.469927 image_template_quality=0.876698 image_gradient_quality=0.532311 image_centering_quality=0.445493 image_final_quality=0.445493
+  id=85 type=l_corner valid=yes image_valid=yes predicted=(3396.56, 2415.72) refined=(3392.81, 2417.21) q_refine=0.548001 template_quality=0.496368 gradient_quality=0.492737 final_quality=0.492737 image_template_quality=0.995859 image_gradient_quality=0.495139 image_centering_quality=0.498131 image_final_quality=0.495139
+  id=90 type=l_corner valid=no image_valid=yes predicted=(3057.13, 2385.34) refined=(3061.32, 2380.05) q_refine=0 template_quality=0.501341 gradient_quality=0.502683 final_quality=0 image_template_quality=0.996433 image_gradient_quality=0.503804 image_centering_quality=0.498185 image_final_quality=0.498185
+  id=92 type=l_corner valid=yes image_valid=yes predicted=(3167.2, 2375.57) refined=(3170.29, 2372.7) q_refine=0.505483 template_quality=0.497159 gradient_quality=0.494319 final_quality=0.494319 image_template_quality=0.995946 image_gradient_quality=0.499964 image_centering_quality=0.495259 image_final_quality=0.495259
+  id=93 type=l_corner valid=yes image_valid=yes predicted=(3223.28, 2370.15) refined=(3226.02, 2368.47) q_refine=0.713027 template_quality=0.500393 gradient_quality=0.500786 final_quality=0.500393 image_template_quality=0.994534 image_gradient_quality=0.501559 image_centering_quality=0.498903 image_final_quality=0.498903
+  id=95 type=l_corner valid=yes image_valid=yes predicted=(3336.64, 2358.26) refined=(3335.37, 2360.31) q_refine=0.837839 template_quality=0.497275 gradient_quality=0.494549 final_quality=0.494549 image_template_quality=0.994986 image_gradient_quality=0.499984 image_centering_quality=0.49533 image_final_quality=0.49533
+
+Internal summary
+  total internal points: 33
+  legacy valid internal points: 7
+  image-evidence internal points: 33
+  avg q_refine: 0.176542
+  avg legacy template_quality: 0.510028
+  avg legacy gradient_quality: 0.508613
+  avg legacy final_quality: 0.139211
+  avg image template_quality: 0.95752
+  avg image gradient_quality: 0.533073
+  avg image centering_quality: 0.502532
+  avg image final_quality: 0.479652
+  avg predicted->refined displacement: 5.91667
+  LCorner valid: 7/32
+  XCorner valid: 0/1

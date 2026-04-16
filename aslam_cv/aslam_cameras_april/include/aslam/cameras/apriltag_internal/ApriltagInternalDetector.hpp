@@ -18,14 +18,19 @@ namespace apriltag_internal {
 
 struct ApriltagInternalDetectionOptions {
   bool do_subpix_refinement = true;
-  double max_subpix_displacement2 = 9.0;
+  double max_subpix_displacement2 = 0.0;
   bool reject_duplicate_ids = true;
   double min_border_distance = 4.0;
   int canonical_pixels_per_module = 24;
-  int refinement_window_radius = 12;
+  int refinement_window_radius = 0;
+  double internal_subpix_window_scale = 0.5;
+  int internal_subpix_window_min = 4;
+  int internal_subpix_window_max = 16;
   double min_quality = 0.35;
   double min_template_contrast = 24.0;
   double virtual_patch_margin = 1.15;
+  double internal_subpix_displacement_scale = 0.25;
+  double max_internal_subpix_displacement = 6.0;
   MultiScaleOuterTagDetectorConfig outer_detector_config;
 };
 
@@ -36,6 +41,10 @@ struct InternalCornerDebugInfo {
   cv::Point2f refined_image{};
   cv::Point2f predicted_patch{};
   cv::Point2f refined_patch{};
+  double local_module_scale = 0.0;
+  int subpix_window_radius = 0;
+  double subpix_displacement_limit = 0.0;
+  int image_evidence_search_radius = 0;
   double q_refine = 0.0;
   double template_quality = 0.0;
   double gradient_quality = 0.0;

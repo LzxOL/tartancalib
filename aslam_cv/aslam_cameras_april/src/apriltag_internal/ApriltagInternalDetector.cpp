@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -244,6 +245,28 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.black_border_bits = ParseInt(key, value);
     } else if (key == "minVisiblePoints" || key == "min_visible_points") {
       config.min_visible_points = ParseInt(key, value);
+    } else if (key == "canonicalPixelsPerModule" || key == "canonical_pixels_per_module") {
+      config.canonical_pixels_per_module = ParseInt(key, value);
+    } else if (key == "refinementWindowRadius" || key == "refinement_window_radius") {
+      config.refinement_window_radius = ParseInt(key, value);
+    } else if (key == "internalSubpixWindowScale" || key == "internal_subpix_window_scale") {
+      config.internal_subpix_window_scale = ParseDouble(key, value);
+    } else if (key == "internalSubpixWindowMin" || key == "internal_subpix_window_min") {
+      config.internal_subpix_window_min = ParseInt(key, value);
+    } else if (key == "internalSubpixWindowMax" || key == "internal_subpix_window_max") {
+      config.internal_subpix_window_max = ParseInt(key, value);
+    } else if (key == "maxSubpixDisplacement2" || key == "max_subpix_displacement2") {
+      config.max_subpix_displacement2 = ParseDouble(key, value);
+    } else if (key == "internalSubpixDisplacementScale" ||
+               key == "internal_subpix_displacement_scale") {
+      config.internal_subpix_displacement_scale = ParseDouble(key, value);
+    } else if (key == "maxInternalSubpixDisplacement" ||
+               key == "max_internal_subpix_displacement") {
+      config.max_internal_subpix_displacement = ParseDouble(key, value);
+    } else if (key == "enableDebugOutput" || key == "enable_debug_output") {
+      config.enable_debug_output =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
     } else if (key == "internal_projection_mode") {
       config.internal_projection_mode = ParseProjectionMode(value);
     } else if (key == "minBorderDistance" || key == "min_border_distance") {
@@ -258,6 +281,14 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.outer_detector_config.do_outer_subpix_refinement =
           Lowercase(value) == "1" || Lowercase(value) == "true" ||
           Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "outerSubpixWindowRadius" || key == "outer_subpix_window_radius") {
+      config.outer_detector_config.outer_subpix_window_radius = ParseInt(key, value);
+    } else if (key == "outerSubpixWindowScale" || key == "outer_subpix_window_scale") {
+      config.outer_detector_config.outer_subpix_window_scale = ParseDouble(key, value);
+    } else if (key == "outerSubpixWindowMin" || key == "outer_subpix_window_min") {
+      config.outer_detector_config.outer_subpix_window_min = ParseInt(key, value);
+    } else if (key == "outerSubpixWindowMax" || key == "outer_subpix_window_max") {
+      config.outer_detector_config.outer_subpix_window_max = ParseInt(key, value);
     } else if (key == "maxOuterRefineDisplacement" || key == "max_outer_refine_displacement") {
       config.outer_detector_config.max_outer_refine_displacement = ParseDouble(key, value);
     } else if (key == "outerRefineDisplacementScale" || key == "outer_refine_displacement_scale") {
@@ -274,9 +305,9 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.outer_detector_config.blur_sigma = ParseDouble(key, value);
     } else if (key == "enableOuterCornerLocalVerification" ||
                key == "enable_outer_corner_local_verification") {
-      config.outer_detector_config.enable_outer_corner_local_verification =
-          Lowercase(value) == "1" || Lowercase(value) == "true" ||
-          Lowercase(value) == "yes" || Lowercase(value) == "on";
+      // Legacy compatibility: the outer pipeline now always runs C-V-S.
+      (void)(Lowercase(value) == "1" || Lowercase(value) == "true" ||
+             Lowercase(value) == "yes" || Lowercase(value) == "on");
     } else if (key == "enableOuterCornerLayoutCheck" ||
                key == "enable_outer_corner_layout_check") {
       config.outer_detector_config.enable_outer_corner_layout_check =
@@ -389,6 +420,61 @@ cv::Rect MakeClampedRoi(const cv::Point2f& center, int radius, const cv::Size& i
   const int right = std::min(image_size.width, static_cast<int>(std::round(center.x)) + radius + 1);
   const int bottom = std::min(image_size.height, static_cast<int>(std::round(center.y)) + radius + 1);
   return cv::Rect(left, top, std::max(0, right - left), std::max(0, bottom - top));
+}
+
+int ClampRadiusFromScale(double scale, double local_scale, int min_radius, int max_radius) {
+  if (min_radius <= 0 || max_radius < min_radius) {
+    throw std::runtime_error("Invalid adaptive radius bounds.");
+  }
+  const double scaled = scale > 0.0 ? scale * local_scale : static_cast<double>(min_radius);
+  const int rounded = static_cast<int>(std::lround(scaled));
+  return std::max(min_radius, std::min(max_radius, rounded));
+}
+
+double ComputeModuleScalePx(const cv::Point2f& module_u_axis,
+                            const cv::Point2f& module_v_axis,
+                            double fallback) {
+  const double u_norm = std::hypot(module_u_axis.x, module_u_axis.y);
+  const double v_norm = std::hypot(module_v_axis.x, module_v_axis.y);
+  const bool u_valid = std::isfinite(u_norm) && u_norm > 1e-6;
+  const bool v_valid = std::isfinite(v_norm) && v_norm > 1e-6;
+  if (u_valid && v_valid) {
+    return std::min(u_norm, v_norm);
+  }
+  if (u_valid) {
+    return u_norm;
+  }
+  if (v_valid) {
+    return v_norm;
+  }
+  return fallback;
+}
+
+int ComputeAdaptiveInternalSubpixRadius(double module_scale_px,
+                                        const ApriltagInternalDetectionOptions& options) {
+  if (options.refinement_window_radius > 0) {
+    return options.refinement_window_radius;
+  }
+  return ClampRadiusFromScale(options.internal_subpix_window_scale, module_scale_px,
+                              options.internal_subpix_window_min, options.internal_subpix_window_max);
+}
+
+double ComputeAdaptiveInternalSubpixDisplacementLimit(
+    double module_scale_px,
+    const ApriltagInternalDetectionOptions& options) {
+  if (options.max_subpix_displacement2 > 0.0) {
+    return std::sqrt(std::max(1e-9, options.max_subpix_displacement2));
+  }
+  const double scale_based_limit =
+      options.internal_subpix_displacement_scale > 0.0
+          ? options.internal_subpix_displacement_scale * std::max(0.0, module_scale_px)
+          : 0.0;
+  return std::max(options.max_internal_subpix_displacement, scale_based_limit);
+}
+
+int ComputeAdaptiveImageEvidenceSearchRadius(double module_scale_px,
+                                             const ApriltagInternalDetectionOptions& options) {
+  return std::max(1, 2 * ComputeAdaptiveInternalSubpixRadius(module_scale_px, options));
 }
 
 double MeanIntensity(const cv::Mat& patch, const cv::Point2f& center, int radius) {
@@ -970,13 +1056,26 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
                                     static_cast<float>(corner_info.lattice_v)));
     const cv::Point2f predicted_patch =
         BoardToPatchPoint(corner_info, model.ModuleDimension(), options.canonical_pixels_per_module);
+    const std::pair<cv::Point2f, cv::Point2f> local_axes =
+        ComputeHomographyLocalAxes(board_to_image, corner_info);
+    const cv::Point2f module_u_axis = local_axes.first;
+    const cv::Point2f module_v_axis = local_axes.second;
+    const double module_scale_px =
+        ComputeModuleScalePx(module_u_axis, module_v_axis,
+                             static_cast<double>(options.canonical_pixels_per_module));
+    const int subpix_window_radius =
+        ComputeAdaptiveInternalSubpixRadius(module_scale_px, options);
+    const double subpix_displacement_limit =
+        ComputeAdaptiveInternalSubpixDisplacementLimit(module_scale_px, options);
+    const int image_evidence_search_radius =
+        ComputeAdaptiveImageEvidenceSearchRadius(module_scale_px, options);
 
     cv::Point2f refined_image = predicted_image;
     if (IsInsideImageWithBorder(predicted_image, gray.size(), options.min_border_distance) &&
         options.do_subpix_refinement) {
       std::vector<cv::Point2f> corners{refined_image};
       cv::cornerSubPix(gray, corners,
-                       cv::Size(options.refinement_window_radius, options.refinement_window_radius),
+                       cv::Size(subpix_window_radius, subpix_window_radius),
                        cv::Size(-1, -1),
                        cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 30, 0.1));
       refined_image = corners.front();
@@ -988,20 +1087,18 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
     const double q_refine = IsInsideImageWithBorder(predicted_image, gray.size(), options.min_border_distance)
                                 ? (options.do_subpix_refinement
                                        ? ClampUnit(1.0 - (displacement * displacement) /
-                                                           options.max_subpix_displacement2)
+                                                           std::max(1e-9, subpix_displacement_limit *
+                                                                             subpix_displacement_limit))
                                        : 1.0)
                                 : 0.0;
     const TemplateScore template_score =
         ComputeTemplateScoreAtPoint(result->canonical_patch, corner_info, refined_patch,
                                     options.canonical_pixels_per_module, options.min_template_contrast);
-    const std::pair<cv::Point2f, cv::Point2f> local_axes =
-        ComputeHomographyLocalAxes(board_to_image, corner_info);
-    const cv::Point2f module_u_axis = local_axes.first;
-    const cv::Point2f module_v_axis = local_axes.second;
     const ImageEvidenceScore image_score =
         EvaluateImageEvidenceAroundPoint(gray, corner_info, refined_image, module_u_axis, module_v_axis,
-                                         options.min_template_contrast, options.max_subpix_displacement2,
-                                         2 * options.refinement_window_radius);
+                                         options.min_template_contrast,
+                                         subpix_displacement_limit * subpix_displacement_limit,
+                                         image_evidence_search_radius);
     const double final_quality =
         std::min({template_score.template_quality, template_score.gradient_quality, q_refine});
     const double image_final_quality = image_score.final_quality;
@@ -1029,6 +1126,10 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
     debug.refined_image = refined_image;
     debug.predicted_patch = predicted_patch;
     debug.refined_patch = refined_patch;
+    debug.local_module_scale = module_scale_px;
+    debug.subpix_window_radius = subpix_window_radius;
+    debug.subpix_displacement_limit = subpix_displacement_limit;
+    debug.image_evidence_search_radius = image_evidence_search_radius;
     debug.q_refine = q_refine;
     debug.template_quality = template_score.template_quality;
     debug.gradient_quality = template_score.gradient_quality;
@@ -1073,6 +1174,11 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
         ProjectTargetPointToImage(camera, context.target_to_camera_rotation,
                                   context.target_to_camera_translation, target_point,
                                   &predicted_image_visible);
+    const double patch_module_scale_px = static_cast<double>(options.canonical_pixels_per_module);
+    const int subpix_window_radius =
+        ComputeAdaptiveInternalSubpixRadius(patch_module_scale_px, options);
+    const double subpix_displacement_limit =
+        ComputeAdaptiveInternalSubpixDisplacementLimit(patch_module_scale_px, options);
 
     cv::Point2f refined_patch = predicted_patch;
     if (predicted_visible &&
@@ -1080,7 +1186,7 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
         options.do_subpix_refinement) {
       std::vector<cv::Point2f> corners{refined_patch};
       cv::cornerSubPix(context.patch, corners,
-                       cv::Size(options.refinement_window_radius, options.refinement_window_radius),
+                       cv::Size(subpix_window_radius, subpix_window_radius),
                        cv::Size(-1, -1),
                        cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 30, 0.1));
       refined_patch = corners.front();
@@ -1099,11 +1205,12 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
     }
 
     const double displacement =
-        std::hypot(refined_image.x - predicted_image.x, refined_image.y - predicted_image.y);
+        std::hypot(refined_patch.x - predicted_patch.x, refined_patch.y - predicted_patch.y);
     const double q_refine = (predicted_visible && predicted_image_visible && refined_visible)
                                 ? (options.do_subpix_refinement
                                        ? ClampUnit(1.0 - (displacement * displacement) /
-                                                           options.max_subpix_displacement2)
+                                                           std::max(1e-9, subpix_displacement_limit *
+                                                                             subpix_displacement_limit))
                                        : 1.0)
                                 : 0.0;
     const TemplateScore template_score =
@@ -1111,13 +1218,24 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
                                     options.canonical_pixels_per_module, options.min_template_contrast);
     cv::Point2f module_u_axis;
     cv::Point2f module_v_axis;
-    const ImageEvidenceScore image_score =
+    const bool has_image_axes =
         ComputeVirtualImageAxes(camera, context.target_to_camera_rotation,
                                 context.target_to_camera_translation, model, corner_info,
-                                &module_u_axis, &module_v_axis)
+                                &module_u_axis, &module_v_axis);
+    const double image_module_scale_px =
+        has_image_axes ? ComputeModuleScalePx(module_u_axis, module_v_axis, patch_module_scale_px)
+                       : patch_module_scale_px;
+    const double image_subpix_displacement_limit =
+        ComputeAdaptiveInternalSubpixDisplacementLimit(image_module_scale_px, options);
+    const int image_evidence_search_radius =
+        ComputeAdaptiveImageEvidenceSearchRadius(image_module_scale_px, options);
+    const ImageEvidenceScore image_score =
+        has_image_axes
             ? EvaluateImageEvidenceAroundPoint(gray, corner_info, refined_image, module_u_axis, module_v_axis,
-                                               options.min_template_contrast, options.max_subpix_displacement2,
-                                               2 * options.refinement_window_radius)
+                                               options.min_template_contrast,
+                                               image_subpix_displacement_limit *
+                                                   image_subpix_displacement_limit,
+                                               image_evidence_search_radius)
             : ImageEvidenceScore{};
     const double final_quality =
         std::min({template_score.template_quality, template_score.gradient_quality, q_refine});
@@ -1147,6 +1265,10 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
     debug.refined_image = refined_image;
     debug.predicted_patch = predicted_patch;
     debug.refined_patch = refined_patch;
+    debug.local_module_scale = patch_module_scale_px;
+    debug.subpix_window_radius = subpix_window_radius;
+    debug.subpix_displacement_limit = subpix_displacement_limit;
+    debug.image_evidence_search_radius = image_evidence_search_radius;
     debug.q_refine = q_refine;
     debug.template_quality = template_score.template_quality;
     debug.gradient_quality = template_score.gradient_quality;
@@ -1170,8 +1292,17 @@ ApriltagInternalDetector::ApriltagInternalDetector(
   if (options_.canonical_pixels_per_module <= 0) {
     throw std::runtime_error("canonical_pixels_per_module must be positive.");
   }
-  if (options_.refinement_window_radius <= 0) {
-    throw std::runtime_error("refinement_window_radius must be positive.");
+  if (options_.refinement_window_radius < 0) {
+    throw std::runtime_error("refinement_window_radius must be non-negative.");
+  }
+  if (options_.internal_subpix_window_scale < 0.0) {
+    throw std::runtime_error("internal_subpix_window_scale must be non-negative.");
+  }
+  if (options_.internal_subpix_window_min <= 0) {
+    throw std::runtime_error("internal_subpix_window_min must be positive.");
+  }
+  if (options_.internal_subpix_window_max < options_.internal_subpix_window_min) {
+    throw std::runtime_error("internal_subpix_window_max must be >= internal_subpix_window_min.");
   }
   if (options_.min_quality < 0.0 || options_.min_quality > 1.0) {
     throw std::runtime_error("min_quality must be in [0, 1].");
@@ -1179,19 +1310,20 @@ ApriltagInternalDetector::ApriltagInternalDetector(
   if (options_.virtual_patch_margin <= 1.0) {
     throw std::runtime_error("virtual_patch_margin must be greater than 1.0.");
   }
+  if (options_.internal_subpix_displacement_scale < 0.0) {
+    throw std::runtime_error("internal_subpix_displacement_scale must be non-negative.");
+  }
+  if (options_.max_internal_subpix_displacement <= 0.0) {
+    throw std::runtime_error("max_internal_subpix_displacement must be positive.");
+  }
 
   options_.do_subpix_refinement =
       options_.do_subpix_refinement && config_.outer_detector_config.do_outer_subpix_refinement;
   options_.min_border_distance = config_.outer_detector_config.min_border_distance;
-  options_.max_subpix_displacement2 =
-      std::max(1e-9, config_.outer_detector_config.max_outer_refine_displacement *
-                           config_.outer_detector_config.max_outer_refine_displacement);
   options_.outer_detector_config = config_.outer_detector_config;
   options_.outer_detector_config.tag_id = config_.tag_id;
   options_.outer_detector_config.min_border_distance = options_.min_border_distance;
   options_.outer_detector_config.do_outer_subpix_refinement = options_.do_subpix_refinement;
-  options_.outer_detector_config.max_outer_refine_displacement =
-      std::sqrt(std::max(1e-9, options_.max_subpix_displacement2));
 
   outer_detector_ = std::make_unique<MultiScaleOuterTagDetector>(options_.outer_detector_config);
 }
@@ -1259,8 +1391,16 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::Detect(const cv::Mat& 
     const double displacement2 =
         std::pow(outer_corners[i].x - raw_outer_corners[i].x, 2.0) +
         std::pow(outer_corners[i].y - raw_outer_corners[i].y, 2.0);
+    const OuterCornerVerificationDebugInfo& outer_debug =
+        result.outer_detection.corner_verification_debug[static_cast<std::size_t>(i)];
+    const double outer_refine_displacement_limit =
+        outer_debug.refine_displacement_limit > 0.0
+            ? outer_debug.refine_displacement_limit
+            : config_.outer_detector_config.max_outer_refine_displacement;
     const double q_refine = options_.do_subpix_refinement
-                                ? ClampUnit(1.0 - displacement2 / options_.max_subpix_displacement2)
+                                ? ClampUnit(1.0 - displacement2 /
+                                                        std::max(1e-9, outer_refine_displacement_limit *
+                                                                          outer_refine_displacement_limit))
                                 : 1.0;
     const double q_gradient =
         ClampUnit(SampleFloatAt(corner_response, outer_corners[i]) / gradient_norm);
@@ -1347,7 +1487,8 @@ void ApriltagInternalDetector::DrawDetections(const ApriltagInternalDetectionRes
     cv::cvtColor(*output_image, *output_image, cv::COLOR_BGRA2BGR);
   }
 
-  outer_detector_->DrawDetection(detections.outer_detection, output_image);
+  outer_detector_->DrawDetection(detections.outer_detection, output_image,
+                                 config_.enable_debug_output);
 
   if (!detections.tag_detected) {
     return;
@@ -1365,14 +1506,25 @@ void ApriltagInternalDetector::DrawDetections(const ApriltagInternalDetectionRes
                 cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(0, 0, 255), 1);
   }
 
-  for (const auto& debug : detections.internal_corner_debug) {
-    if (IsInsideImage(debug.predicted_image, detections.image_size)) {
-      cv::drawMarker(*output_image, debug.predicted_image, cv::Scalar(0, 165, 255),
-                     cv::MARKER_CROSS, 8, 1);
+  if (config_.enable_debug_output) {
+    for (const auto& debug : detections.internal_corner_debug) {
+      if (IsInsideImage(debug.predicted_image, detections.image_size)) {
+        cv::drawMarker(*output_image, debug.predicted_image, cv::Scalar(0, 165, 255),
+                       cv::MARKER_CROSS, 8, 1);
+      }
+      if (IsInsideImage(debug.predicted_image, detections.image_size) &&
+          IsInsideImage(debug.refined_image, detections.image_size)) {
+        cv::line(*output_image, debug.predicted_image, debug.refined_image,
+                 cv::Scalar(180, 180, 180), 1);
+      }
     }
-    if (IsInsideImage(debug.predicted_image, detections.image_size) &&
-        IsInsideImage(debug.refined_image, detections.image_size)) {
-      cv::line(*output_image, debug.predicted_image, debug.refined_image, cv::Scalar(180, 180, 180), 1);
+  }
+
+  std::vector<const InternalCornerDebugInfo*> debug_by_point(model_.PointCount(), nullptr);
+  for (const auto& debug : detections.internal_corner_debug) {
+    if (debug.point_id >= 0 &&
+        static_cast<std::size_t>(debug.point_id) < debug_by_point.size()) {
+      debug_by_point[static_cast<std::size_t>(debug.point_id)] = &debug;
     }
   }
 
@@ -1403,9 +1555,16 @@ void ApriltagInternalDetector::DrawDetections(const ApriltagInternalDetectionRes
       cv::circle(*output_image, point, radius, color, 1);
     }
 
-    if (measurement.valid) {
+    if (config_.enable_debug_output && measurement.valid) {
       std::ostringstream label;
       label << measurement.point_id << ":" << std::lround(measurement.quality * 100.0);
+      const InternalCornerDebugInfo* debug_info =
+          debug_by_point[static_cast<std::size_t>(measurement.point_id)];
+      if (debug_info != nullptr && measurement.corner_type != CornerType::Outer) {
+        label << ":w" << debug_info->subpix_window_radius
+              << ":g" << std::fixed << std::setprecision(1)
+              << debug_info->subpix_displacement_limit;
+      }
       cv::putText(*output_image, label.str(),
                   cv::Point(static_cast<int>(point.x) + 4, static_cast<int>(point.y) - 4),
                   cv::FONT_HERSHEY_PLAIN, 0.8, color, 1);
@@ -1471,13 +1630,15 @@ void ApriltagInternalDetector::DrawCanonicalView(const ApriltagInternalDetection
   cv::polylines(*output_image, outer_polygon, true, cv::Scalar(0, 255, 255), 2);
 
   for (const auto& debug : detections.internal_corner_debug) {
-    if (IsInsideImage(debug.predicted_patch, output_image->size())) {
+    if (config_.enable_debug_output && IsInsideImage(debug.predicted_patch, output_image->size())) {
       cv::drawMarker(*output_image, debug.predicted_patch, cv::Scalar(0, 165, 255),
                      cv::MARKER_CROSS, 8, 1);
     }
-    if (IsInsideImage(debug.predicted_patch, output_image->size()) &&
+    if (config_.enable_debug_output &&
+        IsInsideImage(debug.predicted_patch, output_image->size()) &&
         IsInsideImage(debug.refined_patch, output_image->size())) {
-      cv::line(*output_image, debug.predicted_patch, debug.refined_patch, cv::Scalar(180, 180, 180), 1);
+      cv::line(*output_image, debug.predicted_patch, debug.refined_patch,
+               cv::Scalar(180, 180, 180), 1);
     }
     if (IsInsideImage(debug.refined_patch, output_image->size())) {
       const cv::Scalar color = InternalCornerColor(debug);
@@ -1487,15 +1648,20 @@ void ApriltagInternalDetector::DrawCanonicalView(const ApriltagInternalDetection
         cv::circle(*output_image, debug.refined_patch, 3, color, 1);
       }
 
-      std::ostringstream label;
-      label << debug.point_id;
-      if (debug.valid) {
-        label << ":" << std::lround(debug.final_quality * 100.0);
+      if (config_.enable_debug_output) {
+        std::ostringstream label;
+        label << debug.point_id;
+        if (debug.valid) {
+          label << ":" << std::lround(debug.final_quality * 100.0);
+        }
+        label << ":w" << debug.subpix_window_radius
+              << ":g" << std::fixed << std::setprecision(1)
+              << debug.subpix_displacement_limit;
+        cv::putText(*output_image, label.str(),
+                    cv::Point(static_cast<int>(debug.refined_patch.x) + 4,
+                              static_cast<int>(debug.refined_patch.y) - 4),
+                    cv::FONT_HERSHEY_PLAIN, 0.8, color, 1);
       }
-      cv::putText(*output_image, label.str(),
-                  cv::Point(static_cast<int>(debug.refined_patch.x) + 4,
-                            static_cast<int>(debug.refined_patch.y) - 4),
-                  cv::FONT_HERSHEY_PLAIN, 0.8, color, 1);
     }
   }
 

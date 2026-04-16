@@ -43,6 +43,15 @@ struct ApriltagInternalConfig {
   double tag_size = 0.0;
   int black_border_bits = 2;
   int min_visible_points = 12;
+  int canonical_pixels_per_module = 24;
+  int refinement_window_radius = 0;
+  double internal_subpix_window_scale = 0.5;
+  int internal_subpix_window_min = 4;
+  int internal_subpix_window_max = 16;
+  double max_subpix_displacement2 = 0.0;
+  double internal_subpix_displacement_scale = 0.25;
+  double max_internal_subpix_displacement = 6.0;
+  bool enable_debug_output = false;
   InternalProjectionMode internal_projection_mode = InternalProjectionMode::VirtualPinholePatch;
   IntermediateCameraConfig intermediate_camera;
   MultiScaleOuterTagDetectorConfig outer_detector_config;

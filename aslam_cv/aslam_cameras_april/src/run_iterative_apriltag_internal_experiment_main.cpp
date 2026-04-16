@@ -67,6 +67,20 @@ std::vector<int> ParseIntCsv(const std::string& value) {
   return numbers;
 }
 
+ati::ApriltagInternalDetectionOptions MakeDetectionOptionsFromConfig(
+    const ati::ApriltagInternalConfig& config) {
+  ati::ApriltagInternalDetectionOptions options;
+  options.canonical_pixels_per_module = config.canonical_pixels_per_module;
+  options.refinement_window_radius = config.refinement_window_radius;
+  options.internal_subpix_window_scale = config.internal_subpix_window_scale;
+  options.internal_subpix_window_min = config.internal_subpix_window_min;
+  options.internal_subpix_window_max = config.internal_subpix_window_max;
+  options.max_subpix_displacement2 = config.max_subpix_displacement2;
+  options.internal_subpix_displacement_scale = config.internal_subpix_displacement_scale;
+  options.max_internal_subpix_displacement = config.max_internal_subpix_displacement;
+  return options;
+}
+
 CmdArgs ParseArgs(int argc, char** argv) {
   CmdArgs args;
   for (int i = 1; i < argc; ++i) {
@@ -130,7 +144,8 @@ int main(int argc, char** argv) {
 
     ati::ApriltagInternalConfig config =
         ati::ApriltagInternalDetector::LoadConfig(args.config_path);
-    ati::ApriltagInternalDetectionOptions detection_options;
+    ati::ApriltagInternalDetectionOptions detection_options =
+        MakeDetectionOptionsFromConfig(config);
     detection_options.do_subpix_refinement = !args.no_subpix;
 
     ati::IterativeCoarseCalibrationExperimentRequest request;
