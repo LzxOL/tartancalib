@@ -1561,8 +1561,8 @@ void ApriltagInternalDetector::DrawDetections(const ApriltagInternalDetectionRes
       const InternalCornerDebugInfo* debug_info =
           debug_by_point[static_cast<std::size_t>(measurement.point_id)];
       if (debug_info != nullptr && measurement.corner_type != CornerType::Outer) {
-        label << ":w" << debug_info->subpix_window_radius
-              << ":g" << std::fixed << std::setprecision(1)
+        label << " subpix=" << debug_info->subpix_window_radius
+              << " gate=" << std::fixed << std::setprecision(1)
               << debug_info->subpix_displacement_limit;
       }
       cv::putText(*output_image, label.str(),
@@ -1654,8 +1654,8 @@ void ApriltagInternalDetector::DrawCanonicalView(const ApriltagInternalDetection
         if (debug.valid) {
           label << ":" << std::lround(debug.final_quality * 100.0);
         }
-        label << ":w" << debug.subpix_window_radius
-              << ":g" << std::fixed << std::setprecision(1)
+        label << " subpix=" << debug.subpix_window_radius
+              << " gate=" << std::fixed << std::setprecision(1)
               << debug.subpix_displacement_limit;
         cv::putText(*output_image, label.str(),
                     cv::Point(static_cast<int>(debug.refined_patch.x) + 4,

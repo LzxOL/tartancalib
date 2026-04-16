@@ -2014,12 +2014,12 @@ void MultiScaleOuterTagDetector::DrawDetection(const OuterTagDetectionResult& de
                   verification.verification_passed ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255),
                   line_thickness);
       std::ostringstream adaptive_label;
-      adaptive_label << "s=" << std::fixed << std::setprecision(1) << verification.local_scale
+      adaptive_label << "scale=" << std::fixed << std::setprecision(1) << verification.local_scale
                      << " roi=" << verification.verification_roi_radius
-                     << " cand=" << verification.candidate_radius
-                     << " br=" << verification.branch_search_radius
-                     << " sw=" << verification.subpix_window_radius
-                     << " rg=" << std::setprecision(1) << verification.refine_displacement_limit;
+                     << " candidate=" << verification.candidate_radius
+                     << " branch=" << verification.branch_search_radius
+                     << " subpix=" << verification.subpix_window_radius
+                     << " gate=" << std::setprecision(1) << verification.refine_displacement_limit;
       cv::putText(*output_image, adaptive_label.str(),
                   verified + cv::Point2f(static_cast<float>(6.0 * render_scale),
                                          static_cast<float>(30.0 * render_scale)),
