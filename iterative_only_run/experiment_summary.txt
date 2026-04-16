@@ -1,0 +1,33 @@
+iterative coarse calibration experiment
+image_dir: ./image/img_seq
+output_dir: ./iterative_only_run
+group rule: filename stem before the last '-'
+selected groups: all
+board ids: 1
+images:
+  - image1-1 (group=image1)
+  - image1-2 (group=image1)
+  - image1-3 (group=image1)
+  - image1-4 (group=image1)
+  - image2-1 (group=image2)
+  - image2-2 (group=image2)
+  - image2-3 (group=image2)
+  - image2-4 (group=image2)
+  - image3-1 (group=image3)
+  - image3-2 (group=image3)
+  - image3-3 (group=image3)
+  - image3-4 (group=image3)
+
+iteration summaries
+
+[iteration_0_baseline_homography]
+camera=[xi=-0.200000, alpha=0.600000, fu=2481.600000, fv=2481.600000, cu=2256.000000, cv=2256.000000] camera_rmse=0 score=189.246 valid_internal=189
+
+[iteration_1_iterative_coarse_model]
+camera=[xi=-0.742222, alpha=0.325526, fu=823.710659, fv=823.407768, cu=2256.347114, cv=2256.016404] camera_rmse=9.38289 score=43.0624 valid_internal=43
+
+[iteration_2_iterative_coarse_model]
+camera=[xi=-0.780366, alpha=0.310561, fu=713.377634, fv=712.146785, cu=2256.615534, cv=2256.318591] camera_rmse=9.00312 score=30.0471 valid_internal=30
+
+[iteration_3_iterative_coarse_model]
+camera=[xi=-0.792822, alpha=0.306527, fu=678.450098, fv=676.190787, cu=2256.864377, cv=2256.695065] camera_rmse=8.8857 score=20.0352 valid_internal=20

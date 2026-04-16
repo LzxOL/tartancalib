@@ -1,0 +1,34 @@
+target_type: apriltag_internal
+tagFamily: t36h11
+tagId: 1
+tagSize: 0.15625
+blackBorderBits: 2
+minVisiblePoints: 12
+internal_projection_mode: virtual_pinhole_patch
+
+# Outer-tag detector / Step 1 local structure verification.
+min_border_distance: 4.0
+scale_candidates: [3000, 2400, 1800, 1200, 1000, 800, 600, 500, 400, 300]
+do_outer_subpix_refinement: true
+max_outer_refine_displacement: 6.0
+enable_outer_corner_local_verification: true
+enable_outer_corner_layout_check: false
+outer_corner_verification_roi_scale: 0.035
+outer_corner_verification_roi_min: 12
+outer_corner_verification_roi_max: 48
+outer_corner_candidate_scale: 0.022
+outer_corner_candidate_min: 6
+outer_corner_candidate_max: 24
+outer_corner_branch_search_scale: 0.010
+outer_corner_branch_search_min: 3
+outer_corner_branch_search_max: 12
+outer_corner_min_direction_score: 0.35
+outer_corner_min_layout_score: 0.20
+
+# Either keep the inline Kalibr DS model below, or replace it with:
+# intermediate_camera_yaml: /path/to/mono_fisheye_calib_3_25_right-camchain.yaml
+camera_model: ds
+distortion_model: none
+distortion_coeffs: []
+intrinsics: [-0.17867356705653623, 0.6180871263819165, 1193.6021797760475, 1192.9067980786774, 2287.1229862699843, 2191.8264201158163]
+resolution: [4512, 4512]

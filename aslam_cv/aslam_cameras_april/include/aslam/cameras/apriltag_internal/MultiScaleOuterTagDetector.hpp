@@ -1,0 +1,136 @@
+#ifndef ASLAM_CAMERAS_APRILTAG_INTERNAL_MULTI_SCALE_OUTER_TAG_DETECTOR_HPP
+#define ASLAM_CAMERAS_APRILTAG_INTERNAL_MULTI_SCALE_OUTER_TAG_DETECTOR_HPP
+
+#include <array>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <Eigen/Core>
+#include <opencv2/core.hpp>
+
+namespace AprilTags {
+class TagDetector;
+struct TagDetection;
+}  // namespace AprilTags
+
+namespace aslam {
+namespace cameras {
+namespace apriltag_internal {
+
+enum class OuterTagFailureReason {
+  None = 0,
+  NoDetectionsAtAll,
+  DetectionsExistButNoMatchingTagId,
+  MatchingTagIdButRejectedByBorder,
+  MatchingTagIdButRefinementFailed,
+  MatchingTagIdButAllScalesUnstable,
+};
+
+std::string ToString(OuterTagFailureReason reason);
+
+struct MultiScaleOuterTagDetectorConfig {
+  int tag_id = 1;
+  double min_border_distance = 4.0;
+  int max_scales_to_try = 0;
+  std::vector<int> scale_candidates{3000, 2400, 1800, 1200, 1000, 800, 600, 500, 400, 300};
+  bool do_outer_subpix_refinement = true;
+  double max_outer_refine_displacement = 6.0;
+  double min_detection_quality = 0.0;
+  bool blur_before_detect = false;
+  int blur_kernel = 7;
+  double blur_sigma = 1.6;
+  bool enable_outer_corner_local_verification = true;
+  bool enable_outer_corner_layout_check = false;
+  double outer_corner_verification_roi_scale = 0.035;
+  int outer_corner_verification_roi_min = 12;
+  int outer_corner_verification_roi_max = 48;
+  double outer_corner_candidate_scale = 0.022;
+  int outer_corner_candidate_min = 6;
+  int outer_corner_candidate_max = 24;
+  double outer_corner_branch_search_scale = 0.010;
+  int outer_corner_branch_search_min = 3;
+  int outer_corner_branch_search_max = 12;
+  double outer_corner_min_direction_score = 0.35;
+  double outer_corner_min_layout_score = 0.20;
+};
+
+struct OuterCornerVerificationDebugInfo {
+  int corner_index = -1;
+  cv::Point2f coarse_corner{};
+  cv::Point2f verified_corner{};
+  cv::Point2f subpix_corner{};
+  cv::Rect verification_roi;
+  cv::Point2f prev_edge_direction{};
+  cv::Point2f next_edge_direction{};
+  std::vector<cv::Point2f> prev_branch_points;
+  std::vector<cv::Point2f> next_branch_points;
+  double local_scale = 0.0;
+  int verification_roi_radius = 0;
+  int candidate_radius = 0;
+  int branch_search_radius = 0;
+  double direction_consistency_score = 0.0;
+  double local_layout_score = 0.0;
+  double verification_quality = 0.0;
+  bool verification_passed = false;
+  bool subpix_applied = false;
+  std::string failure_reason;
+};
+
+struct OuterTagScaleDebugInfo {
+  int target_longest_side = 0;
+  double scale_factor = 1.0;
+  cv::Size scaled_size;
+  bool attempted = false;
+  int raw_detection_count = 0;
+  int matching_tag_count = 0;
+  int accepted_candidate_count = 0;
+  int refined_success_count = 0;
+  std::string rejection_summary;
+};
+
+struct OuterTagDetectionResult {
+  bool success = false;
+  int board_id = -1;
+  int detected_tag_id = -1;
+  int chosen_scale_longest_side = 0;
+  double chosen_scale_factor = 1.0;
+  int hamming = -1;
+  bool good = false;
+  std::array<Eigen::Vector2d, 4> coarse_corners_scaled_image{};
+  std::array<Eigen::Vector2d, 4> coarse_corners_original_image{};
+  std::array<Eigen::Vector2d, 4> refined_corners_original_image{};
+  std::array<bool, 4> refined_valid{{false, false, false, false}};
+  double quality = 0.0;
+  OuterTagFailureReason failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
+  std::string failure_reason_text;
+  std::vector<int> successful_scale_longest_sides;
+  std::vector<OuterTagScaleDebugInfo> scale_debug;
+  std::array<OuterCornerVerificationDebugInfo, 4> corner_verification_debug{};
+};
+
+class MultiScaleOuterTagDetector {
+ public:
+  explicit MultiScaleOuterTagDetector(
+      MultiScaleOuterTagDetectorConfig config = MultiScaleOuterTagDetectorConfig{});
+  ~MultiScaleOuterTagDetector();
+
+  static MultiScaleOuterTagDetectorConfig LoadConfig(const std::string& yaml_path);
+
+  OuterTagDetectionResult Detect(const cv::Mat& image) const;
+  void DrawDetection(const OuterTagDetectionResult& detection, cv::Mat* output_image) const;
+
+  const MultiScaleOuterTagDetectorConfig& config() const { return config_; }
+
+ private:
+  cv::Mat ToGray(const cv::Mat& image) const;
+
+  MultiScaleOuterTagDetectorConfig config_;
+  std::unique_ptr<AprilTags::TagDetector> detector_;
+};
+
+}  // namespace apriltag_internal
+}  // namespace cameras
+}  // namespace aslam
+
+#endif  // ASLAM_CAMERAS_APRILTAG_INTERNAL_MULTI_SCALE_OUTER_TAG_DETECTOR_HPP
