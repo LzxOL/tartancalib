@@ -1336,13 +1336,19 @@ ApriltagInternalDetector::ApriltagInternalDetector(
     throw std::runtime_error("max_internal_subpix_displacement must be positive.");
   }
 
-  options_.do_subpix_refinement =
-      options_.do_subpix_refinement && config_.outer_detector_config.do_outer_subpix_refinement;
   options_.min_border_distance = config_.outer_detector_config.min_border_distance;
   options_.outer_detector_config = config_.outer_detector_config;
   options_.outer_detector_config.tag_id = config_.tag_id;
   options_.outer_detector_config.min_border_distance = options_.min_border_distance;
-  options_.outer_detector_config.do_outer_subpix_refinement = options_.do_subpix_refinement;
+  options_.outer_detector_config.do_outer_subpix_refinement =
+      options_.do_subpix_refinement && config_.outer_detector_config.do_outer_subpix_refinement;
+  options_.outer_detector_config.refine_camera.camera_model = config_.intermediate_camera.camera_model;
+  options_.outer_detector_config.refine_camera.distortion_model =
+      config_.intermediate_camera.distortion_model;
+  options_.outer_detector_config.refine_camera.intrinsics = config_.intermediate_camera.intrinsics;
+  options_.outer_detector_config.refine_camera.distortion_coeffs =
+      config_.intermediate_camera.distortion_coeffs;
+  options_.outer_detector_config.refine_camera.resolution = config_.intermediate_camera.resolution;
 
   outer_detector_ = std::make_unique<MultiScaleOuterTagDetector>(options_.outer_detector_config);
 }

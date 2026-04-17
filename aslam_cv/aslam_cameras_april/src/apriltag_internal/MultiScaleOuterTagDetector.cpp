@@ -14,7 +14,10 @@
 #include <utility>
 #include <vector>
 
+#include <Eigen/Eigenvalues>
 #include <opencv2/imgproc.hpp>
+
+#include <aslam/cameras/apriltag_internal/DoubleSphereCameraModel.hpp>
 
 #include "apriltags/TagFamily.h"
 #include "apriltags/Tag36h11.h"
@@ -33,6 +36,8 @@ constexpr double kOuterLineResidualThreshold = 2.5;
 constexpr int kMinLineSupportPoints = 6;
 constexpr double kOuterLineMinQuality = 0.25;
 constexpr double kOuterLineSubpixAgreementPixels = 6.0;
+constexpr double kOuterSpherePlaneResidualThreshold = 0.035;
+constexpr int kOuterSphereMinSupportPoints = 4;
 constexpr int kVerificationLineMinSupportPoints = 4;
 constexpr int kOuterVerificationCandidateStepPixels = 2;
 constexpr double kOuterDirectionAlignmentFloor = 0.75;
@@ -86,6 +91,27 @@ struct CornerLineRefinement {
   bool success = false;
   cv::Point2f refined_corner;
   double quality = 0.0;
+};
+
+struct SphericalEdgePlaneFit {
+  std::vector<cv::Point2f> support_points;
+  std::vector<Eigen::Vector3d> support_rays;
+  Eigen::Vector3d plane_normal = Eigen::Vector3d::Zero();
+  double rms_residual = std::numeric_limits<double>::infinity();
+  int support_count = 0;
+  bool valid = false;
+};
+
+struct SphericalCornerRefinement {
+  bool success = false;
+  cv::Point2f refined_corner{};
+  Eigen::Vector3d refined_ray = Eigen::Vector3d::Zero();
+  SphericalEdgePlaneFit prev_edge_fit;
+  SphericalEdgePlaneFit next_edge_fit;
+  std::vector<cv::Point2f> prev_curve_points;
+  std::vector<cv::Point2f> next_curve_points;
+  double quality = 0.0;
+  std::string failure_reason;
 };
 
 struct OuterCornerLocalVerificationResult {
@@ -290,6 +316,16 @@ Eigen::Vector2d ToEigen(const cv::Point2f& point) {
   return Eigen::Vector2d(point.x, point.y);
 }
 
+IntermediateCameraConfig ToIntermediateCameraConfig(const OuterRefineCameraConfig& config) {
+  IntermediateCameraConfig converted;
+  converted.camera_model = config.camera_model;
+  converted.distortion_model = config.distortion_model;
+  converted.intrinsics = config.intrinsics;
+  converted.distortion_coeffs = config.distortion_coeffs;
+  converted.resolution = config.resolution;
+  return converted;
+}
+
 std::string JoinReasons(const std::vector<std::string>& reasons) {
   if (reasons.empty()) {
     return "";
@@ -373,6 +409,16 @@ MultiScaleOuterTagDetectorConfig ParseConfig(const std::string& yaml_path) {
       config.blur_kernel = ParseInt(key, value);
     } else if (key == "blurSigma" || key == "blur_sigma") {
       config.blur_sigma = ParseDouble(key, value);
+    } else if (key == "camera_model") {
+      config.refine_camera.camera_model = value;
+    } else if (key == "distortion_model") {
+      config.refine_camera.distortion_model = value;
+    } else if (key == "intrinsics") {
+      config.refine_camera.intrinsics = ParseDoubleList(key, value);
+    } else if (key == "distortion_coeffs") {
+      config.refine_camera.distortion_coeffs = ParseDoubleList(key, value);
+    } else if (key == "resolution") {
+      config.refine_camera.resolution = ParseIntList(key, value);
     } else if (key == "enableOuterCornerLocalVerification" ||
                key == "enable_outer_corner_local_verification") {
       // Legacy compatibility: the pipeline is now always C-S.
@@ -511,6 +557,16 @@ bool IsInsideImage(const cv::Point2f& point, const cv::Size& size, float border 
          point.x <= static_cast<float>(size.width) - 1.0f - border &&
          point.y >= border &&
          point.y <= static_cast<float>(size.height) - 1.0f - border;
+}
+
+std::string BuildOuterChainLabel(const OuterCornerVerificationDebugInfo& verification) {
+  if (verification.spherical_refinement_valid) {
+    return verification.subpix_applied ? "C-S-SP" : "C-SP";
+  }
+  if (verification.subpix_applied) {
+    return "C-S";
+  }
+  return "C";
 }
 
 int ClampRadiusFromScale(double ratio, double local_scale, int min_radius, int max_radius) {
@@ -665,6 +721,273 @@ std::vector<cv::Point2f> CollectLocalEdgeSupportPoints(const cv::Mat& gray,
   const double search_radius = std::min(std::max(6.0, edge_length * 0.03), 24.0);
   return CollectDirectionalEdgeBranchPoints(gray, corner, edge_dir, edge_length, quad_center,
                                             start_offset, usable_extent, sample_count, search_radius);
+}
+
+std::vector<cv::Point2f> CollectCornerMarkerEdgeSupportPoints(
+    const cv::Mat& gray,
+    const cv::Point2f& corner,
+    const cv::Point2f& along_edge,
+    double edge_length,
+    const cv::Point2f& quad_center,
+    double corner_marker_width,
+    int verification_roi_radius) {
+  const cv::Point2f edge_dir = NormalizeVector(along_edge);
+  if (Norm(edge_dir) <= 1e-9 || edge_length <= 1.0) {
+    return {};
+  }
+
+  const double marker_extent = std::max(8.0, corner_marker_width);
+  const double start_offset =
+      std::min(std::max(1.5, 0.18 * marker_extent), std::max(2.0, edge_length * 0.18));
+  const double local_extent =
+      std::min(std::max(10.0, 1.20 * marker_extent), std::max(10.0, edge_length * 0.28));
+  const double usable_extent =
+      std::min(local_extent, std::max(0.0, edge_length - start_offset - 1.0));
+  if (usable_extent < 6.0) {
+    return {};
+  }
+
+  const int sample_count =
+      std::max(5, std::min(16, static_cast<int>(std::lround(usable_extent / 3.0))));
+  const double search_radius = std::max(
+      2.0, std::min(std::max(4.0, static_cast<double>(verification_roi_radius) * 0.30),
+                    std::max(3.0, 0.35 * marker_extent)));
+  return CollectDirectionalEdgeBranchPoints(gray, corner, edge_dir, edge_length, quad_center,
+                                            start_offset, usable_extent, sample_count, search_radius);
+}
+
+bool UnprojectSupportPointsToRays(const DoubleSphereCameraModel& camera,
+                                  const std::vector<cv::Point2f>& image_points,
+                                  std::vector<Eigen::Vector3d>* rays) {
+  if (rays == nullptr) {
+    throw std::runtime_error("UnprojectSupportPointsToRays requires a valid output pointer.");
+  }
+
+  rays->clear();
+  rays->reserve(image_points.size());
+  for (const cv::Point2f& point : image_points) {
+    Eigen::Vector3d ray = Eigen::Vector3d::Zero();
+    if (!camera.keypointToEuclidean(Eigen::Vector2d(point.x, point.y), &ray)) {
+      continue;
+    }
+    const double norm = ray.norm();
+    if (!std::isfinite(norm) || norm <= 1e-9) {
+      continue;
+    }
+    rays->push_back(ray / norm);
+  }
+  return rays->size() >= static_cast<std::size_t>(kOuterSphereMinSupportPoints);
+}
+
+bool FitPlaneToRays(const std::vector<Eigen::Vector3d>& rays,
+                    Eigen::Vector3d* plane_normal,
+                    double* rms_residual) {
+  if (plane_normal == nullptr || rms_residual == nullptr) {
+    throw std::runtime_error("FitPlaneToRays requires valid output pointers.");
+  }
+  if (rays.size() < static_cast<std::size_t>(kOuterSphereMinSupportPoints)) {
+    return false;
+  }
+
+  Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+  for (const Eigen::Vector3d& ray : rays) {
+    covariance += ray * ray.transpose();
+  }
+
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
+  if (solver.info() != Eigen::Success) {
+    return false;
+  }
+
+  Eigen::Vector3d normal = solver.eigenvectors().col(0);
+  const double normal_norm = normal.norm();
+  if (!std::isfinite(normal_norm) || normal_norm <= 1e-9) {
+    return false;
+  }
+  normal /= normal_norm;
+
+  double residual_sum_sq = 0.0;
+  for (const Eigen::Vector3d& ray : rays) {
+    const double residual = normal.dot(ray);
+    residual_sum_sq += residual * residual;
+  }
+
+  *plane_normal = normal;
+  *rms_residual = std::sqrt(residual_sum_sq / static_cast<double>(rays.size()));
+  return std::isfinite(*rms_residual) && *rms_residual <= kOuterSpherePlaneResidualThreshold;
+}
+
+std::vector<cv::Point2f> ProjectSphericalPlaneCurve(const DoubleSphereCameraModel& camera,
+                                                    const Eigen::Vector3d& plane_normal,
+                                                    const Eigen::Vector3d& corner_ray,
+                                                    const std::vector<Eigen::Vector3d>& support_rays) {
+  std::vector<cv::Point2f> curve_points;
+  if (support_rays.empty()) {
+    return curve_points;
+  }
+
+  Eigen::Vector3d basis_a = corner_ray.normalized();
+  Eigen::Vector3d basis_b = plane_normal.cross(basis_a);
+  if (basis_b.norm() <= 1e-9) {
+    return curve_points;
+  }
+  basis_b.normalize();
+
+  double theta_min = 0.0;
+  double theta_max = 0.0;
+  bool initialized = false;
+  for (const Eigen::Vector3d& ray : support_rays) {
+    const double theta = std::atan2(ray.dot(basis_b), ray.dot(basis_a));
+    if (!initialized) {
+      theta_min = theta;
+      theta_max = theta;
+      initialized = true;
+    } else {
+      theta_min = std::min(theta_min, theta);
+      theta_max = std::max(theta_max, theta);
+    }
+  }
+  if (!initialized) {
+    return curve_points;
+  }
+
+  theta_min = std::min(theta_min, 0.0) - 0.05;
+  theta_max = std::max(theta_max, 0.0) + 0.05;
+  const int sample_count = 24;
+  curve_points.reserve(static_cast<std::size_t>(sample_count));
+  for (int sample_index = 0; sample_index < sample_count; ++sample_index) {
+    const double alpha =
+        sample_count == 1
+            ? 0.0
+            : static_cast<double>(sample_index) / static_cast<double>(sample_count - 1);
+    const double theta = theta_min + (theta_max - theta_min) * alpha;
+    const Eigen::Vector3d ray = (std::cos(theta) * basis_a + std::sin(theta) * basis_b).normalized();
+    Eigen::Vector2d projected = Eigen::Vector2d::Zero();
+    if (!camera.vsEuclideanToKeypoint(ray, &projected)) {
+      continue;
+    }
+    curve_points.emplace_back(static_cast<float>(projected.x()), static_cast<float>(projected.y()));
+  }
+  return curve_points;
+}
+
+SphericalEdgePlaneFit FitSphericalEdgePlane(const cv::Mat& gray,
+                                            const DoubleSphereCameraModel& camera,
+                                            const cv::Point2f& corner,
+                                            const cv::Point2f& edge,
+                                            double edge_length,
+                                            const cv::Point2f& quad_center,
+                                            double corner_marker_width,
+                                            int verification_roi_radius) {
+  SphericalEdgePlaneFit fit;
+  fit.support_points = CollectCornerMarkerEdgeSupportPoints(
+      gray, corner, edge, edge_length, quad_center, corner_marker_width, verification_roi_radius);
+  fit.support_count = static_cast<int>(fit.support_points.size());
+  if (!UnprojectSupportPointsToRays(camera, fit.support_points, &fit.support_rays)) {
+    return fit;
+  }
+
+  if (!FitPlaneToRays(fit.support_rays, &fit.plane_normal, &fit.rms_residual)) {
+    return fit;
+  }
+
+  fit.valid = true;
+  return fit;
+}
+
+SphericalCornerRefinement RefineCornerBySphericalPlanes(
+    const cv::Mat& gray,
+    const DoubleSphereCameraModel& camera,
+    const std::array<cv::Point2f, 4>& corner_seeds,
+    int corner_index,
+    const MultiScaleOuterTagDetectorConfig& config) {
+  SphericalCornerRefinement refinement;
+
+  const int prev_index = (corner_index + 3) % 4;
+  const int next_index = (corner_index + 1) % 4;
+  const cv::Point2f corner = corner_seeds[static_cast<std::size_t>(corner_index)];
+  const cv::Point2f prev_edge = corner_seeds[static_cast<std::size_t>(prev_index)] - corner;
+  const cv::Point2f next_edge = corner_seeds[static_cast<std::size_t>(next_index)] - corner;
+  const double prev_length = Norm(prev_edge);
+  const double next_length = Norm(next_edge);
+  if (prev_length <= 1.0 || next_length <= 1.0) {
+    refinement.failure_reason = "short_edge";
+    return refinement;
+  }
+
+  const double local_scale = std::min(prev_length, next_length);
+  const double corner_marker_width = ComputeOuterCornerMarkerWidth(local_scale, config);
+  const AdaptiveCornerSearchRadii radii =
+      ComputeAdaptiveCornerSearchRadii(local_scale, config);
+  const cv::Point2f quad_center = ComputeQuadCenter(corner_seeds);
+
+  refinement.prev_edge_fit = FitSphericalEdgePlane(
+      gray, camera, corner, prev_edge, prev_length, quad_center, corner_marker_width,
+      radii.verification_roi_radius);
+  refinement.next_edge_fit = FitSphericalEdgePlane(
+      gray, camera, corner, next_edge, next_length, quad_center, corner_marker_width,
+      radii.verification_roi_radius);
+  if (!refinement.prev_edge_fit.valid || !refinement.next_edge_fit.valid) {
+    refinement.failure_reason = "edge_fit";
+    return refinement;
+  }
+
+  Eigen::Vector3d seed_ray = Eigen::Vector3d::Zero();
+  if (!camera.keypointToEuclidean(Eigen::Vector2d(corner.x, corner.y), &seed_ray)) {
+    refinement.failure_reason = "seed_ray";
+    return refinement;
+  }
+  const double seed_norm = seed_ray.norm();
+  if (!std::isfinite(seed_norm) || seed_norm <= 1e-9) {
+    refinement.failure_reason = "seed_ray";
+    return refinement;
+  }
+  seed_ray /= seed_norm;
+
+  Eigen::Vector3d intersection_ray =
+      refinement.prev_edge_fit.plane_normal.cross(refinement.next_edge_fit.plane_normal);
+  const double intersection_norm = intersection_ray.norm();
+  if (!std::isfinite(intersection_norm) || intersection_norm <= 1e-9) {
+    refinement.failure_reason = "parallel_planes";
+    return refinement;
+  }
+  intersection_ray /= intersection_norm;
+  if (intersection_ray.dot(seed_ray) < 0.0) {
+    intersection_ray = -intersection_ray;
+  }
+
+  Eigen::Vector2d projected = Eigen::Vector2d::Zero();
+  if (!camera.vsEuclideanToKeypoint(intersection_ray, &projected)) {
+    refinement.failure_reason = "projection";
+    return refinement;
+  }
+
+  const cv::Point2f projected_corner(static_cast<float>(projected.x()),
+                                     static_cast<float>(projected.y()));
+  if (!IsInsideImage(projected_corner, gray.size(), 1.0f)) {
+    refinement.failure_reason = "outside";
+    return refinement;
+  }
+
+  refinement.refined_corner = projected_corner;
+  refinement.refined_ray = intersection_ray;
+  refinement.prev_curve_points = ProjectSphericalPlaneCurve(
+      camera, refinement.prev_edge_fit.plane_normal, intersection_ray, refinement.prev_edge_fit.support_rays);
+  refinement.next_curve_points = ProjectSphericalPlaneCurve(
+      camera, refinement.next_edge_fit.plane_normal, intersection_ray, refinement.next_edge_fit.support_rays);
+
+  const double residual_quality =
+      ClampUnit(1.0 - std::max(refinement.prev_edge_fit.rms_residual,
+                               refinement.next_edge_fit.rms_residual) /
+                           kOuterSpherePlaneResidualThreshold);
+  const double support_quality =
+      ClampUnit(static_cast<double>(std::min(refinement.prev_edge_fit.support_count,
+                                             refinement.next_edge_fit.support_count)) /
+                8.0);
+  refinement.quality = std::min(residual_quality, support_quality);
+  refinement.success = true;
+  refinement.failure_reason = "pass";
+  return refinement;
 }
 
 bool FitLineToPoints(const std::vector<cv::Point2f>& points,
@@ -1434,7 +1757,8 @@ MultiScaleCornerFusionOutcome FuseMultiScaleCoarseCorners(
 RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
                                        const ScaleCandidate& coarse_candidate,
                                        const std::array<cv::Point2f, 4>& coarse_original,
-                                       const MultiScaleOuterTagDetectorConfig& config) {
+                                       const MultiScaleOuterTagDetectorConfig& config,
+                                       const DoubleSphereCameraModel* sphere_camera) {
   RefinedCandidate refined_candidate;
   refined_candidate.coarse = coarse_candidate;
   refined_candidate.coarse_original = coarse_original;
@@ -1462,6 +1786,7 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
     debug.corner_marker_width = ComputeOuterCornerMarkerWidth(local_scale, config);
     debug.subpix_window_radius =
         ComputeAdaptiveOuterSubpixRadius(local_scale, debug.verification_roi_radius, config);
+    debug.spherical_corner = coarse_original[static_cast<std::size_t>(index)];
   }
 
   if (config.do_outer_subpix_refinement) {
@@ -1481,17 +1806,52 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
       refined_candidate.refined_original[static_cast<std::size_t>(index)] = point_seed.front();
       refined_candidate.verification_debug[static_cast<std::size_t>(index)].subpix_corner =
           point_seed.front();
+      refined_candidate.verification_debug[static_cast<std::size_t>(index)].spherical_corner =
+          point_seed.front();
       refined_candidate.verification_debug[static_cast<std::size_t>(index)].subpix_applied = true;
     }
   } else {
     for (int index = 0; index < 4; ++index) {
       refined_candidate.verification_debug[static_cast<std::size_t>(index)].subpix_corner =
           coarse_original[static_cast<std::size_t>(index)];
+      refined_candidate.verification_debug[static_cast<std::size_t>(index)].spherical_corner =
+          coarse_original[static_cast<std::size_t>(index)];
     }
   }
 
   for (int index = 0; index < 4; ++index) {
     if (!method_valid[static_cast<std::size_t>(index)]) {
+      continue;
+    }
+
+    OuterCornerVerificationDebugInfo& debug =
+        refined_candidate.verification_debug[static_cast<std::size_t>(index)];
+    if (sphere_camera != nullptr && sphere_camera->IsValid()) {
+      const SphericalCornerRefinement spherical_refinement =
+          RefineCornerBySphericalPlanes(gray_original, *sphere_camera, subpix_seed_corners, index, config);
+      debug.prev_branch_points = spherical_refinement.prev_edge_fit.support_points;
+      debug.next_branch_points = spherical_refinement.next_edge_fit.support_points;
+      debug.prev_spherical_curve_points = spherical_refinement.prev_curve_points;
+      debug.next_spherical_curve_points = spherical_refinement.next_curve_points;
+      debug.prev_spherical_residual = spherical_refinement.prev_edge_fit.rms_residual;
+      debug.next_spherical_residual = spherical_refinement.next_edge_fit.rms_residual;
+      debug.prev_spherical_support_count = spherical_refinement.prev_edge_fit.support_count;
+      debug.next_spherical_support_count = spherical_refinement.next_edge_fit.support_count;
+      debug.spherical_refinement_valid = spherical_refinement.success;
+      debug.spherical_failure_reason = spherical_refinement.failure_reason;
+      debug.spherical_corner = spherical_refinement.success
+                                   ? spherical_refinement.refined_corner
+                                   : subpix_seed_corners[static_cast<std::size_t>(index)];
+
+      if (spherical_refinement.success) {
+        refined_candidate.refined_original[static_cast<std::size_t>(index)] =
+            spherical_refinement.refined_corner;
+        method_quality[static_cast<std::size_t>(index)] =
+            std::min(std::max(method_quality[static_cast<std::size_t>(index)],
+                              spherical_refinement.quality),
+                     1.0);
+        debug.spherical_refinement_applied = true;
+      }
       continue;
     }
 
@@ -1618,6 +1978,10 @@ MultiScaleOuterTagDetector::MultiScaleOuterTagDetector(MultiScaleOuterTagDetecto
   }
 
   detector_ = std::make_unique<AprilTags::TagDetector>(AprilTags::tagCodes36h11, 2);
+  if (config_.refine_camera.IsConfigured()) {
+    sphere_camera_ = std::make_unique<DoubleSphereCameraModel>(
+        DoubleSphereCameraModel::FromConfig(ToIntermediateCameraConfig(config_.refine_camera)));
+  }
 }
 
 MultiScaleOuterTagDetector::~MultiScaleOuterTagDetector() = default;
@@ -1804,7 +2168,8 @@ OuterTagDetectionResult MultiScaleOuterTagDetector::Detect(const cv::Mat& image)
   }
 
   const RefinedCandidate refined_candidate =
-      RefineCoarseCandidate(gray_original, working_candidate, working_coarse_original, config_);
+      RefineCoarseCandidate(gray_original, working_candidate, working_coarse_original, config_,
+                            sphere_camera_.get());
   const bool refined_inside =
       PassesBorderCheck(refined_candidate.refined_original, gray_original.size(), config_.min_border_distance);
   const bool all_refined_valid =
@@ -1958,38 +2323,78 @@ void MultiScaleOuterTagDetector::DrawDetection(const OuterTagDetectionResult& de
 
       const cv::Point2f coarse = verification.coarse_corner;
       const cv::Point2f subpix = verification.subpix_corner;
-      cv::line(*output_image, coarse, subpix, cv::Scalar(255, 220, 0), line_thickness, cv::LINE_AA);
+      const cv::Point2f spherical =
+          verification.spherical_refinement_valid ? verification.spherical_corner : subpix;
+      const cv::Point2f final_corner =
+          verification.spherical_refinement_valid
+              ? verification.spherical_corner
+              : (verification.subpix_applied ? verification.subpix_corner : verification.coarse_corner);
+      for (const cv::Point2f& point : verification.prev_branch_points) {
+        cv::circle(*output_image, point, std::max(2, line_thickness + 1), branch_colors[0], -1, cv::LINE_AA);
+      }
+      for (const cv::Point2f& point : verification.next_branch_points) {
+        cv::circle(*output_image, point, std::max(2, line_thickness + 1), branch_colors[1], -1, cv::LINE_AA);
+      }
+      for (std::size_t point_index = 1;
+           point_index < verification.prev_spherical_curve_points.size();
+           ++point_index) {
+        cv::line(*output_image,
+                 verification.prev_spherical_curve_points[point_index - 1],
+                 verification.prev_spherical_curve_points[point_index],
+                 branch_colors[0], line_thickness, cv::LINE_AA);
+      }
+      for (std::size_t point_index = 1;
+           point_index < verification.next_spherical_curve_points.size();
+           ++point_index) {
+        cv::line(*output_image,
+                 verification.next_spherical_curve_points[point_index - 1],
+                 verification.next_spherical_curve_points[point_index],
+                 branch_colors[1], line_thickness, cv::LINE_AA);
+      }
+      if (verification.subpix_applied) {
+        cv::line(*output_image, coarse, subpix, cv::Scalar(255, 220, 0), line_thickness, cv::LINE_AA);
+      }
+      if (verification.spherical_refinement_valid) {
+        cv::line(*output_image, subpix, spherical, cv::Scalar(255, 80, 255), line_thickness, cv::LINE_AA);
+      } else if (!verification.subpix_applied) {
+        cv::line(*output_image, coarse, final_corner, cv::Scalar(255, 80, 255), line_thickness, cv::LINE_AA);
+      }
       cv::circle(*output_image, coarse, coarse_radius, cv::Scalar(0, 165, 255), line_thickness);
-      cv::drawMarker(*output_image, subpix, cv::Scalar(255, 255, 0),
-                     cv::MARKER_CROSS, subpix_radius * 3, line_thickness);
+      if (verification.subpix_applied) {
+        cv::drawMarker(*output_image, subpix, cv::Scalar(255, 255, 0),
+                       cv::MARKER_CROSS, subpix_radius * 3, line_thickness);
+      }
+      if (verification.spherical_refinement_valid) {
+        cv::drawMarker(*output_image, spherical, cv::Scalar(255, 80, 255),
+                       cv::MARKER_DIAMOND, verified_radius * 3, line_thickness);
+      }
 
       std::ostringstream label;
-      label << "C-S";
+      label << index << " " << BuildOuterChainLabel(verification)
+            << " d=" << std::fixed << std::setprecision(1)
+            << verification.coarse_to_refined_displacement;
       cv::putText(*output_image, label.str(),
                   coarse + cv::Point2f(static_cast<float>(6.0 * render_scale),
                                        static_cast<float>(14.0 * render_scale)),
                   cv::FONT_HERSHEY_PLAIN, label_scale,
                   cv::Scalar(255, 220, 0),
                   line_thickness);
-      std::ostringstream adaptive_label;
-      adaptive_label << "scale=" << std::fixed << std::setprecision(1) << verification.local_scale
-                     << " marker=" << std::setprecision(1) << verification.corner_marker_width
-                     << " context=" << verification.verification_roi_radius
-                     << " subpix=" << verification.subpix_window_radius
-                     << " gate=" << std::setprecision(1) << verification.refine_displacement_limit;
-      cv::putText(*output_image, adaptive_label.str(),
-                  coarse + cv::Point2f(static_cast<float>(6.0 * render_scale),
-                                       static_cast<float>(30.0 * render_scale)),
-                  cv::FONT_HERSHEY_PLAIN, std::max(0.8, 0.6 * render_scale),
-                  cv::Scalar(200, 255, 200), line_thickness);
       cv::putText(*output_image, "C",
                   coarse + cv::Point2f(static_cast<float>(-10.0 * render_scale),
                                        static_cast<float>(-8.0 * render_scale)),
                   cv::FONT_HERSHEY_PLAIN, label_scale, cv::Scalar(0, 165, 255), line_thickness);
-      cv::putText(*output_image, "S",
-                  subpix + cv::Point2f(static_cast<float>(6.0 * render_scale),
-                                       static_cast<float>(-8.0 * render_scale)),
-                  cv::FONT_HERSHEY_PLAIN, label_scale, cv::Scalar(255, 255, 0), line_thickness);
+      if (verification.subpix_applied) {
+        cv::putText(*output_image, "S",
+                    subpix + cv::Point2f(static_cast<float>(6.0 * render_scale),
+                                         static_cast<float>(-8.0 * render_scale)),
+                    cv::FONT_HERSHEY_PLAIN, label_scale, cv::Scalar(255, 255, 0), line_thickness);
+      }
+      if (verification.spherical_refinement_valid) {
+        cv::putText(*output_image, "SP",
+                    spherical + cv::Point2f(static_cast<float>(6.0 * render_scale),
+                                            static_cast<float>(-8.0 * render_scale)),
+                    cv::FONT_HERSHEY_PLAIN, label_scale, cv::Scalar(255, 80, 255), line_thickness);
+      }
     }
   }
 

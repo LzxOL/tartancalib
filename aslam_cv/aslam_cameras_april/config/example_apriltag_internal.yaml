@@ -16,9 +16,10 @@ max_internal_subpix_displacement: 6.0
 enable_debug_output: true
 internal_projection_mode: virtual_pinhole_patch
 
-# Outer-tag detector / fixed C-S outer corner pipeline.
+# Outer-tag detector / fixed C-SP outer corner pipeline.
 outer_local_context_scale: 0.05
-# Subpix radius = outer_subpix_scale * (tagSpacing * local_scale)
+do_outer_subpix_refinement: false
+# If outer subpix is enabled, subpix radius = outer_subpix_scale * (tagSpacing * local_scale)
 outer_subpix_scale: 0.15
 outer_refine_gate_scale: 0.025
 outer_refine_gate_min: 6.0

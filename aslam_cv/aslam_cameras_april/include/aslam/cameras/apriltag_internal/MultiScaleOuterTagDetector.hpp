@@ -18,6 +18,8 @@ namespace aslam {
 namespace cameras {
 namespace apriltag_internal {
 
+class DoubleSphereCameraModel;
+
 enum class OuterTagFailureReason {
   None = 0,
   NoDetectionsAtAll,
@@ -28,6 +30,18 @@ enum class OuterTagFailureReason {
 };
 
 std::string ToString(OuterTagFailureReason reason);
+
+struct OuterRefineCameraConfig {
+  std::string camera_model;
+  std::string distortion_model;
+  std::vector<double> intrinsics;
+  std::vector<double> distortion_coeffs;
+  std::vector<int> resolution;
+
+  bool IsConfigured() const {
+    return !camera_model.empty() && !intrinsics.empty() && resolution.size() == 2;
+  }
+};
 
 struct MultiScaleOuterTagDetectorConfig {
   int tag_id = 1;
@@ -43,6 +57,7 @@ struct MultiScaleOuterTagDetectorConfig {
   bool blur_before_detect = false;
   int blur_kernel = 7;
   double blur_sigma = 1.6;
+  OuterRefineCameraConfig refine_camera;
 
   // Legacy compatibility fields. Old YAML keys may still populate these,
   // but the paper-facing C-S pipeline uses the high-level parameters above.
@@ -116,6 +131,16 @@ struct OuterCornerVerificationDebugInfo {
   double coarse_to_subpix_displacement = 0.0;
   double coarse_to_refined_displacement = 0.0;
   double corner_marker_width = 0.0;
+  cv::Point2f spherical_corner{};
+  std::vector<cv::Point2f> prev_spherical_curve_points;
+  std::vector<cv::Point2f> next_spherical_curve_points;
+  double prev_spherical_residual = 0.0;
+  double next_spherical_residual = 0.0;
+  int prev_spherical_support_count = 0;
+  int next_spherical_support_count = 0;
+  bool spherical_refinement_valid = false;
+  bool spherical_refinement_applied = false;
+  std::string spherical_failure_reason;
   int subpix_window_radius = 0;
   double refine_displacement_limit = 0.0;
   bool refined_valid = false;
@@ -180,8 +205,9 @@ class MultiScaleOuterTagDetector {
  private:
   cv::Mat ToGray(const cv::Mat& image) const;
 
-  MultiScaleOuterTagDetectorConfig config_;
+ MultiScaleOuterTagDetectorConfig config_;
   std::unique_ptr<AprilTags::TagDetector> detector_;
+  std::unique_ptr<DoubleSphereCameraModel> sphere_camera_;
 };
 
 }  // namespace apriltag_internal
