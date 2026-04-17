@@ -307,6 +307,16 @@ int main(int argc, char** argv) {
               << ati::ToString(config.internal_projection_mode) << "\n\n";
     std::cout << "Outer refinement chain\n";
     std::cout << "  chain: C-S\n";
+    std::cout << "  outer_local_context_scale: "
+              << config.outer_detector_config.outer_local_context_scale << "\n";
+    std::cout << "  outer_corner_marker_ratio: "
+              << config.outer_detector_config.outer_corner_marker_ratio << "\n";
+    std::cout << "  outer_subpix_scale: "
+              << config.outer_detector_config.outer_subpix_scale << "\n";
+    std::cout << "  outer_refine_gate_scale: "
+              << config.outer_detector_config.outer_refine_gate_scale << "\n";
+    std::cout << "  outer_refine_gate_min: "
+              << config.outer_detector_config.outer_refine_gate_min << "\n";
     std::cout << "  outer_subpix: "
               << (config.outer_detector_config.do_outer_subpix_refinement ? "on" : "off") << "\n\n";
 
@@ -315,8 +325,8 @@ int main(int argc, char** argv) {
               << result.outer_detection.original_longest_side << "\n";
     std::cout << "  scale mode: "
               << result.outer_detection.scale_configuration_mode << "\n";
-    if (result.outer_detection.scale_configuration_mode == "scale_divisors") {
-      std::cout << "  divisor -> target:";
+    if (result.outer_detection.scale_configuration_mode == "fixed_schedule") {
+      std::cout << "  fixed divisor -> target:";
       bool first_divisor = true;
       for (const auto& debug : result.outer_detection.scale_debug) {
         if (debug.configured_scale_divisor <= 0.0) {
@@ -425,6 +435,8 @@ int main(int argc, char** argv) {
                   << " chain=C-S"
                   << " refined_valid=" << (debug.refined_valid ? "yes" : "no")
                   << " local_scale=" << debug.local_scale
+                  << " marker_width=" << debug.corner_marker_width
+                  << " context_radius=" << debug.verification_roi_radius
                   << " coarse=(" << debug.coarse_corner.x << ", " << debug.coarse_corner.y << ")"
                   << " subpix=(" << debug.subpix_corner.x << ", " << debug.subpix_corner.y << ")"
                   << " d_cs=" << debug.coarse_to_subpix_displacement

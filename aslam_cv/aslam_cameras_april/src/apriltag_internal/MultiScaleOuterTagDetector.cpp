@@ -38,6 +38,10 @@ constexpr int kOuterVerificationCandidateStepPixels = 2;
 constexpr double kOuterDirectionAlignmentFloor = 0.75;
 constexpr double kOuterLayoutContrastFloor = 8.0;
 constexpr double kOuterLayoutContrastRange = 40.0;
+constexpr int kOuterContextRadiusMin = 12;
+constexpr int kOuterContextRadiusMax = 48;
+constexpr int kOuterSubpixRadiusMin = 4;
+constexpr double kOuterFixedScaleDivisors[] = {1.0, 1.5, 2.0, 2.5, 3.5, 4.5, 6.0, 8.0, 12.0};
 
 struct ScaleCandidate {
   int target_longest_side = 0;
@@ -92,6 +96,7 @@ struct OuterCornerLocalVerificationResult {
   DirectionalEdgeBranch prev_branch;
   DirectionalEdgeBranch next_branch;
   double local_scale = 0.0;
+  double corner_marker_width = 0.0;
   int verification_roi_radius = 0;
   int candidate_radius = 0;
   int branch_search_radius = 0;
@@ -328,6 +333,17 @@ MultiScaleOuterTagDetectorConfig ParseConfig(const std::string& yaml_path) {
       config.min_border_distance = ParseDouble(key, value);
     } else if (key == "maxScalesToTry" || key == "max_scales_to_try") {
       config.max_scales_to_try = ParseInt(key, value);
+    } else if (key == "outerLocalContextScale" || key == "outer_local_context_scale") {
+      config.outer_local_context_scale = ParseDouble(key, value);
+    } else if (key == "outerCornerMarkerRatio" || key == "outer_corner_marker_ratio" ||
+               key == "tagSpacing" || key == "tag_spacing") {
+      config.outer_corner_marker_ratio = ParseDouble(key, value);
+    } else if (key == "outerSubpixScale" || key == "outer_subpix_scale") {
+      config.outer_subpix_scale = ParseDouble(key, value);
+    } else if (key == "outerRefineGateScale" || key == "outer_refine_gate_scale") {
+      config.outer_refine_gate_scale = ParseDouble(key, value);
+    } else if (key == "outerRefineGateMin" || key == "outer_refine_gate_min") {
+      config.outer_refine_gate_min = ParseDouble(key, value);
     } else if (key == "scaleCandidates" || key == "scale_candidates") {
       config.scale_candidates = ParseIntList(key, value);
     } else if (key == "scaleDivisors" || key == "scale_divisors") {
@@ -338,14 +354,17 @@ MultiScaleOuterTagDetectorConfig ParseConfig(const std::string& yaml_path) {
       config.outer_subpix_window_radius = ParseInt(key, value);
     } else if (key == "outerSubpixWindowScale" || key == "outer_subpix_window_scale") {
       config.outer_subpix_window_scale = ParseDouble(key, value);
+      config.outer_subpix_scale = config.outer_subpix_window_scale;
     } else if (key == "outerSubpixWindowMin" || key == "outer_subpix_window_min") {
       config.outer_subpix_window_min = ParseInt(key, value);
     } else if (key == "outerSubpixWindowMax" || key == "outer_subpix_window_max") {
       config.outer_subpix_window_max = ParseInt(key, value);
     } else if (key == "maxOuterRefineDisplacement" || key == "max_outer_refine_displacement") {
       config.max_outer_refine_displacement = ParseDouble(key, value);
+      config.outer_refine_gate_min = config.max_outer_refine_displacement;
     } else if (key == "outerRefineDisplacementScale" || key == "outer_refine_displacement_scale") {
       config.outer_refine_displacement_scale = ParseDouble(key, value);
+      config.outer_refine_gate_scale = config.outer_refine_displacement_scale;
     } else if (key == "minDetectionQuality" || key == "min_detection_quality") {
       config.min_detection_quality = ParseDouble(key, value);
     } else if (key == "blurBeforeDetect" || key == "blur_before_detect") {
@@ -364,6 +383,7 @@ MultiScaleOuterTagDetectorConfig ParseConfig(const std::string& yaml_path) {
     } else if (key == "outerCornerVerificationRoiScale" ||
                key == "outer_corner_verification_roi_scale") {
       config.outer_corner_verification_roi_scale = ParseDouble(key, value);
+      config.outer_local_context_scale = config.outer_corner_verification_roi_scale;
     } else if (key == "outerCornerVerificationRoiMin" ||
                key == "outer_corner_verification_roi_min") {
       config.outer_corner_verification_roi_min = ParseInt(key, value);
@@ -508,34 +528,35 @@ AdaptiveCornerSearchRadii ComputeAdaptiveCornerSearchRadii(
   AdaptiveCornerSearchRadii radii;
   radii.local_scale = local_scale;
   radii.verification_roi_radius =
-      ClampRadiusFromScale(config.outer_corner_verification_roi_scale, local_scale,
-                           config.outer_corner_verification_roi_min,
-                           config.outer_corner_verification_roi_max);
-  radii.candidate_radius =
-      ClampRadiusFromScale(config.outer_corner_candidate_scale, local_scale,
-                           config.outer_corner_candidate_min,
-                           config.outer_corner_candidate_max);
-  radii.candidate_radius =
-      std::min(radii.candidate_radius, std::max(0, radii.verification_roi_radius - 1));
-  radii.branch_search_radius =
-      ClampRadiusFromScale(config.outer_corner_branch_search_scale, local_scale,
-                           config.outer_corner_branch_search_min,
-                           config.outer_corner_branch_search_max);
-  radii.branch_search_radius =
-      std::min(radii.branch_search_radius, std::max(1, radii.verification_roi_radius - 1));
+      ClampRadiusFromScale(config.outer_local_context_scale, local_scale,
+                           kOuterContextRadiusMin, kOuterContextRadiusMax);
+  radii.candidate_radius = 0;
+  radii.branch_search_radius = 0;
   return radii;
+}
+
+double ComputeOuterCornerMarkerWidth(double local_scale,
+                                     const MultiScaleOuterTagDetectorConfig& config) {
+  if (config.outer_corner_marker_ratio > 0.0) {
+    return std::max(0.0, config.outer_corner_marker_ratio * local_scale);
+  }
+  return std::max(0.0, local_scale);
 }
 
 int ComputeAdaptiveOuterSubpixRadius(double local_scale,
                                      int verification_roi_radius,
                                      const MultiScaleOuterTagDetectorConfig& config) {
   if (config.outer_subpix_window_radius > 0) {
-    return config.outer_subpix_window_radius;
+    const int radius = std::max(2, config.outer_subpix_window_radius);
+    return std::min(radius, std::max(2, verification_roi_radius - 2));
   }
 
-  int radius =
-      ClampRadiusFromScale(config.outer_subpix_window_scale, local_scale,
-                           config.outer_subpix_window_min, config.outer_subpix_window_max);
+  const double corner_marker_width = ComputeOuterCornerMarkerWidth(local_scale, config);
+  const double scaled =
+      config.outer_subpix_scale > 0.0
+          ? config.outer_subpix_scale * corner_marker_width
+          : static_cast<double>(kOuterSubpixRadiusMin);
+  int radius = std::max(kOuterSubpixRadiusMin, static_cast<int>(std::lround(scaled)));
   radius = std::min(radius, std::max(2, verification_roi_radius - 2));
   return std::max(2, radius);
 }
@@ -804,6 +825,7 @@ OuterCornerVerificationDebugInfo BuildVerificationDebugInfo(
   debug.prev_branch_points = verification.prev_branch.support_points;
   debug.next_branch_points = verification.next_branch.support_points;
   debug.local_scale = verification.local_scale;
+  debug.corner_marker_width = verification.corner_marker_width;
   debug.verification_roi_radius = verification.verification_roi_radius;
   debug.candidate_radius = verification.candidate_radius;
   debug.branch_search_radius = verification.branch_search_radius;
@@ -836,6 +858,7 @@ OuterCornerVerificationDebugInfo BuildCoarseOnlyDebugInfo(
   debug.prev_edge_direction = NormalizeVector(prev_edge);
   debug.next_edge_direction = NormalizeVector(next_edge);
   debug.local_scale = std::min(Norm(prev_edge), Norm(next_edge));
+  debug.corner_marker_width = ComputeOuterCornerMarkerWidth(debug.local_scale, config);
   const AdaptiveCornerSearchRadii radii =
       ComputeAdaptiveCornerSearchRadii(debug.local_scale, config);
   debug.verification_roi_radius = radii.verification_roi_radius;
@@ -881,6 +904,7 @@ OuterCornerLocalVerificationResult VerifyOuterCornerLocalStructure(
   best_any.prev_edge_direction = NormalizeVector(prev_edge);
   best_any.next_edge_direction = NormalizeVector(next_edge);
   best_any.local_scale = radii.local_scale;
+  best_any.corner_marker_width = ComputeOuterCornerMarkerWidth(radii.local_scale, config);
   best_any.verification_roi_radius = radii.verification_roi_radius;
   best_any.candidate_radius = radii.candidate_radius;
   best_any.branch_search_radius = radii.branch_search_radius;
@@ -910,6 +934,7 @@ OuterCornerLocalVerificationResult VerifyOuterCornerLocalStructure(
       candidate_result.prev_edge_direction = NormalizeVector(prev_edge);
       candidate_result.next_edge_direction = NormalizeVector(next_edge);
       candidate_result.local_scale = radii.local_scale;
+      candidate_result.corner_marker_width = ComputeOuterCornerMarkerWidth(radii.local_scale, config);
       candidate_result.verification_roi_radius = radii.verification_roi_radius;
       candidate_result.candidate_radius = radii.candidate_radius;
       candidate_result.branch_search_radius = radii.branch_search_radius;
@@ -1100,10 +1125,10 @@ double ComputeCornerRefineDisplacementLimit(double local_scale,
   const double roi_based_limit =
       verification_roi_radius > 0 ? static_cast<double>(verification_roi_radius) : 0.0;
   const double scale_based_limit =
-      config.outer_refine_displacement_scale > 0.0
-          ? config.outer_refine_displacement_scale * std::max(0.0, local_scale)
+      config.outer_refine_gate_scale > 0.0
+          ? config.outer_refine_gate_scale * std::max(0.0, local_scale)
           : 0.0;
-  return std::max({config.max_outer_refine_displacement, roi_based_limit, scale_based_limit});
+  return std::max({config.outer_refine_gate_min, roi_based_limit, scale_based_limit});
 }
 
 cv::Mat MaybeBlur(const cv::Mat& image, const MultiScaleOuterTagDetectorConfig& config) {
@@ -1194,9 +1219,8 @@ std::vector<ScalePlanEntry> BuildScalePlan(const cv::Size& original_size,
                                            std::string* scale_mode_used) {
   const int original_longest = std::max(original_size.width, original_size.height);
   std::vector<ScalePlanEntry> plan;
-  const bool use_scale_divisors = !config.scale_divisors.empty();
   if (scale_mode_used != nullptr) {
-    *scale_mode_used = use_scale_divisors ? "scale_divisors" : "scale_candidates";
+    *scale_mode_used = "fixed_schedule";
   }
 
   auto append_entry = [&](int target_longest_side, double configured_scale_divisor) {
@@ -1215,23 +1239,13 @@ std::vector<ScalePlanEntry> BuildScalePlan(const cv::Size& original_size,
     plan.push_back(entry);
   };
 
-  append_entry(original_longest, use_scale_divisors ? 1.0 : 0.0);
-  if (use_scale_divisors) {
-    for (const double divisor : config.scale_divisors) {
-      if (divisor <= 0.0) {
-        continue;
-      }
-      const int target_longest_side =
-          std::max(1, static_cast<int>(std::lround(static_cast<double>(original_longest) / divisor)));
-      append_entry(target_longest_side, divisor);
+  for (const double divisor : kOuterFixedScaleDivisors) {
+    if (divisor <= 0.0) {
+      continue;
     }
-  } else {
-    for (const int candidate : config.scale_candidates) {
-      if (candidate <= 0) {
-        continue;
-      }
-      append_entry(candidate, 0.0);
-    }
+    const int target_longest_side =
+        std::max(1, static_cast<int>(std::lround(static_cast<double>(original_longest) / divisor)));
+    append_entry(target_longest_side, divisor);
   }
 
   if (config.max_scales_to_try > 0 && static_cast<int>(plan.size()) > config.max_scales_to_try) {
@@ -1445,6 +1459,7 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
         refined_candidate.verification_debug[static_cast<std::size_t>(index)];
     const double local_scale =
         debug.local_scale > 0.0 ? debug.local_scale : ComputeCornerLocalScale(coarse_original, index);
+    debug.corner_marker_width = ComputeOuterCornerMarkerWidth(local_scale, config);
     debug.subpix_window_radius =
         ComputeAdaptiveOuterSubpixRadius(local_scale, debug.verification_roi_radius, config);
   }
@@ -1485,7 +1500,7 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
     const cv::Point2f coarse_corner = coarse_original[static_cast<std::size_t>(index)];
     const cv::Point2f delta = line_refinement.refined_corner - coarse_corner;
     const double line_jump = std::hypot(delta.x, delta.y);
-    const double line_jump_limit = std::max(config.max_outer_refine_displacement, 8.0);
+    const double line_jump_limit = std::max(config.outer_refine_gate_min, 8.0);
     const bool line_inside =
         line_refinement.refined_corner.x >= config.min_border_distance &&
         line_refinement.refined_corner.x <= static_cast<float>(gray_original.cols) - config.min_border_distance &&
@@ -1577,63 +1592,29 @@ MultiScaleOuterTagDetector::MultiScaleOuterTagDetector(MultiScaleOuterTagDetecto
   if (config_.min_border_distance < 0.0) {
     throw std::runtime_error("min_border_distance must be non-negative.");
   }
+  if (config_.max_scales_to_try < 0) {
+    throw std::runtime_error("max_scales_to_try must be non-negative.");
+  }
+  if (config_.outer_local_context_scale < 0.0) {
+    throw std::runtime_error("outer_local_context_scale must be non-negative.");
+  }
+  if (config_.outer_corner_marker_ratio < 0.0 || config_.outer_corner_marker_ratio > 1.0) {
+    throw std::runtime_error("outer_corner_marker_ratio must be in [0, 1].");
+  }
+  if (config_.outer_subpix_scale < 0.0) {
+    throw std::runtime_error("outer_subpix_scale must be non-negative.");
+  }
+  if (config_.outer_refine_gate_scale < 0.0) {
+    throw std::runtime_error("outer_refine_gate_scale must be non-negative.");
+  }
+  if (config_.outer_refine_gate_min <= 0.0) {
+    throw std::runtime_error("outer_refine_gate_min must be positive.");
+  }
   if (config_.outer_subpix_window_radius < 0) {
     throw std::runtime_error("outer_subpix_window_radius must be non-negative.");
   }
-  if (config_.outer_subpix_window_scale < 0.0) {
-    throw std::runtime_error("outer_subpix_window_scale must be non-negative.");
-  }
-  if (config_.outer_subpix_window_min <= 0) {
-    throw std::runtime_error("outer_subpix_window_min must be positive.");
-  }
-  if (config_.outer_subpix_window_max < config_.outer_subpix_window_min) {
-    throw std::runtime_error("outer_subpix_window_max must be >= outer_subpix_window_min.");
-  }
-  if (config_.max_outer_refine_displacement <= 0.0) {
-    throw std::runtime_error("max_outer_refine_displacement must be positive.");
-  }
-  if (config_.outer_refine_displacement_scale < 0.0) {
-    throw std::runtime_error("outer_refine_displacement_scale must be non-negative.");
-  }
   if (config_.min_detection_quality < 0.0 || config_.min_detection_quality > 1.0) {
     throw std::runtime_error("min_detection_quality must be in [0, 1].");
-  }
-  if (config_.scale_candidates.empty() && config_.scale_divisors.empty()) {
-    throw std::runtime_error("Either scale_candidates or scale_divisors must not be empty.");
-  }
-  for (const double divisor : config_.scale_divisors) {
-    if (divisor <= 0.0) {
-      throw std::runtime_error("scale_divisors must contain only positive values.");
-    }
-  }
-  if (config_.outer_corner_verification_roi_scale < 0.0) {
-    throw std::runtime_error("outer_corner_verification_roi_scale must be non-negative.");
-  }
-  if (config_.outer_corner_verification_roi_min <= 0 ||
-      config_.outer_corner_verification_roi_max < config_.outer_corner_verification_roi_min) {
-    throw std::runtime_error("outer_corner_verification_roi_min/max must define a positive valid range.");
-  }
-  if (config_.outer_corner_candidate_scale < 0.0) {
-    throw std::runtime_error("outer_corner_candidate_scale must be non-negative.");
-  }
-  if (config_.outer_corner_candidate_min < 0 ||
-      config_.outer_corner_candidate_max < config_.outer_corner_candidate_min) {
-    throw std::runtime_error("outer_corner_candidate_min/max must define a valid range.");
-  }
-  if (config_.outer_corner_branch_search_scale < 0.0) {
-    throw std::runtime_error("outer_corner_branch_search_scale must be non-negative.");
-  }
-  if (config_.outer_corner_branch_search_min <= 0 ||
-      config_.outer_corner_branch_search_max < config_.outer_corner_branch_search_min) {
-    throw std::runtime_error("outer_corner_branch_search_min/max must define a positive valid range.");
-  }
-  if (config_.outer_corner_min_direction_score < 0.0 ||
-      config_.outer_corner_min_direction_score > 1.0) {
-    throw std::runtime_error("outer_corner_min_direction_score must be in [0, 1].");
-  }
-  if (config_.outer_corner_min_layout_score < 0.0 ||
-      config_.outer_corner_min_layout_score > 1.0) {
-    throw std::runtime_error("outer_corner_min_layout_score must be in [0, 1].");
   }
 
   detector_ = std::make_unique<AprilTags::TagDetector>(AprilTags::tagCodes36h11, 2);
@@ -1992,6 +1973,8 @@ void MultiScaleOuterTagDetector::DrawDetection(const OuterTagDetectionResult& de
                   line_thickness);
       std::ostringstream adaptive_label;
       adaptive_label << "scale=" << std::fixed << std::setprecision(1) << verification.local_scale
+                     << " marker=" << std::setprecision(1) << verification.corner_marker_width
+                     << " context=" << verification.verification_roi_radius
                      << " subpix=" << verification.subpix_window_radius
                      << " gate=" << std::setprecision(1) << verification.refine_displacement_limit;
       cv::putText(*output_image, adaptive_label.str(),

@@ -273,6 +273,17 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.outer_detector_config.min_border_distance = ParseDouble(key, value);
     } else if (key == "maxScalesToTry" || key == "max_scales_to_try") {
       config.outer_detector_config.max_scales_to_try = ParseInt(key, value);
+    } else if (key == "outerLocalContextScale" || key == "outer_local_context_scale") {
+      config.outer_detector_config.outer_local_context_scale = ParseDouble(key, value);
+    } else if (key == "outerCornerMarkerRatio" || key == "outer_corner_marker_ratio" ||
+               key == "tagSpacing" || key == "tag_spacing") {
+      config.outer_detector_config.outer_corner_marker_ratio = ParseDouble(key, value);
+    } else if (key == "outerSubpixScale" || key == "outer_subpix_scale") {
+      config.outer_detector_config.outer_subpix_scale = ParseDouble(key, value);
+    } else if (key == "outerRefineGateScale" || key == "outer_refine_gate_scale") {
+      config.outer_detector_config.outer_refine_gate_scale = ParseDouble(key, value);
+    } else if (key == "outerRefineGateMin" || key == "outer_refine_gate_min") {
+      config.outer_detector_config.outer_refine_gate_min = ParseDouble(key, value);
     } else if (key == "scaleCandidates" || key == "scale_candidates") {
       config.outer_detector_config.scale_candidates = ParseIntList(key, value);
     } else if (key == "scaleDivisors" || key == "scale_divisors") {
@@ -285,14 +296,20 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.outer_detector_config.outer_subpix_window_radius = ParseInt(key, value);
     } else if (key == "outerSubpixWindowScale" || key == "outer_subpix_window_scale") {
       config.outer_detector_config.outer_subpix_window_scale = ParseDouble(key, value);
+      config.outer_detector_config.outer_subpix_scale =
+          config.outer_detector_config.outer_subpix_window_scale;
     } else if (key == "outerSubpixWindowMin" || key == "outer_subpix_window_min") {
       config.outer_detector_config.outer_subpix_window_min = ParseInt(key, value);
     } else if (key == "outerSubpixWindowMax" || key == "outer_subpix_window_max") {
       config.outer_detector_config.outer_subpix_window_max = ParseInt(key, value);
     } else if (key == "maxOuterRefineDisplacement" || key == "max_outer_refine_displacement") {
       config.outer_detector_config.max_outer_refine_displacement = ParseDouble(key, value);
+      config.outer_detector_config.outer_refine_gate_min =
+          config.outer_detector_config.max_outer_refine_displacement;
     } else if (key == "outerRefineDisplacementScale" || key == "outer_refine_displacement_scale") {
       config.outer_detector_config.outer_refine_displacement_scale = ParseDouble(key, value);
+      config.outer_detector_config.outer_refine_gate_scale =
+          config.outer_detector_config.outer_refine_displacement_scale;
     } else if (key == "minDetectionQuality" || key == "min_detection_quality") {
       config.outer_detector_config.min_detection_quality = ParseDouble(key, value);
     } else if (key == "blurBeforeDetect" || key == "blur_before_detect") {
@@ -316,6 +333,8 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
     } else if (key == "outerCornerVerificationRoiScale" ||
                key == "outer_corner_verification_roi_scale") {
       config.outer_detector_config.outer_corner_verification_roi_scale = ParseDouble(key, value);
+      config.outer_detector_config.outer_local_context_scale =
+          config.outer_detector_config.outer_corner_verification_roi_scale;
     } else if (key == "outerCornerVerificationRoiMin" ||
                key == "outer_corner_verification_roi_min") {
       config.outer_detector_config.outer_corner_verification_roi_min = ParseInt(key, value);
@@ -1396,7 +1415,7 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::Detect(const cv::Mat& 
     const double outer_refine_displacement_limit =
         outer_debug.refine_displacement_limit > 0.0
             ? outer_debug.refine_displacement_limit
-            : config_.outer_detector_config.max_outer_refine_displacement;
+            : config_.outer_detector_config.outer_refine_gate_min;
     const double q_refine = options_.do_subpix_refinement
                                 ? ClampUnit(1.0 - displacement2 /
                                                         std::max(1e-9, outer_refine_displacement_limit *

@@ -33,19 +33,27 @@ struct MultiScaleOuterTagDetectorConfig {
   int tag_id = 1;
   double min_border_distance = 4.0;
   int max_scales_to_try = 0;
+  bool do_outer_subpix_refinement = true;
+  double outer_local_context_scale = 0.05;
+  double outer_corner_marker_ratio = 0.0;
+  double outer_subpix_scale = 0.025;
+  double outer_refine_gate_scale = 0.025;
+  double outer_refine_gate_min = 6.0;
+  double min_detection_quality = 0.0;
+  bool blur_before_detect = false;
+  int blur_kernel = 7;
+  double blur_sigma = 1.6;
+
+  // Legacy compatibility fields. Old YAML keys may still populate these,
+  // but the paper-facing C-S pipeline uses the high-level parameters above.
   std::vector<int> scale_candidates{3000, 2400, 1800, 1200, 1000, 800, 600, 500, 400, 300};
   std::vector<double> scale_divisors;
-  bool do_outer_subpix_refinement = true;
   int outer_subpix_window_radius = 0;
   double outer_subpix_window_scale = 0.015;
   int outer_subpix_window_min = 4;
   int outer_subpix_window_max = 16;
   double max_outer_refine_displacement = 6.0;
   double outer_refine_displacement_scale = 0.025;
-  double min_detection_quality = 0.0;
-  bool blur_before_detect = false;
-  int blur_kernel = 7;
-  double blur_sigma = 1.6;
   bool enable_outer_corner_layout_check = false;
   double outer_corner_verification_roi_scale = 0.035;
   int outer_corner_verification_roi_min = 12;
@@ -107,6 +115,7 @@ struct OuterCornerVerificationDebugInfo {
   double coarse_to_verified_displacement = 0.0;
   double coarse_to_subpix_displacement = 0.0;
   double coarse_to_refined_displacement = 0.0;
+  double corner_marker_width = 0.0;
   int subpix_window_radius = 0;
   double refine_displacement_limit = 0.0;
   bool refined_valid = false;
