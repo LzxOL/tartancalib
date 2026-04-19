@@ -1,0 +1,81 @@
+label: iteration_3_iterative_coarse_model
+iteration_index: 3
+camera: [xi=-0.592063, alpha=0.400327, fu=1274.291540, fv=1272.606138, cu=2256.025989, cv=2256.359265]
+board observations used: 12
+valid poses: 12
+camera correspondences: 232 (outer=48, internal=184)
+camera rmse: 10.0011
+score: 237.319
+
+Global metrics
+  observations: 12
+  successful observations: 12
+  valid internal points: 237/396
+  predicted->refined avg displacement: 11.6002
+  avg template_quality: 0.971377
+  avg gradient_quality: 0.514276
+  avg final_quality: 0.318817
+  avg image template_quality: 0.910156
+  avg image gradient_quality: 0.525927
+  avg image final_quality: 0.486217
+  LCorner valid: 232/384
+  XCorner valid: 5/12
+
+GT comparison metrics
+  matched gt points: 348
+  avg |P - R_gt|: 13.9456
+  avg |SS - R_gt|: 14.2262
+  avg |R - R_gt|: 6.16465
+
+Per-group metrics
+- group: image1
+  observations: 4
+  successful observations: 4
+  valid internal points: 85/132
+  predicted->refined avg displacement: 11.6055
+  avg template_quality: 0.982144
+  avg gradient_quality: 0.519391
+  avg final_quality: 0.341373
+  avg image template_quality: 0.91843
+  avg image gradient_quality: 0.530802
+  avg image final_quality: 0.486023
+  LCorner valid: 83/128
+  XCorner valid: 2/4
+  matched gt points: 123
+  avg |P - R_gt|: 13.3103
+  avg |SS - R_gt|: 14.7412
+  avg |R - R_gt|: 7.70291
+- group: image2
+  observations: 4
+  successful observations: 4
+  valid internal points: 82/132
+  predicted->refined avg displacement: 9.64116
+  avg template_quality: 0.980631
+  avg gradient_quality: 0.509661
+  avg final_quality: 0.323492
+  avg image template_quality: 0.918347
+  avg image gradient_quality: 0.520162
+  avg image final_quality: 0.484041
+  LCorner valid: 80/128
+  XCorner valid: 2/4
+  matched gt points: 107
+  avg |P - R_gt|: 11.5676
+  avg |SS - R_gt|: 12.2733
+  avg |R - R_gt|: 3.47708
+- group: image3
+  observations: 4
+  successful observations: 4
+  valid internal points: 70/132
+  predicted->refined avg displacement: 13.5539
+  avg template_quality: 0.951355
+  avg gradient_quality: 0.513775
+  avg final_quality: 0.291587
+  avg image template_quality: 0.893691
+  avg image gradient_quality: 0.526817
+  avg image final_quality: 0.488586
+  LCorner valid: 69/128
+  XCorner valid: 1/4
+  matched gt points: 118
+  avg |P - R_gt|: 16.7642
+  avg |SS - R_gt|: 15.46
+  avg |R - R_gt|: 6.99825

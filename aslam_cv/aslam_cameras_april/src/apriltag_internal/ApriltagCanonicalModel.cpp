@@ -58,6 +58,8 @@ const char* ToString(InternalProjectionMode mode) {
       return "homography";
     case InternalProjectionMode::VirtualPinholePatch:
       return "virtual_pinhole_patch";
+    case InternalProjectionMode::SphereLattice:
+      return "sphere_lattice";
   }
   return "unknown";
 }

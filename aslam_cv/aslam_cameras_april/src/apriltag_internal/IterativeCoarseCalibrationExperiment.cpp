@@ -134,6 +134,41 @@ struct MetricsAccumulator {
   }
 };
 
+struct GtComparisonAccumulator {
+  int matched_points = 0;
+  double sum_predicted_to_gt = 0.0;
+  double sum_seed_to_gt = 0.0;
+  double sum_refined_to_gt = 0.0;
+
+  void Add(const InternalCornerDebugInfo& debug, const cv::Point2f& gt_refined_image) {
+    ++matched_points;
+    const double d_predicted =
+        std::hypot(static_cast<double>(debug.predicted_image.x - gt_refined_image.x),
+                   static_cast<double>(debug.predicted_image.y - gt_refined_image.y));
+    const double d_seed =
+        std::hypot(static_cast<double>(debug.sphere_seed_image.x - gt_refined_image.x),
+                   static_cast<double>(debug.sphere_seed_image.y - gt_refined_image.y));
+    const double d_refined =
+        std::hypot(static_cast<double>(debug.refined_image.x - gt_refined_image.x),
+                   static_cast<double>(debug.refined_image.y - gt_refined_image.y));
+    sum_predicted_to_gt += d_predicted;
+    sum_seed_to_gt += d_seed;
+    sum_refined_to_gt += d_refined;
+  }
+
+  double AveragePredictedToGt() const {
+    return matched_points > 0 ? sum_predicted_to_gt / static_cast<double>(matched_points) : 0.0;
+  }
+
+  double AverageSeedToGt() const {
+    return matched_points > 0 ? sum_seed_to_gt / static_cast<double>(matched_points) : 0.0;
+  }
+
+  double AverageRefinedToGt() const {
+    return matched_points > 0 ? sum_refined_to_gt / static_cast<double>(matched_points) : 0.0;
+  }
+};
+
 struct IterationSummary {
   int iteration_index = 0;
   std::string label;
@@ -147,11 +182,15 @@ struct IterationSummary {
   double score = 0.0;
   MetricsAccumulator global_metrics;
   std::map<std::string, MetricsAccumulator> group_metrics;
+  GtComparisonAccumulator gt_global_metrics;
+  std::map<std::string, GtComparisonAccumulator> gt_group_metrics;
 };
 
 typedef std::map<BoardKey, BoardDetection> DetectionMap;
 typedef std::map<BoardKey, std::vector<CameraCorrespondence> > CorrespondenceMap;
 typedef std::map<BoardKey, PoseEstimate> PoseMap;
+typedef std::map<int, cv::Point2f> GroundTruthPointMap;
+typedef std::map<BoardKey, GroundTruthPointMap> GroundTruthMap;
 
 std::string GroupNameFromStem(const std::string& stem) {
   const std::size_t dash = stem.find_last_of('-');
@@ -267,9 +306,25 @@ ApriltagInternalConfig MakeBoardConfig(const ApriltagInternalConfig& base_config
   config.tag_id = board_id;
   config.internal_projection_mode = mode;
   if (intrinsics != nullptr) {
+    config.sphere_lattice_use_initial_camera = false;
     config.intermediate_camera = MakeCameraConfig(*intrinsics);
   }
   return config;
+}
+
+DsIntrinsics MakeIntrinsicsFromCameraConfig(const IntermediateCameraConfig& config) {
+  if (config.intrinsics.size() < 6 || config.resolution.size() < 2) {
+    throw std::runtime_error("MakeIntrinsicsFromCameraConfig requires a fully configured DS camera.");
+  }
+  DsIntrinsics intrinsics;
+  intrinsics.xi = config.intrinsics[0];
+  intrinsics.alpha = config.intrinsics[1];
+  intrinsics.fu = config.intrinsics[2];
+  intrinsics.fv = config.intrinsics[3];
+  intrinsics.cu = config.intrinsics[4];
+  intrinsics.cv = config.intrinsics[5];
+  intrinsics.resolution = cv::Size(config.resolution[0], config.resolution[1]);
+  return intrinsics;
 }
 
 DsIntrinsics MakeInitialIntrinsics(const cv::Size& resolution,
@@ -532,6 +587,66 @@ CorrespondenceMap BuildCorrespondenceMap(const DetectionMap& detections,
     }
   }
   return correspondence_map;
+}
+
+GroundTruthMap BuildGroundTruthMap(const DetectionMap& detections) {
+  GroundTruthMap references;
+  for (DetectionMap::const_iterator it = detections.begin(); it != detections.end(); ++it) {
+    if (!it->second.available || !it->second.result.tag_detected) {
+      continue;
+    }
+
+    GroundTruthPointMap point_map;
+    for (std::size_t index = 0; index < it->second.result.internal_corner_debug.size(); ++index) {
+      const InternalCornerDebugInfo& debug = it->second.result.internal_corner_debug[index];
+      if (!debug.valid) {
+        continue;
+      }
+      point_map[debug.point_id] = debug.refined_image;
+    }
+    if (!point_map.empty()) {
+      references[it->first] = point_map;
+    }
+  }
+  return references;
+}
+
+void AccumulateGroundTruthComparisons(const std::vector<ImageRecord>& images,
+                                      const DetectionMap& detections,
+                                      const GroundTruthMap& references,
+                                      GtComparisonAccumulator* global_metrics,
+                                      std::map<std::string, GtComparisonAccumulator>* group_metrics) {
+  if (global_metrics == NULL || group_metrics == NULL) {
+    throw std::runtime_error("AccumulateGroundTruthComparisons requires valid output pointers.");
+  }
+
+  for (DetectionMap::const_iterator it = detections.begin(); it != detections.end(); ++it) {
+    if (!it->second.available || !it->second.result.tag_detected) {
+      continue;
+    }
+
+    GroundTruthMap::const_iterator reference_it = references.find(it->first);
+    if (reference_it == references.end()) {
+      continue;
+    }
+
+    const std::string& group_name =
+        images[static_cast<std::size_t>(it->first.image_index)].group_name;
+    for (std::size_t index = 0; index < it->second.result.internal_corner_debug.size(); ++index) {
+      const InternalCornerDebugInfo& debug = it->second.result.internal_corner_debug[index];
+      if (debug.sphere_search_radius <= 0.0) {
+        continue;
+      }
+
+      GroundTruthPointMap::const_iterator point_it = reference_it->second.find(debug.point_id);
+      if (point_it == reference_it->second.end()) {
+        continue;
+      }
+
+      global_metrics->Add(debug, point_it->second);
+      (*group_metrics)[group_name].Add(debug, point_it->second);
+    }
+  }
 }
 
 bool EstimatePose(const DsIntrinsics& intrinsics,
@@ -810,6 +925,15 @@ std::string FormatMetrics(const MetricsAccumulator& metrics) {
   return stream.str();
 }
 
+std::string FormatGtMetrics(const GtComparisonAccumulator& metrics) {
+  std::ostringstream stream;
+  stream << "  matched gt points: " << metrics.matched_points << "\n";
+  stream << "  avg |P - R_gt|: " << metrics.AveragePredictedToGt() << "\n";
+  stream << "  avg |SS - R_gt|: " << metrics.AverageSeedToGt() << "\n";
+  stream << "  avg |R - R_gt|: " << metrics.AverageRefinedToGt() << "\n";
+  return stream.str();
+}
+
 cv::Mat RenderTitledTile(const cv::Mat& image, const std::string& title) {
   if (image.empty()) {
     return cv::Mat();
@@ -958,10 +1082,16 @@ void WriteIterationSummary(const boost::filesystem::path& output_dir,
   text << "camera rmse: " << summary.camera_rmse << "\n";
   text << "score: " << summary.score << "\n";
   text << "\nGlobal metrics\n" << FormatMetrics(summary.global_metrics) << "\n";
+  text << "GT comparison metrics\n" << FormatGtMetrics(summary.gt_global_metrics) << "\n";
   text << "Per-group metrics\n";
   for (std::map<std::string, MetricsAccumulator>::const_iterator it = summary.group_metrics.begin();
        it != summary.group_metrics.end(); ++it) {
     text << "- group: " << it->first << "\n" << FormatMetrics(it->second);
+    std::map<std::string, GtComparisonAccumulator>::const_iterator gt_it =
+        summary.gt_group_metrics.find(it->first);
+    if (gt_it != summary.gt_group_metrics.end()) {
+      text << FormatGtMetrics(gt_it->second);
+    }
   }
 
   const boost::filesystem::path summary_path = output_dir / "summary.txt";
@@ -1002,6 +1132,10 @@ void AppendIterationCsvRow(std::ofstream* stream,
       << summary.camera.fv << ","
       << summary.camera.cu << ","
       << summary.camera.cv << ","
+      << summary.gt_global_metrics.matched_points << ","
+      << summary.gt_global_metrics.AveragePredictedToGt() << ","
+      << summary.gt_global_metrics.AverageSeedToGt() << ","
+      << summary.gt_global_metrics.AverageRefinedToGt() << ","
       << summary.camera_rmse << ","
       << summary.score << "\n";
 }
@@ -1013,7 +1147,8 @@ void WriteIterationCsv(const boost::filesystem::path& csv_path,
          << "valid_internal_points,total_internal_points,avg_predicted_to_refined,"
          << "avg_template_quality,avg_gradient_quality,avg_final_quality,"
          << "lcorner_valid,lcorner_total,xcorner_valid,xcorner_total,"
-         << "xi,alpha,fu,fv,cu,cv,camera_rmse,score\n";
+         << "xi,alpha,fu,fv,cu,cv,gt_matched_points,avg_predicted_to_gt,avg_seed_to_gt,"
+         << "avg_refined_to_gt,camera_rmse,score\n";
   for (std::size_t index = 0; index < summaries.size(); ++index) {
     AppendIterationCsvRow(&stream, summaries[index], "global", "all",
                           summaries[index].global_metrics);
@@ -1036,7 +1171,8 @@ IterationSummary SummarizeIteration(const std::string& label,
                                     int internal_correspondence_count,
                                     double camera_rmse,
                                     const std::vector<ImageRecord>& images,
-                                    const DetectionMap& detections) {
+                                    const DetectionMap& detections,
+                                    const GroundTruthMap* gt_references) {
   IterationSummary summary;
   summary.label = label;
   summary.iteration_index = iteration_index;
@@ -1056,6 +1192,11 @@ IterationSummary SummarizeIteration(const std::string& label,
     summary.global_metrics.AddObservation(it->second.result);
     const std::string& group_name = images[static_cast<std::size_t>(it->first.image_index)].group_name;
     summary.group_metrics[group_name].AddObservation(it->second.result);
+  }
+
+  if (gt_references != NULL) {
+    AccumulateGroundTruthComparisons(images, detections, *gt_references, &summary.gt_global_metrics,
+                                     &summary.gt_group_metrics);
   }
 
   summary.score = summary.global_metrics.Score();
@@ -1094,6 +1235,8 @@ void WriteDatasetSummary(const boost::filesystem::path& output_dir,
     stream << "camera=" << IntrinsicsToString(summaries[index].camera)
            << " camera_rmse=" << summaries[index].camera_rmse
            << " score=" << summaries[index].score
+           << " avg|P-R_gt|=" << summaries[index].gt_global_metrics.AveragePredictedToGt()
+           << " avg|SS-R_gt|=" << summaries[index].gt_global_metrics.AverageSeedToGt()
            << " valid_internal=" << summaries[index].global_metrics.valid_points << "\n";
   }
 
@@ -1120,9 +1263,12 @@ void IterativeCoarseCalibrationExperiment::Run() const {
   boost::filesystem::create_directories(request_.output_dir);
   const boost::filesystem::path baseline_dir =
       boost::filesystem::path(request_.output_dir) / "baseline_homography";
+  const boost::filesystem::path gt_dir =
+      boost::filesystem::path(request_.output_dir) / "gt_calibrated_model";
   const boost::filesystem::path iterative_dir =
       boost::filesystem::path(request_.output_dir) / "iterative_coarse_model";
   boost::filesystem::create_directories(baseline_dir);
+  boost::filesystem::create_directories(gt_dir);
   boost::filesystem::create_directories(iterative_dir);
 
   const DetectionMap baseline_detections =
@@ -1134,18 +1280,45 @@ void IterativeCoarseCalibrationExperiment::Run() const {
                            InternalProjectionMode::Homography, NULL, it->second);
   }
 
-  std::vector<IterationSummary> summaries;
-  summaries.push_back(
-      SummarizeIteration("iteration_0_baseline_homography", 0,
-                         MakeInitialIntrinsics(images.front().image.size(),
-                                               request_.experiment_options),
-                         0, 0, 0, 0, 0, 0.0, images, baseline_detections));
-  WriteIterationSummary(baseline_dir, summaries.back());
+  ApriltagInternalConfig gt_config = request_.base_config;
+  gt_config.sphere_lattice_use_initial_camera = false;
+  gt_config.sphere_lattice_enable_seed_search = true;
+  const InternalProjectionMode iterative_mode = request_.base_config.internal_projection_mode;
+  const DetectionMap gt_detections =
+      RunDetectionPass(images, board_ids, gt_config, request_.detection_options,
+                       iterative_mode, NULL);
+  for (DetectionMap::const_iterator it = gt_detections.begin(); it != gt_detections.end(); ++it) {
+    SaveBoardVisualization(gt_dir, images[static_cast<std::size_t>(it->first.image_index)],
+                           gt_config, request_.detection_options, it->first.board_id,
+                           iterative_mode, NULL, it->second);
+  }
+  const GroundTruthMap gt_references = BuildGroundTruthMap(gt_detections);
 
+  std::vector<IterationSummary> summaries;
   DsIntrinsics current_camera =
       MakeInitialIntrinsics(images.front().image.size(), request_.experiment_options);
   ClampIntrinsicsInPlace(&current_camera);
-  DetectionMap previous_iterative_detections = baseline_detections;
+  DetectionMap previous_iterative_detections =
+      RunDetectionPass(images, board_ids, request_.base_config, request_.detection_options,
+                       iterative_mode, &current_camera);
+  const boost::filesystem::path initial_iteration_dir = iterative_dir / "iter_0";
+  boost::filesystem::create_directories(initial_iteration_dir);
+  for (DetectionMap::const_iterator it = previous_iterative_detections.begin();
+       it != previous_iterative_detections.end(); ++it) {
+    SaveBoardVisualization(initial_iteration_dir,
+                           images[static_cast<std::size_t>(it->first.image_index)],
+                           request_.base_config, request_.detection_options, it->first.board_id,
+                           iterative_mode, &current_camera, it->second);
+  }
+  summaries.push_back(
+      SummarizeIteration("iteration_0_initial_camera", 0, current_camera,
+                         0, 0, 0, 0, 0, 0.0, images, previous_iterative_detections,
+                         &gt_references));
+  WriteIterationSummary(initial_iteration_dir, summaries.back());
+  std::cout << "[iter 0] avg|P-R_gt|=" << summaries.back().gt_global_metrics.AveragePredictedToGt()
+            << " avg|SS-R_gt|=" << summaries.back().gt_global_metrics.AverageSeedToGt()
+            << " matched=" << summaries.back().gt_global_metrics.matched_points << "\n";
+
   double previous_score = summaries.back().score;
 
   for (int iteration = 1; iteration <= request_.experiment_options.max_iterations; ++iteration) {
@@ -1175,7 +1348,7 @@ void IterativeCoarseCalibrationExperiment::Run() const {
 
     const DetectionMap iterative_detections =
         RunDetectionPass(images, board_ids, request_.base_config, request_.detection_options,
-                         InternalProjectionMode::VirtualPinholePatch, &current_camera);
+                         iterative_mode, &current_camera);
 
     std::ostringstream label_stream;
     label_stream << "iteration_" << iteration << "_iterative_coarse_model";
@@ -1184,7 +1357,7 @@ void IterativeCoarseCalibrationExperiment::Run() const {
                            board_observation_count, valid_pose_count,
                            outer_correspondence_count + internal_correspondence_count,
                            outer_correspondence_count, internal_correspondence_count,
-                           camera_rmse, images, iterative_detections);
+                           camera_rmse, images, iterative_detections, &gt_references);
     summaries.push_back(summary);
 
     const boost::filesystem::path iteration_dir =
@@ -1194,9 +1367,14 @@ void IterativeCoarseCalibrationExperiment::Run() const {
       SaveBoardVisualization(iteration_dir,
                              images[static_cast<std::size_t>(it->first.image_index)],
                              request_.base_config, request_.detection_options, it->first.board_id,
-                             InternalProjectionMode::VirtualPinholePatch, &current_camera, it->second);
+                             iterative_mode, &current_camera, it->second);
     }
     WriteIterationSummary(iteration_dir, summaries.back());
+    std::cout << "[iter " << iteration << "] avg|P-R_gt|="
+              << summaries.back().gt_global_metrics.AveragePredictedToGt()
+              << " avg|SS-R_gt|=" << summaries.back().gt_global_metrics.AverageSeedToGt()
+              << " matched=" << summaries.back().gt_global_metrics.matched_points
+              << " rmse=" << summaries.back().camera_rmse << "\n";
 
     previous_iterative_detections = iterative_detections;
     const double improvement = summaries.back().score - previous_score;
@@ -1209,7 +1387,9 @@ void IterativeCoarseCalibrationExperiment::Run() const {
   WriteIterationCsv(boost::filesystem::path(request_.output_dir) / "iteration_summary.csv",
                     summaries);
   WriteDatasetSummary(request_.output_dir, images, board_ids, request_, summaries);
-  BuildCombinedVisualComparisons(request_.output_dir, images, board_ids, summaries);
+  if (iterative_mode == InternalProjectionMode::VirtualPinholePatch) {
+    BuildCombinedVisualComparisons(request_.output_dir, images, board_ids, summaries);
+  }
 }
 
 }  // namespace apriltag_internal

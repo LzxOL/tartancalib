@@ -49,6 +49,9 @@ struct InternalMetricsSummary {
   double avg_image_gradient_quality = 0.0;
   double avg_image_centering_quality = 0.0;
   double avg_image_final_quality = 0.0;
+  double avg_sphere_seed_quality = 0.0;
+  double avg_predicted_to_seed = 0.0;
+  double avg_seed_to_refined = 0.0;
   double avg_predicted_to_refined = 0.0;
 };
 
@@ -128,6 +131,9 @@ ati::InternalProjectionMode ParseProjectionModeOrThrow(const std::string& value)
   if (lowered == "virtual_pinhole_patch" || lowered == "virtual-pinhole-patch") {
     return ati::InternalProjectionMode::VirtualPinholePatch;
   }
+  if (lowered == "sphere_lattice" || lowered == "sphere-lattice") {
+    return ati::InternalProjectionMode::SphereLattice;
+  }
   throw std::runtime_error("Unsupported --mode value: " + value);
 }
 
@@ -153,6 +159,18 @@ std::string SphereOutputPathForRequestedOutput(const std::string& requested_outp
   const boost::filesystem::path output(requested_output_path);
   const boost::filesystem::path parent = output.has_parent_path() ? output.parent_path() : ".";
   return (parent / (output.stem().string() + "_sphere" + output.extension().string())).string();
+}
+
+std::string InternalSeedOutputPathForRequestedOutput(const std::string& requested_output_path) {
+  const boost::filesystem::path output(requested_output_path);
+  const boost::filesystem::path parent = output.has_parent_path() ? output.parent_path() : ".";
+  return (parent / (output.stem().string() + "_internal_seed" + output.extension().string())).string();
+}
+
+std::string InternalSphereOutputPathForRequestedOutput(const std::string& requested_output_path) {
+  const boost::filesystem::path output(requested_output_path);
+  const boost::filesystem::path parent = output.has_parent_path() ? output.parent_path() : ".";
+  return (parent / (output.stem().string() + "_internal_sphere" + output.extension().string())).string();
 }
 
 std::string BuildMinuteStamp() {
@@ -331,6 +349,37 @@ cv::Point2f MapRayToSpherePanel(const Eigen::Vector3d& ray,
                      panel_center.y - static_cast<float>(ray.y()) * panel_radius);
 }
 
+bool CvVecToUnitRay(const cv::Vec3d& ray_vec, Eigen::Vector3d* ray) {
+  if (ray == nullptr) {
+    throw std::runtime_error("CvVecToUnitRay requires a valid output pointer.");
+  }
+  *ray = Eigen::Vector3d(ray_vec[0], ray_vec[1], ray_vec[2]);
+  const double norm = ray->norm();
+  if (!std::isfinite(norm) || norm <= 1e-9) {
+    return false;
+  }
+  *ray /= norm;
+  return true;
+}
+
+bool BuildLocalSphereOffsetRay(const Eigen::Vector3d& anchor_ray,
+                               const Eigen::Vector3d& tangent_u,
+                               const Eigen::Vector3d& tangent_v,
+                               double alpha,
+                               double beta,
+                               Eigen::Vector3d* ray) {
+  if (ray == nullptr) {
+    throw std::runtime_error("BuildLocalSphereOffsetRay requires a valid output pointer.");
+  }
+  Eigen::Vector3d candidate = anchor_ray + alpha * tangent_u + beta * tangent_v;
+  const double norm = candidate.norm();
+  if (!std::isfinite(norm) || norm <= 1e-9) {
+    return false;
+  }
+  *ray = candidate / norm;
+  return true;
+}
+
 void DrawRayPolyline(cv::Mat* image,
                      const std::vector<Eigen::Vector3d>& rays,
                      const cv::Point2f& panel_center,
@@ -386,6 +435,126 @@ void DrawSpherePointCallout(cv::Mat* image,
   cv::rectangle(*image, box_rect, color, 1, cv::LINE_AA);
   cv::putText(*image, text,
               cv::Point(box_rect.x + padding_x, box_rect.y + box_height - padding_y - 1),
+              cv::FONT_HERSHEY_PLAIN, font_scale, color, font_thickness, cv::LINE_AA);
+}
+
+float ComputePointClusterSpread(const std::vector<cv::Point2f>& points) {
+  if (points.empty()) {
+    return 10.0f;
+  }
+  if (points.size() == 1) {
+    return 10.0f;
+  }
+
+  float max_pairwise_distance = 0.0f;
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    for (std::size_t j = i + 1; j < points.size(); ++j) {
+      max_pairwise_distance =
+          std::max(max_pairwise_distance,
+                   static_cast<float>(cv::norm(points[i] - points[j])));
+    }
+  }
+
+  return std::max(10.0f, std::min(26.0f, max_pairwise_distance * 0.9f + 8.0f));
+}
+
+cv::Point2f ComputeTriadLabelOffset(int slot, float spread, bool compact) {
+  const float gain = compact ? 0.7f : 1.0f;
+  switch (slot) {
+    case 0:
+      return cv::Point2f(-(spread + 20.0f * gain), -(10.0f + 0.55f * spread));
+    case 1:
+      return cv::Point2f(12.0f + 0.65f * spread, -(6.0f + 0.35f * spread));
+    default:
+      return cv::Point2f(12.0f + 0.55f * spread, 14.0f + 0.45f * spread);
+  }
+}
+
+void DrawBoundedCallout(cv::Mat* image,
+                        const cv::Rect& bounds,
+                        const cv::Point2f& point,
+                        const std::string& text,
+                        const cv::Scalar& color,
+                        const cv::Point2f& offset,
+                        double font_scale,
+                        int font_thickness) {
+  if (image == nullptr) {
+    return;
+  }
+
+  int baseline = 0;
+  const cv::Size text_size =
+      cv::getTextSize(text, cv::FONT_HERSHEY_PLAIN, font_scale, font_thickness, &baseline);
+  const int padding_x = 5;
+  const int padding_y = 4;
+  int box_x = static_cast<int>(std::lround(point.x + offset.x));
+  int box_y = static_cast<int>(std::lround(point.y + offset.y));
+  const int box_width = text_size.width + 2 * padding_x;
+  const int box_height = text_size.height + baseline + 2 * padding_y;
+
+  box_x = std::max(bounds.x + 4, std::min(box_x, bounds.x + bounds.width - box_width - 4));
+  box_y = std::max(bounds.y + 4, std::min(box_y, bounds.y + bounds.height - box_height - 4));
+
+  const cv::Rect box_rect(box_x, box_y, box_width, box_height);
+  const cv::Point2f anchor(
+      static_cast<float>(offset.x >= 0.0f ? box_rect.x : box_rect.x + box_rect.width),
+      static_cast<float>(box_rect.y + box_rect.height * 0.5f));
+
+  cv::line(*image, point, anchor, color, 1, cv::LINE_AA);
+  cv::rectangle(*image, box_rect, cv::Scalar(255, 255, 255), cv::FILLED);
+  cv::rectangle(*image, box_rect, color, 1, cv::LINE_AA);
+  cv::putText(*image, text,
+              cv::Point(box_rect.x + padding_x, box_rect.y + box_rect.height - padding_y - baseline),
+              cv::FONT_HERSHEY_PLAIN, font_scale, color, font_thickness, cv::LINE_AA);
+}
+
+void DrawInsetLegendCallout(cv::Mat* image,
+                            const cv::Rect& inset_rect,
+                            const cv::Point2f& point,
+                            const std::string& text,
+                            const cv::Scalar& color,
+                            int slot) {
+  if (image == nullptr) {
+    return;
+  }
+
+  const double font_scale = 0.75;
+  const int font_thickness = 1;
+  int baseline = 0;
+  const cv::Size text_size =
+      cv::getTextSize(text, cv::FONT_HERSHEY_PLAIN, font_scale, font_thickness, &baseline);
+  const int padding_x = 4;
+  const int padding_y = 3;
+  const int box_width = text_size.width + 2 * padding_x;
+  const int box_height = text_size.height + baseline + 2 * padding_y;
+
+  int box_x = inset_rect.x + 6;
+  int box_y = inset_rect.y + 18;
+  switch (slot) {
+    case 0:
+      box_x = inset_rect.x + 6;
+      box_y = inset_rect.y + 18;
+      break;
+    case 1:
+      box_x = inset_rect.x + inset_rect.width - box_width - 6;
+      box_y = inset_rect.y + 18;
+      break;
+    default:
+      box_x = inset_rect.x + inset_rect.width - box_width - 6;
+      box_y = inset_rect.y + inset_rect.height - box_height - 6;
+      break;
+  }
+
+  const cv::Rect box_rect(box_x, box_y, box_width, box_height);
+  const cv::Point2f anchor(
+      static_cast<float>(slot == 0 ? box_rect.x : box_rect.x + box_rect.width),
+      static_cast<float>(box_rect.y + box_rect.height * 0.5f));
+  cv::line(*image, point, anchor, color, 1, cv::LINE_AA);
+  cv::rectangle(*image, box_rect, cv::Scalar(255, 255, 255), cv::FILLED);
+  cv::rectangle(*image, box_rect, color, 1, cv::LINE_AA);
+  cv::putText(*image, text,
+              cv::Point(box_rect.x + padding_x,
+                        box_rect.y + box_rect.height - padding_y - baseline),
               cv::FONT_HERSHEY_PLAIN, font_scale, color, font_thickness, cv::LINE_AA);
 }
 
@@ -583,6 +752,498 @@ cv::Mat BuildOuterSphereDebugView(const ati::ApriltagInternalConfig& config,
   return canvas;
 }
 
+cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
+                                 const ati::ApriltagInternalDetectionResult& result) {
+  if (result.projection_mode != ati::InternalProjectionMode::SphereLattice ||
+      result.internal_corner_debug.empty() || image.empty()) {
+    return cv::Mat();
+  }
+
+  cv::Mat overlay = image.clone();
+  if (overlay.channels() == 1) {
+    cv::cvtColor(overlay, overlay, cv::COLOR_GRAY2BGR);
+  } else if (overlay.channels() == 4) {
+    cv::cvtColor(overlay, overlay, cv::COLOR_BGRA2BGR);
+  }
+
+  const cv::Scalar kPredictedColor(0, 165, 255);
+  const cv::Scalar kSeedColor(255, 80, 255);
+  const cv::Scalar kRefinedColor(0, 220, 80);
+  const cv::Scalar kBoundaryUColor(190, 190, 190);
+  const cv::Scalar kBoundaryVColor(115, 115, 115);
+  const cv::Scalar kArrow1Color(180, 180, 180);
+  const cv::Scalar kArrow2Color(120, 190, 120);
+
+  if (result.tag_detected) {
+    const cv::Scalar outer_outline_color(165, 165, 165);
+    for (int index = 0; index < 4; ++index) {
+      cv::line(overlay, result.outer_corners[index], result.outer_corners[(index + 1) % 4],
+               outer_outline_color, 2, cv::LINE_AA);
+    }
+  }
+
+  for (const auto& debug : result.internal_corner_debug) {
+    const bool predicted_ok = debug.predicted_image.x >= 0.0f &&
+                              debug.predicted_image.x < static_cast<float>(result.image_size.width) &&
+                              debug.predicted_image.y >= 0.0f &&
+                              debug.predicted_image.y < static_cast<float>(result.image_size.height);
+    const bool seed_ok = debug.sphere_seed_image.x >= 0.0f &&
+                         debug.sphere_seed_image.x < static_cast<float>(result.image_size.width) &&
+                         debug.sphere_seed_image.y >= 0.0f &&
+                         debug.sphere_seed_image.y < static_cast<float>(result.image_size.height);
+    const bool refined_ok = debug.refined_image.x >= 0.0f &&
+                            debug.refined_image.x < static_cast<float>(result.image_size.width) &&
+                            debug.refined_image.y >= 0.0f &&
+                            debug.refined_image.y < static_cast<float>(result.image_size.height);
+    if (!predicted_ok) {
+      continue;
+    }
+
+    const cv::Point2f boundary_center = seed_ok ? debug.sphere_seed_image : debug.predicted_image;
+    const double module_u_length = std::hypot(debug.module_u_axis.x, debug.module_u_axis.y);
+    const double module_v_length = std::hypot(debug.module_v_axis.x, debug.module_v_axis.y);
+    if (module_u_length > 1.0 && module_v_length > 1.0) {
+      const cv::Point2f unit_u =
+          debug.module_u_axis * static_cast<float>(1.0 / std::max(1e-9, module_u_length));
+      const cv::Point2f unit_v =
+          debug.module_v_axis * static_cast<float>(1.0 / std::max(1e-9, module_v_length));
+      const float u_half_length = std::max(6.0f, static_cast<float>(0.55 * module_v_length));
+      const float v_half_length = std::max(6.0f, static_cast<float>(0.55 * module_u_length));
+      cv::line(overlay, boundary_center - u_half_length * unit_v,
+               boundary_center + u_half_length * unit_v, kBoundaryUColor, 1, cv::LINE_AA);
+      cv::line(overlay, boundary_center - v_half_length * unit_u,
+               boundary_center + v_half_length * unit_u, kBoundaryVColor, 1, cv::LINE_AA);
+    }
+
+    const float search_radius_px =
+        std::max(6.0f, static_cast<float>(0.35 * std::max(1.0, debug.local_module_scale)));
+    cv::circle(overlay, debug.predicted_image, static_cast<int>(std::lround(search_radius_px)),
+               cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+
+    cv::drawMarker(overlay, debug.predicted_image, cv::Scalar(255, 255, 255),
+                   cv::MARKER_CROSS, 8, 3, cv::LINE_AA);
+    cv::drawMarker(overlay, debug.predicted_image, kPredictedColor,
+                   cv::MARKER_CROSS, 6, 1, cv::LINE_AA);
+    cv::circle(overlay, debug.predicted_image, 2, cv::Scalar(255, 255, 255), cv::FILLED, cv::LINE_AA);
+    cv::circle(overlay, debug.predicted_image, 1, kPredictedColor, cv::FILLED, cv::LINE_AA);
+
+    if (seed_ok) {
+      cv::arrowedLine(overlay, debug.predicted_image, debug.sphere_seed_image,
+                      kArrow1Color, 1, cv::LINE_AA, 0, 0.15);
+      cv::drawMarker(overlay, debug.sphere_seed_image, cv::Scalar(255, 255, 255),
+                     cv::MARKER_DIAMOND, 8, 3, cv::LINE_AA);
+      cv::drawMarker(overlay, debug.sphere_seed_image, kSeedColor,
+                     cv::MARKER_DIAMOND, 6, 1, cv::LINE_AA);
+    }
+    if (seed_ok && refined_ok) {
+      cv::arrowedLine(overlay, debug.sphere_seed_image, debug.refined_image,
+                      kArrow2Color, 1, cv::LINE_AA, 0, 0.15);
+    } else if (predicted_ok && refined_ok) {
+      cv::arrowedLine(overlay, debug.predicted_image, debug.refined_image,
+                      kArrow2Color, 1, cv::LINE_AA, 0, 0.15);
+    }
+    if (refined_ok) {
+      cv::drawMarker(overlay, debug.refined_image, cv::Scalar(255, 255, 255),
+                     cv::MARKER_SQUARE, 7, 3, cv::LINE_AA);
+      cv::drawMarker(overlay, debug.refined_image, kRefinedColor,
+                     cv::MARKER_SQUARE, 5, 1, cv::LINE_AA);
+    }
+  }
+
+  cv::putText(overlay, "Internal Sphere Seed Overlay: P -> SS -> R",
+              cv::Point(20, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 3,
+              cv::LINE_AA);
+  cv::putText(overlay, "Internal Sphere Seed Overlay: P -> SS -> R",
+              cv::Point(20, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(30, 30, 30), 1,
+              cv::LINE_AA);
+  cv::putText(overlay,
+              "Legend: P orange cross, SS magenta diamond, R green square, gray cross: aligned lattice boundaries",
+              cv::Point(20, 56), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 3,
+              cv::LINE_AA);
+  cv::putText(overlay,
+              "Legend: P orange cross, SS magenta diamond, R green square, gray cross: aligned lattice boundaries",
+              cv::Point(20, 56), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(40, 40, 40), 1,
+              cv::LINE_AA);
+  return overlay;
+}
+
+cv::Mat BuildInternalSphereDebugView(const ati::ApriltagInternalDetectionResult& result) {
+  if (result.projection_mode != ati::InternalProjectionMode::SphereLattice ||
+      result.internal_corner_debug.empty()) {
+    return cv::Mat();
+  }
+
+  const int panel_columns = 4;
+  const int panel_width = 320;
+  const int panel_height = 230;
+  const int margin = 26;
+  const int header_height = 85;
+  const int panel_count = static_cast<int>(result.internal_corner_debug.size());
+  const int panel_rows = std::max(1, (panel_count + panel_columns - 1) / panel_columns);
+  const int canvas_width = panel_columns * panel_width + (panel_columns + 1) * margin;
+  const int canvas_height = header_height + panel_rows * panel_height + (panel_rows + 1) * margin;
+
+  cv::Mat canvas(canvas_height, canvas_width, CV_8UC3, cv::Scalar(248, 248, 248));
+  cv::putText(canvas, "Internal Sphere View: predicted ray -> sphere seed -> refined ray",
+              cv::Point(28, 40), cv::FONT_HERSHEY_SIMPLEX, 0.85, cv::Scalar(20, 20, 20), 2);
+  cv::putText(canvas,
+              "P orange, SS magenta, R green. Gray arrow: P->SS, green arrow: SS->R. Gray cross: aligned lattice boundaries.",
+              cv::Point(28, 70), cv::FONT_HERSHEY_SIMPLEX, 0.48, cv::Scalar(60, 60, 60), 1);
+
+  const cv::Scalar kPredictedColor(0, 165, 255);
+  const cv::Scalar kSeedColor(255, 80, 255);
+  const cv::Scalar kRefinedColor(0, 220, 80);
+  const cv::Scalar kBoundaryUColor(190, 190, 190);
+  const cv::Scalar kBoundaryVColor(115, 115, 115);
+  const cv::Scalar kUAxisColor(150, 150, 150);
+  const cv::Scalar kVAxisColor(90, 90, 90);
+  const cv::Scalar kSearchBoxColor(190, 190, 190);
+  const cv::Scalar kArrow1Color(180, 180, 180);
+  const cv::Scalar kArrow2Color(120, 190, 120);
+
+  for (int index = 0; index < panel_count; ++index) {
+    const auto& debug = result.internal_corner_debug[static_cast<std::size_t>(index)];
+    const int row = index / panel_columns;
+    const int col = index % panel_columns;
+    const cv::Rect panel_rect(margin + col * (panel_width + margin),
+                              header_height + margin + row * (panel_height + margin),
+                              panel_width, panel_height);
+    cv::rectangle(canvas, panel_rect, cv::Scalar(255, 255, 255), cv::FILLED);
+    cv::rectangle(canvas, panel_rect, cv::Scalar(90, 90, 90), 1, cv::LINE_AA);
+
+    const cv::Point2f center(panel_rect.x + panel_rect.width * 0.5f,
+                             panel_rect.y + panel_rect.height * 0.43f);
+    const float radius = 0.33f * static_cast<float>(std::min(panel_rect.width, panel_rect.height));
+    cv::circle(canvas, center, static_cast<int>(std::lround(radius)),
+               cv::Scalar(215, 215, 215), 1, cv::LINE_AA);
+    cv::line(canvas,
+             cv::Point(static_cast<int>(std::lround(center.x - radius)), static_cast<int>(std::lround(center.y))),
+             cv::Point(static_cast<int>(std::lround(center.x + radius)), static_cast<int>(std::lround(center.y))),
+             cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+    cv::line(canvas,
+             cv::Point(static_cast<int>(std::lround(center.x)), static_cast<int>(std::lround(center.y - radius))),
+             cv::Point(static_cast<int>(std::lround(center.x)), static_cast<int>(std::lround(center.y + radius))),
+             cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+
+    Eigen::Vector3d predicted_ray = Eigen::Vector3d::Zero();
+    Eigen::Vector3d seed_ray = Eigen::Vector3d::Zero();
+    Eigen::Vector3d refined_ray = Eigen::Vector3d::Zero();
+    Eigen::Vector3d tangent_u = Eigen::Vector3d::Zero();
+    Eigen::Vector3d tangent_v = Eigen::Vector3d::Zero();
+    cv::Point2f predicted_point{};
+    cv::Point2f seed_point{};
+    cv::Point2f refined_point{};
+    cv::Point2f u_plus_point{};
+    cv::Point2f v_plus_point{};
+    std::array<cv::Point2f, 4> search_box_points{};
+    std::array<cv::Point2f, 2> boundary_u_points{};
+    std::array<cv::Point2f, 2> boundary_v_points{};
+    bool search_box_ok = false;
+    bool u_plus_ok = false;
+    bool v_plus_ok = false;
+    bool boundary_u_ok = false;
+    bool boundary_v_ok = false;
+    const bool predicted_ok = CvVecToUnitRay(debug.predicted_ray, &predicted_ray);
+    const bool seed_ok = CvVecToUnitRay(debug.sphere_seed_ray, &seed_ray);
+    const bool refined_ok = CvVecToUnitRay(debug.refined_ray, &refined_ray);
+    const bool tangent_u_ok = CvVecToUnitRay(debug.tangent_u_ray, &tangent_u);
+    const bool tangent_v_ok = CvVecToUnitRay(debug.tangent_v_ray, &tangent_v);
+
+    if (predicted_ok && tangent_u_ok && tangent_v_ok && debug.sphere_search_radius > 1e-9) {
+      const double r = debug.sphere_search_radius;
+      Eigen::Vector3d u_plus = Eigen::Vector3d::Zero();
+      Eigen::Vector3d u_minus = Eigen::Vector3d::Zero();
+      Eigen::Vector3d v_plus = Eigen::Vector3d::Zero();
+      Eigen::Vector3d v_minus = Eigen::Vector3d::Zero();
+      Eigen::Vector3d c00 = Eigen::Vector3d::Zero();
+      Eigen::Vector3d c10 = Eigen::Vector3d::Zero();
+      Eigen::Vector3d c11 = Eigen::Vector3d::Zero();
+      Eigen::Vector3d c01 = Eigen::Vector3d::Zero();
+      if (BuildLocalSphereOffsetRay(predicted_ray, tangent_u, tangent_v, r, 0.0, &u_plus) &&
+          BuildLocalSphereOffsetRay(predicted_ray, tangent_u, tangent_v, -r, 0.0, &u_minus) &&
+          BuildLocalSphereOffsetRay(predicted_ray, tangent_u, tangent_v, 0.0, r, &v_plus) &&
+          BuildLocalSphereOffsetRay(predicted_ray, tangent_u, tangent_v, 0.0, -r, &v_minus) &&
+          BuildLocalSphereOffsetRay(predicted_ray, tangent_u, tangent_v, -r, -r, &c00) &&
+          BuildLocalSphereOffsetRay(predicted_ray, tangent_u, tangent_v, r, -r, &c10) &&
+          BuildLocalSphereOffsetRay(predicted_ray, tangent_u, tangent_v, r, r, &c11) &&
+          BuildLocalSphereOffsetRay(predicted_ray, tangent_u, tangent_v, -r, r, &c01)) {
+        const std::array<cv::Point2f, 4> search_box{{
+            MapRayToSpherePanel(c00, center, radius),
+            MapRayToSpherePanel(c10, center, radius),
+            MapRayToSpherePanel(c11, center, radius),
+            MapRayToSpherePanel(c01, center, radius),
+        }};
+        search_box_points = search_box;
+        search_box_ok = true;
+        for (std::size_t edge_index = 0; edge_index < search_box.size(); ++edge_index) {
+          cv::line(canvas, search_box[edge_index],
+                   search_box[(edge_index + 1) % search_box.size()],
+                   kSearchBoxColor, 1, cv::LINE_AA);
+        }
+        u_plus_point = MapRayToSpherePanel(u_plus, center, radius);
+        v_plus_point = MapRayToSpherePanel(v_plus, center, radius);
+        u_plus_ok = true;
+        v_plus_ok = true;
+        cv::arrowedLine(canvas, MapRayToSpherePanel(predicted_ray, center, radius),
+                        u_plus_point,
+                        kUAxisColor, 1, cv::LINE_AA, 0, 0.15);
+        cv::arrowedLine(canvas, MapRayToSpherePanel(predicted_ray, center, radius),
+                        v_plus_point,
+                        kVAxisColor, 1, cv::LINE_AA, 0, 0.15);
+        cv::putText(canvas, "u",
+                    u_plus_point + cv::Point2f(6.0f, -4.0f),
+                    cv::FONT_HERSHEY_PLAIN, 0.8, kUAxisColor, 1, cv::LINE_AA);
+        cv::putText(canvas, "v",
+                    v_plus_point + cv::Point2f(6.0f, -4.0f),
+                    cv::FONT_HERSHEY_PLAIN, 0.8, kVAxisColor, 1, cv::LINE_AA);
+      }
+    }
+
+    if (seed_ok && tangent_u_ok && tangent_v_ok) {
+      auto project_to_seed_tangent = [&](const Eigen::Vector3d& source_tangent,
+                                         Eigen::Vector3d* projected) {
+        if (projected == nullptr) {
+          return false;
+        }
+        *projected = source_tangent - seed_ray * seed_ray.dot(source_tangent);
+        const double norm = projected->norm();
+        if (!std::isfinite(norm) || norm <= 1e-9) {
+          return false;
+        }
+        *projected /= norm;
+        return true;
+      };
+
+      Eigen::Vector3d seed_tangent_u = Eigen::Vector3d::Zero();
+      Eigen::Vector3d seed_tangent_v = Eigen::Vector3d::Zero();
+      if (project_to_seed_tangent(tangent_u, &seed_tangent_u) &&
+          project_to_seed_tangent(tangent_v, &seed_tangent_v)) {
+        const double boundary_extent = std::max(
+            0.06, std::min(0.18, 0.75 * std::max(debug.sphere_search_radius, 0.08)));
+        Eigen::Vector3d boundary_u_minus = Eigen::Vector3d::Zero();
+        Eigen::Vector3d boundary_u_plus = Eigen::Vector3d::Zero();
+        Eigen::Vector3d boundary_v_minus = Eigen::Vector3d::Zero();
+        Eigen::Vector3d boundary_v_plus = Eigen::Vector3d::Zero();
+        if (BuildLocalSphereOffsetRay(seed_ray, seed_tangent_u, seed_tangent_v, 0.0,
+                                      -boundary_extent, &boundary_u_minus) &&
+            BuildLocalSphereOffsetRay(seed_ray, seed_tangent_u, seed_tangent_v, 0.0,
+                                      boundary_extent, &boundary_u_plus)) {
+          boundary_u_points = {{
+              MapRayToSpherePanel(boundary_u_minus, center, radius),
+              MapRayToSpherePanel(boundary_u_plus, center, radius),
+          }};
+          boundary_u_ok = true;
+          cv::line(canvas, boundary_u_points[0], boundary_u_points[1], kBoundaryUColor, 1,
+                   cv::LINE_AA);
+        }
+        if (BuildLocalSphereOffsetRay(seed_ray, seed_tangent_u, seed_tangent_v,
+                                      -boundary_extent, 0.0, &boundary_v_minus) &&
+            BuildLocalSphereOffsetRay(seed_ray, seed_tangent_u, seed_tangent_v,
+                                      boundary_extent, 0.0, &boundary_v_plus)) {
+          boundary_v_points = {{
+              MapRayToSpherePanel(boundary_v_minus, center, radius),
+              MapRayToSpherePanel(boundary_v_plus, center, radius),
+          }};
+          boundary_v_ok = true;
+          cv::line(canvas, boundary_v_points[0], boundary_v_points[1], kBoundaryVColor, 1,
+                   cv::LINE_AA);
+        }
+      }
+    }
+
+    if (predicted_ok && seed_ok) {
+      cv::arrowedLine(canvas, MapRayToSpherePanel(predicted_ray, center, radius),
+                      MapRayToSpherePanel(seed_ray, center, radius),
+                      kArrow1Color, 2, cv::LINE_AA, 0, 0.14);
+    }
+    if (seed_ok && refined_ok) {
+      cv::arrowedLine(canvas, MapRayToSpherePanel(seed_ray, center, radius),
+                      MapRayToSpherePanel(refined_ray, center, radius),
+                      kArrow2Color, 2, cv::LINE_AA, 0, 0.14);
+    }
+
+    if (predicted_ok) {
+      predicted_point = MapRayToSpherePanel(predicted_ray, center, radius);
+      cv::drawMarker(canvas, predicted_point, cv::Scalar(255, 255, 255),
+                     cv::MARKER_CROSS, 9, 3, cv::LINE_AA);
+      cv::drawMarker(canvas, predicted_point, kPredictedColor, cv::MARKER_CROSS, 7, 1, cv::LINE_AA);
+      cv::circle(canvas, predicted_point, 2, cv::Scalar(255, 255, 255), cv::FILLED, cv::LINE_AA);
+      cv::circle(canvas, predicted_point, 1, kPredictedColor, cv::FILLED, cv::LINE_AA);
+    }
+    if (seed_ok) {
+      seed_point = MapRayToSpherePanel(seed_ray, center, radius);
+      cv::drawMarker(canvas, seed_point, cv::Scalar(255, 255, 255),
+                     cv::MARKER_DIAMOND, 9, 3, cv::LINE_AA);
+      cv::drawMarker(canvas, seed_point, kSeedColor, cv::MARKER_DIAMOND, 7, 1, cv::LINE_AA);
+    }
+    if (refined_ok) {
+      refined_point = MapRayToSpherePanel(refined_ray, center, radius);
+      cv::drawMarker(canvas, refined_point, cv::Scalar(255, 255, 255),
+                     cv::MARKER_SQUARE, 8, 3, cv::LINE_AA);
+      cv::drawMarker(canvas, refined_point, kRefinedColor,
+                     cv::MARKER_SQUARE, 6, 1, cv::LINE_AA);
+    }
+
+    const cv::Rect inset_rect(panel_rect.x + panel_rect.width - 102, panel_rect.y + 12, 90, 90);
+    cv::rectangle(canvas, inset_rect, cv::Scalar(252, 252, 252), cv::FILLED);
+    cv::rectangle(canvas, inset_rect, cv::Scalar(150, 150, 150), 1, cv::LINE_AA);
+    cv::putText(canvas, "zoom", cv::Point(inset_rect.x + 8, inset_rect.y + 14),
+                cv::FONT_HERSHEY_PLAIN, 0.8, cv::Scalar(90, 90, 90), 1, cv::LINE_AA);
+
+    std::vector<cv::Point2f> zoom_points;
+    if (predicted_ok) zoom_points.push_back(predicted_point);
+    if (seed_ok) zoom_points.push_back(seed_point);
+    if (refined_ok) zoom_points.push_back(refined_point);
+    if (search_box_ok) {
+      zoom_points.insert(zoom_points.end(), search_box_points.begin(), search_box_points.end());
+    }
+    if (boundary_u_ok) {
+      zoom_points.insert(zoom_points.end(), boundary_u_points.begin(), boundary_u_points.end());
+    }
+    if (boundary_v_ok) {
+      zoom_points.insert(zoom_points.end(), boundary_v_points.begin(), boundary_v_points.end());
+    }
+    if (u_plus_ok) zoom_points.push_back(u_plus_point);
+    if (v_plus_ok) zoom_points.push_back(v_plus_point);
+
+    if (!zoom_points.empty()) {
+      float min_x = zoom_points.front().x;
+      float max_x = zoom_points.front().x;
+      float min_y = zoom_points.front().y;
+      float max_y = zoom_points.front().y;
+      for (const cv::Point2f& point : zoom_points) {
+        min_x = std::min(min_x, point.x);
+        max_x = std::max(max_x, point.x);
+        min_y = std::min(min_y, point.y);
+        max_y = std::max(max_y, point.y);
+      }
+
+      const float extent = std::max({max_x - min_x, max_y - min_y, 12.0f});
+      const float padding = 0.45f * extent + 4.0f;
+      min_x -= padding;
+      max_x += padding;
+      min_y -= padding;
+      max_y += padding;
+      const float inner_width = static_cast<float>(inset_rect.width - 12);
+      const float inner_height = static_cast<float>(inset_rect.height - 22);
+      const float scale_x = inner_width / std::max(1.0f, max_x - min_x);
+      const float scale_y = inner_height / std::max(1.0f, max_y - min_y);
+      const float zoom_scale = std::min(scale_x, scale_y);
+
+      auto map_to_inset = [&](const cv::Point2f& point) {
+        return cv::Point2f(
+            static_cast<float>(inset_rect.x + 6) + (point.x - min_x) * zoom_scale,
+            static_cast<float>(inset_rect.y + 18) + (point.y - min_y) * zoom_scale);
+      };
+
+      const cv::Point2f inset_center(
+          static_cast<float>(inset_rect.x + inset_rect.width * 0.5f),
+          static_cast<float>(inset_rect.y + inset_rect.height * 0.58f));
+      cv::line(canvas,
+               cv::Point(inset_rect.x + 6, static_cast<int>(std::lround(inset_center.y))),
+               cv::Point(inset_rect.x + inset_rect.width - 6,
+                         static_cast<int>(std::lround(inset_center.y))),
+               cv::Scalar(236, 236, 236), 1, cv::LINE_AA);
+      cv::line(canvas,
+               cv::Point(static_cast<int>(std::lround(inset_center.x)), inset_rect.y + 18),
+               cv::Point(static_cast<int>(std::lround(inset_center.x)),
+                         inset_rect.y + inset_rect.height - 6),
+               cv::Scalar(236, 236, 236), 1, cv::LINE_AA);
+
+      if (search_box_ok) {
+        std::array<cv::Point2f, 4> mapped_box{};
+        for (std::size_t edge_index = 0; edge_index < search_box_points.size(); ++edge_index) {
+          mapped_box[edge_index] = map_to_inset(search_box_points[edge_index]);
+        }
+        for (std::size_t edge_index = 0; edge_index < mapped_box.size(); ++edge_index) {
+          cv::line(canvas, mapped_box[edge_index],
+                   mapped_box[(edge_index + 1) % mapped_box.size()],
+                   kSearchBoxColor, 1, cv::LINE_AA);
+        }
+      }
+      if (boundary_u_ok) {
+        cv::line(canvas, map_to_inset(boundary_u_points[0]), map_to_inset(boundary_u_points[1]),
+                 kBoundaryUColor, 1, cv::LINE_AA);
+      }
+      if (boundary_v_ok) {
+        cv::line(canvas, map_to_inset(boundary_v_points[0]), map_to_inset(boundary_v_points[1]),
+                 kBoundaryVColor, 1, cv::LINE_AA);
+      }
+      if (predicted_ok && u_plus_ok) {
+        cv::arrowedLine(canvas, map_to_inset(predicted_point), map_to_inset(u_plus_point),
+                        kUAxisColor, 1, cv::LINE_AA, 0, 0.15);
+      }
+      if (predicted_ok && v_plus_ok) {
+        cv::arrowedLine(canvas, map_to_inset(predicted_point), map_to_inset(v_plus_point),
+                        kVAxisColor, 1, cv::LINE_AA, 0, 0.15);
+      }
+      if (predicted_ok && seed_ok) {
+        cv::arrowedLine(canvas, map_to_inset(predicted_point), map_to_inset(seed_point),
+                        kArrow1Color, 1, cv::LINE_AA, 0, 0.12);
+      }
+      if (seed_ok && refined_ok) {
+        cv::arrowedLine(canvas, map_to_inset(seed_point), map_to_inset(refined_point),
+                        kArrow2Color, 1, cv::LINE_AA, 0, 0.12);
+      }
+
+      if (predicted_ok) {
+        const cv::Point2f point = map_to_inset(predicted_point);
+        cv::drawMarker(canvas, point, cv::Scalar(255, 255, 255),
+                       cv::MARKER_CROSS, 9, 3, cv::LINE_AA);
+        cv::drawMarker(canvas, point, kPredictedColor, cv::MARKER_CROSS, 7, 1, cv::LINE_AA);
+        cv::circle(canvas, point, 2, cv::Scalar(255, 255, 255), cv::FILLED, cv::LINE_AA);
+        cv::circle(canvas, point, 1, kPredictedColor, cv::FILLED, cv::LINE_AA);
+        DrawInsetLegendCallout(&canvas, inset_rect, point, "P", kPredictedColor, 0);
+      }
+      if (seed_ok) {
+        const cv::Point2f point = map_to_inset(seed_point);
+        cv::drawMarker(canvas, point, cv::Scalar(255, 255, 255),
+                       cv::MARKER_DIAMOND, 8, 3, cv::LINE_AA);
+        cv::drawMarker(canvas, point, kSeedColor, cv::MARKER_DIAMOND, 6, 1, cv::LINE_AA);
+        DrawInsetLegendCallout(&canvas, inset_rect, point, "SS", kSeedColor, 1);
+      }
+      if (refined_ok) {
+        const cv::Point2f point = map_to_inset(refined_point);
+        cv::drawMarker(canvas, point, cv::Scalar(255, 255, 255),
+                       cv::MARKER_SQUARE, 7, 3, cv::LINE_AA);
+        cv::drawMarker(canvas, point, kRefinedColor,
+                       cv::MARKER_SQUARE, 5, 1, cv::LINE_AA);
+        DrawInsetLegendCallout(&canvas, inset_rect, point, "R", kRefinedColor, 2);
+      }
+    }
+
+    int text_y = panel_rect.y + panel_rect.height - 72;
+    std::ostringstream title;
+    title << "id " << debug.point_id << " "
+          << (debug.corner_type == ati::CornerType::XCorner ? "X" : "L")
+          << (debug.valid ? " valid" : " invalid");
+    cv::putText(canvas, title.str(), cv::Point(panel_rect.x + 12, text_y),
+                cv::FONT_HERSHEY_SIMPLEX, 0.52, cv::Scalar(20, 20, 20), 1, cv::LINE_AA);
+    text_y += 20;
+    std::ostringstream line1;
+    line1 << "u=" << std::lround(debug.sphere_template_quality * 100.0)
+          << " v=" << std::lround(debug.sphere_gradient_quality * 100.0)
+          << " seed=" << std::lround(debug.sphere_seed_quality * 100.0);
+    cv::putText(canvas, line1.str(), cv::Point(panel_rect.x + 12, text_y),
+                cv::FONT_HERSHEY_SIMPLEX, 0.44, cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
+    text_y += 18;
+    std::ostringstream line2;
+    line2 << "P->SS " << std::fixed << std::setprecision(1) << debug.predicted_to_seed_displacement
+          << "  SS->R " << debug.seed_to_refined_displacement;
+    cv::putText(canvas, line2.str(), cv::Point(panel_rect.x + 12, text_y),
+                cv::FONT_HERSHEY_SIMPLEX, 0.44, cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
+    text_y += 18;
+    std::ostringstream line3;
+    line3 << "P->R " << std::fixed << std::setprecision(1)
+          << debug.predicted_to_refined_displacement
+          << "  r=" << std::setprecision(4) << debug.sphere_search_radius;
+    cv::putText(canvas, line3.str(), cv::Point(panel_rect.x + 12, text_y),
+                cv::FONT_HERSHEY_SIMPLEX, 0.44, cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
+  }
+
+  return canvas;
+}
+
 InternalMetricsSummary SummarizeInternalCorners(
     const std::vector<ati::InternalCornerDebugInfo>& debug_infos) {
   InternalMetricsSummary summary;
@@ -602,6 +1263,9 @@ InternalMetricsSummary SummarizeInternalCorners(
     summary.avg_image_gradient_quality += debug.image_gradient_quality;
     summary.avg_image_centering_quality += debug.image_centering_quality;
     summary.avg_image_final_quality += debug.image_final_quality;
+    summary.avg_sphere_seed_quality += debug.sphere_seed_quality;
+    summary.avg_predicted_to_seed += debug.predicted_to_seed_displacement;
+    summary.avg_seed_to_refined += debug.seed_to_refined_displacement;
     summary.avg_predicted_to_refined += debug.predicted_to_refined_displacement;
 
     if (debug.corner_type == ati::CornerType::LCorner) {
@@ -622,6 +1286,9 @@ InternalMetricsSummary SummarizeInternalCorners(
   summary.avg_image_gradient_quality /= count;
   summary.avg_image_centering_quality /= count;
   summary.avg_image_final_quality /= count;
+  summary.avg_sphere_seed_quality /= count;
+  summary.avg_predicted_to_seed /= count;
+  summary.avg_seed_to_refined /= count;
   summary.avg_predicted_to_refined /= count;
   return summary;
 }
@@ -661,12 +1328,35 @@ int main(int argc, char** argv) {
     }
 
     std::string sphere_output_path;
+    std::string internal_seed_output_path;
+    std::string internal_sphere_output_path;
     cv::Mat sphere_overlay = BuildOuterSphereDebugView(config, result);
     if (!sphere_overlay.empty()) {
       sphere_output_path =
           AppendMinuteStamp(SphereOutputPathForRequestedOutput(requested_output_path), minute_stamp);
       if (!cv::imwrite(sphere_output_path, sphere_overlay)) {
         throw std::runtime_error("Failed to write sphere output image: " + sphere_output_path);
+      }
+    }
+
+    cv::Mat internal_seed_overlay = BuildInternalSeedOverlay(image, result);
+    if (!internal_seed_overlay.empty()) {
+      internal_seed_output_path =
+          AppendMinuteStamp(InternalSeedOutputPathForRequestedOutput(requested_output_path), minute_stamp);
+      if (!cv::imwrite(internal_seed_output_path, internal_seed_overlay)) {
+        throw std::runtime_error("Failed to write internal seed overlay image: " +
+                                 internal_seed_output_path);
+      }
+    }
+
+    cv::Mat internal_sphere_overlay = BuildInternalSphereDebugView(result);
+    if (!internal_sphere_overlay.empty()) {
+      internal_sphere_output_path =
+          AppendMinuteStamp(InternalSphereOutputPathForRequestedOutput(requested_output_path),
+                            minute_stamp);
+      if (!cv::imwrite(internal_sphere_output_path, internal_sphere_overlay)) {
+        throw std::runtime_error("Failed to write internal sphere output image: " +
+                                 internal_sphere_output_path);
       }
     }
 
@@ -690,12 +1380,28 @@ int main(int argc, char** argv) {
     std::cout << "  enable_debug_output: " << (config.enable_debug_output ? "true" : "false") << "\n";
     std::cout << "  internal_projection_mode: "
               << ati::ToString(config.internal_projection_mode) << "\n\n";
+    if (config.internal_projection_mode == ati::InternalProjectionMode::SphereLattice) {
+      std::cout << "Sphere-lattice seed camera\n";
+      std::cout << "  use_initial_camera: "
+                << (config.sphere_lattice_use_initial_camera ? "true" : "false") << "\n";
+      std::cout << "  enable_seed_search: "
+                << (config.sphere_lattice_enable_seed_search ? "true" : "false") << "\n";
+      std::cout << "  init_xi: " << config.sphere_lattice_init_xi << "\n";
+      std::cout << "  init_alpha: " << config.sphere_lattice_init_alpha << "\n";
+      std::cout << "  init_fu_scale: " << config.sphere_lattice_init_fu_scale << "\n";
+      std::cout << "  init_fv_scale: " << config.sphere_lattice_init_fv_scale << "\n";
+      std::cout << "  init_cu_offset: " << config.sphere_lattice_init_cu_offset << "\n";
+      std::cout << "  init_cv_offset: " << config.sphere_lattice_init_cv_offset << "\n\n";
+    }
     std::cout << "Outer refinement chain\n";
     const bool outer_has_subpix = config.outer_detector_config.do_outer_subpix_refinement;
     const bool outer_has_sphere = config.intermediate_camera.IsConfigured();
     std::cout << "  chain: "
               << (outer_has_sphere ? (outer_has_subpix ? "C-S-SP" : "C-SP")
                                    : (outer_has_subpix ? "C-S" : "C"))
+              << "\n";
+    std::cout << "  sphere_camera: "
+              << (config.outer_spherical_use_initial_camera ? "initial_coarse" : "yaml_calibrated")
               << "\n";
     std::cout << "  outer_local_context_scale: "
               << config.outer_detector_config.outer_local_context_scale << "\n";
@@ -781,6 +1487,12 @@ int main(int argc, char** argv) {
     if (!sphere_output_path.empty()) {
       std::cout << "  sphere view image: " << sphere_output_path << "\n";
     }
+    if (!internal_seed_output_path.empty()) {
+      std::cout << "  internal seed overlay image: " << internal_seed_output_path << "\n";
+    }
+    if (!internal_sphere_output_path.empty()) {
+      std::cout << "  internal sphere view image: " << internal_sphere_output_path << "\n";
+    }
 
     if (config.enable_debug_output) {
       std::cout << "\nOuter corner multi-scale fusion debug\n";
@@ -854,11 +1566,23 @@ int main(int argc, char** argv) {
                   << " valid=" << (debug.valid ? "yes" : "no")
                   << " image_valid=" << (debug.image_evidence_valid ? "yes" : "no")
                   << " predicted=(" << debug.predicted_image.x << ", " << debug.predicted_image.y << ")"
+                  << " sphere_seed=(" << debug.sphere_seed_image.x << ", " << debug.sphere_seed_image.y
+                  << ")"
                   << " refined=(" << debug.refined_image.x << ", " << debug.refined_image.y << ")"
                   << " module_scale=" << debug.local_module_scale
+                  << " sphere_radius=" << debug.sphere_search_radius
+                  << " sphere_u_align=" << debug.sphere_template_quality
+                  << " sphere_v_align=" << debug.sphere_gradient_quality
+                  << " sphere_prior=" << debug.sphere_prior_quality
+                  << " sphere_peak=" << debug.sphere_peak_quality
+                  << " sphere_raw=" << debug.sphere_raw_quality
+                  << " sphere_seed_quality=" << debug.sphere_seed_quality
                   << " subpix_radius=" << debug.subpix_window_radius
                   << " subpix_gate=" << debug.subpix_displacement_limit
                   << " image_search_radius=" << debug.image_evidence_search_radius
+                  << " d_ps=" << debug.predicted_to_seed_displacement
+                  << " d_sr=" << debug.seed_to_refined_displacement
+                  << " d_pr=" << debug.predicted_to_refined_displacement
                   << " q_refine=" << debug.q_refine
                   << " template_quality=" << debug.template_quality
                   << " gradient_quality=" << debug.gradient_quality
@@ -874,16 +1598,19 @@ int main(int argc, char** argv) {
     const InternalMetricsSummary metrics = SummarizeInternalCorners(result.internal_corner_debug);
     std::cout << "\nInternal summary\n";
     std::cout << "  total internal points: " << metrics.total_points << "\n";
-    std::cout << "  legacy valid internal points: " << metrics.valid_points << "\n";
+    std::cout << "  valid internal points: " << metrics.valid_points << "\n";
     std::cout << "  image-evidence internal points: " << metrics.image_evidence_valid_points << "\n";
     std::cout << "  avg q_refine: " << metrics.avg_q_refine << "\n";
-    std::cout << "  avg legacy template_quality: " << metrics.avg_template_quality << "\n";
-    std::cout << "  avg legacy gradient_quality: " << metrics.avg_gradient_quality << "\n";
-    std::cout << "  avg legacy final_quality: " << metrics.avg_final_quality << "\n";
+    std::cout << "  avg seed template_quality: " << metrics.avg_template_quality << "\n";
+    std::cout << "  avg seed gradient_quality: " << metrics.avg_gradient_quality << "\n";
+    std::cout << "  avg final_quality: " << metrics.avg_final_quality << "\n";
     std::cout << "  avg image template_quality: " << metrics.avg_image_template_quality << "\n";
     std::cout << "  avg image gradient_quality: " << metrics.avg_image_gradient_quality << "\n";
     std::cout << "  avg image centering_quality: " << metrics.avg_image_centering_quality << "\n";
     std::cout << "  avg image final_quality: " << metrics.avg_image_final_quality << "\n";
+    std::cout << "  avg sphere seed quality: " << metrics.avg_sphere_seed_quality << "\n";
+    std::cout << "  avg predicted->seed displacement: " << metrics.avg_predicted_to_seed << "\n";
+    std::cout << "  avg seed->refined displacement: " << metrics.avg_seed_to_refined << "\n";
     std::cout << "  avg predicted->refined displacement: " << metrics.avg_predicted_to_refined << "\n";
     std::cout << "  LCorner valid: " << metrics.lcorner_valid << "/" << metrics.lcorner_points << "\n";
     std::cout << "  XCorner valid: " << metrics.xcorner_valid << "/" << metrics.xcorner_points << "\n";

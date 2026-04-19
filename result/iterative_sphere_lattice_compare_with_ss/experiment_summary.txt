@@ -1,0 +1,39 @@
+iterative coarse calibration experiment
+image_dir: /Users/linzhaoxian/lzx-ws/project/calibr/tartancalib/image/img_seq
+output_dir: /Users/linzhaoxian/lzx-ws/project/calibr/tartancalib/result/iterative_sphere_lattice_compare_with_ss
+group rule: filename stem before the last '-'
+selected groups: all
+board ids: 1
+images:
+  - image1-1 (group=image1)
+  - image1-2 (group=image1)
+  - image1-3 (group=image1)
+  - image1-4 (group=image1)
+  - image2-1 (group=image2)
+  - image2-2 (group=image2)
+  - image2-3 (group=image2)
+  - image2-4 (group=image2)
+  - image3-1 (group=image3)
+  - image3-2 (group=image3)
+  - image3-3 (group=image3)
+  - image3-4 (group=image3)
+
+iteration summaries
+
+[iteration_0_initial_camera]
+camera=[xi=-0.200000, alpha=0.600000, fu=2481.600000, fv=2481.600000, cu=2256.000000, cv=2256.000000] camera_rmse=0 score=241.325 avg|P-R_gt|=12.1846 avg|SS-R_gt|=13.1044 valid_internal=241
+
+[iteration_1_iterative_coarse_model]
+camera=[xi=-0.643921, alpha=0.365728, fu=1113.155191, fv=1112.527517, cu=2256.080984, cv=2256.350452] camera_rmse=8.2327 score=226.305 avg|P-R_gt|=14.664 avg|SS-R_gt|=14.733 valid_internal=226
+
+[iteration_2_iterative_coarse_model]
+camera=[xi=-0.610155, alpha=0.386629, fu=1217.243752, fv=1215.893235, cu=2256.017358, cv=2256.436669] camera_rmse=8.92058 score=234.316 avg|P-R_gt|=14.2461 avg|SS-R_gt|=14.2744 valid_internal=234
+
+[iteration_3_iterative_coarse_model]
+camera=[xi=-0.592063, alpha=0.400327, fu=1274.291540, fv=1272.606138, cu=2256.025989, cv=2256.359265] camera_rmse=10.0011 score=237.319 avg|P-R_gt|=13.9456 avg|SS-R_gt|=14.2262 valid_internal=237
+
+[iteration_4_iterative_coarse_model]
+camera=[xi=-0.593215, alpha=0.402110, fu=1272.072148, fv=1270.029258, cu=2256.066729, cv=2256.322872] camera_rmse=9.99922 score=238.322 avg|P-R_gt|=13.8255 avg|SS-R_gt|=14.1349 valid_internal=238
+
+[iteration_5_iterative_coarse_model]
+camera=[xi=-0.559338, alpha=0.425890, fu=1377.812883, fv=1375.103230, cu=2256.039161, cv=2256.306659] camera_rmse=8.92614 score=233.313 avg|P-R_gt|=13.4781 avg|SS-R_gt|=14.1828 valid_internal=233

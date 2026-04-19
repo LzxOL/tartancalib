@@ -20,6 +20,7 @@ struct CmdArgs {
   int max_iterations = 3;
   int pose_refinement_rounds = 2;
   bool no_subpix = false;
+  bool disable_sphere_seed_search = false;
   bool use_internal_points_for_update = false;
   double internal_point_quality_threshold = 0.45;
   double convergence_threshold = 0.05;
@@ -43,7 +44,8 @@ void PrintUsage(const char* program) {
       << "  " << program
       << " --image-dir ./image/img_seq"
       << " --config ./aslam_cv/aslam_cameras_april/config/example_apriltag_internal.yaml"
-      << " --output-dir ./iterative_outputs --max-iterations 3\n";
+      << " --output-dir ./iterative_outputs --max-iterations 3"
+      << " [--disable-sphere-seed-search]\n";
 }
 
 std::vector<std::string> SplitCsv(const std::string& value) {
@@ -101,6 +103,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.pose_refinement_rounds = std::atoi(argv[++i]);
     } else if (token == "--use-internal-points-for-update") {
       args.use_internal_points_for_update = true;
+    } else if (token == "--disable-sphere-seed-search") {
+      args.disable_sphere_seed_search = true;
     } else if (token == "--internal-point-quality-threshold" && i + 1 < argc) {
       args.internal_point_quality_threshold = std::atof(argv[++i]);
     } else if (token == "--convergence-threshold" && i + 1 < argc) {
@@ -144,6 +148,7 @@ int main(int argc, char** argv) {
 
     ati::ApriltagInternalConfig config =
         ati::ApriltagInternalDetector::LoadConfig(args.config_path);
+    config.sphere_lattice_enable_seed_search = !args.disable_sphere_seed_search;
     ati::ApriltagInternalDetectionOptions detection_options =
         MakeDetectionOptionsFromConfig(config);
     detection_options.do_subpix_refinement = !args.no_subpix;
@@ -178,6 +183,8 @@ int main(int argc, char** argv) {
     std::cout << "  max_iterations: " << request.experiment_options.max_iterations << "\n";
     std::cout << "  use_internal_points_for_update: "
               << (request.experiment_options.use_internal_points_for_update ? "yes" : "no") << "\n";
+    std::cout << "  sphere_seed_search: "
+              << (config.sphere_lattice_enable_seed_search ? "enabled" : "disabled") << "\n";
     std::cout << "  group rule: filename stem before the last '-'\n";
     return 0;
   } catch (const std::exception& error) {
