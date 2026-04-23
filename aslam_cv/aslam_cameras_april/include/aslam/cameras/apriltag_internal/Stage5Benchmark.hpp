@@ -195,6 +195,11 @@ class Stage5Benchmark {
 
   Stage5BenchmarkReport Run(const Stage5BenchmarkInput& input) const;
 
+  CameraModelRefitEvaluationResult EvaluateCameraModel(
+      const CalibrationEvaluationDataset& dataset,
+      const OuterBootstrapCameraIntrinsics& camera,
+      const std::string& method_label) const;
+
   cv::Mat RenderProjectionComparison(const Stage5BenchmarkReport& report,
                                      int max_width = 900,
                                      int max_height = 900) const;
@@ -229,10 +234,6 @@ class Stage5Benchmark {
       const FrozenRound2BaselineOptions& baseline_options,
       const JointReprojectionSceneState& optimized_scene_state,
       const std::string& split_signature) const;
-  CameraModelRefitEvaluationResult EvaluateCameraModel(
-      const CalibrationEvaluationDataset& dataset,
-      const OuterBootstrapCameraIntrinsics& camera,
-      const std::string& method_label) const;
   std::string FindFrameImagePath(const Stage5BenchmarkReport& report,
                                  int frame_index) const;
 

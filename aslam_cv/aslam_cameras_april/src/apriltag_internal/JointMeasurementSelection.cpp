@@ -23,6 +23,7 @@ struct CandidateBoardObservation {
   int internal_point_count = 0;
   double average_quality = 0.0;
   double rmse = std::numeric_limits<double>::infinity();
+  double pose_fit_outer_rmse = std::numeric_limits<double>::infinity();
   std::string coverage_signature;
 };
 
@@ -145,6 +146,39 @@ std::string BuildCoverageSignature(const JointBoardObservation& board_observatio
   return stream.str();
 }
 
+double ComputeOuterPoseFitRmse(const JointBoardObservation& board_observation,
+                               const OuterBootstrapCameraIntrinsics& camera) {
+  if (!camera.IsValid()) {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  std::vector<Eigen::Vector3d> outer_targets;
+  std::vector<cv::Point2f> outer_pixels;
+  outer_targets.reserve(4);
+  outer_pixels.reserve(4);
+  for (const JointPointObservation& point : board_observation.points) {
+    if (!point.used_in_solver || point.point_type != JointPointType::Outer) {
+      continue;
+    }
+    outer_targets.push_back(point.target_xyz_board);
+    outer_pixels.push_back(
+        cv::Point2f(static_cast<float>(point.image_xy.x()),
+                    static_cast<float>(point.image_xy.y())));
+  }
+
+  if (outer_targets.size() < 4) {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  Eigen::Isometry3d T_camera_board = Eigen::Isometry3d::Identity();
+  double pose_fit_outer_rmse = std::numeric_limits<double>::infinity();
+  if (!EstimatePoseFromObjectPoints(camera, outer_targets, outer_pixels,
+                                    &T_camera_board, &pose_fit_outer_rmse)) {
+    return std::numeric_limits<double>::infinity();
+  }
+  return pose_fit_outer_rmse;
+}
+
 void RecomputeMeasurementCounts(JointMeasurementBuildResult* result) {
   if (result == nullptr) {
     return;
@@ -228,6 +262,8 @@ const char* ToString(JointBoardObservationSelectionReasonCode reason_code) {
       return "RejectedNotSolverReady";
     case JointBoardObservationSelectionReasonCode::RejectedResidualSanity:
       return "RejectedResidualSanity";
+    case JointBoardObservationSelectionReasonCode::RejectedOuterPoseFit:
+      return "RejectedOuterPoseFit";
     case JointBoardObservationSelectionReasonCode::RejectedFrameRejected:
       return "RejectedFrameRejected";
   }
@@ -280,6 +316,12 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
             << " median_rmse=" << median_rmse;
     result.warnings.push_back(warning.str());
   }
+  {
+    std::ostringstream warning;
+    warning << "selection max_pose_fit_outer_rmse="
+            << options_.max_pose_fit_outer_rmse;
+    result.warnings.push_back(warning.str());
+  }
 
   std::map<std::pair<int, int>, CandidateBoardObservation> candidates;
   for (const JointMeasurementFrameResult& frame_result : measurement_result.frames) {
@@ -294,6 +336,8 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
       candidate.coverage_signature = BuildCoverageSignature(
           board_observation, measurement_result.bootstrap_seed.coarse_camera.resolution,
           options_.coverage_grid_cols, options_.coverage_grid_rows);
+      candidate.pose_fit_outer_rmse =
+          ComputeOuterPoseFitRmse(board_observation, scene_state.camera);
       const auto residual_it = residual_by_key.find(
           std::make_pair(frame_result.frame_index, board_observation.board_id));
       if (residual_it != residual_by_key.end()) {
@@ -308,6 +352,7 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
       decision.frame_label = frame_result.frame_label;
       decision.board_id = board_observation.board_id;
       decision.rmse = candidate.rmse;
+      decision.pose_fit_outer_rmse = candidate.pose_fit_outer_rmse;
       decision.average_quality = candidate.average_quality;
       decision.point_count = candidate.point_count;
       decision.outer_point_count = candidate.outer_point_count;
@@ -322,6 +367,18 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
       if (!solver_ready || candidate.point_count <= 0) {
         decision.reason_code = JointBoardObservationSelectionReasonCode::RejectedNotSolverReady;
         decision.reason_detail = "board observation is not solver-ready for Stage 4 selection";
+        result.board_observation_decisions.push_back(decision);
+        continue;
+      }
+
+      if (!std::isfinite(candidate.pose_fit_outer_rmse) ||
+          (options_.max_pose_fit_outer_rmse > 0.0 &&
+           candidate.pose_fit_outer_rmse > options_.max_pose_fit_outer_rmse)) {
+        decision.reason_code = JointBoardObservationSelectionReasonCode::RejectedOuterPoseFit;
+        std::ostringstream detail;
+        detail << "pose_fit_outer_rmse=" << candidate.pose_fit_outer_rmse
+               << " threshold=" << options_.max_pose_fit_outer_rmse;
+        decision.reason_detail = detail.str();
         result.board_observation_decisions.push_back(decision);
         continue;
       }

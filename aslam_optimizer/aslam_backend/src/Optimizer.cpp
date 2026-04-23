@@ -185,10 +185,7 @@ namespace aslam {
 
     }*/
 
-
-
-
-    
+#ifndef QRSOLVER_DISABLED
           SolutionReturnValue Optimizer::optimizeDogLeg()
           {
             Timer timeGn("Optimizer: build Hessian", true);
@@ -302,7 +299,7 @@ namespace aslam {
 
                               if(!solutionSuccess)
                               {
-
+#ifndef QRSOLVER_DISABLED
                                 // the default solver failed. try the QR solver as a robust sparse alternative:
                                 if(!_fallbackSolver) {  // initialise a new solver
                                   // for now take QR
@@ -328,7 +325,10 @@ namespace aslam {
                                 }
                                 linearSolverFailCounter++;  // increment
                                 // SM_ASSERT_TRUE(Exception, linearSolverFailCounter <= _options.linearSolverMaximumFails, "The linear solution failed");
-
+#else
+                                _options.verbose && std::cout << "Optimizer: The linear solution failed and QR fallback is disabled." << std::endl;
+                                _dx_gn = _dx_sd;
+#endif
                               }
                               gnComputed = true;  // now we have it!
                               // and calculate the norm:
@@ -457,6 +457,7 @@ namespace aslam {
 
 
           }
+#endif
 
 
 
@@ -788,4 +789,3 @@ namespace aslam {
 
   } // namespace backend
 } // namespace aslam
-

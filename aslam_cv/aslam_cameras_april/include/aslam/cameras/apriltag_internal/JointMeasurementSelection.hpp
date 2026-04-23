@@ -26,6 +26,7 @@ enum class JointBoardObservationSelectionReasonCode {
   Accepted,
   RejectedNotSolverReady,
   RejectedResidualSanity,
+  RejectedOuterPoseFit,
   RejectedFrameRejected,
 };
 
@@ -39,6 +40,7 @@ struct JointMeasurementSelectionOptions {
   int min_initial_views_per_board = 3;
   double max_board_observation_rmse = 25.0;
   double residual_sanity_factor = 2.5;
+  double max_pose_fit_outer_rmse = 8.0;
 };
 
 struct JointBoardObservationSelectionDecision {
@@ -50,6 +52,7 @@ struct JointBoardObservationSelectionDecision {
       JointBoardObservationSelectionReasonCode::None;
   std::string reason_detail;
   double rmse = 0.0;
+  double pose_fit_outer_rmse = 0.0;
   double average_quality = 0.0;
   int point_count = 0;
   int outer_point_count = 0;

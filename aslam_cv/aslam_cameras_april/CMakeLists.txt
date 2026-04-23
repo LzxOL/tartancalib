@@ -6,13 +6,19 @@ ADD_DEFINITIONS(-DASLAM_USE_ROS)
 find_package(catkin REQUIRED COMPONENTS
   sm_python
   aslam_cameras
+  aslam_backend
+  aslam_backend_expressions
+  aslam_cv_backend
+  aslam_time
   ethz_apriltag2
   numpy_eigen
   sm_common
   sm_logging
   sm_boost
   sm_eigen
+  sm_kinematics
   python_module
+  sparse_block_matrix
 )
 find_package(OpenCV REQUIRED)
 set(Boost_NO_BOOST_CMAKE ON)
@@ -32,6 +38,7 @@ add_library(${PROJECT_NAME}
   src/apriltag_internal/ApriltagCanonicalModel.cpp
   src/apriltag_internal/ApriltagInternalDetector.cpp
   src/apriltag_internal/ApriltagInternalDebugVisualization.cpp
+  src/apriltag_internal/AslamBackendCalibrationRunner.cpp
   src/apriltag_internal/CalibrationStateBundle.cpp
   src/apriltag_internal/DoubleSphereCameraModel.cpp
   src/apriltag_internal/FrozenRound2BaselinePipeline.cpp
@@ -97,6 +104,12 @@ add_executable(run_stage5_benchmark
 target_link_libraries(run_stage5_benchmark ${PROJECT_NAME} ${OpenCV_LIBS} ${Boost_LIBRARIES})
 target_compile_features(run_stage5_benchmark PUBLIC cxx_std_14)
 
+add_executable(run_stage5_backend
+  src/run_stage5_backend_main.cpp
+)
+target_link_libraries(run_stage5_backend ${PROJECT_NAME} ${OpenCV_LIBS} ${Boost_LIBRARIES})
+target_compile_features(run_stage5_backend PUBLIC cxx_std_14)
+
 add_executable(run_iterative_apriltag_internal_experiment
   src/run_iterative_apriltag_internal_experiment_main.cpp
 )
@@ -125,7 +138,7 @@ target_compile_features(run_compare_outer_adaptive_subpix_vs_sphere PUBLIC cxx_s
 ## Installation ##
 ##################
 
-install(TARGETS ${PROJECT_NAME} detect_apriltag_internal run_multi_board_outer_bootstrap run_multi_board_internal_regeneration run_joint_reprojection_measurement_prep run_joint_reprojection_optimization run_compare_stage5_with_kalibr run_stage5_benchmark run_iterative_apriltag_internal_experiment run_compare_internal_seed_methods run_compare_outer_geometry run_compare_outer_adaptive_subpix_vs_sphere
+install(TARGETS ${PROJECT_NAME} detect_apriltag_internal run_multi_board_outer_bootstrap run_multi_board_internal_regeneration run_joint_reprojection_measurement_prep run_joint_reprojection_optimization run_compare_stage5_with_kalibr run_stage5_benchmark run_stage5_backend run_iterative_apriltag_internal_experiment run_compare_internal_seed_methods run_compare_outer_geometry run_compare_outer_adaptive_subpix_vs_sphere
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

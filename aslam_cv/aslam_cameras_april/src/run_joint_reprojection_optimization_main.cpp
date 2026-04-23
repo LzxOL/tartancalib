@@ -481,6 +481,7 @@ void WriteSelectionSummary(const fs::path& output_path,
            << " accepted=" << (decision.accepted ? 1 : 0)
            << " reason=" << ati::ToString(decision.reason_code)
            << " rmse=" << decision.rmse
+           << " pose_fit_outer_rmse=" << decision.pose_fit_outer_rmse
            << " points=" << decision.point_count
            << " coverage_signature=" << decision.coverage_signature
            << " detail=" << decision.reason_detail << "\n";
