@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED)
 set(Boost_NO_BOOST_CMAKE ON)
-find_package(Boost REQUIRED COMPONENTS filesystem)
+find_package(Boost REQUIRED COMPONENTS filesystem serialization)
 
 set(TARTANCALIB_APRILTAG_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/aslam_offline_calibration/ethz_apriltag2")
@@ -30,9 +30,21 @@ target_link_libraries(tartancalib_ethz_apriltag2_core PUBLIC
 
 add_library(tartancalib_apriltag_internal_core STATIC
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/ApriltagCanonicalModel.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/ApriltagInternalDebugVisualization.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/ApriltagInternalDetector.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/CalibrationStateBundle.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/DoubleSphereCameraModel.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/FrozenRound2BaselinePipeline.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointMeasurementSelection.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointReprojectionCostCore.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointReprojectionMeasurementBuilder.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointReprojectionOptimizer.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointReprojectionResidualEvaluator.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/KalibrBenchmark.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/MultiBoardInternalMeasurementRegenerator.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/MultiBoardOuterBootstrap.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/MultiScaleOuterTagDetector.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/Stage5Benchmark.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/IterativeCoarseCalibrationExperiment.cpp"
 )
 target_include_directories(tartancalib_apriltag_internal_core PUBLIC
@@ -43,6 +55,7 @@ target_link_libraries(tartancalib_apriltag_internal_core PUBLIC
   Eigen3::Eigen
   ${OpenCV_LIBS}
   Boost::filesystem
+  Boost::serialization
 )
 
 add_executable(detect_apriltag_internal
@@ -58,6 +71,87 @@ add_executable(run_iterative_apriltag_internal_experiment
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_iterative_apriltag_internal_experiment_main.cpp"
 )
 target_link_libraries(run_iterative_apriltag_internal_experiment PRIVATE
+  tartancalib_apriltag_internal_core
+  ${OpenCV_LIBS}
+  Boost::filesystem
+)
+
+add_executable(run_multi_board_outer_bootstrap
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_multi_board_outer_bootstrap_main.cpp"
+)
+target_link_libraries(run_multi_board_outer_bootstrap PRIVATE
+  tartancalib_apriltag_internal_core
+  ${OpenCV_LIBS}
+  Boost::filesystem
+)
+
+add_executable(run_multi_board_internal_regeneration
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_multi_board_internal_regeneration_main.cpp"
+)
+target_link_libraries(run_multi_board_internal_regeneration PRIVATE
+  tartancalib_apriltag_internal_core
+  ${OpenCV_LIBS}
+  Boost::filesystem
+)
+
+add_executable(run_joint_reprojection_measurement_prep
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_joint_reprojection_measurement_prep_main.cpp"
+)
+target_link_libraries(run_joint_reprojection_measurement_prep PRIVATE
+  tartancalib_apriltag_internal_core
+  ${OpenCV_LIBS}
+  Boost::filesystem
+)
+
+add_executable(run_joint_reprojection_optimization
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_joint_reprojection_optimization_main.cpp"
+)
+target_link_libraries(run_joint_reprojection_optimization PRIVATE
+  tartancalib_apriltag_internal_core
+  ${OpenCV_LIBS}
+  Boost::filesystem
+)
+
+add_executable(run_compare_stage5_with_kalibr
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_compare_stage5_with_kalibr_main.cpp"
+)
+target_link_libraries(run_compare_stage5_with_kalibr PRIVATE
+  tartancalib_apriltag_internal_core
+  ${OpenCV_LIBS}
+  Boost::filesystem
+)
+
+add_executable(run_stage5_benchmark
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_stage5_benchmark_main.cpp"
+)
+target_link_libraries(run_stage5_benchmark PRIVATE
+  tartancalib_apriltag_internal_core
+  ${OpenCV_LIBS}
+  Boost::filesystem
+)
+
+add_executable(run_compare_internal_seed_methods
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_compare_internal_seed_methods_main.cpp"
+)
+target_link_libraries(run_compare_internal_seed_methods PRIVATE
+  tartancalib_apriltag_internal_core
+  ${OpenCV_LIBS}
+  Boost::filesystem
+)
+
+add_executable(run_compare_outer_geometry
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_compare_outer_geometry_main.cpp"
+)
+target_link_libraries(run_compare_outer_geometry PRIVATE
+  tartancalib_apriltag_internal_core
+  ${OpenCV_LIBS}
+  Boost::filesystem
+)
+
+add_executable(run_compare_outer_adaptive_subpix_vs_sphere
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_compare_outer_adaptive_subpix_vs_sphere_main.cpp"
+)
+target_link_libraries(run_compare_outer_adaptive_subpix_vs_sphere PRIVATE
   tartancalib_apriltag_internal_core
   ${OpenCV_LIBS}
   Boost::filesystem

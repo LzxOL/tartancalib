@@ -19,11 +19,6 @@ namespace apriltag_internal {
 enum class InternalProjectionMode {
   Homography,
   VirtualPinholePatch,
-  VirtualPinholeImageSubpix,
-  VirtualPinholePatchBoundarySeed,
-  SphereLattice,
-  SphereBorderLattice,
-  SphereRayRefine,
 };
 
 const char* ToString(InternalProjectionMode mode);
@@ -58,16 +53,7 @@ struct ApriltagInternalConfig {
   double internal_subpix_displacement_scale = 0.25;
   double max_internal_subpix_displacement = 6.0;
   bool enable_debug_output = false;
-  InternalProjectionMode internal_projection_mode = InternalProjectionMode::SphereLattice;
-  bool sphere_lattice_use_initial_camera = false;
-  bool outer_spherical_use_initial_camera = false;
-  bool sphere_lattice_enable_seed_search = true;
-  double sphere_lattice_init_xi = -0.2;
-  double sphere_lattice_init_alpha = 0.6;
-  double sphere_lattice_init_fu_scale = 0.55;
-  double sphere_lattice_init_fv_scale = 0.55;
-  double sphere_lattice_init_cu_offset = 0.0;
-  double sphere_lattice_init_cv_offset = 0.0;
+  InternalProjectionMode internal_projection_mode = InternalProjectionMode::VirtualPinholePatch;
   IntermediateCameraConfig intermediate_camera;
   MultiScaleOuterTagDetectorConfig outer_detector_config;
 };

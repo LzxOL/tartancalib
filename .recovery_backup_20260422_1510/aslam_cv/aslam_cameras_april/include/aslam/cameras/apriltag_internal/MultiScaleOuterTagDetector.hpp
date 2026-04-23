@@ -18,8 +18,6 @@ namespace aslam {
 namespace cameras {
 namespace apriltag_internal {
 
-class DoubleSphereCameraModel;
-
 enum class OuterTagFailureReason {
   None = 0,
   NoDetectionsAtAll,
@@ -31,46 +29,24 @@ enum class OuterTagFailureReason {
 
 std::string ToString(OuterTagFailureReason reason);
 
-struct OuterRefineCameraConfig {
-  std::string camera_model;
-  std::string distortion_model;
-  std::vector<double> intrinsics;
-  std::vector<double> distortion_coeffs;
-  std::vector<int> resolution;
-
-  bool IsConfigured() const {
-    return !camera_model.empty() && !intrinsics.empty() && resolution.size() == 2;
-  }
-};
-
 struct MultiScaleOuterTagDetectorConfig {
   int tag_id = 1;
   std::vector<int> tag_ids;
   double min_border_distance = 4.0;
   int max_scales_to_try = 0;
-  bool enable_outer_spherical_refinement = true;
-  bool do_outer_subpix_refinement = true;
-  double outer_local_context_scale = 0.05;
-  double outer_corner_marker_ratio = 0.0;
-  double outer_subpix_scale = 0.025;
-  double outer_refine_gate_scale = 0.025;
-  double outer_refine_gate_min = 6.0;
-  double min_detection_quality = 0.0;
-  bool blur_before_detect = false;
-  int blur_kernel = 7;
-  double blur_sigma = 1.6;
-  OuterRefineCameraConfig refine_camera;
-
-  // Legacy compatibility fields. Old YAML keys may still populate these,
-  // but the paper-facing C-S pipeline uses the high-level parameters above.
   std::vector<int> scale_candidates{3000, 2400, 1800, 1200, 1000, 800, 600, 500, 400, 300};
   std::vector<double> scale_divisors;
+  bool do_outer_subpix_refinement = true;
   int outer_subpix_window_radius = 0;
   double outer_subpix_window_scale = 0.015;
   int outer_subpix_window_min = 4;
   int outer_subpix_window_max = 16;
   double max_outer_refine_displacement = 6.0;
   double outer_refine_displacement_scale = 0.025;
+  double min_detection_quality = 0.0;
+  bool blur_before_detect = false;
+  int blur_kernel = 7;
+  double blur_sigma = 1.6;
   bool enable_outer_corner_layout_check = false;
   double outer_corner_verification_roi_scale = 0.035;
   int outer_corner_verification_roi_min = 12;
@@ -120,8 +96,6 @@ struct OuterCornerVerificationDebugInfo {
   cv::Rect verification_roi;
   cv::Point2f prev_edge_direction{};
   cv::Point2f next_edge_direction{};
-  std::vector<cv::Point2f> prev_marker_support_points;
-  std::vector<cv::Point2f> next_marker_support_points;
   std::vector<cv::Point2f> prev_branch_points;
   std::vector<cv::Point2f> next_branch_points;
   double local_scale = 0.0;
@@ -134,30 +108,6 @@ struct OuterCornerVerificationDebugInfo {
   double coarse_to_verified_displacement = 0.0;
   double coarse_to_subpix_displacement = 0.0;
   double coarse_to_refined_displacement = 0.0;
-  double corner_marker_width = 0.0;
-  cv::Point2f image_line_corner{};
-  double prev_image_line_residual = 0.0;
-  double next_image_line_residual = 0.0;
-  int prev_image_line_support_count = 0;
-  int next_image_line_support_count = 0;
-  bool image_line_valid = false;
-  bool line_refinement_success = false;
-  double line_refinement_quality = 0.0;
-  double line_jump = 0.0;
-  double line_jump_limit = 0.0;
-  bool line_inside = false;
-  double line_seed_gap = 0.0;
-  bool line_seed_accepted = false;
-  cv::Point2f spherical_corner{};
-  std::vector<cv::Point2f> prev_spherical_curve_points;
-  std::vector<cv::Point2f> next_spherical_curve_points;
-  double prev_spherical_residual = 0.0;
-  double next_spherical_residual = 0.0;
-  int prev_spherical_support_count = 0;
-  int next_spherical_support_count = 0;
-  bool spherical_refinement_valid = false;
-  bool spherical_refinement_applied = false;
-  std::string spherical_failure_reason;
   int subpix_window_radius = 0;
   double refine_displacement_limit = 0.0;
   bool refined_valid = false;
@@ -173,13 +123,10 @@ struct OuterTagScaleDebugInfo {
   cv::Size scaled_size;
   bool attempted = false;
   int raw_detection_count = 0;
-  int raw_good_detection_count = 0;
   int matching_tag_count = 0;
-  int matching_good_tag_count = 0;
   int accepted_candidate_count = 0;
   int refined_success_count = 0;
   bool contributed_to_corner_fusion = false;
-  std::vector<std::string> raw_detection_summaries;
   std::string rejection_summary;
 };
 
@@ -194,9 +141,6 @@ struct OuterTagDetectionResult {
   bool used_corner_fusion = false;
   int hamming = -1;
   bool good = false;
-  bool attempted_local_patch_rescue = false;
-  bool used_local_patch_rescue = false;
-  std::string local_patch_rescue_summary;
   std::array<Eigen::Vector2d, 4> coarse_corners_scaled_image{};
   std::array<Eigen::Vector2d, 4> coarse_corners_original_image{};
   std::array<Eigen::Vector2d, 4> refined_corners_original_image{};
@@ -212,52 +156,35 @@ struct OuterTagDetectionResult {
 
 struct OuterBoardMeasurement {
   int board_id = -1;
-  int detected_tag_id = -1;
   bool success = false;
-  double detection_quality = 0.0;
-  int valid_refined_corner_count = 0;
-  std::array<Eigen::Vector2d, 4> refined_outer_corners_original_image{};
-  std::array<bool, 4> refined_corner_valid{{false, false, false, false}};
+  double quality = 0.0;
+  std::array<Eigen::Vector2d, 4> refined_outer_corners{};
+  std::array<bool, 4> refined_valid{{false, false, false, false}};
   OuterTagFailureReason failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
   std::string failure_reason_text;
+  OuterTagDetectionResult detection;
 };
 
 struct OuterFrameMeasurementResult {
-  cv::Size image_size;
-  std::vector<int> requested_board_ids;
+  int frame_index = -1;
+  std::string frame_label;
   std::vector<OuterBoardMeasurement> board_measurements;
-
-  bool AnySuccess() const {
-    for (const OuterBoardMeasurement& measurement : board_measurements) {
-      if (measurement.success) {
-        return true;
-      }
-    }
-    return false;
-  }
 
   int SuccessfulBoardCount() const {
     int count = 0;
-    for (const OuterBoardMeasurement& measurement : board_measurements) {
-      count += measurement.success ? 1 : 0;
+    for (const OuterBoardMeasurement& board_measurement : board_measurements) {
+      if (board_measurement.success) {
+        ++count;
+      }
     }
     return count;
   }
 };
 
 struct OuterTagMultiDetectionResult {
-  cv::Size image_size;
-  std::vector<int> requested_board_ids;
-  std::vector<OuterTagDetectionResult> detections;
   OuterFrameMeasurementResult frame_measurements;
 
-  bool AnySuccess() const {
-    return frame_measurements.AnySuccess();
-  }
-
-  int SuccessfulBoardCount() const {
-    return frame_measurements.SuccessfulBoardCount();
-  }
+  int SuccessfulBoardCount() const { return frame_measurements.SuccessfulBoardCount(); }
 };
 
 class MultiScaleOuterTagDetector {
@@ -270,29 +197,23 @@ class MultiScaleOuterTagDetector {
 
   OuterTagDetectionResult Detect(const cv::Mat& image) const;
   OuterTagMultiDetectionResult DetectMultiple(const cv::Mat& image) const;
-  std::vector<OuterTagDetectionResult> DetectMultiple(
-      const cv::Mat& image, const std::vector<int>& requested_tag_ids) const;
   void DrawDetection(const OuterTagDetectionResult& detection,
                      cv::Mat* output_image,
                      bool draw_debug) const;
-  void DrawDetections(const OuterTagMultiDetectionResult& detections,
+  void DrawDetection(const OuterBoardMeasurement& detection,
+                     cv::Mat* output_image,
+                     bool draw_debug) const;
+  void DrawDetections(const OuterFrameMeasurementResult& detections,
                       cv::Mat* output_image,
                       bool draw_debug) const;
 
   const MultiScaleOuterTagDetectorConfig& config() const { return config_; }
-  const std::vector<int>& requested_board_ids() const { return requested_board_ids_; }
 
  private:
   cv::Mat ToGray(const cv::Mat& image) const;
-  void DrawDetectionImpl(const OuterTagDetectionResult& detection,
-                         cv::Mat* output_image,
-                         bool draw_debug,
-                         bool include_status_text) const;
 
   MultiScaleOuterTagDetectorConfig config_;
-  std::vector<int> requested_board_ids_;
   std::unique_ptr<AprilTags::TagDetector> detector_;
-  std::unique_ptr<DoubleSphereCameraModel> sphere_camera_;
 };
 
 }  // namespace apriltag_internal

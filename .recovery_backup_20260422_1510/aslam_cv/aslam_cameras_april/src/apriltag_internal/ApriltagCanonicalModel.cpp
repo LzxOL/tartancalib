@@ -58,16 +58,6 @@ const char* ToString(InternalProjectionMode mode) {
       return "homography";
     case InternalProjectionMode::VirtualPinholePatch:
       return "virtual_pinhole_patch";
-    case InternalProjectionMode::VirtualPinholeImageSubpix:
-      return "virtual_pinhole_image_subpix";
-    case InternalProjectionMode::VirtualPinholePatchBoundarySeed:
-      return "virtual_pinhole_patch_boundary_seed";
-    case InternalProjectionMode::SphereLattice:
-      return "sphere_lattice";
-    case InternalProjectionMode::SphereBorderLattice:
-      return "sphere_border_lattice";
-    case InternalProjectionMode::SphereRayRefine:
-      return "sphere_ray_refine";
   }
   return "unknown";
 }
