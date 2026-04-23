@@ -504,8 +504,21 @@ class DsReprojectionError : public aslam::backend::ErrorTermFs<2> {
 
   void evaluateJacobiansImplementation(
       aslam::backend::JacobianContainer& jacobians) const override {
-    DsReprojectionError* mutable_this = const_cast<DsReprojectionError*>(this);
-    mutable_this->evaluateJacobiansFiniteDifference(jacobians);
+    const Eigen::Vector4d point_homogeneous = point_camera_.toHomogeneous();
+    typename DsGeometry::jacobian_homogeneous_t projection_jacobian;
+    Eigen::Vector2d predicted = Eigen::Vector2d::Zero();
+    const bool valid_projection =
+        camera_dv_.camera()->homogeneousToKeypoint(point_homogeneous, predicted,
+                                                   projection_jacobian) &&
+        predicted.allFinite() && projection_jacobian.allFinite();
+    if (!valid_projection) {
+      return;
+    }
+
+    // Residual is defined as measurement - predicted, so the projection Jacobians
+    // enter with a negative sign for both the pose chain and camera intrinsics.
+    point_camera_.evaluateJacobians(jacobians, -projection_jacobian);
+    camera_dv_.evaluateJacobians(jacobians, point_homogeneous);
   }
 
  private:
@@ -549,11 +562,39 @@ double EvaluateTotalProblemObjective(
   return total_cost;
 }
 
-double EvaluateSelectedErrorTermsObjective(
+struct FrozenWeightErrorState {
+  aslam::backend::ErrorTerm* error_term = nullptr;
+  double frozen_m_estimator_weight = 1.0;
+};
+
+std::vector<FrozenWeightErrorState> CaptureFrozenWeightErrorStates(
     const std::set<aslam::backend::ErrorTerm*>& error_terms) {
-  double total_cost = 0.0;
+  std::vector<FrozenWeightErrorState> frozen_states;
+  frozen_states.reserve(error_terms.size());
   for (aslam::backend::ErrorTerm* error_term : error_terms) {
-    total_cost += error_term->evaluateError();
+    if (error_term == nullptr) {
+      continue;
+    }
+    error_term->evaluateError();
+    FrozenWeightErrorState frozen_state;
+    frozen_state.error_term = error_term;
+    frozen_state.frozen_m_estimator_weight = error_term->getCurrentMEstimatorWeight();
+    frozen_states.push_back(frozen_state);
+  }
+  return frozen_states;
+}
+
+double EvaluateFrozenWeightObjective(
+    const std::vector<FrozenWeightErrorState>& frozen_states) {
+  double total_cost = 0.0;
+  for (const FrozenWeightErrorState& frozen_state : frozen_states) {
+    if (frozen_state.error_term == nullptr) {
+      continue;
+    }
+    frozen_state.error_term->evaluateError();
+    total_cost +=
+        frozen_state.frozen_m_estimator_weight *
+        frozen_state.error_term->getRawSquaredError();
   }
   return total_cost;
 }
@@ -638,6 +679,9 @@ AslamBackendJacobianBlockDiagnostics RunJacobianBlockCheck(
     return diagnostics;
   }
 
+  const std::vector<FrozenWeightErrorState> frozen_error_states =
+      CaptureFrozenWeightErrorStates(attached_error_terms);
+
   Eigen::VectorXd analytic_gradient =
       Eigen::VectorXd::Zero(design_variable->minimalDimensions());
   for (aslam::backend::ErrorTerm* error_term : attached_error_terms) {
@@ -659,13 +703,13 @@ AslamBackendJacobianBlockDiagnostics RunJacobianBlockCheck(
     Eigen::VectorXd positive_step = Eigen::VectorXd::Zero(dimension);
     positive_step[index] = finite_difference_epsilon;
     design_variable->update(positive_step.data(), dimension);
-    const double positive_cost = EvaluateSelectedErrorTermsObjective(attached_error_terms);
+    const double positive_cost = EvaluateFrozenWeightObjective(frozen_error_states);
     design_variable->revertUpdate();
 
     Eigen::VectorXd negative_step = Eigen::VectorXd::Zero(dimension);
     negative_step[index] = -finite_difference_epsilon;
     design_variable->update(negative_step.data(), dimension);
-    const double negative_cost = EvaluateSelectedErrorTermsObjective(attached_error_terms);
+    const double negative_cost = EvaluateFrozenWeightObjective(frozen_error_states);
     design_variable->revertUpdate();
 
     const double finite_difference =
@@ -692,6 +736,7 @@ AslamBackendJacobianDiagnostics RunJacobianDiagnostics(
     double finite_difference_epsilon) {
   AslamBackendJacobianDiagnostics diagnostics;
   diagnostics.finite_difference_epsilon = finite_difference_epsilon;
+  diagnostics.objective_model = "irls_frozen_weighted_cost";
 
   std::vector<std::string> warnings;
   if (!frame_variables.empty()) {
@@ -1409,6 +1454,7 @@ void WriteAslamBackendJacobianSummary(
   output << "failure_reason: " << diagnostics.failure_reason << "\n";
   output << "finite_difference_epsilon: "
          << diagnostics.finite_difference_epsilon << "\n";
+  output << "objective_model: " << diagnostics.objective_model << "\n";
   for (const AslamBackendJacobianBlockDiagnostics& block :
        diagnostics.block_diagnostics) {
     output << "block_label: " << block.block_label << "\n";

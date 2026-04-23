@@ -101,6 +101,7 @@ struct AslamBackendJacobianBlockDiagnostics {
 struct AslamBackendJacobianDiagnostics {
   bool success = false;
   double finite_difference_epsilon = 0.0;
+  std::string objective_model;
   std::vector<AslamBackendJacobianBlockDiagnostics> block_diagnostics;
   std::vector<std::string> warnings;
   std::string failure_reason;

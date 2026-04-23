@@ -437,10 +437,21 @@ int main(int argc, char** argv) {
     backend_options.intrinsics_release_iteration =
         args.second_pass_intrinsics_release_iteration;
 
+    ati::CalibrationBenchmarkSplitOptions split_options;
+    split_options.holdout_stride = args.holdout_stride;
+    split_options.holdout_offset = args.holdout_offset;
+    const ati::Stage5Benchmark benchmark(split_options);
+    const ati::CalibrationBenchmarkSplit preview_split =
+        benchmark.BuildDeterministicSplit(all_frames);
+    const std::string kalibr_training_split_signature =
+        !args.kalibr_training_split_signature.empty()
+            ? args.kalibr_training_split_signature
+            : (preview_split.success ? preview_split.split_signature : std::string());
+
     ati::KalibrBenchmarkReference kalibr_reference;
     kalibr_reference.camchain_yaml = args.kalibr_camchain_yaml;
     kalibr_reference.camera_model_family = "ds";
-    kalibr_reference.training_split_signature = args.kalibr_training_split_signature;
+    kalibr_reference.training_split_signature = kalibr_training_split_signature;
     kalibr_reference.runtime_seconds = args.kalibr_runtime_seconds;
     kalibr_reference.source_label = args.kalibr_source_label.empty()
                                         ? fs::path(args.kalibr_camchain_yaml).stem().string()
@@ -453,10 +464,6 @@ int main(int argc, char** argv) {
     benchmark_input.kalibr_reference = kalibr_reference;
     benchmark_input.dataset_label = dataset_label;
 
-    ati::CalibrationBenchmarkSplitOptions split_options;
-    split_options.holdout_stride = args.holdout_stride;
-    split_options.holdout_offset = args.holdout_offset;
-    const ati::Stage5Benchmark benchmark(split_options);
     const ati::Stage5BenchmarkReport report = benchmark.Run(benchmark_input);
 
     const fs::path output_dir(args.output_path);
