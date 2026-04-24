@@ -27,6 +27,7 @@ sphere_lattice_init_fu_scale: 0.55
 sphere_lattice_init_fv_scale: 0.55
 sphere_lattice_init_cu_offset: 0.0
 sphere_lattice_init_cv_offset: 0.0
+camera_initialization_mode: auto_with_manual_fallback
 
 # Outer-tag detector / fixed C-S outer corner pipeline.
 outer_local_context_scale: 0.05
@@ -38,6 +39,7 @@ outer_subpix_scale: 0.15
 outer_refine_gate_scale: 0.025
 outer_refine_gate_min: 6.0
 
+# Manual intermediate camera is now fallback/debug input, not the default primary path.
 # Either keep the inline Kalibr DS model below, or replace it with:
 # intermediate_camera_yaml: /path/to/mono_fisheye_calib_3_25_right-camchain.yaml
 camera_model: ds

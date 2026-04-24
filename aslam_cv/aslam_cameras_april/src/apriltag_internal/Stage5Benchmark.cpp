@@ -480,6 +480,9 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
     regen_input.outer_detections = outer_detection;
     const InternalRegenerationFrameResult regen_result =
         regenerator.RegenerateFrame(image, regen_input, optimized_scene_state);
+    for (const std::string& warning : regen_result.warnings) {
+      dataset.warnings.push_back(warning);
+    }
 
     CalibrationEvaluationFrameInput frame_input;
     frame_input.frame_index = frame_source.frame_index;

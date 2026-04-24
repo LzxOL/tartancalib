@@ -1,6 +1,7 @@
 #include <aslam/cameras/apriltag_internal/ApriltagInternalDetector.hpp>
 #include <aslam/cameras/apriltag_internal/CalibrationStateBundle.hpp>
 #include <aslam/cameras/apriltag_internal/KalibrBenchmark.hpp>
+#include <aslam/cameras/apriltag_internal/OuterOnlyCameraInitializer.hpp>
 #include <aslam/cameras/apriltag_internal/Stage5Benchmark.hpp>
 
 #include <algorithm>
@@ -29,6 +30,7 @@ struct CmdArgs {
   std::string kalibr_camchain_yaml;
   std::string kalibr_training_split_signature;
   std::string kalibr_source_label;
+  std::string camera_init_mode_override;
   bool all = false;
   bool show = false;
   int reference_board_id = 1;
@@ -50,6 +52,7 @@ void PrintUsage(const char* program) {
       << " [--intrinsics-release-iteration N]"
       << " [--second-pass-intrinsics-release-iteration N]"
       << " [--holdout-stride N] [--holdout-offset N]"
+      << " [--camera-init-mode manual|auto|auto_with_manual_fallback]"
       << " [--kalibr-training-split-signature SIGNATURE]"
       << " [--kalibr-source-label LABEL] [--kalibr-runtime-seconds SEC]\n";
 }
@@ -70,6 +73,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.kalibr_training_split_signature = argv[++i];
     } else if (token == "--kalibr-source-label" && i + 1 < argc) {
       args.kalibr_source_label = argv[++i];
+    } else if (token == "--camera-init-mode" && i + 1 < argc) {
+      args.camera_init_mode_override = argv[++i];
     } else if (token == "--kalibr-runtime-seconds" && i + 1 < argc) {
       args.kalibr_runtime_seconds = std::stod(argv[++i]);
     } else if (token == "--all") {
@@ -419,6 +424,10 @@ int main(int argc, char** argv) {
 
     ati::FrozenRound2BaselineOptions baseline_options;
     baseline_options.config = ati::ApriltagInternalDetector::LoadConfig(args.config_path);
+    if (!args.camera_init_mode_override.empty()) {
+      baseline_options.config.camera_initialization_mode =
+          ati::ParseCameraInitializationMode(args.camera_init_mode_override);
+    }
     baseline_options.reference_board_id = args.reference_board_id;
     baseline_options.optimize_intrinsics = args.optimize_intrinsics;
     baseline_options.intrinsics_release_iteration = args.intrinsics_release_iteration;
@@ -484,6 +493,15 @@ int main(int argc, char** argv) {
           (output_dir / "stage5_backend_problem_summary.txt").string(),
           report.backend_problem_input);
     }
+    ati::WriteAutoCameraInitializationSummary(
+        (output_dir / "auto_camera_initialization_summary.txt").string(),
+        report.baseline_result.auto_camera_initialization);
+    ati::WriteAutoCameraInitializationCandidatesCsv(
+        (output_dir / "auto_camera_initialization_candidates.csv").string(),
+        report.baseline_result.auto_camera_initialization);
+    ati::WriteAutoCameraInitializationOuterResidualsCsv(
+        (output_dir / "auto_camera_initialization_outer_residuals.csv").string(),
+        report.baseline_result.auto_camera_initialization);
     ati::WriteStage5BenchmarkProtocolSummary(
         (output_dir / "benchmark_protocol_summary.txt").string(), report);
     ati::WriteStage5BenchmarkTrainingSummary(

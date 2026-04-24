@@ -1,6 +1,7 @@
 #include <aslam/cameras/apriltag_internal/ApriltagInternalDetector.hpp>
 #include <aslam/cameras/apriltag_internal/AslamBackendCalibrationRunner.hpp>
 #include <aslam/cameras/apriltag_internal/KalibrBenchmark.hpp>
+#include <aslam/cameras/apriltag_internal/OuterOnlyCameraInitializer.hpp>
 #include <aslam/cameras/apriltag_internal/Stage5Benchmark.hpp>
 
 #include <algorithm>
@@ -29,6 +30,7 @@ struct CmdArgs {
   std::string kalibr_camchain_yaml;
   std::string kalibr_training_split_signature;
   std::string kalibr_source_label;
+  std::string camera_init_mode_override;
   bool all = false;
   bool show = false;
   int reference_board_id = 1;
@@ -50,6 +52,7 @@ void PrintUsage(const char* program) {
       << " [--intrinsics-release-iteration N]"
       << " [--second-pass-intrinsics-release-iteration N]"
       << " [--holdout-stride N] [--holdout-offset N]"
+      << " [--camera-init-mode manual|auto|auto_with_manual_fallback]"
       << " [--kalibr-training-split-signature SIGNATURE]"
       << " [--kalibr-source-label LABEL] [--kalibr-runtime-seconds SEC]\n";
 }
@@ -70,6 +73,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.kalibr_training_split_signature = argv[++i];
     } else if (token == "--kalibr-source-label" && i + 1 < argc) {
       args.kalibr_source_label = argv[++i];
+    } else if (token == "--camera-init-mode" && i + 1 < argc) {
+      args.camera_init_mode_override = argv[++i];
     } else if (token == "--kalibr-runtime-seconds" && i + 1 < argc) {
       args.kalibr_runtime_seconds = std::stod(argv[++i]);
     } else if (token == "--all") {
@@ -330,6 +335,36 @@ bool HasBackendCostDescent(const ati::AslamBackendCalibrationResult& result) {
   return false;
 }
 
+void PrintProgress(const std::string& message) {
+  std::cout << "[stage5_backend] " << message << std::endl;
+}
+
+void PrintEvaluationProgress(
+    const std::string& label,
+    const ati::CameraModelRefitEvaluationResult& evaluation) {
+  std::cout << "[stage5_backend] " << label
+            << " overall=" << evaluation.overall_rmse
+            << " outer=" << evaluation.outer_only_rmse
+            << " internal=" << evaluation.internal_only_rmse
+            << " points=" << evaluation.point_count << std::endl;
+}
+
+void PrintBackendResultProgress(
+    const ati::AslamBackendCalibrationResult& result) {
+  std::cout << "[stage5_backend] backend success=" << (result.success ? 1 : 0)
+            << " initial_rmse=" << result.initial_residual.overall_rmse
+            << " optimized_rmse=" << result.optimized_residual.overall_rmse
+            << std::endl;
+  for (const ati::AslamBackendOptimizationStageSummary& stage : result.stages) {
+    std::cout << "[stage5_backend] stage " << stage.stage_label
+              << " cost=" << stage.objective_start << " -> "
+              << stage.objective_final
+              << " iterations=" << stage.iterations
+              << " failed=" << stage.failed_iterations
+              << " lambda=" << stage.lm_lambda_final << std::endl;
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -337,6 +372,10 @@ int main(int argc, char** argv) {
     const CmdArgs args = ParseArgs(argc, argv);
     const std::string dataset_label = InferDatasetLabel(args);
     const std::vector<std::string> image_paths = CollectImagePaths(args.image_path, args.all);
+    PrintProgress("dataset=" + dataset_label);
+    PrintProgress("input=" + args.image_path);
+    PrintProgress("output=" + args.output_path);
+    PrintProgress("collected_images=" + std::to_string(image_paths.size()));
 
     std::vector<ati::FrozenRound2BaselineFrameSource> all_frames;
     all_frames.reserve(image_paths.size());
@@ -350,6 +389,10 @@ int main(int argc, char** argv) {
 
     ati::FrozenRound2BaselineOptions baseline_options;
     baseline_options.config = ati::ApriltagInternalDetector::LoadConfig(args.config_path);
+    if (!args.camera_init_mode_override.empty()) {
+      baseline_options.config.camera_initialization_mode =
+          ati::ParseCameraInitializationMode(args.camera_init_mode_override);
+    }
     baseline_options.reference_board_id = args.reference_board_id;
     baseline_options.optimize_intrinsics = args.optimize_intrinsics;
     baseline_options.intrinsics_release_iteration = args.intrinsics_release_iteration;
@@ -374,6 +417,15 @@ int main(int argc, char** argv) {
     const ati::Stage5Benchmark benchmark(split_options);
     const ati::CalibrationBenchmarkSplit preview_split =
         benchmark.BuildDeterministicSplit(all_frames);
+    if (preview_split.success) {
+      PrintProgress("split=" + preview_split.split_signature +
+                    " training=" +
+                    std::to_string(preview_split.training_frames.size()) +
+                    " holdout=" +
+                    std::to_string(preview_split.holdout_frames.size()));
+    } else {
+      PrintProgress("split preview failed: " + preview_split.failure_reason);
+    }
     const std::string kalibr_training_split_signature =
         !args.kalibr_training_split_signature.empty()
             ? args.kalibr_training_split_signature
@@ -395,10 +447,12 @@ int main(int argc, char** argv) {
     benchmark_input.kalibr_reference = kalibr_reference;
     benchmark_input.dataset_label = dataset_label;
 
+    PrintProgress("running frozen frontend baseline + Stage 5 benchmark...");
     const ati::Stage5BenchmarkReport report = benchmark.Run(benchmark_input);
 
     const fs::path output_dir(args.output_path);
     EnsureDirectoryExists(output_dir);
+    PrintProgress("writing Stage 5 benchmark artifacts...");
 
     if (report.baseline_result.stage5_round1_bundle.success) {
       ati::WriteCalibrationStateBundleSummary(
@@ -413,6 +467,15 @@ int main(int argc, char** argv) {
           (output_dir / "stage5_backend_problem_summary.txt").string(),
           report.backend_problem_input);
     }
+    ati::WriteAutoCameraInitializationSummary(
+        (output_dir / "auto_camera_initialization_summary.txt").string(),
+        report.baseline_result.auto_camera_initialization);
+    ati::WriteAutoCameraInitializationCandidatesCsv(
+        (output_dir / "auto_camera_initialization_candidates.csv").string(),
+        report.baseline_result.auto_camera_initialization);
+    ati::WriteAutoCameraInitializationOuterResidualsCsv(
+        (output_dir / "auto_camera_initialization_outer_residuals.csv").string(),
+        report.baseline_result.auto_camera_initialization);
     ati::WriteStage5BenchmarkProtocolSummary(
         (output_dir / "benchmark_protocol_summary.txt").string(), report);
     ati::WriteStage5BenchmarkTrainingSummary(
@@ -445,6 +508,19 @@ int main(int argc, char** argv) {
                 << (output_dir / "benchmark_protocol_summary.txt").string() << "\n";
       return 1;
     }
+    PrintProgress("Stage 5 benchmark completed.");
+    PrintProgress("camera init mode=" +
+                  std::string(ati::ToString(
+                      report.baseline_result.auto_camera_initialization.selected_mode)) +
+                  " source=" +
+                  report.baseline_result.auto_camera_initialization.selected_source_label +
+                  " fallback=" +
+                  std::to_string(
+                      report.baseline_result.auto_camera_initialization.fallback_used ? 1 : 0));
+    PrintEvaluationProgress("frontend training", report.our_training_evaluation);
+    PrintEvaluationProgress("frontend holdout", report.our_holdout_evaluation);
+    PrintEvaluationProgress("kalibr training", report.kalibr_training_evaluation);
+    PrintEvaluationProgress("kalibr holdout", report.kalibr_holdout_evaluation);
 
     ati::AslamBackendCalibrationOptions minimal_runner_options;
     minimal_runner_options.max_iterations = 6;
@@ -465,8 +541,10 @@ int main(int argc, char** argv) {
     minimal_runner_options.force_pose_only = true;
     const ati::AslamBackendCalibrationRunner minimal_backend_runner(
         minimal_runner_options);
+    PrintProgress("running minimal pose-only backend smoke check...");
     const ati::AslamBackendCalibrationResult minimal_backend_result =
         minimal_backend_runner.Run(report.backend_problem_input);
+    PrintBackendResultProgress(minimal_backend_result);
     WriteBackendDiagnosticArtifacts(
         output_dir, "backend_minimal_pose_only", minimal_backend_result);
 
@@ -489,8 +567,10 @@ int main(int argc, char** argv) {
     runner_options.invalid_projection_penalty_pixels = 100.0;
     runner_options.export_cost_parity_diagnostics = true;
     const ati::AslamBackendCalibrationRunner backend_runner(runner_options);
+    PrintProgress("running full backend optimization...");
     const ati::AslamBackendCalibrationResult backend_result =
         backend_runner.Run(report.backend_problem_input);
+    PrintBackendResultProgress(backend_result);
     WriteBackendDiagnosticArtifacts(output_dir, "backend_optimization", backend_result);
 
     if (!backend_result.success) {
@@ -514,6 +594,8 @@ int main(int argc, char** argv) {
       output << "holdout_failure_reason: " << backend_holdout_evaluation.failure_reason << "\n";
       return 1;
     }
+    PrintEvaluationProgress("backend training", backend_training_evaluation);
+    PrintEvaluationProgress("backend holdout", backend_holdout_evaluation);
 
     WriteEvaluationSummary(
         (output_dir / "backend_training_summary.txt").string(),
@@ -537,6 +619,7 @@ int main(int argc, char** argv) {
         output_dir / "backend_compare_outer_pose_frames";
     const fs::path compare_outer_board_dir =
         output_dir / "backend_compare_outer_pose_boards";
+    PrintProgress("rendering backend/frontend/Kalibr comparison overlays...");
     EnsureDirectoryExists(compare_frame_dir);
     EnsureDirectoryExists(compare_board_dir);
     EnsureDirectoryExists(compare_outer_frame_dir);

@@ -28,6 +28,15 @@ enum class InternalProjectionMode {
 
 const char* ToString(InternalProjectionMode mode);
 
+enum class CameraInitializationMode {
+  Manual,
+  Auto,
+  AutoWithManualFallback,
+};
+
+const char* ToString(CameraInitializationMode mode);
+CameraInitializationMode ParseCameraInitializationMode(const std::string& value);
+
 struct IntermediateCameraConfig {
   std::string camera_yaml;
   std::string camera_model;
@@ -68,6 +77,8 @@ struct ApriltagInternalConfig {
   double sphere_lattice_init_fv_scale = 0.55;
   double sphere_lattice_init_cu_offset = 0.0;
   double sphere_lattice_init_cv_offset = 0.0;
+  CameraInitializationMode camera_initialization_mode =
+      CameraInitializationMode::AutoWithManualFallback;
   IntermediateCameraConfig intermediate_camera;
   MultiScaleOuterTagDetectorConfig outer_detector_config;
 };

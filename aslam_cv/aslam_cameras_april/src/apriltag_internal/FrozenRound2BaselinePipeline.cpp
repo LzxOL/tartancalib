@@ -21,6 +21,26 @@ namespace cameras {
 namespace apriltag_internal {
 namespace {
 
+void AppendUniqueWarning(const std::string& warning,
+                         std::vector<std::string>* warnings) {
+  if (warnings == nullptr || warning.empty()) {
+    return;
+  }
+  if (std::find(warnings->begin(), warnings->end(), warning) == warnings->end()) {
+    warnings->push_back(warning);
+  }
+}
+
+void AppendWarnings(const std::vector<std::string>& new_warnings,
+                    std::vector<std::string>* warnings) {
+  if (warnings == nullptr) {
+    return;
+  }
+  for (const std::string& warning : new_warnings) {
+    AppendUniqueWarning(warning, warnings);
+  }
+}
+
 std::vector<int> NormalizeBoardIds(const std::vector<int>& configured_ids,
                                    int fallback_tag_id) {
   std::vector<int> board_ids;
@@ -102,6 +122,23 @@ OuterBootstrapOptions MakeBootstrapOptions(const ApriltagInternalConfig& config,
   }
   bootstrap_options.min_detection_quality = config.outer_detector_config.min_detection_quality;
   return bootstrap_options;
+}
+
+void SetBootstrapInitFromIntrinsics(const OuterBootstrapCameraIntrinsics& intrinsics,
+                                    OuterBootstrapOptions* options) {
+  if (options == nullptr) {
+    throw std::runtime_error("SetBootstrapInitFromIntrinsics requires a valid options pointer.");
+  }
+  options->init_xi = intrinsics.xi;
+  options->init_alpha = intrinsics.alpha;
+  options->init_fu_scale =
+      intrinsics.fu / static_cast<double>(intrinsics.resolution.width);
+  options->init_fv_scale =
+      intrinsics.fv / static_cast<double>(intrinsics.resolution.height);
+  options->init_cu_offset =
+      intrinsics.cu - 0.5 * static_cast<double>(intrinsics.resolution.width);
+  options->init_cv_offset =
+      intrinsics.cv - 0.5 * static_cast<double>(intrinsics.resolution.height);
 }
 
 std::set<std::tuple<int, int, int, int, int> > BuildSolverSignatureSet(
@@ -261,7 +298,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   const ApriltagInternalConfig config = NormalizeConfig(options_.config);
   const ApriltagInternalDetectionOptions detection_options = MakeDetectionOptions(config);
   const MultiScaleOuterTagDetector outer_detector(config.outer_detector_config);
-  const OuterBootstrapOptions bootstrap_options = MakeBootstrapOptions(config, options_);
+  OuterBootstrapOptions bootstrap_options = MakeBootstrapOptions(config, options_);
   const MultiBoardOuterBootstrap bootstrap(config, bootstrap_options);
   const MultiBoardInternalMeasurementRegenerator regenerator(config, detection_options);
   JointMeasurementBuildOptions build_options;
@@ -305,12 +342,26 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
     regeneration_inputs.push_back(regeneration_input);
   }
 
+  AutoCameraInitializationOptions initialization_options;
+  initialization_options.mode = config.camera_initialization_mode;
+  const OuterOnlyCameraInitializer camera_initializer(config, initialization_options);
+  result.auto_camera_initialization = camera_initializer.Initialize(bootstrap_frames);
+  AppendWarnings(result.auto_camera_initialization.warnings, &result.warnings);
+  if (!result.auto_camera_initialization.success) {
+    result.failure_reason = result.auto_camera_initialization.failure_reason.empty()
+                                ? "Automatic camera initialization failed."
+                                : result.auto_camera_initialization.failure_reason;
+    return result;
+  }
+  SetBootstrapInitFromIntrinsics(result.auto_camera_initialization.selected_camera,
+                                 &bootstrap_options);
+
   result.bootstrap_result = bootstrap.Solve(bootstrap_frames);
   if (!result.bootstrap_result.success) {
     result.failure_reason = result.bootstrap_result.failure_reason.empty()
                                 ? "Outer bootstrap failed."
                                 : result.bootstrap_result.failure_reason;
-    result.warnings = result.bootstrap_result.warnings;
+    AppendWarnings(result.bootstrap_result.warnings, &result.warnings);
     return result;
   }
 
@@ -328,6 +379,9 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
         regenerator.RegenerateFrame(image, regeneration_inputs[frame_index],
                                     result.bootstrap_result);
     result.round1.regeneration_results.push_back(regeneration_result);
+    for (const std::string& warning : regeneration_result.warnings) {
+      AppendUniqueWarning(warning, &result.warnings);
+    }
 
     JointMeasurementFrameInput joint_input;
     joint_input.frame_index = regeneration_inputs[frame_index].frame_index;
@@ -344,7 +398,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       result.round1.measurement_result);
   if (!result.round1.validation_summary.success) {
     result.failure_reason = result.round1.validation_summary.failure_reason;
-    result.warnings = result.round1.validation_summary.warnings;
+    AppendWarnings(result.round1.validation_summary.warnings, &result.warnings);
     return result;
   }
 
@@ -354,7 +408,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       residual_evaluator.Evaluate(result.round1.measurement_result, initial_scene_state);
   if (!result.round1.residual_result.success) {
     result.failure_reason = result.round1.residual_result.failure_reason;
-    result.warnings = result.round1.residual_result.warnings;
+    AppendWarnings(result.round1.residual_result.warnings, &result.warnings);
     return result;
   }
 
@@ -363,7 +417,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
                       initial_scene_state);
   if (!result.round1.selection_result.success) {
     result.failure_reason = result.round1.selection_result.failure_reason;
-    result.warnings = result.round1.selection_result.warnings;
+    AppendWarnings(result.round1.selection_result.warnings, &result.warnings);
     return result;
   }
 
@@ -371,7 +425,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       optimizer.Optimize(result.round1.selection_result, initial_scene_state);
   if (!result.round1.optimization_result.success) {
     result.failure_reason = result.round1.optimization_result.failure_reason;
-    result.warnings = result.round1.optimization_result.warnings;
+    AppendWarnings(result.round1.optimization_result.warnings, &result.warnings);
     return result;
   }
 
@@ -409,6 +463,9 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
               image, regeneration_inputs[frame_index],
               result.round1.optimization_result.optimized_state);
       result.round2.regeneration_results.push_back(regeneration_result);
+      for (const std::string& warning : regeneration_result.warnings) {
+        AppendUniqueWarning(warning, &result.warnings);
+      }
 
       JointMeasurementFrameInput joint_input;
       joint_input.frame_index = regeneration_inputs[frame_index].frame_index;
@@ -425,7 +482,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
         result.round2.measurement_result);
     if (!result.round2.validation_summary.success) {
       result.failure_reason = result.round2.validation_summary.failure_reason;
-      result.warnings = result.round2.validation_summary.warnings;
+      AppendWarnings(result.round2.validation_summary.warnings, &result.warnings);
       return result;
     }
 
@@ -434,7 +491,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
         result.round1.optimization_result.optimized_state);
     if (!result.round2.residual_result.success) {
       result.failure_reason = result.round2.residual_result.failure_reason;
-      result.warnings = result.round2.residual_result.warnings;
+      AppendWarnings(result.round2.residual_result.warnings, &result.warnings);
       return result;
     }
 
@@ -443,7 +500,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
                         result.round1.optimization_result.optimized_state);
     if (!result.round2.selection_result.success) {
       result.failure_reason = result.round2.selection_result.failure_reason;
-      result.warnings = result.round2.selection_result.warnings;
+      AppendWarnings(result.round2.selection_result.warnings, &result.warnings);
       return result;
     }
 
@@ -456,7 +513,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
         result.round1.optimization_result.optimized_state);
     if (!result.round2.optimization_result.success) {
       result.failure_reason = result.round2.optimization_result.failure_reason;
-      result.warnings = result.round2.optimization_result.warnings;
+      AppendWarnings(result.round2.optimization_result.warnings, &result.warnings);
       return result;
     }
 
@@ -476,11 +533,11 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       result.round2.selection_result,
       result.round2.optimization_result);
   result.success = true;
-  result.warnings = result.round1.optimization_result.warnings;
+  result.warnings.clear();
+  AppendWarnings(result.auto_camera_initialization.warnings, &result.warnings);
+  AppendWarnings(result.round1.optimization_result.warnings, &result.warnings);
   if (result.round2_available) {
-    result.warnings.insert(result.warnings.end(),
-                           result.round2.optimization_result.warnings.begin(),
-                           result.round2.optimization_result.warnings.end());
+    AppendWarnings(result.round2.optimization_result.warnings, &result.warnings);
   }
   if (!result.stage5_bundle_available) {
     result.warnings.push_back(

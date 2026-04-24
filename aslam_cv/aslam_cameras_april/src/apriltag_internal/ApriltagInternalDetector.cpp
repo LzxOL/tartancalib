@@ -556,6 +556,9 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.sphere_lattice_init_cu_offset = ParseDouble(key, value);
     } else if (key == "sphereLatticeInitCvOffset" || key == "sphere_lattice_init_cv_offset") {
       config.sphere_lattice_init_cv_offset = ParseDouble(key, value);
+    } else if (key == "cameraInitializationMode" ||
+               key == "camera_initialization_mode") {
+      config.camera_initialization_mode = ParseCameraInitializationMode(value);
     } else if (key == "minBorderDistance" || key == "min_border_distance") {
       config.outer_detector_config.min_border_distance = ParseDouble(key, value);
     } else if (key == "maxScalesToTry" || key == "max_scales_to_try") {
@@ -3725,6 +3728,7 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
   result.internal_corner_debug.reserve(model.VisiblePointIds().size());
   result.outer_detection = outer_detection;
   if (!result.outer_detection.success) {
+    result.failure_reason = result.outer_detection.failure_reason_text;
     return result;
   }
 
@@ -3838,8 +3842,10 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
       cv::Mat rvec;
       cv::Mat tvec;
       if (!EstimateTargetPose(camera, outer_corners, outer_point_ids, model, &rvec, &tvec)) {
-        throw std::runtime_error("Failed to estimate target pose for " +
-                                 std::string(ToString(board_config.internal_projection_mode)) + " mode.");
+        result.failure_reason =
+            "Failed to estimate target pose for " +
+            std::string(ToString(board_config.internal_projection_mode)) + " mode.";
+        return result;
       }
       cv::Rodrigues(rvec, target_to_camera_rotation);
       target_to_camera_translation = MatToEigenVector3d(tvec);
@@ -3870,8 +3876,10 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
                 target_to_camera_translation.y(),
                 target_to_camera_translation.z());
       } else if (!EstimateTargetPose(camera, outer_corners, outer_point_ids, model, &rvec, &tvec)) {
-        throw std::runtime_error("Failed to estimate target pose for " +
-                                 std::string(ToString(board_config.internal_projection_mode)) + " mode.");
+        result.failure_reason =
+            "Failed to estimate target pose for " +
+            std::string(ToString(board_config.internal_projection_mode)) + " mode.";
+        return result;
       }
       const VirtualPatchContext context =
           BuildVirtualPatchContext(gray, camera, rvec, tvec, model, outer_point_ids, options_);

@@ -100,6 +100,7 @@ struct ApriltagInternalDetectionResult {
   bool tag_detected = false;
   int board_id = -1;
   cv::Size image_size;
+  std::string failure_reason;
   InternalProjectionMode projection_mode = InternalProjectionMode::Homography;
   cv::Point2f tag_center;
   float observed_perimeter = 0.0f;

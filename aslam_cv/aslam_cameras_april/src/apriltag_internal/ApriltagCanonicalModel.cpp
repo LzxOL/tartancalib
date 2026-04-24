@@ -1,7 +1,9 @@
 #include <aslam/cameras/apriltag_internal/ApriltagCanonicalModel.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "apriltags/TagFamily.h"
@@ -70,6 +72,35 @@ const char* ToString(InternalProjectionMode mode) {
       return "sphere_ray_refine";
   }
   return "unknown";
+}
+
+const char* ToString(CameraInitializationMode mode) {
+  switch (mode) {
+    case CameraInitializationMode::Manual:
+      return "manual";
+    case CameraInitializationMode::Auto:
+      return "auto";
+    case CameraInitializationMode::AutoWithManualFallback:
+      return "auto_with_manual_fallback";
+  }
+  return "unknown";
+}
+
+CameraInitializationMode ParseCameraInitializationMode(const std::string& value) {
+  std::string lowered = value;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  if (lowered == "manual") {
+    return CameraInitializationMode::Manual;
+  }
+  if (lowered == "auto") {
+    return CameraInitializationMode::Auto;
+  }
+  if (lowered == "auto_with_manual_fallback" ||
+      lowered == "auto-with-manual-fallback") {
+    return CameraInitializationMode::AutoWithManualFallback;
+  }
+  throw std::runtime_error("Unsupported camera_initialization_mode '" + value + "'.");
 }
 
 ApriltagCanonicalModel::ApriltagCanonicalModel(ApriltagInternalConfig config)

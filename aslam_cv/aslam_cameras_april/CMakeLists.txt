@@ -51,6 +51,7 @@ add_library(${PROJECT_NAME}
   src/apriltag_internal/MultiBoardInternalMeasurementRegenerator.cpp
   src/apriltag_internal/MultiBoardOuterBootstrap.cpp
   src/apriltag_internal/MultiScaleOuterTagDetector.cpp
+  src/apriltag_internal/OuterOnlyCameraInitializer.cpp
   src/apriltag_internal/Stage5Benchmark.cpp
   src/apriltag_internal/IterativeCoarseCalibrationExperiment.cpp
 )

@@ -6,6 +6,7 @@
 
 #include <aslam/cameras/apriltag_internal/CalibrationStateBundle.hpp>
 #include <aslam/cameras/apriltag_internal/MultiBoardInternalMeasurementRegenerator.hpp>
+#include <aslam/cameras/apriltag_internal/OuterOnlyCameraInitializer.hpp>
 
 namespace aslam {
 namespace cameras {
@@ -65,6 +66,7 @@ struct FrozenRound2BaselineResult {
   CalibrationStateBundle stage5_round1_bundle;
   CalibrationStateBundle final_stage5_bundle;
   bool stage5_bundle_available = false;
+  AutoCameraInitializationResult auto_camera_initialization;
   std::vector<std::string> warnings;
   std::string failure_reason;
 };

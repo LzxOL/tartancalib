@@ -38,6 +38,7 @@ struct InternalRegenerationFrameResult {
   std::string state_source_label = "bootstrap";
   cv::Size image_size;
   std::vector<int> visible_board_ids;
+  std::vector<std::string> warnings;
   std::vector<RegeneratedBoardMeasurement> board_measurements;
 
   int SuccessfulBoardCount() const;

@@ -1,6 +1,7 @@
 #include <aslam/cameras/apriltag_internal/MultiBoardInternalMeasurementRegenerator.hpp>
 
 #include <algorithm>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -23,6 +24,16 @@ void AppendUniqueBoardId(int board_id, std::vector<int>* board_ids) {
   }
 }
 
+void AppendUniqueWarning(const std::string& warning,
+                         std::vector<std::string>* warnings) {
+  if (warnings == nullptr || warning.empty()) {
+    return;
+  }
+  if (std::find(warnings->begin(), warnings->end(), warning) == warnings->end()) {
+    warnings->push_back(warning);
+  }
+}
+
 std::string JoinBoardIds(const std::vector<int>& board_ids) {
   std::ostringstream stream;
   for (std::size_t index = 0; index < board_ids.size(); ++index) {
@@ -37,6 +48,47 @@ std::string JoinBoardIds(const std::vector<int>& board_ids) {
 Eigen::Matrix4d ComposeCameraBoardTransform(const Eigen::Matrix4d& T_camera_reference,
                                             const Eigen::Matrix4d& T_reference_board) {
   return T_camera_reference * T_reference_board;
+}
+
+ApriltagInternalDetectionResult BuildFailedDetectionResult(
+    int board_id,
+    const cv::Size& image_size,
+    const OuterTagDetectionResult& outer_detection,
+    const std::string& failure_reason) {
+  ApriltagInternalDetectionResult detection;
+  detection.board_id = board_id;
+  detection.image_size = image_size;
+  detection.outer_detection = outer_detection;
+  detection.tag_detected = outer_detection.success;
+  detection.failure_reason = failure_reason;
+  return detection;
+}
+
+std::string BuildRegenerationFailureWarning(
+    const InternalRegenerationFrameInput& frame_input,
+    const std::string& state_source_label,
+    int board_id,
+    bool pose_prior_used,
+    const std::string& failure_reason) {
+  std::ostringstream stream;
+  stream << "state=" << state_source_label
+         << " frame=" << frame_input.frame_index;
+  if (!frame_input.frame_label.empty()) {
+    stream << " (" << frame_input.frame_label << ")";
+  }
+  stream << " board=" << board_id
+         << " prior=" << (pose_prior_used ? 1 : 0)
+         << " skipped: " << failure_reason;
+  return stream.str();
+}
+
+void EmitRegenerationWarning(const std::string& warning,
+                             std::vector<std::string>* warnings) {
+  if (warning.empty()) {
+    return;
+  }
+  AppendUniqueWarning(warning, warnings);
+  std::cerr << "[internal_regen] " << warning << std::endl;
 }
 
 }  // namespace
@@ -123,9 +175,22 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
     measurement.frame_bootstrap_initialized = frame_state != nullptr && frame_state->initialized;
     measurement.board_bootstrap_initialized = board_state != nullptr && board_state->initialized;
     measurement.pose_prior_used = pose_prior_available;
-    measurement.detection = detector_.DetectFromOuterDetection(
-        image, board_id, outer_detection, &camera_override,
-        pose_prior_available ? &T_camera_board : nullptr);
+    try {
+      measurement.detection = detector_.DetectFromOuterDetection(
+          image, board_id, outer_detection, &camera_override,
+          pose_prior_available ? &T_camera_board : nullptr);
+    } catch (const std::exception& error) {
+      measurement.detection = BuildFailedDetectionResult(
+          board_id, image.size(), outer_detection, error.what());
+    }
+    if (outer_detection.success && !measurement.detection.success &&
+        !measurement.detection.failure_reason.empty()) {
+      EmitRegenerationWarning(
+          BuildRegenerationFailureWarning(
+              frame_input, result.state_source_label, board_id,
+              measurement.pose_prior_used, measurement.detection.failure_reason),
+          &result.warnings);
+    }
     result.board_measurements.push_back(measurement);
 
     if (outer_detection.success) {
@@ -183,9 +248,22 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
     measurement.frame_bootstrap_initialized = frame_state != nullptr && frame_state->initialized;
     measurement.board_bootstrap_initialized = board_state != nullptr && board_state->initialized;
     measurement.pose_prior_used = pose_prior_available;
-    measurement.detection = detector_.DetectFromOuterDetection(
-        image, board_id, outer_detection, &camera_override,
-        pose_prior_available ? &T_camera_board : nullptr);
+    try {
+      measurement.detection = detector_.DetectFromOuterDetection(
+          image, board_id, outer_detection, &camera_override,
+          pose_prior_available ? &T_camera_board : nullptr);
+    } catch (const std::exception& error) {
+      measurement.detection = BuildFailedDetectionResult(
+          board_id, image.size(), outer_detection, error.what());
+    }
+    if (outer_detection.success && !measurement.detection.success &&
+        !measurement.detection.failure_reason.empty()) {
+      EmitRegenerationWarning(
+          BuildRegenerationFailureWarning(
+              frame_input, result.state_source_label, board_id,
+              measurement.pose_prior_used, measurement.detection.failure_reason),
+          &result.warnings);
+    }
     result.board_measurements.push_back(measurement);
 
     if (outer_detection.success) {
