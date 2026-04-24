@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -23,6 +24,14 @@ namespace {
 namespace ati = aslam::cameras::apriltag_internal;
 namespace fs = boost::filesystem;
 
+constexpr const char kFrozenBaselineLabel[] = "stage5_backend_auto_v1";
+
+enum class IntrinsicsReleaseMode {
+  Delayed,
+  Immediate,
+  PoseOnly,
+};
+
 struct CmdArgs {
   std::string config_path;
   std::string image_path;
@@ -31,16 +40,196 @@ struct CmdArgs {
   std::string kalibr_training_split_signature;
   std::string kalibr_source_label;
   std::string camera_init_mode_override;
+  std::string experiment_tag;
   bool all = false;
   bool show = false;
   int reference_board_id = 1;
-  bool optimize_intrinsics = false;
+  bool optimize_intrinsics = true;
   int intrinsics_release_iteration = 3;
   int second_pass_intrinsics_release_iteration = 1;
   int holdout_stride = 5;
   int holdout_offset = 0;
+  bool disable_second_pass = false;
+  IntrinsicsReleaseMode intrinsics_release_mode = IntrinsicsReleaseMode::Delayed;
+  bool disable_residual_sanity_gate = false;
+  bool disable_board_pose_fit_gate = false;
   double kalibr_runtime_seconds = -1.0;
 };
+
+std::string BuildKalibrSourceLabel(const std::string& kalibr_camchain_yaml) {
+  return fs::path(kalibr_camchain_yaml).lexically_normal().generic_string();
+}
+
+struct RequestedExperimentConfig {
+  std::string frozen_baseline_label = kFrozenBaselineLabel;
+  std::string experiment_tag;
+  std::string effective_protocol_label = kFrozenBaselineLabel;
+  ati::CameraInitializationMode camera_init_mode =
+      ati::CameraInitializationMode::Auto;
+  bool run_second_pass = true;
+  bool frontend_optimize_intrinsics = true;
+  int frontend_intrinsics_release_iteration = 3;
+  int frontend_second_pass_intrinsics_release_iteration = 1;
+  IntrinsicsReleaseMode frontend_intrinsics_release_mode =
+      IntrinsicsReleaseMode::Delayed;
+  bool backend_optimize_intrinsics = true;
+  bool backend_delayed_intrinsics_release = true;
+  int backend_intrinsics_release_iteration = 1;
+  IntrinsicsReleaseMode backend_intrinsics_release_mode =
+      IntrinsicsReleaseMode::Delayed;
+  bool enable_residual_sanity_gate = true;
+  bool enable_board_pose_fit_gate = true;
+};
+
+const char* ToString(IntrinsicsReleaseMode mode) {
+  switch (mode) {
+    case IntrinsicsReleaseMode::Delayed:
+      return "delayed";
+    case IntrinsicsReleaseMode::Immediate:
+      return "immediate";
+    case IntrinsicsReleaseMode::PoseOnly:
+      return "pose_only";
+  }
+  return "unknown";
+}
+
+IntrinsicsReleaseMode ParseIntrinsicsReleaseMode(const std::string& value) {
+  std::string lowered = value;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  if (lowered == "delayed") {
+    return IntrinsicsReleaseMode::Delayed;
+  }
+  if (lowered == "immediate") {
+    return IntrinsicsReleaseMode::Immediate;
+  }
+  if (lowered == "pose_only" || lowered == "pose-only") {
+    return IntrinsicsReleaseMode::PoseOnly;
+  }
+  throw std::runtime_error("Unsupported intrinsics release mode: " + value);
+}
+
+IntrinsicsReleaseMode DeriveFrontendIntrinsicsReleaseMode(
+    bool optimize_intrinsics,
+    bool run_second_pass,
+    int round1_release_iteration,
+    int round2_release_iteration) {
+  if (!optimize_intrinsics) {
+    return IntrinsicsReleaseMode::PoseOnly;
+  }
+  if (round1_release_iteration <= 0 &&
+      (!run_second_pass || round2_release_iteration <= 0)) {
+    return IntrinsicsReleaseMode::Immediate;
+  }
+  return IntrinsicsReleaseMode::Delayed;
+}
+
+IntrinsicsReleaseMode DeriveBackendIntrinsicsReleaseMode(
+    bool optimize_intrinsics,
+    bool delayed_intrinsics_release) {
+  if (!optimize_intrinsics) {
+    return IntrinsicsReleaseMode::PoseOnly;
+  }
+  return delayed_intrinsics_release ? IntrinsicsReleaseMode::Delayed
+                                    : IntrinsicsReleaseMode::Immediate;
+}
+
+bool HasAblationOverrides(const RequestedExperimentConfig& config) {
+  return config.camera_init_mode != ati::CameraInitializationMode::Auto ||
+         !config.run_second_pass ||
+         config.frontend_intrinsics_release_mode != IntrinsicsReleaseMode::Delayed ||
+         config.backend_intrinsics_release_mode != IntrinsicsReleaseMode::Delayed ||
+         !config.enable_residual_sanity_gate ||
+         !config.enable_board_pose_fit_gate;
+}
+
+std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& config) {
+  std::vector<std::string> parts;
+  if (config.camera_init_mode != ati::CameraInitializationMode::Auto) {
+    parts.push_back("caminit_" + std::string(ati::ToString(config.camera_init_mode)));
+  }
+  if (!config.run_second_pass) {
+    parts.push_back("no_round2");
+  }
+  if (config.frontend_intrinsics_release_mode != IntrinsicsReleaseMode::Delayed) {
+    parts.push_back("intrinsics_" +
+                    std::string(ToString(config.frontend_intrinsics_release_mode)));
+  }
+  if (!config.enable_residual_sanity_gate) {
+    parts.push_back("no_residual_gate");
+  }
+  if (!config.enable_board_pose_fit_gate) {
+    parts.push_back("no_board_pose_gate");
+  }
+  if (parts.empty()) {
+    return std::string();
+  }
+  std::ostringstream stream;
+  for (std::size_t index = 0; index < parts.size(); ++index) {
+    if (index > 0) {
+      stream << "__";
+    }
+    stream << parts[index];
+  }
+  return stream.str();
+}
+
+RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
+  RequestedExperimentConfig config;
+  config.camera_init_mode = args.camera_init_mode_override.empty()
+                                ? ati::CameraInitializationMode::Auto
+                                : ati::ParseCameraInitializationMode(
+                                      args.camera_init_mode_override);
+  config.run_second_pass = !args.disable_second_pass;
+  config.enable_residual_sanity_gate = !args.disable_residual_sanity_gate;
+  config.enable_board_pose_fit_gate = !args.disable_board_pose_fit_gate;
+
+  switch (args.intrinsics_release_mode) {
+    case IntrinsicsReleaseMode::Delayed:
+      config.frontend_optimize_intrinsics = true;
+      config.frontend_intrinsics_release_iteration =
+          args.intrinsics_release_iteration;
+      config.frontend_second_pass_intrinsics_release_iteration =
+          args.second_pass_intrinsics_release_iteration;
+      config.frontend_intrinsics_release_mode = IntrinsicsReleaseMode::Delayed;
+      config.backend_optimize_intrinsics = true;
+      config.backend_delayed_intrinsics_release = true;
+      config.backend_intrinsics_release_iteration =
+          args.second_pass_intrinsics_release_iteration;
+      config.backend_intrinsics_release_mode = IntrinsicsReleaseMode::Delayed;
+      break;
+    case IntrinsicsReleaseMode::Immediate:
+      config.frontend_optimize_intrinsics = true;
+      config.frontend_intrinsics_release_iteration = 0;
+      config.frontend_second_pass_intrinsics_release_iteration = 0;
+      config.frontend_intrinsics_release_mode = IntrinsicsReleaseMode::Immediate;
+      config.backend_optimize_intrinsics = true;
+      config.backend_delayed_intrinsics_release = false;
+      config.backend_intrinsics_release_iteration = 0;
+      config.backend_intrinsics_release_mode = IntrinsicsReleaseMode::Immediate;
+      break;
+    case IntrinsicsReleaseMode::PoseOnly:
+      config.frontend_optimize_intrinsics = false;
+      config.frontend_intrinsics_release_iteration = 0;
+      config.frontend_second_pass_intrinsics_release_iteration = 0;
+      config.frontend_intrinsics_release_mode = IntrinsicsReleaseMode::PoseOnly;
+      config.backend_optimize_intrinsics = false;
+      config.backend_delayed_intrinsics_release = false;
+      config.backend_intrinsics_release_iteration = 0;
+      config.backend_intrinsics_release_mode = IntrinsicsReleaseMode::PoseOnly;
+      break;
+  }
+
+  config.experiment_tag = args.experiment_tag;
+  if (config.experiment_tag.empty() && HasAblationOverrides(config)) {
+    config.experiment_tag = BuildDeterministicExperimentTag(config);
+  }
+  if (!config.experiment_tag.empty()) {
+    config.effective_protocol_label =
+        config.frozen_baseline_label + "__" + config.experiment_tag;
+  }
+  return config;
+}
 
 void PrintUsage(const char* program) {
   std::cout
@@ -53,8 +242,12 @@ void PrintUsage(const char* program) {
       << " [--second-pass-intrinsics-release-iteration N]"
       << " [--holdout-stride N] [--holdout-offset N]"
       << " [--camera-init-mode manual|auto|auto_with_manual_fallback]"
+      << " [--experiment-tag TAG] [--disable-second-pass]"
+      << " [--intrinsics-release-mode delayed|immediate|pose_only]"
+      << " [--disable-residual-sanity-gate] [--disable-board-pose-fit-gate]"
       << " [--kalibr-training-split-signature SIGNATURE]"
-      << " [--kalibr-source-label LABEL] [--kalibr-runtime-seconds SEC]\n";
+      << " [--kalibr-source-label LABEL (deprecated, ignored)]"
+      << " [--kalibr-runtime-seconds SEC]\n";
 }
 
 CmdArgs ParseArgs(int argc, char** argv) {
@@ -75,6 +268,16 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.kalibr_source_label = argv[++i];
     } else if (token == "--camera-init-mode" && i + 1 < argc) {
       args.camera_init_mode_override = argv[++i];
+    } else if (token == "--experiment-tag" && i + 1 < argc) {
+      args.experiment_tag = argv[++i];
+    } else if (token == "--disable-second-pass") {
+      args.disable_second_pass = true;
+    } else if (token == "--intrinsics-release-mode" && i + 1 < argc) {
+      args.intrinsics_release_mode = ParseIntrinsicsReleaseMode(argv[++i]);
+    } else if (token == "--disable-residual-sanity-gate") {
+      args.disable_residual_sanity_gate = true;
+    } else if (token == "--disable-board-pose-fit-gate") {
+      args.disable_board_pose_fit_gate = true;
     } else if (token == "--kalibr-runtime-seconds" && i + 1 < argc) {
       args.kalibr_runtime_seconds = std::stod(argv[++i]);
     } else if (token == "--all") {
@@ -292,6 +495,153 @@ void WriteBackendComparisonSummary(
   }
 }
 
+void WriteExperimentConfigSummary(
+    const std::string& path,
+    const RequestedExperimentConfig& requested,
+    const ati::Stage5BenchmarkReport& report,
+    const ati::AslamBackendCalibrationResult* backend_result) {
+  std::ofstream output(path.c_str());
+  output << "frozen_baseline_label: " << requested.frozen_baseline_label << "\n";
+  output << "experiment_tag: " << requested.experiment_tag << "\n";
+  output << "effective_protocol_label: " << requested.effective_protocol_label << "\n";
+
+  output << "requested_camera_init_mode: "
+         << ati::ToString(requested.camera_init_mode) << "\n";
+  output << "requested_run_second_pass: " << (requested.run_second_pass ? 1 : 0) << "\n";
+  output << "requested_frontend_optimize_intrinsics: "
+         << (requested.frontend_optimize_intrinsics ? 1 : 0) << "\n";
+  output << "requested_frontend_intrinsics_release_mode: "
+         << ToString(requested.frontend_intrinsics_release_mode) << "\n";
+  output << "requested_frontend_intrinsics_release_iteration: "
+         << requested.frontend_intrinsics_release_iteration << "\n";
+  output << "requested_frontend_second_pass_intrinsics_release_iteration: "
+         << requested.frontend_second_pass_intrinsics_release_iteration << "\n";
+  output << "requested_backend_optimize_intrinsics: "
+         << (requested.backend_optimize_intrinsics ? 1 : 0) << "\n";
+  output << "requested_backend_delayed_intrinsics_release: "
+         << (requested.backend_delayed_intrinsics_release ? 1 : 0) << "\n";
+  output << "requested_backend_intrinsics_release_mode: "
+         << ToString(requested.backend_intrinsics_release_mode) << "\n";
+  output << "requested_backend_intrinsics_release_iteration: "
+         << requested.backend_intrinsics_release_iteration << "\n";
+  output << "requested_enable_residual_sanity_gate: "
+         << (requested.enable_residual_sanity_gate ? 1 : 0) << "\n";
+  output << "requested_enable_board_pose_fit_gate: "
+         << (requested.enable_board_pose_fit_gate ? 1 : 0) << "\n";
+
+  output << "stage5_success: " << (report.success ? 1 : 0) << "\n";
+  output << "stage5_failure_reason: " << report.failure_reason << "\n";
+  output << "effective_stage5_baseline_protocol_label: "
+         << report.baseline_protocol_label << "\n";
+  output << "effective_camera_init_mode: "
+         << ati::ToString(report.baseline_result.auto_camera_initialization.selected_mode) << "\n";
+  output << "effective_camera_init_source: "
+         << report.baseline_result.auto_camera_initialization.selected_source_label << "\n";
+  output << "effective_camera_init_fallback_used: "
+         << (report.baseline_result.auto_camera_initialization.fallback_used ? 1 : 0) << "\n";
+  output << "effective_run_second_pass: "
+         << (report.baseline_result.effective_options.run_second_pass ? 1 : 0) << "\n";
+  output << "effective_round2_available: "
+         << (report.baseline_result.round2_available ? 1 : 0) << "\n";
+  output << "effective_frontend_optimize_intrinsics: "
+         << (report.baseline_result.effective_options.optimize_intrinsics ? 1 : 0) << "\n";
+  output << "effective_frontend_intrinsics_release_mode: "
+         << ToString(DeriveFrontendIntrinsicsReleaseMode(
+                report.baseline_result.effective_options.optimize_intrinsics,
+                report.baseline_result.effective_options.run_second_pass,
+                report.baseline_result.effective_options.intrinsics_release_iteration,
+                report.baseline_result.effective_options
+                    .second_pass_intrinsics_release_iteration))
+         << "\n";
+  output << "effective_frontend_intrinsics_release_iteration: "
+         << report.baseline_result.round1.optimization_result.intrinsics_release_iteration << "\n";
+  output << "effective_frontend_second_pass_intrinsics_release_iteration: "
+         << (report.baseline_result.round2_available
+                 ? report.baseline_result.round2.optimization_result
+                       .intrinsics_release_iteration
+                 : report.baseline_result.effective_options
+                       .second_pass_intrinsics_release_iteration)
+         << "\n";
+  output << "effective_enable_residual_sanity_gate: "
+         << (report.baseline_result.effective_options.enable_residual_sanity_gate ? 1 : 0)
+         << "\n";
+  output << "effective_enable_board_pose_fit_gate: "
+         << (report.baseline_result.effective_options.enable_board_pose_fit_gate ? 1 : 0)
+         << "\n";
+  output << "effective_residual_sanity_factor: 2.5\n";
+  output << "effective_max_pose_fit_outer_rmse: 8\n";
+
+  output << "effective_backend_problem_optimize_intrinsics: "
+         << (report.backend_problem_input.optimization_masks.optimize_intrinsics ? 1 : 0)
+         << "\n";
+  output << "effective_backend_problem_delayed_intrinsics_release: "
+         << (report.backend_problem_input.optimization_masks.delayed_intrinsics_release ? 1 : 0)
+         << "\n";
+  output << "effective_backend_problem_intrinsics_release_mode: "
+         << ToString(DeriveBackendIntrinsicsReleaseMode(
+                report.backend_problem_input.optimization_masks.optimize_intrinsics,
+                report.backend_problem_input.optimization_masks
+                    .delayed_intrinsics_release))
+         << "\n";
+  output << "effective_backend_problem_intrinsics_release_iteration: "
+         << report.backend_problem_input.optimization_masks.intrinsics_release_iteration << "\n";
+
+  output << "round1_selected_frame_count: "
+         << report.baseline_result.round1.selection_result.accepted_frame_count << "\n";
+  output << "round1_selected_board_observation_count: "
+         << report.baseline_result.round1.selection_result
+                .accepted_board_observation_count
+         << "\n";
+  output << "round1_selected_internal_point_count: "
+         << report.baseline_result.round1.selection_result.accepted_internal_point_count
+         << "\n";
+  output << "round2_selected_frame_count: "
+         << (report.baseline_result.round2_available
+                 ? report.baseline_result.round2.selection_result.accepted_frame_count
+                 : 0)
+         << "\n";
+  output << "round2_selected_board_observation_count: "
+         << (report.baseline_result.round2_available
+                 ? report.baseline_result.round2.selection_result
+                       .accepted_board_observation_count
+                 : 0)
+         << "\n";
+  output << "round2_selected_internal_point_count: "
+         << (report.baseline_result.round2_available
+                 ? report.baseline_result.round2.selection_result
+                       .accepted_internal_point_count
+                 : 0)
+         << "\n";
+
+  if (backend_result != nullptr) {
+    output << "backend_success: " << (backend_result->success ? 1 : 0) << "\n";
+    output << "backend_failure_reason: " << backend_result->failure_reason << "\n";
+    output << "effective_backend_runner_optimize_intrinsics: "
+           << (backend_result->effective_problem_input.optimization_masks
+                       .optimize_intrinsics
+                   ? 1
+                   : 0)
+           << "\n";
+    output << "effective_backend_runner_delayed_intrinsics_release: "
+           << (backend_result->effective_problem_input.optimization_masks
+                       .delayed_intrinsics_release
+                   ? 1
+                   : 0)
+           << "\n";
+    output << "effective_backend_runner_intrinsics_release_mode: "
+           << ToString(DeriveBackendIntrinsicsReleaseMode(
+                  backend_result->effective_problem_input.optimization_masks
+                      .optimize_intrinsics,
+                  backend_result->effective_problem_input.optimization_masks
+                      .delayed_intrinsics_release))
+           << "\n";
+    output << "effective_backend_runner_intrinsics_release_iteration: "
+           << backend_result->effective_problem_input.optimization_masks
+                  .intrinsics_release_iteration
+           << "\n";
+  }
+}
+
 void WriteBackendDiagnosticArtifacts(const fs::path& output_dir,
                                      const std::string& prefix,
                                      const ati::AslamBackendCalibrationResult& result) {
@@ -370,12 +720,23 @@ void PrintBackendResultProgress(
 int main(int argc, char** argv) {
   try {
     const CmdArgs args = ParseArgs(argc, argv);
+    const RequestedExperimentConfig requested_config =
+        BuildRequestedExperimentConfig(args);
     const std::string dataset_label = InferDatasetLabel(args);
     const std::vector<std::string> image_paths = CollectImagePaths(args.image_path, args.all);
     PrintProgress("dataset=" + dataset_label);
     PrintProgress("input=" + args.image_path);
     PrintProgress("output=" + args.output_path);
     PrintProgress("collected_images=" + std::to_string(image_paths.size()));
+    const std::string kalibr_source_label =
+        BuildKalibrSourceLabel(args.kalibr_camchain_yaml);
+    if (!args.kalibr_source_label.empty() &&
+        args.kalibr_source_label != kalibr_source_label) {
+      PrintProgress("warning: ignoring deprecated --kalibr-source-label=" +
+                    args.kalibr_source_label +
+                    "; using actual camchain path label=" +
+                    kalibr_source_label);
+    }
 
     std::vector<ati::FrozenRound2BaselineFrameSource> all_frames;
     all_frames.reserve(image_paths.size());
@@ -389,27 +750,35 @@ int main(int argc, char** argv) {
 
     ati::FrozenRound2BaselineOptions baseline_options;
     baseline_options.config = ati::ApriltagInternalDetector::LoadConfig(args.config_path);
-    if (!args.camera_init_mode_override.empty()) {
-      baseline_options.config.camera_initialization_mode =
-          ati::ParseCameraInitializationMode(args.camera_init_mode_override);
-    }
+    baseline_options.config.camera_initialization_mode =
+        requested_config.camera_init_mode;
     baseline_options.reference_board_id = args.reference_board_id;
-    baseline_options.optimize_intrinsics = args.optimize_intrinsics;
-    baseline_options.intrinsics_release_iteration = args.intrinsics_release_iteration;
-    baseline_options.run_second_pass = true;
+    baseline_options.optimize_intrinsics =
+        requested_config.frontend_optimize_intrinsics;
+    baseline_options.intrinsics_release_iteration =
+        requested_config.frontend_intrinsics_release_iteration;
+    baseline_options.run_second_pass = requested_config.run_second_pass;
     baseline_options.second_pass_intrinsics_release_iteration =
-        args.second_pass_intrinsics_release_iteration;
+        requested_config.frontend_second_pass_intrinsics_release_iteration;
+    baseline_options.enable_residual_sanity_gate =
+        requested_config.enable_residual_sanity_gate;
+    baseline_options.enable_board_pose_fit_gate =
+        requested_config.enable_board_pose_fit_gate;
     baseline_options.dataset_label = dataset_label;
+    baseline_options.baseline_protocol_label =
+        requested_config.effective_protocol_label;
     baseline_options.source_pipeline_label = "run_stage5_backend";
 
     ati::BackendProblemOptions backend_options;
     backend_options.reference_board_id = args.reference_board_id;
     backend_options.optimize_frame_poses = true;
     backend_options.optimize_board_poses = true;
-    backend_options.optimize_intrinsics = args.optimize_intrinsics;
-    backend_options.delayed_intrinsics_release = true;
+    backend_options.optimize_intrinsics =
+        requested_config.backend_optimize_intrinsics;
+    backend_options.delayed_intrinsics_release =
+        requested_config.backend_delayed_intrinsics_release;
     backend_options.intrinsics_release_iteration =
-        args.second_pass_intrinsics_release_iteration;
+        requested_config.backend_intrinsics_release_iteration;
 
     ati::CalibrationBenchmarkSplitOptions split_options;
     split_options.holdout_stride = args.holdout_stride;
@@ -436,9 +805,7 @@ int main(int argc, char** argv) {
     kalibr_reference.camera_model_family = "ds";
     kalibr_reference.training_split_signature = kalibr_training_split_signature;
     kalibr_reference.runtime_seconds = args.kalibr_runtime_seconds;
-    kalibr_reference.source_label = args.kalibr_source_label.empty()
-                                        ? fs::path(args.kalibr_camchain_yaml).stem().string()
-                                        : args.kalibr_source_label;
+    kalibr_reference.source_label = kalibr_source_label;
 
     ati::Stage5BenchmarkInput benchmark_input;
     benchmark_input.all_frames = all_frames;
@@ -476,6 +843,11 @@ int main(int argc, char** argv) {
     ati::WriteAutoCameraInitializationOuterResidualsCsv(
         (output_dir / "auto_camera_initialization_outer_residuals.csv").string(),
         report.baseline_result.auto_camera_initialization);
+    WriteExperimentConfigSummary(
+        (output_dir / "experiment_config_summary.txt").string(),
+        requested_config,
+        report,
+        nullptr);
     ati::WriteStage5BenchmarkProtocolSummary(
         (output_dir / "benchmark_protocol_summary.txt").string(), report);
     ati::WriteStage5BenchmarkTrainingSummary(
@@ -509,6 +881,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     PrintProgress("Stage 5 benchmark completed.");
+    PrintProgress("protocol=" + requested_config.effective_protocol_label);
     PrintProgress("camera init mode=" +
                   std::string(ati::ToString(
                       report.baseline_result.auto_camera_initialization.selected_mode)) +
@@ -572,6 +945,11 @@ int main(int argc, char** argv) {
         backend_runner.Run(report.backend_problem_input);
     PrintBackendResultProgress(backend_result);
     WriteBackendDiagnosticArtifacts(output_dir, "backend_optimization", backend_result);
+    WriteExperimentConfigSummary(
+        (output_dir / "experiment_config_summary.txt").string(),
+        requested_config,
+        report,
+        &backend_result);
 
     if (!backend_result.success) {
       std::cout << "Backend summary: "

@@ -289,6 +289,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   result.training_split_signature = options_.training_split_signature;
   result.reference_board_id = options_.reference_board_id;
   result.frame_sources = frame_sources;
+  result.effective_options = options_;
 
   if (frame_sources.empty()) {
     result.failure_reason = "FrozenRound2BaselinePipeline requires at least one frame.";
@@ -308,6 +309,8 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   const JointReprojectionResidualEvaluator residual_evaluator(residual_options);
   JointMeasurementSelectionOptions selection_options;
   selection_options.reference_board_id = options_.reference_board_id;
+  selection_options.enable_residual_sanity_gate = options_.enable_residual_sanity_gate;
+  selection_options.enable_board_pose_fit_gate = options_.enable_board_pose_fit_gate;
   const JointMeasurementSelection selector(selection_options);
   JointOptimizationOptions optimization_options;
   optimization_options.reference_board_id = options_.reference_board_id;

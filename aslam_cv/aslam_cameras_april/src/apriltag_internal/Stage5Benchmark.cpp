@@ -780,7 +780,6 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
   FrozenRound2BaselineOptions baseline_options = input.baseline_options;
   baseline_options.dataset_label = report.dataset_label;
   baseline_options.training_split_signature = report.split.split_signature;
-  baseline_options.run_second_pass = true;
   const FrozenRound2BaselinePipeline baseline_pipeline(baseline_options);
   report.baseline_result = baseline_pipeline.Run(report.split.training_frames);
   report.baseline_protocol_label = report.baseline_result.baseline_protocol_label;

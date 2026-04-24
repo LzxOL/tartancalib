@@ -42,6 +42,10 @@ struct CmdArgs {
   double kalibr_runtime_seconds = -1.0;
 };
 
+std::string BuildKalibrSourceLabel(const std::string& kalibr_camchain_yaml) {
+  return fs::path(kalibr_camchain_yaml).lexically_normal().generic_string();
+}
+
 void PrintUsage(const char* program) {
   std::cout
       << "Usage:\n"
@@ -54,7 +58,8 @@ void PrintUsage(const char* program) {
       << " [--holdout-stride N] [--holdout-offset N]"
       << " [--camera-init-mode manual|auto|auto_with_manual_fallback]"
       << " [--kalibr-training-split-signature SIGNATURE]"
-      << " [--kalibr-source-label LABEL] [--kalibr-runtime-seconds SEC]\n";
+      << " [--kalibr-source-label LABEL (deprecated, ignored)]"
+      << " [--kalibr-runtime-seconds SEC]\n";
 }
 
 CmdArgs ParseArgs(int argc, char** argv) {
@@ -410,6 +415,16 @@ void WriteAcceptedBundleOverlays(
 int main(int argc, char** argv) {
   try {
     const CmdArgs args = ParseArgs(argc, argv);
+    const std::string kalibr_source_label =
+        BuildKalibrSourceLabel(args.kalibr_camchain_yaml);
+    if (!args.kalibr_source_label.empty() &&
+        args.kalibr_source_label != kalibr_source_label) {
+      std::cout << "[stage5_benchmark] warning: ignoring deprecated "
+                   "--kalibr-source-label="
+                << args.kalibr_source_label
+                << "; using actual camchain path label="
+                << kalibr_source_label << std::endl;
+    }
     const std::string dataset_label = InferDatasetLabel(args);
     const std::vector<std::string> image_paths = CollectImagePaths(args.image_path, args.all);
     std::vector<ati::FrozenRound2BaselineFrameSource> all_frames;
@@ -462,9 +477,7 @@ int main(int argc, char** argv) {
     kalibr_reference.camera_model_family = "ds";
     kalibr_reference.training_split_signature = kalibr_training_split_signature;
     kalibr_reference.runtime_seconds = args.kalibr_runtime_seconds;
-    kalibr_reference.source_label = args.kalibr_source_label.empty()
-                                        ? fs::path(args.kalibr_camchain_yaml).stem().string()
-                                        : args.kalibr_source_label;
+    kalibr_reference.source_label = kalibr_source_label;
 
     ati::Stage5BenchmarkInput benchmark_input;
     benchmark_input.all_frames = all_frames;

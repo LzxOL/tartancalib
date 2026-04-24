@@ -318,8 +318,20 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
   }
   {
     std::ostringstream warning;
+    warning << "selection enable_residual_sanity_gate="
+            << (options_.enable_residual_sanity_gate ? 1 : 0);
+    result.warnings.push_back(warning.str());
+  }
+  {
+    std::ostringstream warning;
     warning << "selection max_pose_fit_outer_rmse="
             << options_.max_pose_fit_outer_rmse;
+    result.warnings.push_back(warning.str());
+  }
+  {
+    std::ostringstream warning;
+    warning << "selection enable_board_pose_fit_gate="
+            << (options_.enable_board_pose_fit_gate ? 1 : 0);
     result.warnings.push_back(warning.str());
   }
 
@@ -371,9 +383,10 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
         continue;
       }
 
-      if (!std::isfinite(candidate.pose_fit_outer_rmse) ||
-          (options_.max_pose_fit_outer_rmse > 0.0 &&
-           candidate.pose_fit_outer_rmse > options_.max_pose_fit_outer_rmse)) {
+      if (options_.enable_board_pose_fit_gate &&
+          (!std::isfinite(candidate.pose_fit_outer_rmse) ||
+           (options_.max_pose_fit_outer_rmse > 0.0 &&
+            candidate.pose_fit_outer_rmse > options_.max_pose_fit_outer_rmse))) {
         decision.reason_code = JointBoardObservationSelectionReasonCode::RejectedOuterPoseFit;
         std::ostringstream detail;
         detail << "pose_fit_outer_rmse=" << candidate.pose_fit_outer_rmse
@@ -383,7 +396,8 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
         continue;
       }
 
-      if (!std::isfinite(candidate.rmse) || candidate.rmse > residual_sanity_threshold) {
+      if (options_.enable_residual_sanity_gate &&
+          (!std::isfinite(candidate.rmse) || candidate.rmse > residual_sanity_threshold)) {
         decision.reason_code = JointBoardObservationSelectionReasonCode::RejectedResidualSanity;
         std::ostringstream detail;
         detail << "rmse=" << candidate.rmse

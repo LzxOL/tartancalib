@@ -45,6 +45,8 @@ struct FrozenRound2BaselineOptions {
   int intrinsics_release_iteration = 3;
   bool run_second_pass = true;
   int second_pass_intrinsics_release_iteration = 1;
+  bool enable_residual_sanity_gate = true;
+  bool enable_board_pose_fit_gate = true;
   std::string dataset_label;
   std::string training_split_signature = "all_frames";
   std::string baseline_protocol_label = "frozen_round2_v2_kalibr_corner_filter";
@@ -67,6 +69,7 @@ struct FrozenRound2BaselineResult {
   CalibrationStateBundle final_stage5_bundle;
   bool stage5_bundle_available = false;
   AutoCameraInitializationResult auto_camera_initialization;
+  FrozenRound2BaselineOptions effective_options;
   std::vector<std::string> warnings;
   std::string failure_reason;
 };

@@ -41,6 +41,8 @@ struct JointMeasurementSelectionOptions {
   double max_board_observation_rmse = 25.0;
   double residual_sanity_factor = 2.5;
   double max_pose_fit_outer_rmse = 8.0;
+  bool enable_residual_sanity_gate = true;
+  bool enable_board_pose_fit_gate = true;
 };
 
 struct JointBoardObservationSelectionDecision {
