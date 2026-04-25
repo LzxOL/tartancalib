@@ -91,6 +91,31 @@ void EmitRegenerationWarning(const std::string& warning,
   std::cerr << "[internal_regen] " << warning << std::endl;
 }
 
+void AccumulateRuntimeBreakdown(
+    const ApriltagInternalRuntimeBreakdown& detection_runtime,
+    InternalRegenerationRuntimeBreakdown* frame_runtime) {
+  if (frame_runtime == nullptr) {
+    return;
+  }
+  frame_runtime->pose_estimation_seconds +=
+      detection_runtime.pose_estimation_seconds;
+  frame_runtime->boundary_model_seconds +=
+      detection_runtime.boundary_model_seconds;
+  frame_runtime->seed_search_seconds += detection_runtime.seed_search_seconds;
+  frame_runtime->ray_refine_seconds += detection_runtime.ray_refine_seconds;
+  frame_runtime->image_evidence_seconds +=
+      detection_runtime.image_evidence_seconds;
+  frame_runtime->subpix_seconds += detection_runtime.subpix_seconds;
+  frame_runtime->pose_estimation_call_count +=
+      detection_runtime.pose_estimation_call_count;
+  frame_runtime->boundary_model_build_count +=
+      detection_runtime.boundary_model_build_count;
+  frame_runtime->attempted_internal_corner_count +=
+      detection_runtime.attempted_internal_corner_count;
+  frame_runtime->valid_internal_corner_count +=
+      detection_runtime.valid_internal_corner_count;
+}
+
 }  // namespace
 
 int InternalRegenerationFrameResult::SuccessfulBoardCount() const {
@@ -191,6 +216,8 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
               measurement.pose_prior_used, measurement.detection.failure_reason),
           &result.warnings);
     }
+    AccumulateRuntimeBreakdown(measurement.detection.runtime_breakdown,
+                               &result.runtime_breakdown);
     result.board_measurements.push_back(measurement);
 
     if (outer_detection.success) {
@@ -264,6 +291,8 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
               measurement.pose_prior_used, measurement.detection.failure_reason),
           &result.warnings);
     }
+    AccumulateRuntimeBreakdown(measurement.detection.runtime_breakdown,
+                               &result.runtime_breakdown);
     result.board_measurements.push_back(measurement);
 
     if (outer_detection.success) {

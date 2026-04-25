@@ -9,6 +9,7 @@
 
 #include <aslam/cameras/apriltag_internal/FrozenRound2BaselinePipeline.hpp>
 #include <aslam/cameras/apriltag_internal/KalibrBenchmark.hpp>
+#include <aslam/cameras/apriltag_internal/OuterDetectionCache.hpp>
 
 namespace aslam {
 namespace cameras {
@@ -154,12 +155,21 @@ struct KalibrBenchmarkReference {
   std::string source_label;
 };
 
+struct Stage5BenchmarkRuntimeBreakdown {
+  double split_seconds = 0.0;
+  double training_dataset_build_seconds = 0.0;
+  double holdout_dataset_build_seconds = 0.0;
+  double diagnostic_compare_seconds = 0.0;
+  OuterDetectionCacheStats holdout_detection_cache;
+};
+
 struct Stage5BenchmarkInput {
   std::vector<FrozenRound2BaselineFrameSource> all_frames;
   FrozenRound2BaselineOptions baseline_options;
   BackendProblemOptions backend_options;
   KalibrBenchmarkReference kalibr_reference;
   std::string dataset_label;
+  bool enable_diagnostic_compare = true;
 };
 
 struct Stage5BenchmarkReport {
@@ -180,6 +190,7 @@ struct Stage5BenchmarkReport {
   CameraModelRefitEvaluationResult kalibr_holdout_evaluation;
   KalibrBenchmarkReference kalibr_reference;
   KalibrBenchmarkReport diagnostic_compare;
+  Stage5BenchmarkRuntimeBreakdown runtime_breakdown;
   std::vector<std::string> warnings;
   std::string failure_reason;
 };
@@ -233,7 +244,8 @@ class Stage5Benchmark {
       const std::vector<FrozenRound2BaselineFrameSource>& holdout_frames,
       const FrozenRound2BaselineOptions& baseline_options,
       const JointReprojectionSceneState& optimized_scene_state,
-      const std::string& split_signature) const;
+      const std::string& split_signature,
+      OuterDetectionCacheStats* cache_stats) const;
   std::string FindFrameImagePath(const Stage5BenchmarkReport& report,
                                  int frame_index) const;
 

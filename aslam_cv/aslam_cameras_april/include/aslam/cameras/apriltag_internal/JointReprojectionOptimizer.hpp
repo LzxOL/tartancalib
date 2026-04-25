@@ -44,6 +44,16 @@ struct JointOptimizationIterationSummary {
   double max_parameter_delta = 0.0;
 };
 
+struct JointOptimizationRuntimeBreakdown {
+  double residual_evaluation_seconds = 0.0;
+  int residual_evaluation_call_count = 0;
+  double cost_evaluation_seconds = 0.0;
+  int cost_evaluation_call_count = 0;
+  double frame_update_seconds = 0.0;
+  double board_update_seconds = 0.0;
+  double intrinsics_update_seconds = 0.0;
+};
+
 struct JointOptimizationResult {
   bool success = false;
   int reference_board_id = 1;
@@ -55,6 +65,7 @@ struct JointOptimizationResult {
   JointResidualEvaluationResult initial_residual;
   JointResidualEvaluationResult optimized_residual;
   std::vector<JointOptimizationIterationSummary> iterations;
+  JointOptimizationRuntimeBreakdown runtime_breakdown;
   std::vector<std::string> warnings;
   std::string failure_reason;
 };

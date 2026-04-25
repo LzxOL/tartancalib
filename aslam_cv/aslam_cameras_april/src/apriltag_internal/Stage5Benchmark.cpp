@@ -1,6 +1,7 @@
 #include <aslam/cameras/apriltag_internal/Stage5Benchmark.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <limits>
@@ -28,6 +29,12 @@ namespace {
 constexpr double kInvalidProjectionPenaltyPixels = 100.0;
 constexpr double kKalibrCornerSigmaThreshold = 2.0;
 constexpr double kKalibrCornerMinReprojErrorPixels = 0.2;
+
+double ElapsedSeconds(const std::chrono::steady_clock::time_point& start_time) {
+  return std::chrono::duration_cast<std::chrono::duration<double> >(
+             std::chrono::steady_clock::now() - start_time)
+      .count();
+}
 
 std::vector<int> NormalizeBoardIds(const std::vector<int>& configured_ids,
                                    int fallback_tag_id) {
@@ -453,7 +460,8 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
     const std::vector<FrozenRound2BaselineFrameSource>& holdout_frames,
     const FrozenRound2BaselineOptions& baseline_options,
     const JointReprojectionSceneState& optimized_scene_state,
-    const std::string& split_signature) const {
+    const std::string& split_signature,
+    OuterDetectionCacheStats* cache_stats) const {
   CalibrationEvaluationDataset dataset;
   dataset.dataset_label = baseline_options.dataset_label;
   dataset.split_label = "holdout";
@@ -463,6 +471,10 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
   const ApriltagInternalDetectionOptions detection_options = MakeDetectionOptions(config);
   const MultiScaleOuterTagDetector outer_detector(config.outer_detector_config);
   const MultiBoardInternalMeasurementRegenerator regenerator(config, detection_options);
+  const OuterDetectionCache detection_cache(
+      config.outer_detector_config,
+      OuterDetectionCacheOptions{baseline_options.enable_outer_detection_cache,
+                                 baseline_options.outer_detection_cache_dir});
 
   for (std::size_t frame_storage_index = 0; frame_storage_index < holdout_frames.size();
        ++frame_storage_index) {
@@ -473,7 +485,33 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
       continue;
     }
 
-    const OuterTagMultiDetectionResult outer_detection = outer_detector.DetectMultiple(image);
+    OuterTagMultiDetectionResult outer_detection;
+    std::string cache_warning;
+    if (detection_cache.Load(frame_source.image_path, &outer_detection, &cache_warning)) {
+      if (cache_stats != nullptr) {
+        ++cache_stats->cache_hits;
+      }
+    } else {
+      if (cache_stats != nullptr) {
+        ++cache_stats->cache_misses;
+      }
+      if (!cache_warning.empty()) {
+        if (cache_stats != nullptr) {
+          ++cache_stats->load_failures;
+        }
+        dataset.warnings.push_back("Outer detection cache load warning: " + cache_warning);
+      }
+      outer_detection = outer_detector.DetectMultiple(image);
+      if (detection_cache.enabled() &&
+          !detection_cache.Save(frame_source.image_path, outer_detection, &cache_warning)) {
+        if (cache_stats != nullptr) {
+          ++cache_stats->store_failures;
+        }
+        if (!cache_warning.empty()) {
+          dataset.warnings.push_back("Outer detection cache store warning: " + cache_warning);
+        }
+      }
+    }
     InternalRegenerationFrameInput regen_input;
     regen_input.frame_index = frame_source.frame_index;
     regen_input.frame_label = frame_source.frame_label;
@@ -769,7 +807,11 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
                              ? input.baseline_options.dataset_label
                              : input.dataset_label;
 
-  report.split = BuildDeterministicSplit(input.all_frames);
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    report.split = BuildDeterministicSplit(input.all_frames);
+    report.runtime_breakdown.split_seconds = ElapsedSeconds(stage_start);
+  }
   if (!report.split.success) {
     report.failure_reason = report.split.failure_reason;
     return report;
@@ -795,8 +837,13 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
 
   report.backend_problem_input = BuildBackendProblemInput(
       report.baseline_result.final_stage5_bundle, input.backend_options);
-  report.training_dataset =
-      BuildTrainingEvaluationDataset(report.baseline_result.final_stage5_bundle);
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    report.training_dataset =
+        BuildTrainingEvaluationDataset(report.baseline_result.final_stage5_bundle);
+    report.runtime_breakdown.training_dataset_build_seconds =
+        ElapsedSeconds(stage_start);
+  }
   if (!report.training_dataset.success) {
     report.failure_reason = report.training_dataset.failure_reason;
     return report;
@@ -806,9 +853,14 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
       report.baseline_result.round2_available
           ? report.baseline_result.round2.optimization_result.optimized_state
           : report.baseline_result.round1.optimization_result.optimized_state;
-  report.holdout_dataset = BuildHoldoutEvaluationDataset(
-      report.split.holdout_frames, baseline_options, optimized_scene_state,
-      report.split.split_signature);
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    report.holdout_dataset = BuildHoldoutEvaluationDataset(
+        report.split.holdout_frames, baseline_options, optimized_scene_state,
+        report.split.split_signature, &report.runtime_breakdown.holdout_detection_cache);
+    report.runtime_breakdown.holdout_dataset_build_seconds =
+        ElapsedSeconds(stage_start);
+  }
   if (!report.holdout_dataset.success) {
     report.failure_reason = report.holdout_dataset.failure_reason;
     return report;
@@ -855,16 +907,23 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
     return report;
   }
 
-  KalibrBenchmarkInput diagnostic_input;
-  diagnostic_input.dataset_label = report.dataset_label;
-  diagnostic_input.kalibr_camchain_yaml = input.kalibr_reference.camchain_yaml;
-  diagnostic_input.our_bundle = report.baseline_result.final_stage5_bundle;
-  const KalibrBenchmark diagnostic_benchmark;
-  report.diagnostic_compare = diagnostic_benchmark.Compare(diagnostic_input);
-  if (!report.diagnostic_compare.success) {
-    report.warnings.push_back(
-        "Low-level Stage 5 diagnostic projection compare failed: " +
-        report.diagnostic_compare.failure_reason);
+  if (input.enable_diagnostic_compare) {
+    const auto stage_start = std::chrono::steady_clock::now();
+    KalibrBenchmarkInput diagnostic_input;
+    diagnostic_input.dataset_label = report.dataset_label;
+    diagnostic_input.kalibr_camchain_yaml = input.kalibr_reference.camchain_yaml;
+    diagnostic_input.our_bundle = report.baseline_result.final_stage5_bundle;
+    const KalibrBenchmark diagnostic_benchmark;
+    report.diagnostic_compare = diagnostic_benchmark.Compare(diagnostic_input);
+    report.runtime_breakdown.diagnostic_compare_seconds =
+        ElapsedSeconds(stage_start);
+    if (!report.diagnostic_compare.success) {
+      report.warnings.push_back(
+          "Low-level Stage 5 diagnostic projection compare failed: " +
+          report.diagnostic_compare.failure_reason);
+    }
+  } else {
+    report.diagnostic_compare.failure_reason = "Skipped by runtime mode.";
   }
 
   report.success = true;

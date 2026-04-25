@@ -95,6 +95,20 @@ struct InternalCornerDebugInfo {
   bool image_evidence_valid = false;
 };
 
+struct ApriltagInternalRuntimeBreakdown {
+  double total_seconds = 0.0;
+  double pose_estimation_seconds = 0.0;
+  double boundary_model_seconds = 0.0;
+  double seed_search_seconds = 0.0;
+  double ray_refine_seconds = 0.0;
+  double image_evidence_seconds = 0.0;
+  double subpix_seconds = 0.0;
+  int pose_estimation_call_count = 0;
+  int boundary_model_build_count = 0;
+  int attempted_internal_corner_count = 0;
+  int valid_internal_corner_count = 0;
+};
+
 struct ApriltagInternalDetectionResult {
   bool success = false;
   bool tag_detected = false;
@@ -121,6 +135,7 @@ struct ApriltagInternalDetectionResult {
   std::array<std::vector<cv::Vec3d>, 4> border_curves_ray{};
   cv::Mat canonical_patch;
   OuterTagDetectionResult outer_detection;
+  ApriltagInternalRuntimeBreakdown runtime_breakdown;
 };
 
 struct ApriltagInternalMultiDetectionResult {

@@ -1,6 +1,7 @@
 #include <aslam/cameras/apriltag_internal/FrozenRound2BaselinePipeline.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <set>
 #include <stdexcept>
@@ -21,6 +22,12 @@ namespace cameras {
 namespace apriltag_internal {
 namespace {
 
+double ElapsedSeconds(const std::chrono::steady_clock::time_point& start_time) {
+  return std::chrono::duration_cast<std::chrono::duration<double> >(
+             std::chrono::steady_clock::now() - start_time)
+      .count();
+}
+
 void AppendUniqueWarning(const std::string& warning,
                          std::vector<std::string>* warnings) {
   if (warnings == nullptr || warning.empty()) {
@@ -38,6 +45,34 @@ void AppendWarnings(const std::vector<std::string>& new_warnings,
   }
   for (const std::string& warning : new_warnings) {
     AppendUniqueWarning(warning, warnings);
+  }
+}
+
+void AccumulateRegenerationRuntime(
+    const InternalRegenerationRuntimeBreakdown& frame_runtime,
+    double* pose_estimation_seconds,
+    double* boundary_model_seconds,
+    double* seed_search_seconds,
+    double* ray_refine_seconds,
+    double* image_evidence_seconds,
+    double* subpix_seconds) {
+  if (pose_estimation_seconds != nullptr) {
+    *pose_estimation_seconds += frame_runtime.pose_estimation_seconds;
+  }
+  if (boundary_model_seconds != nullptr) {
+    *boundary_model_seconds += frame_runtime.boundary_model_seconds;
+  }
+  if (seed_search_seconds != nullptr) {
+    *seed_search_seconds += frame_runtime.seed_search_seconds;
+  }
+  if (ray_refine_seconds != nullptr) {
+    *ray_refine_seconds += frame_runtime.ray_refine_seconds;
+  }
+  if (image_evidence_seconds != nullptr) {
+    *image_evidence_seconds += frame_runtime.image_evidence_seconds;
+  }
+  if (subpix_seconds != nullptr) {
+    *subpix_seconds += frame_runtime.subpix_seconds;
   }
 }
 
@@ -317,38 +352,72 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   optimization_options.optimize_intrinsics = options_.optimize_intrinsics;
   optimization_options.intrinsics_release_iteration = options_.intrinsics_release_iteration;
   const JointReprojectionOptimizer optimizer(optimization_options);
+  const OuterDetectionCache detection_cache(
+      config.outer_detector_config,
+      OuterDetectionCacheOptions{options_.enable_outer_detection_cache,
+                                 options_.outer_detection_cache_dir});
 
   std::vector<OuterBootstrapFrameInput> bootstrap_frames;
   std::vector<InternalRegenerationFrameInput> regeneration_inputs;
   bootstrap_frames.reserve(frame_sources.size());
   regeneration_inputs.reserve(frame_sources.size());
-  for (const FrozenRound2BaselineFrameSource& frame_source : frame_sources) {
-    const cv::Mat image = cv::imread(frame_source.image_path, cv::IMREAD_UNCHANGED);
-    if (image.empty()) {
-      result.failure_reason = "Failed to read image: " + frame_source.image_path;
-      return result;
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    for (const FrozenRound2BaselineFrameSource& frame_source : frame_sources) {
+      const cv::Mat image = cv::imread(frame_source.image_path, cv::IMREAD_UNCHANGED);
+      if (image.empty()) {
+        result.failure_reason = "Failed to read image: " + frame_source.image_path;
+        return result;
+      }
+
+      OuterTagMultiDetectionResult outer_detections;
+      std::string cache_warning;
+      if (detection_cache.Load(frame_source.image_path, &outer_detections, &cache_warning)) {
+        ++result.runtime_breakdown.training_detection_cache.cache_hits;
+      } else {
+        ++result.runtime_breakdown.training_detection_cache.cache_misses;
+        if (!cache_warning.empty()) {
+          ++result.runtime_breakdown.training_detection_cache.load_failures;
+          AppendUniqueWarning("Outer detection cache load warning: " + cache_warning,
+                              &result.warnings);
+        }
+        outer_detections = outer_detector.DetectMultiple(image);
+        if (detection_cache.enabled() &&
+            !detection_cache.Save(frame_source.image_path, outer_detections,
+                                  &cache_warning)) {
+          ++result.runtime_breakdown.training_detection_cache.store_failures;
+          if (!cache_warning.empty()) {
+            AppendUniqueWarning("Outer detection cache store warning: " + cache_warning,
+                                &result.warnings);
+          }
+        }
+      }
+
+      OuterBootstrapFrameInput bootstrap_input;
+      bootstrap_input.frame_index = frame_source.frame_index;
+      bootstrap_input.frame_label = frame_source.frame_label;
+      bootstrap_input.measurements = outer_detections.frame_measurements;
+      bootstrap_frames.push_back(bootstrap_input);
+
+      InternalRegenerationFrameInput regeneration_input;
+      regeneration_input.frame_index = frame_source.frame_index;
+      regeneration_input.frame_label = frame_source.frame_label;
+      regeneration_input.outer_detections = outer_detections;
+      regeneration_inputs.push_back(regeneration_input);
     }
-
-    const OuterTagMultiDetectionResult outer_detections =
-        outer_detector.DetectMultiple(image);
-
-    OuterBootstrapFrameInput bootstrap_input;
-    bootstrap_input.frame_index = frame_source.frame_index;
-    bootstrap_input.frame_label = frame_source.frame_label;
-    bootstrap_input.measurements = outer_detections.frame_measurements;
-    bootstrap_frames.push_back(bootstrap_input);
-
-    InternalRegenerationFrameInput regeneration_input;
-    regeneration_input.frame_index = frame_source.frame_index;
-    regeneration_input.frame_label = frame_source.frame_label;
-    regeneration_input.outer_detections = outer_detections;
-    regeneration_inputs.push_back(regeneration_input);
+    result.runtime_breakdown.training_outer_detection_seconds =
+        ElapsedSeconds(stage_start);
   }
 
   AutoCameraInitializationOptions initialization_options;
   initialization_options.mode = config.camera_initialization_mode;
   const OuterOnlyCameraInitializer camera_initializer(config, initialization_options);
-  result.auto_camera_initialization = camera_initializer.Initialize(bootstrap_frames);
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    result.auto_camera_initialization = camera_initializer.Initialize(bootstrap_frames);
+    result.runtime_breakdown.auto_camera_initialization_seconds =
+        ElapsedSeconds(stage_start);
+  }
   AppendWarnings(result.auto_camera_initialization.warnings, &result.warnings);
   if (!result.auto_camera_initialization.success) {
     result.failure_reason = result.auto_camera_initialization.failure_reason.empty()
@@ -359,7 +428,11 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   SetBootstrapInitFromIntrinsics(result.auto_camera_initialization.selected_camera,
                                  &bootstrap_options);
 
-  result.bootstrap_result = bootstrap.Solve(bootstrap_frames);
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    result.bootstrap_result = bootstrap.Solve(bootstrap_frames);
+    result.runtime_breakdown.outer_bootstrap_seconds = ElapsedSeconds(stage_start);
+  }
   if (!result.bootstrap_result.success) {
     result.failure_reason = result.bootstrap_result.failure_reason.empty()
                                 ? "Outer bootstrap failed."
@@ -370,32 +443,54 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
   result.round1.regeneration_results.reserve(frame_sources.size());
   result.round1.joint_inputs.reserve(frame_sources.size());
-  for (std::size_t frame_index = 0; frame_index < frame_sources.size(); ++frame_index) {
-    const cv::Mat image =
-        cv::imread(frame_sources[frame_index].image_path, cv::IMREAD_UNCHANGED);
-    if (image.empty()) {
-      result.failure_reason = "Failed to read image: " + frame_sources[frame_index].image_path;
-      return result;
-    }
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    for (std::size_t frame_index = 0; frame_index < frame_sources.size(); ++frame_index) {
+      const cv::Mat image =
+          cv::imread(frame_sources[frame_index].image_path, cv::IMREAD_UNCHANGED);
+      if (image.empty()) {
+        result.failure_reason = "Failed to read image: " + frame_sources[frame_index].image_path;
+        return result;
+      }
 
-    const InternalRegenerationFrameResult regeneration_result =
-        regenerator.RegenerateFrame(image, regeneration_inputs[frame_index],
-                                    result.bootstrap_result);
-    result.round1.regeneration_results.push_back(regeneration_result);
-    for (const std::string& warning : regeneration_result.warnings) {
-      AppendUniqueWarning(warning, &result.warnings);
-    }
+      const InternalRegenerationFrameResult regeneration_result =
+          regenerator.RegenerateFrame(image, regeneration_inputs[frame_index],
+                                      result.bootstrap_result);
+      AccumulateRegenerationRuntime(
+          regeneration_result.runtime_breakdown,
+          &result.runtime_breakdown.round1_regeneration_pose_estimation_seconds,
+          &result.runtime_breakdown.round1_regeneration_boundary_model_seconds,
+          &result.runtime_breakdown.round1_regeneration_seed_search_seconds,
+          &result.runtime_breakdown.round1_regeneration_ray_refine_seconds,
+          &result.runtime_breakdown.round1_regeneration_image_evidence_seconds,
+          &result.runtime_breakdown.round1_regeneration_subpix_seconds);
+      result.runtime_breakdown.round1_regeneration_attempted_internal_corners +=
+          regeneration_result.runtime_breakdown.attempted_internal_corner_count;
+      result.runtime_breakdown.round1_regeneration_valid_internal_corners +=
+          regeneration_result.runtime_breakdown.valid_internal_corner_count;
+      result.round1.regeneration_results.push_back(regeneration_result);
+      for (const std::string& warning : regeneration_result.warnings) {
+        AppendUniqueWarning(warning, &result.warnings);
+      }
 
-    JointMeasurementFrameInput joint_input;
-    joint_input.frame_index = regeneration_inputs[frame_index].frame_index;
-    joint_input.frame_label = regeneration_inputs[frame_index].frame_label;
-    joint_input.outer_detections = regeneration_inputs[frame_index].outer_detections;
-    joint_input.regenerated_internal = regeneration_result;
-    result.round1.joint_inputs.push_back(joint_input);
+      JointMeasurementFrameInput joint_input;
+      joint_input.frame_index = regeneration_inputs[frame_index].frame_index;
+      joint_input.frame_label = regeneration_inputs[frame_index].frame_label;
+      joint_input.outer_detections = regeneration_inputs[frame_index].outer_detections;
+      joint_input.regenerated_internal = regeneration_result;
+      result.round1.joint_inputs.push_back(joint_input);
+    }
+    result.runtime_breakdown.round1_regeneration_seconds =
+        ElapsedSeconds(stage_start);
   }
 
-  result.round1.measurement_result =
-      builder.Build(result.round1.joint_inputs, result.bootstrap_result);
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    result.round1.measurement_result =
+        builder.Build(result.round1.joint_inputs, result.bootstrap_result);
+    result.runtime_breakdown.round1_measurement_build_seconds =
+        ElapsedSeconds(stage_start);
+  }
   result.round1.validation_summary = ValidateJointMeasurementBuilder(
       result.round1.joint_inputs, result.bootstrap_result, builder,
       result.round1.measurement_result);
@@ -407,25 +502,54 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
   const JointReprojectionSceneState initial_scene_state =
       BuildSceneStateFromBootstrap(result.bootstrap_result);
-  result.round1.residual_result =
-      residual_evaluator.Evaluate(result.round1.measurement_result, initial_scene_state);
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    result.round1.residual_result =
+        residual_evaluator.Evaluate(result.round1.measurement_result, initial_scene_state);
+    result.runtime_breakdown.round1_residual_evaluation_seconds =
+        ElapsedSeconds(stage_start);
+  }
   if (!result.round1.residual_result.success) {
     result.failure_reason = result.round1.residual_result.failure_reason;
     AppendWarnings(result.round1.residual_result.warnings, &result.warnings);
     return result;
   }
 
-  result.round1.selection_result =
-      selector.Select(result.round1.measurement_result, result.round1.residual_result,
-                      initial_scene_state);
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    result.round1.selection_result =
+        selector.Select(result.round1.measurement_result, result.round1.residual_result,
+                        initial_scene_state);
+    result.runtime_breakdown.round1_selection_seconds =
+        ElapsedSeconds(stage_start);
+  }
   if (!result.round1.selection_result.success) {
     result.failure_reason = result.round1.selection_result.failure_reason;
     AppendWarnings(result.round1.selection_result.warnings, &result.warnings);
     return result;
   }
 
-  result.round1.optimization_result =
-      optimizer.Optimize(result.round1.selection_result, initial_scene_state);
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    result.round1.optimization_result =
+        optimizer.Optimize(result.round1.selection_result, initial_scene_state);
+    result.runtime_breakdown.round1_optimization_seconds =
+        ElapsedSeconds(stage_start);
+    result.runtime_breakdown.round1_optimization_residual_evaluation_seconds =
+        result.round1.optimization_result.runtime_breakdown.residual_evaluation_seconds;
+    result.runtime_breakdown.round1_optimization_residual_evaluation_call_count =
+        result.round1.optimization_result.runtime_breakdown.residual_evaluation_call_count;
+    result.runtime_breakdown.round1_optimization_cost_evaluation_seconds =
+        result.round1.optimization_result.runtime_breakdown.cost_evaluation_seconds;
+    result.runtime_breakdown.round1_optimization_cost_evaluation_call_count =
+        result.round1.optimization_result.runtime_breakdown.cost_evaluation_call_count;
+    result.runtime_breakdown.round1_optimization_frame_update_seconds =
+        result.round1.optimization_result.runtime_breakdown.frame_update_seconds;
+    result.runtime_breakdown.round1_optimization_board_update_seconds =
+        result.round1.optimization_result.runtime_breakdown.board_update_seconds;
+    result.runtime_breakdown.round1_optimization_intrinsics_update_seconds =
+        result.round1.optimization_result.runtime_breakdown.intrinsics_update_seconds;
+  }
   if (!result.round1.optimization_result.success) {
     result.failure_reason = result.round1.optimization_result.failure_reason;
     AppendWarnings(result.round1.optimization_result.warnings, &result.warnings);
@@ -452,34 +576,56 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
     result.round2_available = true;
     result.round2.regeneration_results.reserve(frame_sources.size());
     result.round2.joint_inputs.reserve(frame_sources.size());
-    for (std::size_t frame_index = 0; frame_index < frame_sources.size(); ++frame_index) {
-      const cv::Mat image =
-          cv::imread(frame_sources[frame_index].image_path, cv::IMREAD_UNCHANGED);
-      if (image.empty()) {
-        result.failure_reason =
-            "Failed to read image: " + frame_sources[frame_index].image_path;
-        return result;
-      }
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      for (std::size_t frame_index = 0; frame_index < frame_sources.size(); ++frame_index) {
+        const cv::Mat image =
+            cv::imread(frame_sources[frame_index].image_path, cv::IMREAD_UNCHANGED);
+        if (image.empty()) {
+          result.failure_reason =
+              "Failed to read image: " + frame_sources[frame_index].image_path;
+          return result;
+        }
 
-      const InternalRegenerationFrameResult regeneration_result =
-          regenerator.RegenerateFrame(
-              image, regeneration_inputs[frame_index],
-              result.round1.optimization_result.optimized_state);
-      result.round2.regeneration_results.push_back(regeneration_result);
-      for (const std::string& warning : regeneration_result.warnings) {
-        AppendUniqueWarning(warning, &result.warnings);
-      }
+        const InternalRegenerationFrameResult regeneration_result =
+            regenerator.RegenerateFrame(
+                image, regeneration_inputs[frame_index],
+                result.round1.optimization_result.optimized_state);
+        AccumulateRegenerationRuntime(
+            regeneration_result.runtime_breakdown,
+            &result.runtime_breakdown.round2_regeneration_pose_estimation_seconds,
+            &result.runtime_breakdown.round2_regeneration_boundary_model_seconds,
+            &result.runtime_breakdown.round2_regeneration_seed_search_seconds,
+            &result.runtime_breakdown.round2_regeneration_ray_refine_seconds,
+            &result.runtime_breakdown.round2_regeneration_image_evidence_seconds,
+            &result.runtime_breakdown.round2_regeneration_subpix_seconds);
+        result.runtime_breakdown.round2_regeneration_attempted_internal_corners +=
+            regeneration_result.runtime_breakdown.attempted_internal_corner_count;
+        result.runtime_breakdown.round2_regeneration_valid_internal_corners +=
+            regeneration_result.runtime_breakdown.valid_internal_corner_count;
+        result.round2.regeneration_results.push_back(regeneration_result);
+        for (const std::string& warning : regeneration_result.warnings) {
+          AppendUniqueWarning(warning, &result.warnings);
+        }
 
-      JointMeasurementFrameInput joint_input;
-      joint_input.frame_index = regeneration_inputs[frame_index].frame_index;
-      joint_input.frame_label = regeneration_inputs[frame_index].frame_label;
-      joint_input.outer_detections = regeneration_inputs[frame_index].outer_detections;
-      joint_input.regenerated_internal = regeneration_result;
-      result.round2.joint_inputs.push_back(joint_input);
+        JointMeasurementFrameInput joint_input;
+        joint_input.frame_index = regeneration_inputs[frame_index].frame_index;
+        joint_input.frame_label = regeneration_inputs[frame_index].frame_label;
+        joint_input.outer_detections = regeneration_inputs[frame_index].outer_detections;
+        joint_input.regenerated_internal = regeneration_result;
+        result.round2.joint_inputs.push_back(joint_input);
+      }
+      result.runtime_breakdown.round2_regeneration_seconds =
+          ElapsedSeconds(stage_start);
     }
 
-    result.round2.measurement_result =
-        builder.Build(result.round2.joint_inputs, result.bootstrap_result);
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      result.round2.measurement_result =
+          builder.Build(result.round2.joint_inputs, result.bootstrap_result);
+      result.runtime_breakdown.round2_measurement_build_seconds =
+          ElapsedSeconds(stage_start);
+    }
     result.round2.validation_summary = ValidateJointMeasurementBuilder(
         result.round2.joint_inputs, result.bootstrap_result, builder,
         result.round2.measurement_result);
@@ -489,18 +635,28 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       return result;
     }
 
-    result.round2.residual_result = residual_evaluator.Evaluate(
-        result.round2.measurement_result,
-        result.round1.optimization_result.optimized_state);
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      result.round2.residual_result = residual_evaluator.Evaluate(
+          result.round2.measurement_result,
+          result.round1.optimization_result.optimized_state);
+      result.runtime_breakdown.round2_residual_evaluation_seconds =
+          ElapsedSeconds(stage_start);
+    }
     if (!result.round2.residual_result.success) {
       result.failure_reason = result.round2.residual_result.failure_reason;
       AppendWarnings(result.round2.residual_result.warnings, &result.warnings);
       return result;
     }
 
-    result.round2.selection_result =
-        selector.Select(result.round2.measurement_result, result.round2.residual_result,
-                        result.round1.optimization_result.optimized_state);
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      result.round2.selection_result =
+          selector.Select(result.round2.measurement_result, result.round2.residual_result,
+                          result.round1.optimization_result.optimized_state);
+      result.runtime_breakdown.round2_selection_seconds =
+          ElapsedSeconds(stage_start);
+    }
     if (!result.round2.selection_result.success) {
       result.failure_reason = result.round2.selection_result.failure_reason;
       AppendWarnings(result.round2.selection_result.warnings, &result.warnings);
@@ -511,9 +667,28 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
     second_pass_options.intrinsics_release_iteration =
         options_.second_pass_intrinsics_release_iteration;
     const JointReprojectionOptimizer round2_optimizer(second_pass_options);
-    result.round2.optimization_result = round2_optimizer.Optimize(
-        result.round2.selection_result,
-        result.round1.optimization_result.optimized_state);
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      result.round2.optimization_result = round2_optimizer.Optimize(
+          result.round2.selection_result,
+          result.round1.optimization_result.optimized_state);
+      result.runtime_breakdown.round2_optimization_seconds =
+          ElapsedSeconds(stage_start);
+      result.runtime_breakdown.round2_optimization_residual_evaluation_seconds =
+          result.round2.optimization_result.runtime_breakdown.residual_evaluation_seconds;
+      result.runtime_breakdown.round2_optimization_residual_evaluation_call_count =
+          result.round2.optimization_result.runtime_breakdown.residual_evaluation_call_count;
+      result.runtime_breakdown.round2_optimization_cost_evaluation_seconds =
+          result.round2.optimization_result.runtime_breakdown.cost_evaluation_seconds;
+      result.runtime_breakdown.round2_optimization_cost_evaluation_call_count =
+          result.round2.optimization_result.runtime_breakdown.cost_evaluation_call_count;
+      result.runtime_breakdown.round2_optimization_frame_update_seconds =
+          result.round2.optimization_result.runtime_breakdown.frame_update_seconds;
+      result.runtime_breakdown.round2_optimization_board_update_seconds =
+          result.round2.optimization_result.runtime_breakdown.board_update_seconds;
+      result.runtime_breakdown.round2_optimization_intrinsics_update_seconds =
+          result.round2.optimization_result.runtime_breakdown.intrinsics_update_seconds;
+    }
     if (!result.round2.optimization_result.success) {
       result.failure_reason = result.round2.optimization_result.failure_reason;
       AppendWarnings(result.round2.optimization_result.warnings, &result.warnings);

@@ -1,7 +1,10 @@
 #include <aslam/cameras/apriltag_internal/JointReprojectionOptimizer.hpp>
 
+#include <aslam/cameras/apriltag_internal/DoubleSphereCameraModel.hpp>
+
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -15,6 +18,10 @@ namespace cameras {
 namespace apriltag_internal {
 namespace {
 
+double ElapsedSeconds(const std::chrono::steady_clock::time_point& start) {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
 double ComputeWeightedVectorRmse(const Eigen::VectorXd& residuals) {
   if (residuals.size() <= 0) {
     return 0.0;
@@ -24,6 +31,13 @@ double ComputeWeightedVectorRmse(const Eigen::VectorXd& residuals) {
 
 double ParameterStep(double value, double fallback_step) {
   return std::max(std::abs(value) * 1e-4, fallback_step);
+}
+
+double HuberWeight(double residual_norm, double delta) {
+  if (!(delta > 0.0) || residual_norm <= 0.0 || residual_norm <= delta) {
+    return 1.0;
+  }
+  return delta / residual_norm;
 }
 
 bool ClampIntrinsicsInPlace(OuterBootstrapCameraIntrinsics* intrinsics) {
@@ -180,10 +194,139 @@ bool RefineBoardPoseFromSelection(
     const JointReprojectionSceneState& current_state,
     int board_id,
     Eigen::Isometry3d* pose,
-    double* rmse) {
+    double* rmse,
+    JointOptimizationRuntimeBreakdown* runtime_breakdown) {
   if (pose == nullptr || rmse == nullptr) {
     throw std::runtime_error("RefineBoardPoseFromSelection requires valid output pointers.");
   }
+
+  struct LocalBoardResidualEvaluation {
+    bool success = false;
+    Eigen::VectorXd weighted_residuals;
+    double cost = 0.0;
+  };
+  const auto evaluate_board_residuals =
+      [&measurement_result, &cost_core, board_id](
+          const JointReprojectionSceneState& scene_state) -> LocalBoardResidualEvaluation {
+    LocalBoardResidualEvaluation result;
+    if (!scene_state.IsValid()) {
+      return result;
+    }
+
+    const DoubleSphereCameraModel camera =
+        DoubleSphereCameraModel::FromConfig(MakeIntermediateCameraConfig(scene_state.camera));
+    if (!camera.IsValid()) {
+      return result;
+    }
+
+    struct ObservationBudget {
+      int outer_count = 0;
+      int internal_count = 0;
+    };
+    std::map<std::pair<int, int>, ObservationBudget> budgets;
+    int selected_point_count = 0;
+    for (const JointPointObservation& point : measurement_result.solver_observations) {
+      if (!point.used_in_solver || point.board_id != board_id) {
+        continue;
+      }
+      ObservationBudget& budget =
+          budgets[std::make_pair(point.frame_index, point.board_id)];
+      if (point.point_type == JointPointType::Outer) {
+        ++budget.outer_count;
+      } else {
+        ++budget.internal_count;
+      }
+      ++selected_point_count;
+    }
+    if (selected_point_count <= 0) {
+      return result;
+    }
+
+    result.weighted_residuals.resize(2 * selected_point_count);
+    int row = 0;
+    for (const JointPointObservation& point : measurement_result.solver_observations) {
+      if (!point.used_in_solver || point.board_id != board_id) {
+        continue;
+      }
+
+      const JointSceneFrameState* frame_state =
+          FindJointSceneFrameState(scene_state, point.frame_index);
+      if (frame_state == nullptr || !frame_state->initialized) {
+        continue;
+      }
+
+      Eigen::Matrix4d T_reference_board = Eigen::Matrix4d::Identity();
+      if (point.board_id != scene_state.reference_board_id) {
+        const JointSceneBoardState* board_state =
+            FindJointSceneBoardState(scene_state, point.board_id);
+        if (board_state == nullptr || !board_state->initialized) {
+          continue;
+        }
+        T_reference_board = board_state->T_reference_board;
+      }
+
+      const Eigen::Vector4d point_board(point.target_xyz_board.x(),
+                                        point.target_xyz_board.y(),
+                                        point.target_xyz_board.z(),
+                                        1.0);
+      const Eigen::Vector4d point_camera_h =
+          frame_state->T_camera_reference * (T_reference_board * point_board);
+      const Eigen::Vector3d point_camera = point_camera_h.head<3>();
+
+      Eigen::Vector2d predicted_image_xy = Eigen::Vector2d::Zero();
+      Eigen::Vector2d residual_xy = Eigen::Vector2d::Zero();
+      if (!camera.vsEuclideanToKeypoint(point_camera, &predicted_image_xy)) {
+        if (cost_core.options().enable_invalid_projection_penalty) {
+          residual_xy = Eigen::Vector2d(
+              cost_core.options().invalid_projection_penalty_pixels,
+              cost_core.options().invalid_projection_penalty_pixels);
+        }
+      } else {
+        residual_xy = predicted_image_xy - point.image_xy;
+      }
+
+      const double residual_norm = residual_xy.norm();
+      const ObservationBudget& budget =
+          budgets[std::make_pair(point.frame_index, point.board_id)];
+      const bool has_outer = budget.outer_count > 0;
+      const bool has_internal = budget.internal_count > 0;
+      double type_budget = 1.0;
+      int type_count = 1;
+      if (has_outer && has_internal) {
+        type_budget = 0.5;
+        type_count = point.point_type == JointPointType::Outer
+                         ? budget.outer_count
+                         : budget.internal_count;
+      } else if (point.point_type == JointPointType::Outer) {
+        type_count = budget.outer_count;
+      } else {
+        type_count = budget.internal_count;
+      }
+
+      const double balance_weight =
+          type_budget / std::max(1, type_count);
+      const double huber_delta =
+          point.point_type == JointPointType::Outer
+              ? cost_core.options().outer_huber_delta_pixels
+              : cost_core.options().internal_huber_delta_pixels;
+      const double huber_weight = HuberWeight(residual_norm, huber_delta);
+      const double final_weight = balance_weight * huber_weight;
+      const double scale = std::sqrt(std::max(0.0, final_weight));
+      result.weighted_residuals[row++] = scale * residual_xy.x();
+      result.weighted_residuals[row++] = scale * residual_xy.y();
+      result.cost += final_weight * residual_xy.squaredNorm();
+    }
+
+    if (row <= 0) {
+      result.weighted_residuals.resize(0);
+      return result;
+    }
+    if (row != result.weighted_residuals.rows()) {
+      result.weighted_residuals.conservativeResize(row);
+    }
+    result.success = true;
+    return result;
+  };
 
   JointReprojectionSceneState working_state = current_state;
   JointSceneBoardState* working_board = FindJointSceneBoardState(&working_state, board_id);
@@ -191,14 +334,19 @@ bool RefineBoardPoseFromSelection(
     return false;
   }
   working_board->T_reference_board = ToMatrix4d(*pose);
-  JointCostEvaluation evaluation = cost_core.Evaluate(measurement_result, working_state);
-  Eigen::VectorXd residuals = BuildWeightedResidualVectorForBoard(evaluation, board_id);
+  const auto evaluation_start = std::chrono::steady_clock::now();
+  LocalBoardResidualEvaluation evaluation = evaluate_board_residuals(working_state);
+  if (runtime_breakdown != nullptr) {
+    runtime_breakdown->cost_evaluation_seconds += ElapsedSeconds(evaluation_start);
+    ++runtime_breakdown->cost_evaluation_call_count;
+  }
+  Eigen::VectorXd residuals = evaluation.weighted_residuals;
   if (!evaluation.success || residuals.size() <= 0) {
     return false;
   }
 
   double lambda = 1e-3;
-  double best_cost = residuals.squaredNorm();
+  double best_cost = evaluation.cost;
   for (int iteration = 0; iteration < 12; ++iteration) {
     Eigen::MatrixXd jacobian(residuals.rows(), 6);
     for (int column = 0; column < 6; ++column) {
@@ -215,14 +363,23 @@ bool RefineBoardPoseFromSelection(
       FindJointSceneBoardState(&minus_state, board_id)->T_reference_board =
           ToMatrix4d(ApplyPoseDelta(*pose, minus_delta));
 
-      const JointCostEvaluation plus_eval = cost_core.Evaluate(measurement_result, plus_state);
-      const JointCostEvaluation minus_eval = cost_core.Evaluate(measurement_result, minus_state);
+      const auto plus_start = std::chrono::steady_clock::now();
+      const LocalBoardResidualEvaluation plus_eval = evaluate_board_residuals(plus_state);
+      if (runtime_breakdown != nullptr) {
+        runtime_breakdown->cost_evaluation_seconds += ElapsedSeconds(plus_start);
+        ++runtime_breakdown->cost_evaluation_call_count;
+      }
+      const auto minus_start = std::chrono::steady_clock::now();
+      const LocalBoardResidualEvaluation minus_eval = evaluate_board_residuals(minus_state);
+      if (runtime_breakdown != nullptr) {
+        runtime_breakdown->cost_evaluation_seconds += ElapsedSeconds(minus_start);
+        ++runtime_breakdown->cost_evaluation_call_count;
+      }
       if (!plus_eval.success || !minus_eval.success) {
         return false;
       }
       jacobian.col(column) =
-          (BuildWeightedResidualVectorForBoard(plus_eval, board_id) -
-           BuildWeightedResidualVectorForBoard(minus_eval, board_id)) /
+          (plus_eval.weighted_residuals - minus_eval.weighted_residuals) /
           (2.0 * step);
     }
 
@@ -238,16 +395,20 @@ bool RefineBoardPoseFromSelection(
     JointReprojectionSceneState candidate_state = working_state;
     FindJointSceneBoardState(&candidate_state, board_id)->T_reference_board =
         ToMatrix4d(candidate_pose);
-    const JointCostEvaluation candidate_eval =
-        cost_core.Evaluate(measurement_result, candidate_state);
+    const auto candidate_start = std::chrono::steady_clock::now();
+    const LocalBoardResidualEvaluation candidate_eval =
+        evaluate_board_residuals(candidate_state);
+    if (runtime_breakdown != nullptr) {
+      runtime_breakdown->cost_evaluation_seconds += ElapsedSeconds(candidate_start);
+      ++runtime_breakdown->cost_evaluation_call_count;
+    }
     if (!candidate_eval.success) {
       lambda *= 4.0;
       continue;
     }
 
-    const Eigen::VectorXd candidate_residuals =
-        BuildWeightedResidualVectorForBoard(candidate_eval, board_id);
-    const double candidate_cost = candidate_residuals.squaredNorm();
+    const Eigen::VectorXd& candidate_residuals = candidate_eval.weighted_residuals;
+    const double candidate_cost = candidate_eval.cost;
     if (candidate_cost < best_cost) {
       *pose = candidate_pose;
       working_state = candidate_state;
@@ -272,7 +433,8 @@ bool EstimateBoardPoseFromSelectedFrames(
     const JointReprojectionSceneState& scene_state,
     int board_id,
     Eigen::Isometry3d* pose,
-    double* rmse) {
+    double* rmse,
+    JointOptimizationRuntimeBreakdown* runtime_breakdown) {
   if (pose == nullptr || rmse == nullptr) {
     throw std::runtime_error("EstimateBoardPoseFromSelectedFrames requires valid output pointers.");
   }
@@ -326,7 +488,7 @@ bool EstimateBoardPoseFromSelectedFrames(
 
   *pose = AverageTransforms(candidates);
   if (!RefineBoardPoseFromSelection(measurement_result, cost_core, scene_state,
-                                    board_id, pose, rmse)) {
+                                    board_id, pose, rmse, runtime_breakdown)) {
     return false;
   }
   return true;
@@ -337,14 +499,148 @@ bool OptimizeIntrinsicsIfEnabled(const JointMeasurementBuildResult& measurement_
                                  const JointOptimizationOptions& options,
                                  const JointReprojectionSceneState& anchor_state,
                                  JointReprojectionSceneState* scene_state,
-                                 double* step_norm) {
+                                 double* step_norm,
+                                 JointOptimizationRuntimeBreakdown* runtime_breakdown) {
   if (scene_state == nullptr || step_norm == nullptr) {
     throw std::runtime_error("OptimizeIntrinsicsIfEnabled requires valid output pointers.");
   }
   *step_norm = 0.0;
 
-  JointCostEvaluation evaluation = cost_core.Evaluate(measurement_result, *scene_state);
-  Eigen::VectorXd residuals = BuildWeightedResidualVector(evaluation);
+  struct LocalGlobalResidualEvaluation {
+    bool success = false;
+    Eigen::VectorXd weighted_residuals;
+    double total_cost = 0.0;
+  };
+  const auto evaluate_global_residuals =
+      [&measurement_result, &cost_core](
+          const JointReprojectionSceneState& current_state) -> LocalGlobalResidualEvaluation {
+    LocalGlobalResidualEvaluation result;
+    if (!measurement_result.success || !current_state.IsValid()) {
+      return result;
+    }
+
+    const DoubleSphereCameraModel camera =
+        DoubleSphereCameraModel::FromConfig(MakeIntermediateCameraConfig(current_state.camera));
+    if (!camera.IsValid()) {
+      return result;
+    }
+
+    struct ObservationBudget {
+      int outer_count = 0;
+      int internal_count = 0;
+    };
+    std::map<std::pair<int, int>, ObservationBudget> budgets;
+    int selected_point_count = 0;
+    for (const JointPointObservation& point : measurement_result.solver_observations) {
+      if (!point.used_in_solver) {
+        continue;
+      }
+      ObservationBudget& budget =
+          budgets[std::make_pair(point.frame_index, point.board_id)];
+      if (point.point_type == JointPointType::Outer) {
+        ++budget.outer_count;
+      } else {
+        ++budget.internal_count;
+      }
+      ++selected_point_count;
+    }
+    if (selected_point_count <= 0) {
+      return result;
+    }
+
+    result.weighted_residuals.resize(2 * selected_point_count);
+    int row = 0;
+    for (const JointPointObservation& point : measurement_result.solver_observations) {
+      if (!point.used_in_solver) {
+        continue;
+      }
+
+      const JointSceneFrameState* frame_state =
+          FindJointSceneFrameState(current_state, point.frame_index);
+      if (frame_state == nullptr || !frame_state->initialized) {
+        continue;
+      }
+
+      Eigen::Matrix4d T_reference_board = Eigen::Matrix4d::Identity();
+      if (point.board_id != current_state.reference_board_id) {
+        const JointSceneBoardState* board_state =
+            FindJointSceneBoardState(current_state, point.board_id);
+        if (board_state == nullptr || !board_state->initialized) {
+          continue;
+        }
+        T_reference_board = board_state->T_reference_board;
+      }
+
+      const Eigen::Vector4d point_board(point.target_xyz_board.x(),
+                                        point.target_xyz_board.y(),
+                                        point.target_xyz_board.z(),
+                                        1.0);
+      const Eigen::Vector4d point_camera_h =
+          frame_state->T_camera_reference * (T_reference_board * point_board);
+      const Eigen::Vector3d point_camera = point_camera_h.head<3>();
+
+      Eigen::Vector2d predicted_image_xy = Eigen::Vector2d::Zero();
+      Eigen::Vector2d residual_xy = Eigen::Vector2d::Zero();
+      if (!camera.vsEuclideanToKeypoint(point_camera, &predicted_image_xy)) {
+        if (cost_core.options().enable_invalid_projection_penalty) {
+          residual_xy = Eigen::Vector2d(
+              cost_core.options().invalid_projection_penalty_pixels,
+              cost_core.options().invalid_projection_penalty_pixels);
+        }
+      } else {
+        residual_xy = predicted_image_xy - point.image_xy;
+      }
+
+      const double residual_norm = residual_xy.norm();
+      const ObservationBudget& budget =
+          budgets[std::make_pair(point.frame_index, point.board_id)];
+      const bool has_outer = budget.outer_count > 0;
+      const bool has_internal = budget.internal_count > 0;
+      double type_budget = 1.0;
+      int type_count = 1;
+      if (has_outer && has_internal) {
+        type_budget = 0.5;
+        type_count = point.point_type == JointPointType::Outer
+                         ? budget.outer_count
+                         : budget.internal_count;
+      } else if (point.point_type == JointPointType::Outer) {
+        type_count = budget.outer_count;
+      } else {
+        type_count = budget.internal_count;
+      }
+
+      const double balance_weight =
+          type_budget / std::max(1, type_count);
+      const double huber_delta =
+          point.point_type == JointPointType::Outer
+              ? cost_core.options().outer_huber_delta_pixels
+              : cost_core.options().internal_huber_delta_pixels;
+      const double huber_weight = HuberWeight(residual_norm, huber_delta);
+      const double final_weight = balance_weight * huber_weight;
+      const double scale = std::sqrt(std::max(0.0, final_weight));
+      result.weighted_residuals[row++] = scale * residual_xy.x();
+      result.weighted_residuals[row++] = scale * residual_xy.y();
+      result.total_cost += final_weight * residual_xy.squaredNorm();
+    }
+
+    if (row <= 0) {
+      result.weighted_residuals.resize(0);
+      return result;
+    }
+    if (row != result.weighted_residuals.rows()) {
+      result.weighted_residuals.conservativeResize(row);
+    }
+    result.success = true;
+    return result;
+  };
+
+  const auto evaluation_start = std::chrono::steady_clock::now();
+  const LocalGlobalResidualEvaluation evaluation = evaluate_global_residuals(*scene_state);
+  if (runtime_breakdown != nullptr) {
+    runtime_breakdown->cost_evaluation_seconds += ElapsedSeconds(evaluation_start);
+    ++runtime_breakdown->cost_evaluation_call_count;
+  }
+  Eigen::VectorXd residuals = evaluation.weighted_residuals;
   if (!evaluation.success || residuals.size() <= 0) {
     return false;
   }
@@ -377,14 +673,24 @@ bool OptimizeIntrinsicsIfEnabled(const JointMeasurementBuildResult& measurement_
       ClampIntrinsicsInPlace(&plus_state.camera);
       ClampIntrinsicsInPlace(&minus_state.camera);
 
-      const JointCostEvaluation plus_eval = cost_core.Evaluate(measurement_result, plus_state);
-      const JointCostEvaluation minus_eval = cost_core.Evaluate(measurement_result, minus_state);
+      const auto plus_start = std::chrono::steady_clock::now();
+      const LocalGlobalResidualEvaluation plus_eval = evaluate_global_residuals(plus_state);
+      if (runtime_breakdown != nullptr) {
+        runtime_breakdown->cost_evaluation_seconds += ElapsedSeconds(plus_start);
+        ++runtime_breakdown->cost_evaluation_call_count;
+      }
+      const auto minus_start = std::chrono::steady_clock::now();
+      const LocalGlobalResidualEvaluation minus_eval = evaluate_global_residuals(minus_state);
+      if (runtime_breakdown != nullptr) {
+        runtime_breakdown->cost_evaluation_seconds += ElapsedSeconds(minus_start);
+        ++runtime_breakdown->cost_evaluation_call_count;
+      }
       if (!plus_eval.success || !minus_eval.success) {
         return false;
       }
       jacobian.col(column) =
-          (BuildWeightedResidualVector(plus_eval) -
-           BuildWeightedResidualVector(minus_eval)) /
+          (plus_eval.weighted_residuals -
+           minus_eval.weighted_residuals) /
           (2.0 * step);
     }
 
@@ -407,8 +713,13 @@ bool OptimizeIntrinsicsIfEnabled(const JointMeasurementBuildResult& measurement_
     JointReprojectionSceneState candidate_state = *scene_state;
     candidate_state.camera = FromVector(parameters + delta, scene_state->camera.resolution);
     ClampIntrinsicsInPlace(&candidate_state.camera);
-    const JointCostEvaluation candidate_eval =
-        cost_core.Evaluate(measurement_result, candidate_state);
+    const auto candidate_start = std::chrono::steady_clock::now();
+    const LocalGlobalResidualEvaluation candidate_eval =
+        evaluate_global_residuals(candidate_state);
+    if (runtime_breakdown != nullptr) {
+      runtime_breakdown->cost_evaluation_seconds += ElapsedSeconds(candidate_start);
+      ++runtime_breakdown->cost_evaluation_call_count;
+    }
     if (!candidate_eval.success) {
       lambda *= 4.0;
       continue;
@@ -425,7 +736,7 @@ bool OptimizeIntrinsicsIfEnabled(const JointMeasurementBuildResult& measurement_
       *step_norm = delta.norm();
       *scene_state = candidate_state;
       parameters = candidate_vector;
-      residuals = BuildWeightedResidualVector(candidate_eval);
+      residuals = candidate_eval.weighted_residuals;
       best_cost = candidate_cost;
       lambda *= 0.5;
       if (delta.norm() < 1e-4) {
@@ -505,8 +816,13 @@ JointOptimizationResult JointReprojectionOptimizer::Optimize(
     return result;
   }
 
-  result.initial_residual =
-      residual_evaluator_.Evaluate(selection_result.selected_measurement_result, result.initial_state);
+  {
+    const auto start = std::chrono::steady_clock::now();
+    result.initial_residual =
+        residual_evaluator_.Evaluate(selection_result.selected_measurement_result, result.initial_state);
+    result.runtime_breakdown.residual_evaluation_seconds += ElapsedSeconds(start);
+    ++result.runtime_breakdown.residual_evaluation_call_count;
+  }
   if (!result.initial_residual.success) {
     result.failure_reason = "failed to evaluate initial residuals";
     return result;
@@ -516,8 +832,14 @@ JointOptimizationResult JointReprojectionOptimizer::Optimize(
                          &result.initial_state);
   result.optimized_state = result.initial_state;
 
-  JointCostEvaluation current_eval =
-      cost_core_.Evaluate(selection_result.selected_measurement_result, result.optimized_state);
+  JointCostEvaluation current_eval;
+  {
+    const auto start = std::chrono::steady_clock::now();
+    current_eval =
+        cost_core_.Evaluate(selection_result.selected_measurement_result, result.optimized_state);
+    result.runtime_breakdown.cost_evaluation_seconds += ElapsedSeconds(start);
+    ++result.runtime_breakdown.cost_evaluation_call_count;
+  }
   if (!current_eval.success) {
     result.failure_reason = current_eval.failure_reason;
     result.warnings = current_eval.warnings;
@@ -538,6 +860,7 @@ JointOptimizationResult JointReprojectionOptimizer::Optimize(
     summary.overall_rmse_before = current_eval.overall_rmse;
 
     if (options_.optimize_frame_poses) {
+      const auto frame_update_start = std::chrono::steady_clock::now();
       for (int frame_index : frame_indices) {
         JointSceneFrameState* frame_state =
             FindJointSceneFrameState(&result.optimized_state, frame_index);
@@ -560,8 +883,11 @@ JointOptimizationResult JointReprojectionOptimizer::Optimize(
         JointReprojectionSceneState candidate_state = result.optimized_state;
         FindJointSceneFrameState(&candidate_state, frame_index)->T_camera_reference =
             ToMatrix4d(candidate_pose);
+        const auto candidate_start = std::chrono::steady_clock::now();
         const JointCostEvaluation candidate_eval =
             cost_core_.Evaluate(selection_result.selected_measurement_result, candidate_state);
+        result.runtime_breakdown.cost_evaluation_seconds += ElapsedSeconds(candidate_start);
+        ++result.runtime_breakdown.cost_evaluation_call_count;
         if (candidate_eval.success && candidate_eval.total_cost < current_eval.total_cost) {
           summary.max_parameter_delta = std::max(
               summary.max_parameter_delta,
@@ -573,9 +899,11 @@ JointOptimizationResult JointReprojectionOptimizer::Optimize(
           ++summary.rejected_frame_updates;
         }
       }
+      result.runtime_breakdown.frame_update_seconds += ElapsedSeconds(frame_update_start);
     }
 
     if (options_.optimize_board_poses) {
+      const auto board_update_start = std::chrono::steady_clock::now();
       for (int board_id : board_ids) {
         JointSceneBoardState* board_state =
             FindJointSceneBoardState(&result.optimized_state, board_id);
@@ -591,7 +919,8 @@ JointOptimizationResult JointReprojectionOptimizer::Optimize(
                                                  result.optimized_state,
                                                  board_id,
                                                  &candidate_pose,
-                                                 &pose_rmse)) {
+                                                 &pose_rmse,
+                                                 &result.runtime_breakdown)) {
           ++summary.rejected_board_updates;
           continue;
         }
@@ -599,8 +928,11 @@ JointOptimizationResult JointReprojectionOptimizer::Optimize(
         JointReprojectionSceneState candidate_state = result.optimized_state;
         FindJointSceneBoardState(&candidate_state, board_id)->T_reference_board =
             ToMatrix4d(candidate_pose);
+        const auto candidate_start = std::chrono::steady_clock::now();
         const JointCostEvaluation candidate_eval =
             cost_core_.Evaluate(selection_result.selected_measurement_result, candidate_state);
+        result.runtime_breakdown.cost_evaluation_seconds += ElapsedSeconds(candidate_start);
+        ++result.runtime_breakdown.cost_evaluation_call_count;
         if (candidate_eval.success && candidate_eval.total_cost < current_eval.total_cost) {
           summary.max_parameter_delta = std::max(
               summary.max_parameter_delta,
@@ -612,10 +944,12 @@ JointOptimizationResult JointReprojectionOptimizer::Optimize(
           ++summary.rejected_board_updates;
         }
       }
+      result.runtime_breakdown.board_update_seconds += ElapsedSeconds(board_update_start);
     }
 
     if (options_.optimize_intrinsics &&
         iteration >= options_.intrinsics_release_iteration) {
+      const auto intrinsics_start = std::chrono::steady_clock::now();
       intrinsics_release_window_reached = true;
       summary.attempted_intrinsics_update = true;
       any_intrinsics_attempted = true;
@@ -626,9 +960,13 @@ JointOptimizationResult JointReprojectionOptimizer::Optimize(
                                       options_,
                                       result.initial_state,
                                       &candidate_state,
-                                      &intrinsics_step_norm)) {
+                                      &intrinsics_step_norm,
+                                      &result.runtime_breakdown)) {
+        const auto candidate_start = std::chrono::steady_clock::now();
         const JointCostEvaluation candidate_eval =
             cost_core_.Evaluate(selection_result.selected_measurement_result, candidate_state);
+        result.runtime_breakdown.cost_evaluation_seconds += ElapsedSeconds(candidate_start);
+        ++result.runtime_breakdown.cost_evaluation_call_count;
         if (candidate_eval.success && candidate_eval.total_cost < current_eval.total_cost) {
           result.optimized_state = candidate_state;
           current_eval = candidate_eval;
@@ -642,6 +980,7 @@ JointOptimizationResult JointReprojectionOptimizer::Optimize(
       } else {
         summary.rejected_intrinsics_update = true;
       }
+      result.runtime_breakdown.intrinsics_update_seconds += ElapsedSeconds(intrinsics_start);
     }
 
     summary.cost_after = current_eval.total_cost;
@@ -656,8 +995,13 @@ JointOptimizationResult JointReprojectionOptimizer::Optimize(
     }
   }
 
-  result.optimized_residual =
-      residual_evaluator_.Evaluate(selection_result.selected_measurement_result, result.optimized_state);
+  {
+    const auto start = std::chrono::steady_clock::now();
+    result.optimized_residual =
+        residual_evaluator_.Evaluate(selection_result.selected_measurement_result, result.optimized_state);
+    result.runtime_breakdown.residual_evaluation_seconds += ElapsedSeconds(start);
+    ++result.runtime_breakdown.residual_evaluation_call_count;
+  }
   if (!result.optimized_residual.success) {
     result.failure_reason = "failed to evaluate optimized residuals";
     return result;

@@ -1,0 +1,3376 @@
+%YAML:1.0
+---
+format_version: outer_detection_cache_v2
+absolute_image_path: "/Users/linzhaoxian/lzx-ws/project/calibr/tartancalib/image/dataset_4-22/right_record_20260421_141444_first20/right_vimbax_camera_right_image_raw_000014_1580637892600.png"
+image_file_size: 6437923
+image_mtime: 1776752091
+detector_config_hash: a5f7c893e3a5f9e3
+image_size:
+   - 4512
+   - 4512
+requested_board_ids:
+   - 1
+   - 2
+   - 3
+   - 4
+   - 5
+detections:
+   -
+      success: 1
+      board_id: 1
+      detected_tag_id: 1
+      original_longest_side: 4512
+      chosen_scale_longest_side: 3008
+      chosen_scale_factor: 0.66666666666666663
+      scale_configuration_mode: fixed_schedule
+      used_corner_fusion: 1
+      hamming: 0
+      good: 1
+      attempted_local_patch_rescue: 0
+      used_local_patch_rescue: 0
+      local_patch_rescue_summary: ""
+      quality: 0.98831260949800459
+      failure_reason: 0
+      failure_reason_text: None
+      coarse_corners_scaled_image:
+         -
+            - 1274.4840087890625
+            - 1680.2662353515625
+         -
+            - 1661.8726806640625
+            - 1701.8841552734375
+         -
+            - 1680.369140625
+            - 1315.3963623046875
+         -
+            - 1297.4046630859375
+            - 1295.9715576171875
+      coarse_corners_original_image:
+         -
+            - 1911.7259521484375
+            - 2520.3994140625
+         -
+            - 2492.80908203125
+            - 2552.826171875
+         -
+            - 2520.5537109375
+            - 1973.094482421875
+         -
+            - 1946.10693359375
+            - 1943.9573974609375
+      refined_corners_original_image:
+         -
+            - 1916.0263671875
+            - 2522.657958984375
+         -
+            - 2491.5498046875
+            - 2553.2109375
+         -
+            - 2519.084716796875
+            - 1977.1480712890625
+         -
+            - 1949.9901123046875
+            - 1949.987548828125
+      refined_valid:
+         - 1
+         - 1
+         - 1
+         - 1
+      successful_scale_longest_sides:
+         - 3008
+         - 2256
+         - 1805
+         - 1289
+         - 1003
+         - 752
+         - 564
+         - 376
+      corner_verification_debug:
+         -
+            corner_index: 0
+            coarse_corner:
+               - 1911.7259521484375
+               - 2520.3994140625
+            verified_corner:
+               - 1911.7259521484375
+               - 2520.3994140625
+            subpix_corner:
+               - 1916.0263671875
+               - 2522.657958984375
+            verification_roi:
+               - 1882
+               - 2491
+               - 60
+               - 60
+            prev_edge_direction:
+               - 0.059537626802921295
+               - -0.99822604656219482
+            next_edge_direction:
+               - 0.99844658374786377
+               - 0.055717304348945618
+            prev_marker_support_points:
+               -
+                  - 1915.5689697265625
+                  - 2494.596435546875
+               -
+                  - 1919.20556640625
+                  - 2484.0146484375
+               -
+                  - 1917.850830078125
+                  - 2473.135498046875
+               -
+                  - 1915.4979248046875
+                  - 2462.196533203125
+               -
+                  - 1915.1414794921875
+                  - 2451.376708984375
+               -
+                  - 1915.783203125
+                  - 2440.616455078125
+               -
+                  - 1916.425048828125
+                  - 2429.856201171875
+               -
+                  - 1916.0684814453125
+                  - 2419.036376953125
+               -
+                  - 1917.7086181640625
+                  - 2408.335693359375
+               -
+                  - 1920.3468017578125
+                  - 2397.694580078125
+               -
+                  - 1917.993896484375
+                  - 2386.755615234375
+               -
+                  - 1917.637451171875
+                  - 2375.93603515625
+               -
+                  - 1919.2774658203125
+                  - 2365.235107421875
+               -
+                  - 1923.912109375
+                  - 2354.713134765625
+               -
+                  - 1922.557373046875
+                  - 2343.833740234375
+               -
+                  - 1920.20458984375
+                  - 2332.89501953125
+            next_marker_support_points:
+               -
+                  - 1937.4097900390625
+                  - 2526.539794921875
+               -
+                  - 1948.256591796875
+                  - 2527.145263671875
+               -
+                  - 1959.103515625
+                  - 2527.75048828125
+               -
+                  - 1969.950439453125
+                  - 2528.355712890625
+               -
+                  - 1980.7972412109375
+                  - 2528.961181640625
+               -
+                  - 1991.6441650390625
+                  - 2529.56640625
+               -
+                  - 2002.435302734375
+                  - 2531.170166015625
+               -
+                  - 2013.2821044921875
+                  - 2531.775634765625
+               -
+                  - 2024.1290283203125
+                  - 2532.380859375
+               -
+                  - 2034.9759521484375
+                  - 2532.986083984375
+               -
+                  - 2045.82275390625
+                  - 2533.591552734375
+               -
+                  - 2056.669677734375
+                  - 2534.19677734375
+               -
+                  - 2067.4609375
+                  - 2535.800537109375
+               -
+                  - 2078.307861328125
+                  - 2536.40576171875
+               -
+                  - 2089.15478515625
+                  - 2537.01123046875
+               -
+                  - 2100.00146484375
+                  - 2537.616455078125
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 577.4664306640625
+            verification_roi_radius: 29
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 4.857426643371582
+            coarse_to_refined_displacement: 4.857426643371582
+            corner_marker_width: 144.36660766601562
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 1
+            line_refinement_quality: 0.15462843524606118
+            line_jump: 5.5166926383972168
+            line_jump_limit: 0.
+            line_inside: 1
+            line_seed_gap: 5.5166926383972168
+            line_seed_accepted: 0
+            spherical_corner:
+               - 1911.7259521484375
+               - 2520.3994140625
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 22
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+         -
+            corner_index: 1
+            coarse_corner:
+               - 2492.80908203125
+               - 2552.826171875
+            verified_corner:
+               - 2492.80908203125
+               - 2552.826171875
+            subpix_corner:
+               - 2491.5498046875
+               - 2553.2109375
+            verification_roi:
+               - 2463
+               - 2523
+               - 60
+               - 60
+            prev_edge_direction:
+               - -0.99844658374786377
+               - -0.055717304348945618
+            next_edge_direction:
+               - 0.047802995890378952
+               - -0.99885678291320801
+            prev_marker_support_points:
+               -
+                  - 2466.58154296875
+                  - 2554.066650390625
+               -
+                  - 2455.734619140625
+                  - 2553.46142578125
+               -
+                  - 2444.83203125
+                  - 2553.854736328125
+               -
+                  - 2433.985107421875
+                  - 2553.24951171875
+               -
+                  - 2423.082275390625
+                  - 2553.642333984375
+               -
+                  - 2412.29150390625
+                  - 2552.038818359375
+               -
+                  - 2401.444580078125
+                  - 2551.43359375
+               -
+                  - 2390.541748046875
+                  - 2551.826416015625
+               -
+                  - 2379.69482421875
+                  - 2551.22119140625
+               -
+                  - 2368.847900390625
+                  - 2550.615966796875
+               -
+                  - 2358.0009765625
+                  - 2550.010498046875
+               -
+                  - 2347.154052734375
+                  - 2549.4052734375
+               -
+                  - 2336.251708984375
+                  - 2549.798583984375
+               -
+                  - 2325.40478515625
+                  - 2549.193115234375
+               -
+                  - 2314.557861328125
+                  - 2548.587890625
+               -
+                  - 2303.7109375
+                  - 2547.982666015625
+            next_marker_support_points:
+               -
+                  - 2492.759033203125
+                  - 2526.676025390625
+               -
+                  - 2494.27587890625
+                  - 2515.902099609375
+               -
+                  - 2494.7939453125
+                  - 2505.08056640625
+               -
+                  - 2495.311767578125
+                  - 2494.2587890625
+               -
+                  - 2495.82958984375
+                  - 2483.437255859375
+               -
+                  - 2496.347412109375
+                  - 2472.615478515625
+               -
+                  - 2497.8642578125
+                  - 2461.841796875
+               -
+                  - 2498.382080078125
+                  - 2451.02001953125
+               -
+                  - 2498.89990234375
+                  - 2440.198486328125
+               -
+                  - 2499.41796875
+                  - 2429.376708984375
+               -
+                  - 2499.935791015625
+                  - 2418.55517578125
+               -
+                  - 2500.45361328125
+                  - 2407.7333984375
+               -
+                  - 2501.970458984375
+                  - 2396.959716796875
+               -
+                  - 2502.48828125
+                  - 2386.137939453125
+               -
+                  - 2503.006103515625
+                  - 2375.31640625
+               -
+                  - 2503.524169921875
+                  - 2364.49462890625
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 580.39520263671875
+            verification_roi_radius: 29
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 1.3167475461959839
+            coarse_to_refined_displacement: 1.3167475461959839
+            corner_marker_width: 145.09880065917969
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 1
+            line_refinement_quality: 0.86175801827736631
+            line_jump: 2.8609175682067871
+            line_jump_limit: 0.
+            line_inside: 1
+            line_seed_gap: 2.8609175682067871
+            line_seed_accepted: 1
+            spherical_corner:
+               - 2492.80908203125
+               - 2552.826171875
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 22
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+         -
+            corner_index: 2
+            coarse_corner:
+               - 2520.5537109375
+               - 1973.094482421875
+            verified_corner:
+               - 2520.5537109375
+               - 1973.094482421875
+            subpix_corner:
+               - 2519.084716796875
+               - 1977.1480712890625
+            verification_roi:
+               - 2491
+               - 1944
+               - 60
+               - 60
+            prev_edge_direction:
+               - -0.047802995890378952
+               - 0.99885678291320801
+            next_edge_direction:
+               - -0.99871611595153809
+               - -0.050656870007514954
+            prev_marker_support_points:
+               -
+                  - 2519.016845703125
+                  - 1998.9339599609375
+               -
+                  - 2518.4990234375
+                  - 2009.755615234375
+               -
+                  - 2517.98095703125
+                  - 2020.5772705078125
+               -
+                  - 2517.463134765625
+                  - 2031.39892578125
+               -
+                  - 2517.944091796875
+                  - 2042.268310546875
+               -
+                  - 2517.426025390625
+                  - 2053.090087890625
+               -
+                  - 2516.908203125
+                  - 2063.91162109375
+               -
+                  - 2516.390380859375
+                  - 2074.7333984375
+               -
+                  - 2515.872314453125
+                  - 2085.554931640625
+               -
+                  - 2515.3544921875
+                  - 2096.376708984375
+               -
+                  - 2514.836669921875
+                  - 2107.1982421875
+               -
+                  - 2515.317626953125
+                  - 2118.06787109375
+               -
+                  - 2514.799560546875
+                  - 2128.889404296875
+               -
+                  - 2514.28173828125
+                  - 2139.711181640625
+               -
+                  - 2513.763916015625
+                  - 2150.53271484375
+               -
+                  - 2513.245849609375
+                  - 2161.3544921875
+            next_marker_support_points:
+               -
+                  - 2494.48583984375
+                  - 1976.0777587890625
+               -
+                  - 2483.762939453125
+                  - 1975.5338134765625
+               -
+                  - 2473.09033203125
+                  - 1973.9913330078125
+               -
+                  - 2462.367431640625
+                  - 1973.4473876953125
+               -
+                  - 2451.644287109375
+                  - 1972.903564453125
+               -
+                  - 2440.92138671875
+                  - 1972.359619140625
+               -
+                  - 2430.1982421875
+                  - 1971.8157958984375
+               -
+                  - 2419.526123046875
+                  - 1970.2730712890625
+               -
+                  - 2408.802978515625
+                  - 1969.7291259765625
+               -
+                  - 2398.080078125
+                  - 1969.185302734375
+               -
+                  - 2387.357177734375
+                  - 1968.641357421875
+               -
+                  - 2376.634033203125
+                  - 1968.0975341796875
+               -
+                  - 2365.9111328125
+                  - 1967.5535888671875
+               -
+                  - 2355.238525390625
+                  - 1966.0111083984375
+               -
+                  - 2344.465087890625
+                  - 1966.4658203125
+               -
+                  - 2333.79248046875
+                  - 1964.9232177734375
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 575.18524169921875
+            verification_roi_radius: 29
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 4.3115572929382324
+            coarse_to_refined_displacement: 4.3115572929382324
+            corner_marker_width: 143.79631042480469
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 1
+            line_refinement_quality: 0.87889810965857174
+            line_jump: 4.7603535652160645
+            line_jump_limit: 0.
+            line_inside: 1
+            line_seed_gap: 4.7603535652160645
+            line_seed_accepted: 1
+            spherical_corner:
+               - 2520.5537109375
+               - 1973.094482421875
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 22
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+         -
+            corner_index: 3
+            coarse_corner:
+               - 1946.10693359375
+               - 1943.9573974609375
+            verified_corner:
+               - 1946.10693359375
+               - 1943.9573974609375
+            subpix_corner:
+               - 1949.9901123046875
+               - 1949.987548828125
+            verification_roi:
+               - 1917
+               - 1914
+               - 60
+               - 60
+            prev_edge_direction:
+               - 0.99871611595153809
+               - 0.050656870007514954
+            next_edge_direction:
+               - -0.059537626802921295
+               - 0.99822604656219482
+            prev_marker_support_points:
+               -
+                  - 1971.6885986328125
+                  - 1950.561767578125
+               -
+                  - 1982.4622802734375
+                  - 1950.10693359375
+               -
+                  - 1993.28662109375
+                  - 1948.6533203125
+               -
+                  - 2003.958984375
+                  - 1950.196044921875
+               -
+                  - 2014.6820068359375
+                  - 1950.7398681640625
+               -
+                  - 2025.4049072265625
+                  - 1951.2838134765625
+               -
+                  - 2036.1279296875
+                  - 1951.82763671875
+               -
+                  - 2046.8509521484375
+                  - 1952.37158203125
+               -
+                  - 2057.573974609375
+                  - 1952.91552734375
+               -
+                  - 2068.34765625
+                  - 1952.4605712890625
+               -
+                  - 2079.070556640625
+                  - 1953.0045166015625
+               -
+                  - 2089.793701171875
+                  - 1953.54833984375
+               -
+                  - 2100.5166015625
+                  - 1954.09228515625
+               -
+                  - 2111.23974609375
+                  - 1954.6361083984375
+               -
+                  - 2121.962646484375
+                  - 1955.1800537109375
+               -
+                  - 2132.736328125
+                  - 1954.725341796875
+            next_marker_support_points:
+               -
+                  - 1947.860107421875
+                  - 1969.9913330078125
+               -
+                  - 1945.2218017578125
+                  - 1980.6324462890625
+               -
+                  - 1941.5853271484375
+                  - 1991.214111328125
+               -
+                  - 1943.9383544921875
+                  - 2002.1529541015625
+               -
+                  - 1945.29296875
+                  - 2013.0323486328125
+               -
+                  - 1938.661865234375
+                  - 2023.435302734375
+               -
+                  - 1938.02001953125
+                  - 2034.195556640625
+               -
+                  - 1941.3712158203125
+                  - 2045.1939697265625
+               -
+                  - 1941.7275390625
+                  - 2056.013916015625
+               -
+                  - 1946.0770263671875
+                  - 2067.071533203125
+               -
+                  - 1938.447509765625
+                  - 2077.4150390625
+               -
+                  - 1933.8128662109375
+                  - 2087.937255859375
+               -
+                  - 1938.1622314453125
+                  - 2098.9951171875
+               -
+                  - 1936.522216796875
+                  - 2109.69580078125
+               -
+                  - 1932.8858642578125
+                  - 2120.277587890625
+               -
+                  - 1940.2298583984375
+                  - 2131.513916015625
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 575.18524169921875
+            verification_roi_radius: 29
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 7.1722941398620605
+            coarse_to_refined_displacement: 7.1722941398620605
+            corner_marker_width: 143.79631042480469
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 0
+            line_refinement_quality: 0.
+            line_jump: 2750.69140625
+            line_jump_limit: 0.
+            line_inside: 0
+            line_seed_gap: 2750.69140625
+            line_seed_accepted: 0
+            spherical_corner:
+               - 1946.10693359375
+               - 1943.9573974609375
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 22
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+   -
+      success: 0
+      board_id: 2
+      detected_tag_id: -1
+      original_longest_side: 4512
+      chosen_scale_longest_side: 0
+      chosen_scale_factor: 1.
+      scale_configuration_mode: fixed_schedule
+      used_corner_fusion: 0
+      hamming: -1
+      good: 0
+      attempted_local_patch_rescue: 0
+      used_local_patch_rescue: 0
+      local_patch_rescue_summary: ""
+      quality: 0.
+      failure_reason: 2
+      failure_reason_text: DetectionsExistButNoMatchingTagId
+      coarse_corners_scaled_image:
+         -
+            - 0.
+            - 0.
+         -
+            - 0.
+            - 0.
+         -
+            - 0.
+            - 0.
+         -
+            - 0.
+            - 0.
+      coarse_corners_original_image:
+         -
+            - 0.
+            - 0.
+         -
+            - 0.
+            - 0.
+         -
+            - 0.
+            - 0.
+         -
+            - 0.
+            - 0.
+      refined_corners_original_image:
+         -
+            - 0.
+            - 0.
+         -
+            - 0.
+            - 0.
+         -
+            - 0.
+            - 0.
+         -
+            - 0.
+            - 0.
+      refined_valid:
+         - 0
+         - 0
+         - 0
+         - 0
+      successful_scale_longest_sides:
+         []
+      corner_verification_debug:
+         -
+            corner_index: -1
+            coarse_corner:
+               - 0.
+               - 0.
+            verified_corner:
+               - 0.
+               - 0.
+            subpix_corner:
+               - 0.
+               - 0.
+            verification_roi:
+               - 0
+               - 0
+               - 0
+               - 0
+            prev_edge_direction:
+               - 0.
+               - 0.
+            next_edge_direction:
+               - 0.
+               - 0.
+            prev_marker_support_points:
+               []
+            next_marker_support_points:
+               []
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 0.
+            verification_roi_radius: 0
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 0.
+            local_layout_score: 0.
+            verification_quality: 0.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 0.
+            coarse_to_refined_displacement: 0.
+            corner_marker_width: 0.
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 0
+            line_refinement_quality: 0.
+            line_jump: 0.
+            line_jump_limit: 0.
+            line_inside: 0
+            line_seed_gap: 0.
+            line_seed_accepted: 0
+            spherical_corner:
+               - 0.
+               - 0.
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 0
+            refine_displacement_limit: 0.
+            refined_valid: 0
+            verification_passed: 0
+            subpix_applied: 0
+            failure_reason: ""
+         -
+            corner_index: -1
+            coarse_corner:
+               - 0.
+               - 0.
+            verified_corner:
+               - 0.
+               - 0.
+            subpix_corner:
+               - 0.
+               - 0.
+            verification_roi:
+               - 0
+               - 0
+               - 0
+               - 0
+            prev_edge_direction:
+               - 0.
+               - 0.
+            next_edge_direction:
+               - 0.
+               - 0.
+            prev_marker_support_points:
+               []
+            next_marker_support_points:
+               []
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 0.
+            verification_roi_radius: 0
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 0.
+            local_layout_score: 0.
+            verification_quality: 0.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 0.
+            coarse_to_refined_displacement: 0.
+            corner_marker_width: 0.
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 0
+            line_refinement_quality: 0.
+            line_jump: 0.
+            line_jump_limit: 0.
+            line_inside: 0
+            line_seed_gap: 0.
+            line_seed_accepted: 0
+            spherical_corner:
+               - 0.
+               - 0.
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 0
+            refine_displacement_limit: 0.
+            refined_valid: 0
+            verification_passed: 0
+            subpix_applied: 0
+            failure_reason: ""
+         -
+            corner_index: -1
+            coarse_corner:
+               - 0.
+               - 0.
+            verified_corner:
+               - 0.
+               - 0.
+            subpix_corner:
+               - 0.
+               - 0.
+            verification_roi:
+               - 0
+               - 0
+               - 0
+               - 0
+            prev_edge_direction:
+               - 0.
+               - 0.
+            next_edge_direction:
+               - 0.
+               - 0.
+            prev_marker_support_points:
+               []
+            next_marker_support_points:
+               []
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 0.
+            verification_roi_radius: 0
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 0.
+            local_layout_score: 0.
+            verification_quality: 0.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 0.
+            coarse_to_refined_displacement: 0.
+            corner_marker_width: 0.
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 0
+            line_refinement_quality: 0.
+            line_jump: 0.
+            line_jump_limit: 0.
+            line_inside: 0
+            line_seed_gap: 0.
+            line_seed_accepted: 0
+            spherical_corner:
+               - 0.
+               - 0.
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 0
+            refine_displacement_limit: 0.
+            refined_valid: 0
+            verification_passed: 0
+            subpix_applied: 0
+            failure_reason: ""
+         -
+            corner_index: -1
+            coarse_corner:
+               - 0.
+               - 0.
+            verified_corner:
+               - 0.
+               - 0.
+            subpix_corner:
+               - 0.
+               - 0.
+            verification_roi:
+               - 0
+               - 0
+               - 0
+               - 0
+            prev_edge_direction:
+               - 0.
+               - 0.
+            next_edge_direction:
+               - 0.
+               - 0.
+            prev_marker_support_points:
+               []
+            next_marker_support_points:
+               []
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 0.
+            verification_roi_radius: 0
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 0.
+            local_layout_score: 0.
+            verification_quality: 0.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 0.
+            coarse_to_refined_displacement: 0.
+            corner_marker_width: 0.
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 0
+            line_refinement_quality: 0.
+            line_jump: 0.
+            line_jump_limit: 0.
+            line_inside: 0
+            line_seed_gap: 0.
+            line_seed_accepted: 0
+            spherical_corner:
+               - 0.
+               - 0.
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 0
+            refine_displacement_limit: 0.
+            refined_valid: 0
+            verification_passed: 0
+            subpix_applied: 0
+            failure_reason: ""
+   -
+      success: 1
+      board_id: 3
+      detected_tag_id: 3
+      original_longest_side: 4512
+      chosen_scale_longest_side: 1805
+      chosen_scale_factor: 0.40004432624113473
+      scale_configuration_mode: fixed_schedule
+      used_corner_fusion: 1
+      hamming: 0
+      good: 1
+      attempted_local_patch_rescue: 0
+      used_local_patch_rescue: 0
+      local_patch_rescue_summary: ""
+      quality: 0.87595586901235545
+      failure_reason: 0
+      failure_reason_text: None
+      coarse_corners_scaled_image:
+         -
+            - 967.3243408203125
+            - 1229.3271484375
+         -
+            - 771.75714111328125
+            - 1220.0013427734375
+         -
+            - 765.77227783203125
+            - 1391.3997802734375
+         -
+            - 960.03692626953125
+            - 1400.862060546875
+      coarse_corners_original_image:
+         -
+            - 2418.04296875
+            - 3072.977294921875
+         -
+            - 1929.1790771484375
+            - 3049.66552734375
+         -
+            - 1914.218505859375
+            - 3478.114013671875
+         -
+            - 2399.826416015625
+            - 3501.76708984375
+      refined_corners_original_image:
+         -
+            - 2419.365478515625
+            - 3074.659912109375
+         -
+            - 1932.395263671875
+            - 3052.088134765625
+         -
+            - 1919.1546630859375
+            - 3476.706787109375
+         -
+            - 2400.329833984375
+            - 3501.439453125
+      refined_valid:
+         - 1
+         - 1
+         - 1
+         - 1
+      successful_scale_longest_sides:
+         - 1805
+         - 1289
+         - 1003
+         - 752
+         - 564
+         - 376
+      corner_verification_debug:
+         -
+            corner_index: 0
+            coarse_corner:
+               - 2418.04296875
+               - 3072.977294921875
+            verified_corner:
+               - 2418.04296875
+               - 3072.977294921875
+            subpix_corner:
+               - 2419.365478515625
+               - 3074.659912109375
+            verification_roi:
+               - 2397
+               - 3051
+               - 44
+               - 44
+            prev_edge_direction:
+               - -0.042445357888936996
+               - 0.99909877777099609
+            next_edge_direction:
+               - -0.99886494874954224
+               - -0.04763147234916687
+            prev_marker_support_points:
+               -
+                  - 2418.52197265625
+                  - 3092.328125
+               -
+                  - 2418.18212890625
+                  - 3100.33203125
+               -
+                  - 2417.842041015625
+                  - 3108.336181640625
+               -
+                  - 2418.5009765625
+                  - 3116.3828125
+               -
+                  - 2418.160888671875
+                  - 3124.38671875
+               -
+                  - 2417.82080078125
+                  - 3132.390869140625
+               -
+                  - 2417.480712890625
+                  - 3140.39501953125
+               -
+                  - 2417.140869140625
+                  - 3148.39892578125
+               -
+                  - 2416.80078125
+                  - 3156.403076171875
+               -
+                  - 2416.460693359375
+                  - 3164.4072265625
+               -
+                  - 2416.12060546875
+                  - 3172.4111328125
+               -
+                  - 2415.780517578125
+                  - 3180.415283203125
+               -
+                  - 2415.440673828125
+                  - 3188.41943359375
+               -
+                  - 2415.1005859375
+                  - 3196.423583984375
+               -
+                  - 2414.760498046875
+                  - 3204.427490234375
+               -
+                  - 2414.42041015625
+                  - 3212.431640625
+            next_marker_support_points:
+               -
+                  - 2398.528076171875
+                  - 3076.751953125
+               -
+                  - 2389.90673828125
+                  - 3077.342041015625
+               -
+                  - 2381.3330078125
+                  - 3076.933349609375
+               -
+                  - 2372.806640625
+                  - 3075.525390625
+               -
+                  - 2364.185302734375
+                  - 3076.11572265625
+               -
+                  - 2355.611572265625
+                  - 3075.706787109375
+               -
+                  - 2347.037841796875
+                  - 3075.2978515625
+               -
+                  - 2338.4638671875
+                  - 3074.88916015625
+               -
+                  - 2329.89013671875
+                  - 3074.480224609375
+               -
+                  - 2321.31640625
+                  - 3074.0712890625
+               -
+                  - 2312.74267578125
+                  - 3073.66259765625
+               -
+                  - 2304.692626953125
+                  - 3062.26611328125
+               -
+                  - 2295.594970703125
+                  - 3072.8447265625
+               -
+                  - 2287.021240234375
+                  - 3072.43603515625
+               -
+                  - 2278.447509765625
+                  - 3072.027099609375
+               -
+                  - 2270.159423828125
+                  - 3065.625244140625
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 429.17657470703125
+            verification_roi_radius: 21
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 2.1401479244232178
+            coarse_to_refined_displacement: 2.1401479244232178
+            corner_marker_width: 107.29414367675781
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 1
+            line_refinement_quality: 0.75
+            line_jump: 4.4183516502380371
+            line_jump_limit: 0.
+            line_inside: 1
+            line_seed_gap: 4.4183516502380371
+            line_seed_accepted: 1
+            spherical_corner:
+               - 2418.04296875
+               - 3072.977294921875
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 16
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+         -
+            corner_index: 1
+            coarse_corner:
+               - 1929.1790771484375
+               - 3049.66552734375
+            verified_corner:
+               - 1929.1790771484375
+               - 3049.66552734375
+            subpix_corner:
+               - 1932.395263671875
+               - 3052.088134765625
+            verification_roi:
+               - 1908
+               - 3028
+               - 44
+               - 44
+            prev_edge_direction:
+               - 0.99886494874954224
+               - 0.04763147234916687
+            next_edge_direction:
+               - -0.034896750003099442
+               - 0.99939095973968506
+            prev_marker_support_points:
+               -
+                  - 1948.2728271484375
+                  - 3054.2802734375
+               -
+                  - 1956.8372802734375
+                  - 3054.688720703125
+               -
+                  - 1965.3541259765625
+                  - 3056.095703125
+               -
+                  - 1973.8709716796875
+                  - 3057.503173828125
+               -
+                  - 1982.4354248046875
+                  - 3057.91162109375
+               -
+                  - 1990.9998779296875
+                  - 3058.320068359375
+               -
+                  - 1999.5643310546875
+                  - 3058.728515625
+               -
+                  - 2008.12890625
+                  - 3059.136962890625
+               -
+                  - 2017.0743408203125
+                  - 3051.55419921875
+               -
+                  - 2025.2578125
+                  - 3059.95361328125
+               -
+                  - 2033.822265625
+                  - 3060.362060546875
+               -
+                  - 2042.38671875
+                  - 3060.7705078125
+               -
+                  - 2050.951171875
+                  - 3061.178955078125
+               -
+                  - 2059.801513671875
+                  - 3055.593994140625
+               -
+                  - 2068.080078125
+                  - 3061.99560546875
+               -
+                  - 2076.64453125
+                  - 3062.404052734375
+            next_marker_support_points:
+               -
+                  - 1932.20361328125
+                  - 3069.074951171875
+               -
+                  - 1928.9261474609375
+                  - 3076.9677734375
+               -
+                  - 1931.64501953125
+                  - 3085.0703125
+               -
+                  - 1929.3670654296875
+                  - 3092.998046875
+               -
+                  - 1929.0877685546875
+                  - 3100.995849609375
+               -
+                  - 1928.8084716796875
+                  - 3108.99365234375
+               -
+                  - 1927.5299072265625
+                  - 3116.956298828125
+               -
+                  - 1927.2506103515625
+                  - 3124.9541015625
+               -
+                  - 1926.9713134765625
+                  - 3132.95166015625
+               -
+                  - 1926.6920166015625
+                  - 3140.949462890625
+               -
+                  - 1927.4122314453125
+                  - 3148.982177734375
+               -
+                  - 1928.13232421875
+                  - 3157.0146484375
+               -
+                  - 1926.8536376953125
+                  - 3164.9775390625
+               -
+                  - 1924.5755615234375
+                  - 3172.9052734375
+               -
+                  - 1927.2945556640625
+                  - 3181.0078125
+               -
+                  - 1925.0164794921875
+                  - 3188.935791015625
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 428.7095947265625
+            verification_roi_radius: 21
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 4.026522159576416
+            coarse_to_refined_displacement: 4.026522159576416
+            corner_marker_width: 107.17739868164062
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 1
+            line_refinement_quality: 0.6603726268283453
+            line_jump: 4.1208548545837402
+            line_jump_limit: 0.
+            line_inside: 1
+            line_seed_gap: 4.1208548545837402
+            line_seed_accepted: 1
+            spherical_corner:
+               - 1929.1790771484375
+               - 3049.66552734375
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 16
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+         -
+            corner_index: 2
+            coarse_corner:
+               - 1914.218505859375
+               - 3478.114013671875
+            verified_corner:
+               - 1914.218505859375
+               - 3478.114013671875
+            subpix_corner:
+               - 1919.1546630859375
+               - 3476.706787109375
+            verification_roi:
+               - 1893
+               - 3457
+               - 44
+               - 44
+            prev_edge_direction:
+               - 0.034896750003099442
+               - -0.99939095973968506
+            next_edge_direction:
+               - 0.99881583452224731
+               - 0.048650499433279037
+            prev_marker_support_points:
+               -
+                  - 1919.5888671875
+                  - 3458.997802734375
+               -
+                  - 1918.8687744140625
+                  - 3450.96533203125
+               -
+                  - 1918.148681640625
+                  - 3442.9326171875
+               -
+                  - 1919.42724609375
+                  - 3434.969970703125
+               -
+                  - 1921.705322265625
+                  - 3427.0419921875
+               -
+                  - 1917.987060546875
+                  - 3418.904541015625
+               -
+                  - 1919.265625
+                  - 3410.94189453125
+               -
+                  - 1919.544921875
+                  - 3402.944091796875
+               -
+                  - 1919.82421875
+                  - 3394.946533203125
+               -
+                  - 1919.1041259765625
+                  - 3386.913818359375
+               -
+                  - 1919.38330078125
+                  - 3378.916015625
+               -
+                  - 1919.66259765625
+                  - 3370.91845703125
+               -
+                  - 1919.94189453125
+                  - 3362.920654296875
+               -
+                  - 1919.2218017578125
+                  - 3354.88818359375
+               -
+                  - 1920.5003662109375
+                  - 3346.92529296875
+               -
+                  - 1921.779052734375
+                  - 3338.96240234375
+            next_marker_support_points:
+               -
+                  - 1933.3756103515625
+                  - 3481.349853515625
+               -
+                  - 1941.939697265625
+                  - 3481.76708984375
+               -
+                  - 1950.4552001953125
+                  - 3483.18310546875
+               -
+                  - 1958.8731689453125
+                  - 3486.596435546875
+               -
+                  - 1967.583251953125
+                  - 3484.017333984375
+               -
+                  - 1976.0499267578125
+                  - 3486.431884765625
+               -
+                  - 1984.66259765625
+                  - 3485.850341796875
+               -
+                  - 1993.1781005859375
+                  - 3487.266357421875
+               -
+                  - 2001.693359375
+                  - 3488.68212890625
+               -
+                  - 2010.2574462890625
+                  - 3489.099365234375
+               -
+                  - 2018.8214111328125
+                  - 3489.516357421875
+               -
+                  - 2027.4342041015625
+                  - 3488.934814453125
+               -
+                  - 2035.9495849609375
+                  - 3490.350830078125
+               -
+                  - 2044.5135498046875
+                  - 3490.767822265625
+               -
+                  - 2053.07763671875
+                  - 3491.18505859375
+               -
+                  - 2061.641845703125
+                  - 3491.60205078125
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 428.7095947265625
+            verification_roi_radius: 21
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 5.1328291893005371
+            coarse_to_refined_displacement: 5.1328291893005371
+            corner_marker_width: 107.17739868164062
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 1
+            line_refinement_quality: 0.49291702111543001
+            line_jump: 5.0950784683227539
+            line_jump_limit: 0.
+            line_inside: 1
+            line_seed_gap: 5.0950784683227539
+            line_seed_accepted: 1
+            spherical_corner:
+               - 1914.218505859375
+               - 3478.114013671875
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 16
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+         -
+            corner_index: 3
+            coarse_corner:
+               - 2399.826416015625
+               - 3501.76708984375
+            verified_corner:
+               - 2399.826416015625
+               - 3501.76708984375
+            subpix_corner:
+               - 2400.329833984375
+               - 3501.439453125
+            verification_roi:
+               - 2378
+               - 3480
+               - 44
+               - 44
+            prev_edge_direction:
+               - -0.99881583452224731
+               - -0.048650499433279037
+            next_edge_direction:
+               - 0.042445357888936996
+               - -0.99909877777099609
+            prev_marker_support_points:
+               -
+                  - 2380.424560546875
+                  - 3503.124755859375
+               -
+                  - 2371.753662109375
+                  - 3504.704833984375
+               -
+                  - 2363.1318359375
+                  - 3505.2861328125
+               -
+                  - 2354.655517578125
+                  - 3502.870849609375
+               -
+                  - 2346.03369140625
+                  - 3503.4521484375
+               -
+                  - 2337.363037109375
+                  - 3505.031982421875
+               -
+                  - 2328.83837890625
+                  - 3503.61572265625
+               -
+                  - 2320.264892578125
+                  - 3503.197998046875
+               -
+                  - 2311.64306640625
+                  - 3503.779296875
+               -
+                  - 2303.069580078125
+                  - 3503.361572265625
+               -
+                  - 2294.496337890625
+                  - 3502.944091796875
+               -
+                  - 2285.9228515625
+                  - 3502.5263671875
+               -
+                  - 2277.44677734375
+                  - 3500.111328125
+               -
+                  - 2268.776123046875
+                  - 3501.691162109375
+               -
+                  - 2260.202880859375
+                  - 3501.273681640625
+               -
+                  - 2251.62939453125
+                  - 3500.856201171875
+            next_marker_support_points:
+               -
+                  - 2401.945068359375
+                  - 3482.526611328125
+               -
+                  - 2402.284912109375
+                  - 3474.522705078125
+               -
+                  - 2402.625
+                  - 3466.5185546875
+               -
+                  - 2402.965087890625
+                  - 3458.514404296875
+               -
+                  - 2403.30517578125
+                  - 3450.510498046875
+               -
+                  - 2403.645263671875
+                  - 3442.50634765625
+               -
+                  - 2403.9853515625
+                  - 3434.502197265625
+               -
+                  - 2404.3251953125
+                  - 3426.498291015625
+               -
+                  - 2405.664306640625
+                  - 3418.53662109375
+               -
+                  - 2406.00439453125
+                  - 3410.532470703125
+               -
+                  - 2406.344482421875
+                  - 3402.528564453125
+               -
+                  - 2406.6845703125
+                  - 3394.5244140625
+               -
+                  - 2407.0244140625
+                  - 3386.520263671875
+               -
+                  - 2407.364501953125
+                  - 3378.51611328125
+               -
+                  - 2407.70458984375
+                  - 3370.51220703125
+               -
+                  - 2408.044677734375
+                  - 3362.508056640625
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 429.17657470703125
+            verification_roi_radius: 21
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 0.60064589977264404
+            coarse_to_refined_displacement: 0.60064589977264404
+            corner_marker_width: 107.29414367675781
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 1
+            line_refinement_quality: 0.36026849949443329
+            line_jump: 3.8399009704589844
+            line_jump_limit: 0.
+            line_inside: 1
+            line_seed_gap: 3.8399009704589844
+            line_seed_accepted: 1
+            spherical_corner:
+               - 2399.826416015625
+               - 3501.76708984375
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 16
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+   -
+      success: 1
+      board_id: 4
+      detected_tag_id: 4
+      original_longest_side: 4512
+      chosen_scale_longest_side: 752
+      chosen_scale_factor: 0.16666666666666666
+      scale_configuration_mode: fixed_schedule
+      used_corner_fusion: 1
+      hamming: 0
+      good: 1
+      attempted_local_patch_rescue: 0
+      used_local_patch_rescue: 0
+      local_patch_rescue_summary: ""
+      quality: 0.77457169299085837
+      failure_reason: 0
+      failure_reason_text: None
+      coarse_corners_scaled_image:
+         -
+            - 122.52947235107422
+            - 302.44155883789062
+         -
+            - 112.08868408203125
+            - 415.48611450195312
+         -
+            - 201.731689453125
+            - 415.66775512695312
+         -
+            - 209.33734130859375
+            - 316.46810913085938
+      coarse_corners_original_image:
+         -
+            - 735.17681884765625
+            - 1814.6494140625
+         -
+            - 672.5321044921875
+            - 2492.916748046875
+         -
+            - 1210.39013671875
+            - 2494.006591796875
+         -
+            - 1256.0240478515625
+            - 1898.80859375
+      refined_corners_original_image:
+         -
+            - 751.32647705078125
+            - 1824.874267578125
+         -
+            - 687.4638671875
+            - 2495.961669921875
+         -
+            - 1218.98583984375
+            - 2498.447998046875
+         -
+            - 1266.8150634765625
+            - 1907.180908203125
+      refined_valid:
+         - 1
+         - 1
+         - 1
+         - 1
+      successful_scale_longest_sides:
+         - 752
+         - 564
+         - 376
+      corner_verification_debug:
+         -
+            corner_index: 0
+            coarse_corner:
+               - 735.17681884765625
+               - 1814.6494140625
+            verified_corner:
+               - 735.17681884765625
+               - 1814.6494140625
+            subpix_corner:
+               - 751.32647705078125
+               - 1824.874267578125
+            verification_roi:
+               - 709
+               - 1788
+               - 54
+               - 54
+            prev_edge_direction:
+               - 0.98719584941864014
+               - 0.15951240062713623
+            next_edge_direction:
+               - -0.091968491673469543
+               - 0.9957619309425354
+            prev_marker_support_points:
+               -
+                  - 757.4664306640625
+                  - 1825.5443115234375
+               -
+                  - 767.34844970703125
+                  - 1826.128173828125
+               -
+                  - 777.07098388671875
+                  - 1827.6990966796875
+               -
+                  - 786.79345703125
+                  - 1829.2701416015625
+               -
+                  - 796.6754150390625
+                  - 1829.8538818359375
+               -
+                  - 806.39788818359375
+                  - 1831.4248046875
+               -
+                  - 816.120361328125
+                  - 1832.995849609375
+               -
+                  - 825.84283447265625
+                  - 1834.5667724609375
+               -
+                  - 835.5653076171875
+                  - 1836.1378173828125
+               -
+                  - 845.4473876953125
+                  - 1836.7215576171875
+               -
+                  - 855.16986083984375
+                  - 1838.29248046875
+               -
+                  - 864.892333984375
+                  - 1839.863525390625
+               -
+                  - 874.61480712890625
+                  - 1841.4344482421875
+               -
+                  - 884.3372802734375
+                  - 1843.0054931640625
+               -
+                  - 894.05975341796875
+                  - 1844.576416015625
+               -
+                  - 903.7822265625
+                  - 1846.1473388671875
+            next_marker_support_points:
+               -
+                  - 733.19244384765625
+                  - 1838.309326171875
+               -
+                  - 734.2135009765625
+                  - 1849.00048828125
+               -
+                  - 733.2430419921875
+                  - 1859.5078125
+               -
+                  - 729.2852783203125
+                  - 1869.7392578125
+               -
+                  - 732.29791259765625
+                  - 1880.6146240234375
+               -
+                  - 725.35284423828125
+                  - 1890.570068359375
+               -
+                  - 734.34002685546875
+                  - 1901.9971923828125
+               -
+                  - 724.40771484375
+                  - 1911.6767578125
+               -
+                  - 719.4542236328125
+                  - 1921.816162109375
+               -
+                  - 718.4837646484375
+                  - 1932.323486328125
+               -
+                  - 715.521728515625
+                  - 1942.6468505859375
+               -
+                  - 721.52166748046875
+                  - 1953.7979736328125
+               -
+                  - 715.57244873046875
+                  - 1963.845458984375
+               -
+                  - 726.55108642578125
+                  - 1975.4564208984375
+               -
+                  - 719.6060791015625
+                  - 1985.4119873046875
+               -
+                  - 721.6229248046875
+                  - 1996.1951904296875
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 527.60272216796875
+            verification_roi_radius: 26
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 19.114368438720703
+            coarse_to_refined_displacement: 19.114368438720703
+            corner_marker_width: 131.90068054199219
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 0
+            line_refinement_quality: 0.
+            line_jump: 1957.9166259765625
+            line_jump_limit: 0.
+            line_inside: 0
+            line_seed_gap: 1957.9166259765625
+            line_seed_accepted: 0
+            spherical_corner:
+               - 735.17681884765625
+               - 1814.6494140625
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 20
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+         -
+            corner_index: 1
+            coarse_corner:
+               - 672.5321044921875
+               - 2492.916748046875
+            verified_corner:
+               - 672.5321044921875
+               - 2492.916748046875
+            subpix_corner:
+               - 687.4638671875
+               - 2495.961669921875
+            verification_roi:
+               - 645
+               - 2465
+               - 56
+               - 56
+            prev_edge_direction:
+               - 0.091968491673469543
+               - -0.9957619309425354
+            next_edge_direction:
+               - 0.99999797344207764
+               - 0.0020262624602764845
+            prev_marker_support_points:
+               -
+                  - 675.65423583984375
+                  - 2468.8984375
+               -
+                  - 683.6138916015625
+                  - 2458.83056640625
+               -
+                  - 681.61590576171875
+                  - 2447.84326171875
+               -
+                  - 683.60107421875
+                  - 2437.2236328125
+               -
+                  - 682.598876953125
+                  - 2426.327880859375
+               -
+                  - 680.60089111328125
+                  - 2415.340576171875
+               -
+                  - 681.5902099609375
+                  - 2404.62890625
+               -
+                  - 680.5880126953125
+                  - 2393.7333984375
+               -
+                  - 688.54766845703125
+                  - 2383.66552734375
+               -
+                  - 676.59210205078125
+                  - 2371.75830078125
+               -
+                  - 678.5771484375
+                  - 2361.138671875
+               -
+                  - 691.515625
+                  - 2351.53076171875
+               -
+                  - 687.526123046875
+                  - 2340.359375
+               -
+                  - 693.4942626953125
+                  - 2330.107666015625
+               -
+                  - 694.48358154296875
+                  - 2319.39599609375
+               -
+                  - 685.5152587890625
+                  - 2307.764892578125
+            next_marker_support_points:
+               -
+                  - 696.72332763671875
+                  - 2499.06591796875
+               -
+                  - 706.76336669921875
+                  - 2499.086181640625
+               -
+                  - 716.8033447265625
+                  - 2499.106689453125
+               -
+                  - 726.8433837890625
+                  - 2499.126953125
+               -
+                  - 736.88134765625
+                  - 2500.147216796875
+               -
+                  - 746.92138671875
+                  - 2500.167724609375
+               -
+                  - 756.96142578125
+                  - 2500.18798828125
+               -
+                  - 767.00140380859375
+                  - 2500.208251953125
+               -
+                  - 777.04144287109375
+                  - 2500.228759765625
+               -
+                  - 787.08148193359375
+                  - 2500.2490234375
+               -
+                  - 797.11944580078125
+                  - 2501.269287109375
+               -
+                  - 807.15948486328125
+                  - 2501.28955078125
+               -
+                  - 817.19952392578125
+                  - 2501.31005859375
+               -
+                  - 827.239501953125
+                  - 2501.330322265625
+               -
+                  - 837.279541015625
+                  - 2501.3505859375
+               -
+                  - 847.31951904296875
+                  - 2501.37109375
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 537.859130859375
+            verification_roi_radius: 27
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 15.23906421661377
+            coarse_to_refined_displacement: 15.23906421661377
+            corner_marker_width: 134.46478271484375
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 0
+            line_refinement_quality: 0.
+            line_jump: 2582.04052734375
+            line_jump_limit: 0.
+            line_inside: 0
+            line_seed_gap: 2582.04052734375
+            line_seed_accepted: 0
+            spherical_corner:
+               - 672.5321044921875
+               - 2492.916748046875
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 20
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+         -
+            corner_index: 2
+            coarse_corner:
+               - 1210.39013671875
+               - 2494.006591796875
+            verified_corner:
+               - 1210.39013671875
+               - 2494.006591796875
+            subpix_corner:
+               - 1218.98583984375
+               - 2498.447998046875
+            verification_roi:
+               - 1183
+               - 2467
+               - 56
+               - 56
+            prev_edge_direction:
+               - -0.99999797344207764
+               - -0.0020262624602764845
+            next_edge_direction:
+               - 0.076445780694484711
+               - -0.9970737099647522
+            prev_marker_support_points:
+               -
+                  - 1186.1741943359375
+                  - 2500.0576171875
+               -
+                  - 1176.1341552734375
+                  - 2500.037353515625
+               -
+                  - 1166.092041015625
+                  - 2501.016845703125
+               -
+                  - 1156.0521240234375
+                  - 2500.99658203125
+               -
+                  - 1146.0120849609375
+                  - 2500.976318359375
+               -
+                  - 1135.9720458984375
+                  - 2500.955810546875
+               -
+                  - 1125.9320068359375
+                  - 2500.935546875
+               -
+                  - 1115.8919677734375
+                  - 2500.915283203125
+               -
+                  - 1105.85009765625
+                  - 2501.894775390625
+               -
+                  - 1095.81201171875
+                  - 2500.87451171875
+               -
+                  - 1085.77001953125
+                  - 2501.854248046875
+               -
+                  - 1075.72998046875
+                  - 2501.833984375
+               -
+                  - 1065.68994140625
+                  - 2501.8134765625
+               -
+                  - 1055.64990234375
+                  - 2501.793212890625
+               -
+                  - 1045.6099853515625
+                  - 2501.77294921875
+               -
+                  - 1035.5699462890625
+                  - 2501.75244140625
+            next_marker_support_points:
+               -
+                  - 1216.328369140625
+                  - 2470.187255859375
+               -
+                  - 1214.1595458984375
+                  - 2459.23193359375
+               -
+                  - 1216.97607421875
+                  - 2448.659423828125
+               -
+                  - 1220.78955078125
+                  - 2438.162841796875
+               -
+                  - 1215.6295166015625
+                  - 2426.978515625
+               -
+                  - 1214.4576416015625
+                  - 2416.099853515625
+               -
+                  - 1222.259521484375
+                  - 2405.909423828125
+               -
+                  - 1216.1024169921875
+                  - 2394.648681640625
+               -
+                  - 1215.9276123046875
+                  - 2383.846435546875
+               -
+                  - 1215.7529296875
+                  - 2373.04443359375
+               -
+                  - 1215.5782470703125
+                  - 2362.2421875
+               -
+                  - 1221.3858642578125
+                  - 2351.898681640625
+               -
+                  - 1216.225830078125
+                  - 2340.71435546875
+               -
+                  - 1224.027587890625
+                  - 2330.523681640625
+               -
+                  - 1224.8499755859375
+                  - 2319.7978515625
+               -
+                  - 1226.66943359375
+                  - 2309.14892578125
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 537.859130859375
+            verification_roi_radius: 27
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 9.6753396987915039
+            coarse_to_refined_displacement: 9.6753396987915039
+            corner_marker_width: 134.46478271484375
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 0
+            line_refinement_quality: 0.
+            line_jump: 2772.20361328125
+            line_jump_limit: 0.
+            line_inside: 0
+            line_seed_gap: 2772.20361328125
+            line_seed_accepted: 0
+            spherical_corner:
+               - 1210.39013671875
+               - 2494.006591796875
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 20
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+         -
+            corner_index: 3
+            coarse_corner:
+               - 1256.0240478515625
+               - 1898.80859375
+            verified_corner:
+               - 1256.0240478515625
+               - 1898.80859375
+            subpix_corner:
+               - 1266.8150634765625
+               - 1907.180908203125
+            verification_roi:
+               - 1230
+               - 1872
+               - 54
+               - 54
+            prev_edge_direction:
+               - -0.076445780694484711
+               - 0.9970737099647522
+            next_edge_direction:
+               - -0.98719584941864014
+               - -0.15951240062713623
+            prev_marker_support_points:
+               -
+                  - 1257.0008544921875
+                  - 1922.6951904296875
+               -
+                  - 1254.199951171875
+                  - 1933.0635986328125
+               -
+                  - 1252.396240234375
+                  - 1943.50830078125
+               -
+                  - 1250.592529296875
+                  - 1953.953125
+               -
+                  - 1258.7596435546875
+                  - 1965.1622314453125
+               -
+                  - 1255.9588623046875
+                  - 1975.530517578125
+               -
+                  - 1253.1580810546875
+                  - 1985.8988037109375
+               -
+                  - 1244.374755859375
+                  - 1995.8084716796875
+               -
+                  - 1252.541748046875
+                  - 2007.017578125
+               -
+                  - 1252.732177734375
+                  - 2017.615234375
+               -
+                  - 1249.931396484375
+                  - 2027.9835205078125
+               -
+                  - 1248.1275634765625
+                  - 2038.42822265625
+               -
+                  - 1238.3472900390625
+                  - 2048.261474609375
+               -
+                  - 1246.5142822265625
+                  - 2059.470703125
+               -
+                  - 1248.6988525390625
+                  - 2070.22119140625
+               -
+                  - 1241.90966796875
+                  - 2080.283447265625
+            next_marker_support_points:
+               -
+                  - 1231.7564697265625
+                  - 1900.1549072265625
+               -
+                  - 1222.033935546875
+                  - 1898.5838623046875
+               -
+                  - 1212.3115234375
+                  - 1897.012939453125
+               -
+                  - 1202.5889892578125
+                  - 1895.44189453125
+               -
+                  - 1192.8665771484375
+                  - 1893.8709716796875
+               -
+                  - 1183.3035888671875
+                  - 1891.3128662109375
+               -
+                  - 1173.5810546875
+                  - 1889.7418212890625
+               -
+                  - 1163.858642578125
+                  - 1888.1708984375
+               -
+                  - 1154.1361083984375
+                  - 1886.599853515625
+               -
+                  - 1144.4136962890625
+                  - 1885.0289306640625
+               -
+                  - 1134.691162109375
+                  - 1883.4580078125
+               -
+                  - 1124.96875
+                  - 1881.886962890625
+               -
+                  - 1115.2462158203125
+                  - 1880.3160400390625
+               -
+                  - 1105.523681640625
+                  - 1878.7449951171875
+               -
+                  - 1095.80126953125
+                  - 1877.174072265625
+               -
+                  - 1086.2381591796875
+                  - 1874.615966796875
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 527.60272216796875
+            verification_roi_radius: 26
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 13.658025741577148
+            coarse_to_refined_displacement: 13.658025741577148
+            corner_marker_width: 131.90068054199219
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 0
+            line_refinement_quality: 0.
+            line_jump: 2276.6357421875
+            line_jump_limit: 0.
+            line_inside: 0
+            line_seed_gap: 2276.6357421875
+            line_seed_accepted: 0
+            spherical_corner:
+               - 1256.0240478515625
+               - 1898.80859375
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 20
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+   -
+      success: 1
+      board_id: 5
+      detected_tag_id: 5
+      original_longest_side: 4512
+      chosen_scale_longest_side: 564
+      chosen_scale_factor: 0.125
+      scale_configuration_mode: fixed_schedule
+      used_corner_fusion: 1
+      hamming: 0
+      good: 1
+      attempted_local_patch_rescue: 0
+      used_local_patch_rescue: 0
+      local_patch_rescue_summary: ""
+      quality: 0.76692608379849436
+      failure_reason: 0
+      failure_reason_text: None
+      coarse_corners_scaled_image:
+         -
+            - 474.76715087890625
+            - 328.7271728515625
+         -
+            - 471.77310180664062
+            - 234.92350769042969
+         -
+            - 400.1553955078125
+            - 242.10743713378906
+         -
+            - 400.0394287109375
+            - 322.23788452148438
+      coarse_corners_original_image:
+         -
+            - 3798.13720703125
+            - 2629.8173828125
+         -
+            - 3774.184814453125
+            - 1879.3880615234375
+         -
+            - 3201.2431640625
+            - 1936.8594970703125
+         -
+            - 3200.3154296875
+            - 2577.903076171875
+      refined_corners_original_image:
+         -
+            - 3781.433349609375
+            - 2631.02978515625
+         -
+            - 3760.3505859375
+            - 1891.515869140625
+         -
+            - 3196.257080078125
+            - 1946.8416748046875
+         -
+            - 3197.812255859375
+            - 2582.850341796875
+      refined_valid:
+         - 1
+         - 1
+         - 1
+         - 1
+      successful_scale_longest_sides:
+         - 564
+         - 376
+      corner_verification_debug:
+         -
+            corner_index: 0
+            coarse_corner:
+               - 3798.13720703125
+               - 2629.8173828125
+            verified_corner:
+               - 3798.13720703125
+               - 2629.8173828125
+            subpix_corner:
+               - 3781.433349609375
+               - 2631.02978515625
+            verification_roi:
+               - 3768
+               - 2599
+               - 62
+               - 62
+            prev_edge_direction:
+               - -0.99625062942504883
+               - -0.086513511836528778
+            next_edge_direction:
+               - -0.031902007758617401
+               - -0.99949103593826294
+            prev_marker_support_points:
+               -
+                  - 3770.88916015625
+                  - 2631.46630859375
+               -
+                  - 3759.81640625
+                  - 2629.5009765625
+               -
+                  - 3748.570556640625
+                  - 2629.5283203125
+               -
+                  - 3737.411376953125
+                  - 2628.55908203125
+               -
+                  - 3726.251953125
+                  - 2627.590087890625
+               -
+                  - 3715.005859375
+                  - 2627.6171875
+               -
+                  - 3703.933349609375
+                  - 2625.65185546875
+               -
+                  - 3692.687255859375
+                  - 2625.678955078125
+               -
+                  - 3681.52783203125
+                  - 2624.7099609375
+               -
+                  - 3670.36865234375
+                  - 2623.74072265625
+               -
+                  - 3659.122802734375
+                  - 2623.76806640625
+               -
+                  - 3647.96337890625
+                  - 2622.799072265625
+               -
+                  - 3636.80419921875
+                  - 2621.830078125
+               -
+                  - 3625.644775390625
+                  - 2620.86083984375
+               -
+                  - 3614.4853515625
+                  - 2619.891845703125
+               -
+                  - 3603.239501953125
+                  - 2619.9189453125
+            next_marker_support_points:
+               -
+                  - 3791.27880859375
+                  - 2603.019287109375
+               -
+                  - 3790.89599609375
+                  - 2591.02392578125
+               -
+                  - 3794.510986328125
+                  - 2578.90087890625
+               -
+                  - 3796.127197265625
+                  - 2566.842041015625
+               -
+                  - 3797.743408203125
+                  - 2554.782958984375
+               -
+                  - 3798.35986328125
+                  - 2542.755615234375
+               -
+                  - 3797.97705078125
+                  - 2530.76025390625
+               -
+                  - 3800.592529296875
+                  - 2518.669189453125
+               -
+                  - 3802.208740234375
+                  - 2506.610107421875
+               -
+                  - 3802.8251953125
+                  - 2494.582763671875
+               -
+                  - 3802.4423828125
+                  - 2482.587646484375
+               -
+                  - 3789.066162109375
+                  - 2471.007080078125
+               -
+                  - 3796.679443359375
+                  - 2458.75634765625
+               -
+                  - 3794.29736328125
+                  - 2446.824951171875
+               -
+                  - 3788.9169921875
+                  - 2434.989013671875
+               -
+                  - 3796.5302734375
+                  - 2422.738525390625
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 600.0716552734375
+            verification_roi_radius: 30
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 16.747798919677734
+            coarse_to_refined_displacement: 16.747798919677734
+            corner_marker_width: 150.01791381835938
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 1
+            line_refinement_quality: 0.28978502644802195
+            line_jump: 10.566017150878906
+            line_jump_limit: 0.
+            line_inside: 1
+            line_seed_gap: 10.566017150878906
+            line_seed_accepted: 1
+            spherical_corner:
+               - 3798.13720703125
+               - 2629.8173828125
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 23
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+         -
+            corner_index: 1
+            coarse_corner:
+               - 3774.184814453125
+               - 1879.3880615234375
+            verified_corner:
+               - 3774.184814453125
+               - 1879.3880615234375
+            subpix_corner:
+               - 3760.3505859375
+               - 1891.515869140625
+            verification_roi:
+               - 3745
+               - 1850
+               - 60
+               - 60
+            prev_edge_direction:
+               - 0.031902007758617401
+               - 0.99949103593826294
+            next_edge_direction:
+               - -0.99500668048858643
+               - 0.099808529019355774
+            prev_marker_support_points:
+               -
+                  - 3778.70947265625
+                  - 1905.1685791015625
+               -
+                  - 3782.075439453125
+                  - 1916.5833740234375
+               -
+                  - 3784.44189453125
+                  - 1928.030029296875
+               -
+                  - 3782.81005859375
+                  - 1939.6043701171875
+               -
+                  - 3775.181640625
+                  - 1951.3699951171875
+               -
+                  - 3780.54638671875
+                  - 1962.720947265625
+               -
+                  - 3782.912841796875
+                  - 1974.1676025390625
+               -
+                  - 3777.283447265625
+                  - 1985.8695068359375
+               -
+                  - 3770.654296875
+                  - 1997.6033935546875
+               -
+                  - 3781.016845703125
+                  - 2008.7947998046875
+               -
+                  - 3770.3896484375
+                  - 2020.6561279296875
+               -
+                  - 3786.748779296875
+                  - 2031.65625
+               -
+                  - 3787.1162109375
+                  - 2043.166748046875
+               -
+                  - 3784.485107421875
+                  - 2054.77294921875
+               -
+                  - 3787.85107421875
+                  - 2066.187744140625
+               -
+                  - 3789.218017578125
+                  - 2077.666259765625
+            next_marker_support_points:
+               -
+                  - 3748.83154296875
+                  - 1886.2528076171875
+               -
+                  - 3738.535888671875
+                  - 1891.3056640625
+               -
+                  - 3727.841064453125
+                  - 1892.37841796875
+               -
+                  - 3717.14599609375
+                  - 1893.451171875
+               -
+                  - 3706.451171875
+                  - 1894.5240478515625
+               -
+                  - 3695.75634765625
+                  - 1895.5968017578125
+               -
+                  - 3685.061279296875
+                  - 1896.669677734375
+               -
+                  - 3674.366455078125
+                  - 1897.742431640625
+               -
+                  - 3663.671630859375
+                  - 1898.815185546875
+               -
+                  - 3652.876708984375
+                  - 1898.89306640625
+               -
+                  - 3642.181884765625
+                  - 1899.9658203125
+               -
+                  - 3631.48681640625
+                  - 1901.03857421875
+               -
+                  - 3620.7919921875
+                  - 1902.1114501953125
+               -
+                  - 3610.09716796875
+                  - 1903.1842041015625
+               -
+                  - 3599.402099609375
+                  - 1904.257080078125
+               -
+                  - 3588.607666015625
+                  - 1904.3348388671875
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 575.81689453125
+            verification_roi_radius: 29
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 18.397542953491211
+            coarse_to_refined_displacement: 18.397542953491211
+            corner_marker_width: 143.9542236328125
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 0
+            line_refinement_quality: 0.
+            line_jump: 4216.22705078125
+            line_jump_limit: 0.
+            line_inside: 0
+            line_seed_gap: 4216.22705078125
+            line_seed_accepted: 0
+            spherical_corner:
+               - 3774.184814453125
+               - 1879.3880615234375
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 22
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+         -
+            corner_index: 2
+            coarse_corner:
+               - 3201.2431640625
+               - 1936.8594970703125
+            verified_corner:
+               - 3201.2431640625
+               - 1936.8594970703125
+            subpix_corner:
+               - 3196.257080078125
+               - 1946.8416748046875
+            verification_roi:
+               - 3172
+               - 1907
+               - 60
+               - 60
+            prev_edge_direction:
+               - 0.99500668048858643
+               - -0.099808529019355774
+            next_edge_direction:
+               - -0.0014472235925495625
+               - 0.99999892711639404
+            prev_marker_support_points:
+               -
+                  - 3227.85400390625
+                  - 1942.5318603515625
+               -
+                  - 3238.548828125
+                  - 1941.458984375
+               -
+                  - 3249.24365234375
+                  - 1940.38623046875
+               -
+                  - 3259.938720703125
+                  - 1939.3134765625
+               -
+                  - 3270.53369140625
+                  - 1937.24560546875
+               -
+                  - 3281.228515625
+                  - 1936.1728515625
+               -
+                  - 3291.923583984375
+                  - 1935.0999755859375
+               -
+                  - 3302.618408203125
+                  - 1934.0272216796875
+               -
+                  - 3313.313232421875
+                  - 1932.9544677734375
+               -
+                  - 3324.00830078125
+                  - 1931.881591796875
+               -
+                  - 3334.603515625
+                  - 1929.8138427734375
+               -
+                  - 3345.29833984375
+                  - 1928.7410888671875
+               -
+                  - 3355.993408203125
+                  - 1927.668212890625
+               -
+                  - 3366.688232421875
+                  - 1926.595458984375
+               -
+                  - 3377.38330078125
+                  - 1925.5225830078125
+               -
+                  - 3388.078125
+                  - 1924.4498291015625
+            next_marker_support_points:
+               -
+                  - 3205.505615234375
+                  - 1962.7774658203125
+               -
+                  - 3205.489013671875
+                  - 1974.2938232421875
+               -
+                  - 3207.472412109375
+                  - 1985.81298828125
+               -
+                  - 3208.455810546875
+                  - 1997.330810546875
+               -
+                  - 3209.43896484375
+                  - 2008.8485107421875
+               -
+                  - 3209.42236328125
+                  - 2020.3648681640625
+               -
+                  - 3209.40576171875
+                  - 2031.881103515625
+               -
+                  - 3209.38916015625
+                  - 2043.3974609375
+               -
+                  - 3207.372314453125
+                  - 2054.910888671875
+               -
+                  - 3207.355712890625
+                  - 2066.42724609375
+               -
+                  - 3197.339111328125
+                  - 2077.92919921875
+               -
+                  - 3205.322265625
+                  - 2089.456787109375
+               -
+                  - 3199.3056640625
+                  - 2100.964599609375
+               -
+                  - 3209.2890625
+                  - 2112.495361328125
+               -
+                  - 3201.2724609375
+                  - 2124.000244140625
+               -
+                  - 3205.255615234375
+                  - 2135.522216796875
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 575.81689453125
+            verification_roi_radius: 29
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 11.158176422119141
+            coarse_to_refined_displacement: 11.158176422119141
+            corner_marker_width: 143.9542236328125
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 1
+            line_refinement_quality: 0.80053450907715318
+            line_jump: 9.2370738983154297
+            line_jump_limit: 0.
+            line_inside: 1
+            line_seed_gap: 9.2370738983154297
+            line_seed_accepted: 1
+            spherical_corner:
+               - 3201.2431640625
+               - 1936.8594970703125
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 22
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only
+         -
+            corner_index: 3
+            coarse_corner:
+               - 3200.3154296875
+               - 2577.903076171875
+            verified_corner:
+               - 3200.3154296875
+               - 2577.903076171875
+            subpix_corner:
+               - 3197.812255859375
+               - 2582.850341796875
+            verification_roi:
+               - 3170
+               - 2547
+               - 62
+               - 62
+            prev_edge_direction:
+               - 0.0014472235925495625
+               - -0.99999892711639404
+            next_edge_direction:
+               - 0.99625062942504883
+               - 0.086513511836528778
+            prev_marker_support_points:
+               -
+                  - 3205.3544921875
+                  - 2550.9072265625
+               -
+                  - 3207.371826171875
+                  - 2538.94384765625
+               -
+                  - 3208.38916015625
+                  - 2526.97900390625
+               -
+                  - 3208.406494140625
+                  - 2515.012939453125
+               -
+                  - 3209.423828125
+                  - 2503.04833984375
+               -
+                  - 3209.441162109375
+                  - 2491.08203125
+               -
+                  - 3200.45849609375
+                  - 2479.10302734375
+               -
+                  - 3195.475830078125
+                  - 2467.129638671875
+               -
+                  - 3197.4931640625
+                  - 2455.166259765625
+               -
+                  - 3209.51025390625
+                  - 2443.217529296875
+               -
+                  - 3199.527587890625
+                  - 2431.23681640625
+               -
+                  - 3209.544921875
+                  - 2419.28515625
+               -
+                  - 3193.562255859375
+                  - 2407.296142578125
+               -
+                  - 3205.57958984375
+                  - 2395.347412109375
+               -
+                  - 3193.596923828125
+                  - 2383.36376953125
+               -
+                  - 3203.6142578125
+                  - 2371.412109375
+            next_marker_support_points:
+               -
+                  - 3226.784912109375
+                  - 2585.220458984375
+               -
+                  - 3237.857666015625
+                  - 2587.185791015625
+               -
+                  - 3249.01708984375
+                  - 2588.15478515625
+               -
+                  - 3260.17626953125
+                  - 2589.1240234375
+               -
+                  - 3271.335693359375
+                  - 2590.093017578125
+               -
+                  - 3282.408447265625
+                  - 2592.05810546875
+               -
+                  - 3293.567626953125
+                  - 2593.02734375
+               -
+                  - 3304.72705078125
+                  - 2593.996337890625
+               -
+                  - 3315.886474609375
+                  - 2594.96533203125
+               -
+                  - 3327.045654296875
+                  - 2595.9345703125
+               -
+                  - 3338.205078125
+                  - 2596.903564453125
+               -
+                  - 3349.364501953125
+                  - 2597.87255859375
+               -
+                  - 3360.523681640625
+                  - 2598.841552734375
+               -
+                  - 3371.68310546875
+                  - 2599.810791015625
+               -
+                  - 3382.842529296875
+                  - 2600.77978515625
+               -
+                  - 3394.001708984375
+                  - 2601.748779296875
+            prev_branch_points:
+               []
+            next_branch_points:
+               []
+            local_scale: 600.0716552734375
+            verification_roi_radius: 30
+            candidate_radius: 0
+            branch_search_radius: 0
+            direction_consistency_score: 1.
+            local_layout_score: 1.
+            verification_quality: 1.
+            coarse_to_verified_displacement: 0.
+            coarse_to_subpix_displacement: 5.5444850921630859
+            coarse_to_refined_displacement: 5.5444850921630859
+            corner_marker_width: 150.01791381835938
+            image_line_corner:
+               - 0.
+               - 0.
+            prev_image_line_residual: 0.
+            next_image_line_residual: 0.
+            prev_image_line_support_count: 0
+            next_image_line_support_count: 0
+            image_line_valid: 0
+            line_refinement_success: 1
+            line_refinement_quality: 0.81575370345488563
+            line_jump: 7.0506877899169922
+            line_jump_limit: 0.
+            line_inside: 1
+            line_seed_gap: 7.0506877899169922
+            line_seed_accepted: 1
+            spherical_corner:
+               - 3200.3154296875
+               - 2577.903076171875
+            prev_spherical_curve_points:
+               []
+            next_spherical_curve_points:
+               []
+            prev_spherical_residual: 0.
+            next_spherical_residual: 0.
+            prev_spherical_support_count: 0
+            next_spherical_support_count: 0
+            spherical_refinement_valid: 0
+            spherical_refinement_applied: 0
+            spherical_failure_reason: ""
+            subpix_window_radius: 23
+            refine_displacement_limit: 0.
+            refined_valid: 1
+            verification_passed: 1
+            subpix_applied: 1
+            failure_reason: cs_only

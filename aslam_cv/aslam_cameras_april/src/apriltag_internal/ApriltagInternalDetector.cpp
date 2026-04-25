@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -26,6 +27,12 @@ namespace aslam {
 namespace cameras {
 namespace apriltag_internal {
 namespace {
+
+double ElapsedSeconds(const std::chrono::steady_clock::time_point& start_time) {
+  return std::chrono::duration_cast<std::chrono::duration<double> >(
+             std::chrono::steady_clock::now() - start_time)
+      .count();
+}
 
 struct TemplateScore {
   double template_quality = 0.0;
@@ -790,7 +797,42 @@ int ComputeAdaptiveImageEvidenceSearchRadius(double module_scale_px,
   return std::max(1, 2 * ComputeAdaptiveInternalSubpixRadius(module_scale_px, options));
 }
 
-double MeanIntensity(const cv::Mat& patch, const cv::Point2f& center, int radius) {
+class IntegralMeanImage {
+ public:
+  explicit IntegralMeanImage(const cv::Mat& image) : image_size_(image.size()) {
+    if (image.empty()) {
+      return;
+    }
+    cv::integral(image, integral_, CV_64F);
+  }
+
+  bool valid() const { return !integral_.empty(); }
+
+  double MeanIntensity(const cv::Point2f& center, int radius) const {
+    const cv::Rect roi = MakeClampedRoi(center, radius, image_size_);
+    if (roi.width <= 0 || roi.height <= 0 || integral_.empty()) {
+      return 0.0;
+    }
+
+    const double* top_row = integral_.ptr<double>(roi.y);
+    const double* bottom_row = integral_.ptr<double>(roi.y + roi.height);
+    const double sum = bottom_row[roi.x + roi.width] - bottom_row[roi.x] -
+                       top_row[roi.x + roi.width] + top_row[roi.x];
+    return sum / static_cast<double>(roi.area());
+  }
+
+ private:
+  cv::Size image_size_;
+  cv::Mat integral_;
+};
+
+double MeanIntensity(const cv::Mat& patch,
+                     const cv::Point2f& center,
+                     int radius,
+                     const IntegralMeanImage* integral_image = nullptr) {
+  if (integral_image != nullptr && integral_image->valid()) {
+    return integral_image->MeanIntensity(center, radius);
+  }
   const cv::Rect roi = MakeClampedRoi(center, radius, patch.size());
   if (roi.width <= 0 || roi.height <= 0) {
     return 0.0;
@@ -1302,7 +1344,8 @@ TemplateScore ComputeImageEvidenceScoreAtPoint(const cv::Mat& gray,
                                                const cv::Point2f& module_u_axis,
                                                const cv::Point2f& module_v_axis,
                                                double min_template_contrast,
-                                               double sample_radius_scale = 1.0) {
+                                               double sample_radius_scale = 1.0,
+                                               const IntegralMeanImage* gray_integral = nullptr) {
   if (corner_info.corner_type == CornerType::Outer || !corner_info.observable) {
     return {1.0, 1.0};
   }
@@ -1333,10 +1376,10 @@ TemplateScore ComputeImageEvidenceScoreAtPoint(const cv::Mat& gray,
   }
 
   const std::array<double, 4> means{{
-      MeanIntensity(gray, sample_centers[0], sample_radius),
-      MeanIntensity(gray, sample_centers[1], sample_radius),
-      MeanIntensity(gray, sample_centers[2], sample_radius),
-      MeanIntensity(gray, sample_centers[3], sample_radius),
+      MeanIntensity(gray, sample_centers[0], sample_radius, gray_integral),
+      MeanIntensity(gray, sample_centers[1], sample_radius, gray_integral),
+      MeanIntensity(gray, sample_centers[2], sample_radius, gray_integral),
+      MeanIntensity(gray, sample_centers[3], sample_radius, gray_integral),
   }};
 
   const std::pair<std::array<double, 4>::const_iterator, std::array<double, 4>::const_iterator> minmax =
@@ -1377,12 +1420,14 @@ ImageEvidenceScore EvaluateImageEvidenceAroundPoint(const cv::Mat& gray,
                                                     const cv::Point2f& module_v_axis,
                                                     double min_template_contrast,
                                                     double max_center_error2,
-                                                    int search_radius) {
+                                                    int search_radius,
+                                                    const IntegralMeanImage* gray_integral = nullptr) {
   ImageEvidenceScore evidence;
   evidence.best_point = image_point;
   evidence.point_score = ComputeImageEvidenceScoreAtPoint(gray, corner_info, image_point,
                                                           module_u_axis, module_v_axis,
-                                                          min_template_contrast);
+                                                          min_template_contrast, 1.0,
+                                                          gray_integral);
   evidence.best_score = evidence.point_score;
   double best_raw_quality =
       std::min(evidence.best_score.template_quality, evidence.best_score.gradient_quality);
@@ -1398,7 +1443,7 @@ ImageEvidenceScore EvaluateImageEvidenceAroundPoint(const cv::Mat& gray,
           image_point + cv::Point2f(static_cast<float>(dx), static_cast<float>(dy));
       const TemplateScore candidate_score =
           ComputeImageEvidenceScoreAtPoint(gray, corner_info, candidate, module_u_axis, module_v_axis,
-                                           min_template_contrast);
+                                           min_template_contrast, 1.0, gray_integral);
       const double candidate_raw_quality =
           std::min(candidate_score.template_quality, candidate_score.gradient_quality);
       const double candidate_distance2 = static_cast<double>(dx * dx + dy * dy);
@@ -2756,6 +2801,7 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
   if (result == nullptr) {
     throw std::runtime_error("Result pointer must not be null.");
   }
+  const IntegralMeanImage gray_integral(gray);
 
   for (const int point_id : model.VisiblePointIds()) {
     if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) != outer_point_ids.end()) {
@@ -2810,7 +2856,7 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
         EvaluateImageEvidenceAroundPoint(gray, corner_info, refined_image, module_u_axis, module_v_axis,
                                          options.min_template_contrast,
                                          subpix_displacement_limit * subpix_displacement_limit,
-                                         image_evidence_search_radius);
+                                         image_evidence_search_radius, &gray_integral);
     const double final_quality =
         std::min({template_score.template_quality, template_score.gradient_quality, q_refine});
     const double image_final_quality = image_score.final_quality;
@@ -2869,20 +2915,32 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
                                               bool enable_seed_search,
                                               bool use_border_conditioned_seed,
                                               bool use_ray_domain_refine,
+                                              ApriltagInternalRuntimeBreakdown* runtime_breakdown,
                                               ApriltagInternalDetectionResult* result) {
   if (result == nullptr) {
     throw std::runtime_error("Result pointer must not be null.");
   }
+  const IntegralMeanImage gray_integral(gray);
 
   BoardSphereBoundaryModel boundary_model;
-  const bool has_boundary_model =
-      use_border_conditioned_seed &&
-      BuildBoardSphereBoundaryModel(camera, outer_detection, &boundary_model);
+  bool has_boundary_model = false;
+  if (use_border_conditioned_seed) {
+    const auto boundary_start = std::chrono::steady_clock::now();
+    has_boundary_model =
+        BuildBoardSphereBoundaryModel(camera, outer_detection, &boundary_model);
+    if (runtime_breakdown != nullptr) {
+      runtime_breakdown->boundary_model_seconds += ElapsedSeconds(boundary_start);
+      runtime_breakdown->boundary_model_build_count += 1;
+    }
+  }
   StoreBoardBoundaryDebugCurves(boundary_model, camera, result);
 
   for (const int point_id : model.VisiblePointIds()) {
     if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) != outer_point_ids.end()) {
       continue;
+    }
+    if (runtime_breakdown != nullptr) {
+      ++runtime_breakdown->attempted_internal_corner_count;
     }
 
     const CanonicalCorner& corner_info = model.corner(point_id);
@@ -2952,15 +3010,21 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     bool has_seed = false;
     if (has_search_anchor) {
       if (use_ray_domain_refine) {
+        const auto ray_refine_start = std::chrono::steady_clock::now();
         ray_refine_result =
             RefineSphereSeedRayLocally(gray, camera, corner_info, search_frame, options,
                                        search_frame.predicted_ray);
+        if (runtime_breakdown != nullptr) {
+          runtime_breakdown->ray_refine_seconds +=
+              ElapsedSeconds(ray_refine_start);
+        }
         if (ray_refine_result.valid) {
           sphere_seed_image = ray_refine_result.refined_image;
           sphere_seed_ray = ray_refine_result.refined_ray;
           has_seed = true;
         }
       } else {
+        const auto search_start = std::chrono::steady_clock::now();
         anchor_candidate =
             EvaluateSphereSeedCandidate(gray, camera, corner_info, search_frame, options, 0.0, 0.0);
         if (anchor_candidate.valid) {
@@ -2972,6 +3036,10 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
                              ? SearchSphereLatticeSeed(gray, camera, corner_info, search_frame,
                                                        options)
                              : anchor_candidate;
+        if (runtime_breakdown != nullptr) {
+          runtime_breakdown->seed_search_seconds +=
+              ElapsedSeconds(search_start);
+        }
         if (seed_candidate.valid) {
           sphere_seed_image = seed_candidate.image_point;
           sphere_seed_ray = seed_candidate.ray;
@@ -3021,12 +3089,16 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
       if (has_frame && has_seed &&
           IsInsideImageWithBorder(sphere_seed_image, gray.size(), options.min_border_distance) &&
           options.do_subpix_refinement) {
+        const auto subpix_start = std::chrono::steady_clock::now();
         std::vector<cv::Point2f> corners{refined_image};
         cv::cornerSubPix(gray, corners,
                          cv::Size(subpix_window_radius, subpix_window_radius),
                          cv::Size(-1, -1),
                          cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 30, 0.1));
         refined_image = corners.front();
+        if (runtime_breakdown != nullptr) {
+          runtime_breakdown->subpix_seconds += ElapsedSeconds(subpix_start);
+        }
       }
       if (IsInsideImage(refined_image, gray.size())) {
         Eigen::Vector3d refined_ray_candidate = Eigen::Vector3d::Zero();
@@ -3056,12 +3128,16 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
       if (has_frame && has_seed &&
           IsInsideImageWithBorder(sphere_seed_image, gray.size(), options.min_border_distance) &&
           options.do_subpix_refinement) {
+        const auto subpix_start = std::chrono::steady_clock::now();
         std::vector<cv::Point2f> corners{refined_image};
         cv::cornerSubPix(gray, corners,
                          cv::Size(subpix_window_radius, subpix_window_radius),
                          cv::Size(-1, -1),
                          cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 30, 0.1));
         refined_image = corners.front();
+        if (runtime_breakdown != nullptr) {
+          runtime_breakdown->subpix_seconds += ElapsedSeconds(subpix_start);
+        }
       }
       if (IsInsideImage(refined_image, gray.size())) {
         Eigen::Vector3d refined_ray_candidate = Eigen::Vector3d::Zero();
@@ -3098,11 +3174,16 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
 
     ImageEvidenceScore image_score;
     if (has_frame && has_seed) {
+      const auto image_evidence_start = std::chrono::steady_clock::now();
       image_score = EvaluateImageEvidenceAroundPoint(
           gray, corner_info, refined_image, frame.module_u_axis, frame.module_v_axis,
           options.min_template_contrast,
           subpix_displacement_limit * subpix_displacement_limit,
-          image_evidence_search_radius);
+          image_evidence_search_radius, &gray_integral);
+      if (runtime_breakdown != nullptr) {
+        runtime_breakdown->image_evidence_seconds +=
+            ElapsedSeconds(image_evidence_start);
+      }
     }
 
     debug.template_quality = debug.sphere_template_quality;
@@ -3134,6 +3215,9 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     if (valid) {
       ++result->valid_corner_count;
       ++result->valid_internal_corner_count;
+      if (runtime_breakdown != nullptr) {
+        ++runtime_breakdown->valid_internal_corner_count;
+      }
     }
 
     result->internal_corner_debug.push_back(debug);
@@ -3150,6 +3234,7 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
   if (result == nullptr) {
     throw std::runtime_error("Result pointer must not be null.");
   }
+  const IntegralMeanImage gray_integral(gray);
 
   for (const int point_id : model.VisiblePointIds()) {
     if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) != outer_point_ids.end()) {
@@ -3230,7 +3315,7 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
                                                options.min_template_contrast,
                                                image_subpix_displacement_limit *
                                                    image_subpix_displacement_limit,
-                                               image_evidence_search_radius)
+                                               image_evidence_search_radius, &gray_integral)
             : ImageEvidenceScore{};
     const double final_quality =
         std::min({template_score.template_quality, template_score.gradient_quality, q_refine});
@@ -3293,6 +3378,7 @@ void PopulateInternalCornersFromVirtualPatchImageSubpix(
   if (result == nullptr) {
     throw std::runtime_error("Result pointer must not be null.");
   }
+  const IntegralMeanImage gray_integral(gray);
 
   for (const int point_id : model.VisiblePointIds()) {
     if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) !=
@@ -3377,7 +3463,7 @@ void PopulateInternalCornersFromVirtualPatchImageSubpix(
                                                module_v_axis, options.min_template_contrast,
                                                subpix_displacement_limit *
                                                    subpix_displacement_limit,
-                                               image_evidence_search_radius)
+                                               image_evidence_search_radius, &gray_integral)
             : ImageEvidenceScore{};
     const double final_quality = std::min(q_refine, image_score.final_quality);
     const double image_final_quality = image_score.final_quality;
@@ -3440,6 +3526,7 @@ void PopulateInternalCornersFromVirtualPatchBoundarySeed(
   if (result == nullptr) {
     throw std::runtime_error("Result pointer must not be null.");
   }
+  const IntegralMeanImage gray_integral(gray);
 
   for (const int point_id : model.VisiblePointIds()) {
     if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) !=
@@ -3549,7 +3636,7 @@ void PopulateInternalCornersFromVirtualPatchBoundarySeed(
                                                options.min_template_contrast,
                                                subpix_displacement_limit *
                                                    subpix_displacement_limit,
-                                               image_evidence_search_radius)
+                                               image_evidence_search_radius, &gray_integral)
             : ImageEvidenceScore{};
     const double final_quality =
         std::min({seed_quality, q_refine, image_score.final_quality});
@@ -3719,6 +3806,7 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
     const Eigen::Matrix4d* T_camera_board_prior) const {
   const ApriltagInternalConfig& board_config = board_runtime.config;
   const ApriltagCanonicalModel& model = board_runtime.model;
+  const auto total_start = std::chrono::steady_clock::now();
   ApriltagInternalDetectionResult result;
   result.image_size = gray.size();
   result.board_id = board_config.tag_id;
@@ -3729,6 +3817,7 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
   result.outer_detection = outer_detection;
   if (!result.outer_detection.success) {
     result.failure_reason = result.outer_detection.failure_reason_text;
+    result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
     return result;
   }
 
@@ -3839,14 +3928,22 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
       target_to_camera_rotation = Matrix4dToMatx33d(*T_camera_board_prior);
       target_to_camera_translation = Matrix4dToTranslation(*T_camera_board_prior);
     } else {
+      const auto pose_start = std::chrono::steady_clock::now();
       cv::Mat rvec;
       cv::Mat tvec;
       if (!EstimateTargetPose(camera, outer_corners, outer_point_ids, model, &rvec, &tvec)) {
         result.failure_reason =
             "Failed to estimate target pose for " +
             std::string(ToString(board_config.internal_projection_mode)) + " mode.";
+        result.runtime_breakdown.pose_estimation_seconds +=
+            ElapsedSeconds(pose_start);
+        result.runtime_breakdown.pose_estimation_call_count += 1;
+        result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
         return result;
       }
+      result.runtime_breakdown.pose_estimation_seconds +=
+          ElapsedSeconds(pose_start);
+      result.runtime_breakdown.pose_estimation_call_count += 1;
       cv::Rodrigues(rvec, target_to_camera_rotation);
       target_to_camera_translation = MatToEigenVector3d(tvec);
     }
@@ -3860,6 +3957,7 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
                                                    board_config.internal_projection_mode),
                                                board_config.internal_projection_mode ==
                                                    InternalProjectionMode::SphereRayRefine,
+                                               &result.runtime_breakdown,
                                                &result);
     } else {
       cv::Mat rvec;
@@ -3875,11 +3973,21 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
         tvec = (cv::Mat_<double>(3, 1) << target_to_camera_translation.x(),
                 target_to_camera_translation.y(),
                 target_to_camera_translation.z());
-      } else if (!EstimateTargetPose(camera, outer_corners, outer_point_ids, model, &rvec, &tvec)) {
-        result.failure_reason =
-            "Failed to estimate target pose for " +
-            std::string(ToString(board_config.internal_projection_mode)) + " mode.";
-        return result;
+      } else {
+        const auto pose_start = std::chrono::steady_clock::now();
+        if (!EstimateTargetPose(camera, outer_corners, outer_point_ids, model, &rvec, &tvec)) {
+          result.failure_reason =
+              "Failed to estimate target pose for " +
+              std::string(ToString(board_config.internal_projection_mode)) + " mode.";
+          result.runtime_breakdown.pose_estimation_seconds +=
+              ElapsedSeconds(pose_start);
+          result.runtime_breakdown.pose_estimation_call_count += 1;
+          result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
+          return result;
+        }
+        result.runtime_breakdown.pose_estimation_seconds +=
+            ElapsedSeconds(pose_start);
+        result.runtime_breakdown.pose_estimation_call_count += 1;
       }
       const VirtualPatchContext context =
           BuildVirtualPatchContext(gray, camera, rvec, tvec, model, outer_point_ids, options_);
@@ -3904,6 +4012,7 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
   result.success =
       result.valid_internal_corner_count > 0 &&
       result.valid_corner_count >= board_config.min_visible_points;
+  result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
   return result;
 }
 

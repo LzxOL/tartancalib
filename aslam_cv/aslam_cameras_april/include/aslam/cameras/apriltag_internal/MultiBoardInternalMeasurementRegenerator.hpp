@@ -31,6 +31,19 @@ struct RegeneratedBoardMeasurement {
   ApriltagInternalDetectionResult detection;
 };
 
+struct InternalRegenerationRuntimeBreakdown {
+  double pose_estimation_seconds = 0.0;
+  double boundary_model_seconds = 0.0;
+  double seed_search_seconds = 0.0;
+  double ray_refine_seconds = 0.0;
+  double image_evidence_seconds = 0.0;
+  double subpix_seconds = 0.0;
+  int pose_estimation_call_count = 0;
+  int boundary_model_build_count = 0;
+  int attempted_internal_corner_count = 0;
+  int valid_internal_corner_count = 0;
+};
+
 struct InternalRegenerationFrameResult {
   int frame_index = -1;
   std::string frame_label;
@@ -40,6 +53,7 @@ struct InternalRegenerationFrameResult {
   std::vector<int> visible_board_ids;
   std::vector<std::string> warnings;
   std::vector<RegeneratedBoardMeasurement> board_measurements;
+  InternalRegenerationRuntimeBreakdown runtime_breakdown;
 
   int SuccessfulBoardCount() const;
   int ValidInternalCornerCount() const;

@@ -3,8 +3,10 @@
 #include <aslam/cameras/apriltag_internal/KalibrBenchmark.hpp>
 #include <aslam/cameras/apriltag_internal/OuterOnlyCameraInitializer.hpp>
 #include <aslam/cameras/apriltag_internal/Stage5Benchmark.hpp>
+#include <aslam/cameras/apriltag_internal/Stage5Runtime.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <fstream>
 #include <iostream>
@@ -41,6 +43,7 @@ struct CmdArgs {
   std::string kalibr_source_label;
   std::string camera_init_mode_override;
   std::string experiment_tag;
+  std::string cache_dir;
   bool all = false;
   bool show = false;
   int reference_board_id = 1;
@@ -52,12 +55,33 @@ struct CmdArgs {
   bool disable_second_pass = false;
   IntrinsicsReleaseMode intrinsics_release_mode = IntrinsicsReleaseMode::Delayed;
   bool disable_residual_sanity_gate = false;
-  bool disable_board_pose_fit_gate = false;
+  bool enable_board_pose_fit_gate = false;
   double kalibr_runtime_seconds = -1.0;
+  ati::Stage5RuntimeMode runtime_mode = ati::Stage5RuntimeMode::Research;
 };
 
 std::string BuildKalibrSourceLabel(const std::string& kalibr_camchain_yaml) {
   return fs::path(kalibr_camchain_yaml).lexically_normal().generic_string();
+}
+
+double ElapsedSeconds(const std::chrono::steady_clock::time_point& start_time) {
+  return std::chrono::duration_cast<std::chrono::duration<double> >(
+             std::chrono::steady_clock::now() - start_time)
+      .count();
+}
+
+void AddRuntimeStage(ati::Stage5RuntimeSummary* summary,
+                     const std::string& stage_label,
+                     double seconds,
+                     bool skipped_in_fast_mode) {
+  if (summary == nullptr) {
+    return;
+  }
+  ati::Stage5RuntimeStageRecord record;
+  record.stage_label = stage_label;
+  record.wall_time_seconds = seconds;
+  record.skipped_in_fast_mode = skipped_in_fast_mode;
+  summary->stage_records.push_back(record);
 }
 
 struct RequestedExperimentConfig {
@@ -78,7 +102,7 @@ struct RequestedExperimentConfig {
   IntrinsicsReleaseMode backend_intrinsics_release_mode =
       IntrinsicsReleaseMode::Delayed;
   bool enable_residual_sanity_gate = true;
-  bool enable_board_pose_fit_gate = true;
+  bool enable_board_pose_fit_gate = false;
 };
 
 const char* ToString(IntrinsicsReleaseMode mode) {
@@ -140,7 +164,7 @@ bool HasAblationOverrides(const RequestedExperimentConfig& config) {
          config.frontend_intrinsics_release_mode != IntrinsicsReleaseMode::Delayed ||
          config.backend_intrinsics_release_mode != IntrinsicsReleaseMode::Delayed ||
          !config.enable_residual_sanity_gate ||
-         !config.enable_board_pose_fit_gate;
+         config.enable_board_pose_fit_gate;
 }
 
 std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& config) {
@@ -158,8 +182,8 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
   if (!config.enable_residual_sanity_gate) {
     parts.push_back("no_residual_gate");
   }
-  if (!config.enable_board_pose_fit_gate) {
-    parts.push_back("no_board_pose_gate");
+  if (config.enable_board_pose_fit_gate) {
+    parts.push_back("board_pose_gate_debug");
   }
   if (parts.empty()) {
     return std::string();
@@ -182,7 +206,7 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
                                       args.camera_init_mode_override);
   config.run_second_pass = !args.disable_second_pass;
   config.enable_residual_sanity_gate = !args.disable_residual_sanity_gate;
-  config.enable_board_pose_fit_gate = !args.disable_board_pose_fit_gate;
+  config.enable_board_pose_fit_gate = args.enable_board_pose_fit_gate;
 
   switch (args.intrinsics_release_mode) {
     case IntrinsicsReleaseMode::Delayed:
@@ -244,7 +268,9 @@ void PrintUsage(const char* program) {
       << " [--camera-init-mode manual|auto|auto_with_manual_fallback]"
       << " [--experiment-tag TAG] [--disable-second-pass]"
       << " [--intrinsics-release-mode delayed|immediate|pose_only]"
-      << " [--disable-residual-sanity-gate] [--disable-board-pose-fit-gate]"
+      << " [--runtime-mode research|fast]"
+      << " [--cache-dir PATH]"
+      << " [--disable-residual-sanity-gate] [--enable-board-pose-fit-gate]"
       << " [--kalibr-training-split-signature SIGNATURE]"
       << " [--kalibr-source-label LABEL (deprecated, ignored)]"
       << " [--kalibr-runtime-seconds SEC]\n";
@@ -270,14 +296,20 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.camera_init_mode_override = argv[++i];
     } else if (token == "--experiment-tag" && i + 1 < argc) {
       args.experiment_tag = argv[++i];
+    } else if (token == "--runtime-mode" && i + 1 < argc) {
+      args.runtime_mode = ati::ParseStage5RuntimeMode(argv[++i]);
+    } else if (token == "--cache-dir" && i + 1 < argc) {
+      args.cache_dir = argv[++i];
     } else if (token == "--disable-second-pass") {
       args.disable_second_pass = true;
     } else if (token == "--intrinsics-release-mode" && i + 1 < argc) {
       args.intrinsics_release_mode = ParseIntrinsicsReleaseMode(argv[++i]);
     } else if (token == "--disable-residual-sanity-gate") {
       args.disable_residual_sanity_gate = true;
+    } else if (token == "--enable-board-pose-fit-gate") {
+      args.enable_board_pose_fit_gate = true;
     } else if (token == "--disable-board-pose-fit-gate") {
-      args.disable_board_pose_fit_gate = true;
+      args.enable_board_pose_fit_gate = false;
     } else if (token == "--kalibr-runtime-seconds" && i + 1 < argc) {
       args.kalibr_runtime_seconds = std::stod(argv[++i]);
     } else if (token == "--all") {
@@ -719,15 +751,30 @@ void PrintBackendResultProgress(
 
 int main(int argc, char** argv) {
   try {
+    const auto total_start = std::chrono::steady_clock::now();
     const CmdArgs args = ParseArgs(argc, argv);
     const RequestedExperimentConfig requested_config =
         BuildRequestedExperimentConfig(args);
+    ati::Stage5RuntimeSummary runtime_summary;
+    runtime_summary.runtime_mode = args.runtime_mode;
+    runtime_summary.cache_dir =
+        args.cache_dir.empty() ? "result/.stage5_backend_cache" : args.cache_dir;
+    runtime_summary.cache_enabled = true;
     const std::string dataset_label = InferDatasetLabel(args);
-    const std::vector<std::string> image_paths = CollectImagePaths(args.image_path, args.all);
+    std::vector<std::string> image_paths;
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      image_paths = CollectImagePaths(args.image_path, args.all);
+      AddRuntimeStage(&runtime_summary, "image_collection", ElapsedSeconds(stage_start),
+                      false);
+    }
     PrintProgress("dataset=" + dataset_label);
     PrintProgress("input=" + args.image_path);
     PrintProgress("output=" + args.output_path);
     PrintProgress("collected_images=" + std::to_string(image_paths.size()));
+    PrintProgress("runtime_mode=" +
+                  std::string(ati::ToString(args.runtime_mode)));
+    PrintProgress("cache_dir=" + runtime_summary.cache_dir);
     const std::string kalibr_source_label =
         BuildKalibrSourceLabel(args.kalibr_camchain_yaml);
     if (!args.kalibr_source_label.empty() &&
@@ -768,6 +815,12 @@ int main(int argc, char** argv) {
     baseline_options.baseline_protocol_label =
         requested_config.effective_protocol_label;
     baseline_options.source_pipeline_label = "run_stage5_backend";
+    baseline_options.enable_outer_detection_cache = true;
+    baseline_options.outer_detection_cache_dir = runtime_summary.cache_dir;
+
+    if (args.runtime_mode == ati::Stage5RuntimeMode::Fast && args.show) {
+      PrintProgress("warning: --show is ignored in fast runtime mode.");
+    }
 
     ati::BackendProblemOptions backend_options;
     backend_options.reference_board_id = args.reference_board_id;
@@ -784,8 +837,13 @@ int main(int argc, char** argv) {
     split_options.holdout_stride = args.holdout_stride;
     split_options.holdout_offset = args.holdout_offset;
     const ati::Stage5Benchmark benchmark(split_options);
-    const ati::CalibrationBenchmarkSplit preview_split =
-        benchmark.BuildDeterministicSplit(all_frames);
+    ati::CalibrationBenchmarkSplit preview_split;
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      preview_split = benchmark.BuildDeterministicSplit(all_frames);
+      AddRuntimeStage(&runtime_summary, "split_preview", ElapsedSeconds(stage_start),
+                      false);
+    }
     if (preview_split.success) {
       PrintProgress("split=" + preview_split.split_signature +
                     " training=" +
@@ -813,12 +871,188 @@ int main(int argc, char** argv) {
     benchmark_input.backend_options = backend_options;
     benchmark_input.kalibr_reference = kalibr_reference;
     benchmark_input.dataset_label = dataset_label;
-
-    PrintProgress("running frozen frontend baseline + Stage 5 benchmark...");
-    const ati::Stage5BenchmarkReport report = benchmark.Run(benchmark_input);
+    benchmark_input.enable_diagnostic_compare =
+        args.runtime_mode == ati::Stage5RuntimeMode::Research;
 
     const fs::path output_dir(args.output_path);
     EnsureDirectoryExists(output_dir);
+    const auto write_runtime_summary = [&runtime_summary, &output_dir, &total_start]() {
+      runtime_summary.total_runtime_seconds = ElapsedSeconds(total_start);
+      ati::WriteStage5RuntimeSummary(
+          (output_dir / "runtime_summary.txt").string(), runtime_summary);
+    };
+
+    PrintProgress("running frozen frontend baseline + Stage 5 benchmark...");
+    const ati::Stage5BenchmarkReport report = benchmark.Run(benchmark_input);
+    runtime_summary.training_detection_cache_hits =
+        report.baseline_result.runtime_breakdown.training_detection_cache.cache_hits;
+    runtime_summary.training_detection_cache_misses =
+        report.baseline_result.runtime_breakdown.training_detection_cache.cache_misses;
+    runtime_summary.holdout_detection_cache_hits =
+        report.runtime_breakdown.holdout_detection_cache.cache_hits;
+    runtime_summary.holdout_detection_cache_misses =
+        report.runtime_breakdown.holdout_detection_cache.cache_misses;
+    runtime_summary.round1_regeneration_attempted_internal_corners =
+        report.baseline_result.runtime_breakdown
+            .round1_regeneration_attempted_internal_corners;
+    runtime_summary.round1_regeneration_valid_internal_corners =
+        report.baseline_result.runtime_breakdown
+            .round1_regeneration_valid_internal_corners;
+    runtime_summary.round2_regeneration_attempted_internal_corners =
+        report.baseline_result.runtime_breakdown
+            .round2_regeneration_attempted_internal_corners;
+    runtime_summary.round2_regeneration_valid_internal_corners =
+        report.baseline_result.runtime_breakdown
+            .round2_regeneration_valid_internal_corners;
+    runtime_summary.round1_optimization_residual_evaluation_call_count =
+        report.baseline_result.runtime_breakdown
+            .round1_optimization_residual_evaluation_call_count;
+    runtime_summary.round1_optimization_cost_evaluation_call_count =
+        report.baseline_result.runtime_breakdown
+            .round1_optimization_cost_evaluation_call_count;
+    runtime_summary.round2_optimization_residual_evaluation_call_count =
+        report.baseline_result.runtime_breakdown
+            .round2_optimization_residual_evaluation_call_count;
+    runtime_summary.round2_optimization_cost_evaluation_call_count =
+        report.baseline_result.runtime_breakdown
+            .round2_optimization_cost_evaluation_call_count;
+    AddRuntimeStage(&runtime_summary, "training_outer_detection_load_build",
+                    report.baseline_result.runtime_breakdown.training_outer_detection_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "auto_camera_initialization",
+                    report.baseline_result.runtime_breakdown
+                        .auto_camera_initialization_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "outer_bootstrap",
+                    report.baseline_result.runtime_breakdown.outer_bootstrap_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_regeneration",
+                    report.baseline_result.runtime_breakdown.round1_regeneration_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_regeneration_pose_estimation",
+                    report.baseline_result.runtime_breakdown
+                        .round1_regeneration_pose_estimation_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_regeneration_boundary_model",
+                    report.baseline_result.runtime_breakdown
+                        .round1_regeneration_boundary_model_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_regeneration_seed_search",
+                    report.baseline_result.runtime_breakdown
+                        .round1_regeneration_seed_search_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_regeneration_ray_refine",
+                    report.baseline_result.runtime_breakdown
+                        .round1_regeneration_ray_refine_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_regeneration_image_evidence",
+                    report.baseline_result.runtime_breakdown
+                        .round1_regeneration_image_evidence_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_regeneration_subpix",
+                    report.baseline_result.runtime_breakdown
+                        .round1_regeneration_subpix_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_measurement_build",
+                    report.baseline_result.runtime_breakdown
+                        .round1_measurement_build_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_residual_evaluation",
+                    report.baseline_result.runtime_breakdown
+                        .round1_residual_evaluation_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_selection",
+                    report.baseline_result.runtime_breakdown.round1_selection_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_optimization",
+                    report.baseline_result.runtime_breakdown.round1_optimization_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_optimization_residual_evaluation",
+                    report.baseline_result.runtime_breakdown
+                        .round1_optimization_residual_evaluation_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_optimization_cost_evaluation",
+                    report.baseline_result.runtime_breakdown
+                        .round1_optimization_cost_evaluation_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_optimization_frame_updates",
+                    report.baseline_result.runtime_breakdown
+                        .round1_optimization_frame_update_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_optimization_board_updates",
+                    report.baseline_result.runtime_breakdown
+                        .round1_optimization_board_update_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round1_optimization_intrinsics_updates",
+                    report.baseline_result.runtime_breakdown
+                        .round1_optimization_intrinsics_update_seconds,
+                    false);
+    AddRuntimeStage(&runtime_summary, "round2_regeneration",
+                    report.baseline_result.runtime_breakdown.round2_regeneration_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_regeneration_pose_estimation",
+                    report.baseline_result.runtime_breakdown
+                        .round2_regeneration_pose_estimation_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_regeneration_boundary_model",
+                    report.baseline_result.runtime_breakdown
+                        .round2_regeneration_boundary_model_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_regeneration_seed_search",
+                    report.baseline_result.runtime_breakdown
+                        .round2_regeneration_seed_search_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_regeneration_ray_refine",
+                    report.baseline_result.runtime_breakdown
+                        .round2_regeneration_ray_refine_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_regeneration_image_evidence",
+                    report.baseline_result.runtime_breakdown
+                        .round2_regeneration_image_evidence_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_regeneration_subpix",
+                    report.baseline_result.runtime_breakdown
+                        .round2_regeneration_subpix_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_measurement_build",
+                    report.baseline_result.runtime_breakdown
+                        .round2_measurement_build_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_residual_evaluation",
+                    report.baseline_result.runtime_breakdown
+                        .round2_residual_evaluation_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_selection",
+                    report.baseline_result.runtime_breakdown.round2_selection_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_optimization",
+                    report.baseline_result.runtime_breakdown.round2_optimization_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_optimization_residual_evaluation",
+                    report.baseline_result.runtime_breakdown
+                        .round2_optimization_residual_evaluation_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_optimization_cost_evaluation",
+                    report.baseline_result.runtime_breakdown
+                        .round2_optimization_cost_evaluation_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_optimization_frame_updates",
+                    report.baseline_result.runtime_breakdown
+                        .round2_optimization_frame_update_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_optimization_board_updates",
+                    report.baseline_result.runtime_breakdown
+                        .round2_optimization_board_update_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "round2_optimization_intrinsics_updates",
+                    report.baseline_result.runtime_breakdown
+                        .round2_optimization_intrinsics_update_seconds,
+                    !report.baseline_result.effective_options.run_second_pass);
+    AddRuntimeStage(&runtime_summary, "holdout_dataset_build",
+                    report.runtime_breakdown.holdout_dataset_build_seconds, false);
+    AddRuntimeStage(&runtime_summary, "diagnostic_compare",
+                    report.runtime_breakdown.diagnostic_compare_seconds,
+                    args.runtime_mode == ati::Stage5RuntimeMode::Fast);
     PrintProgress("writing Stage 5 benchmark artifacts...");
 
     if (report.baseline_result.stage5_round1_bundle.success) {
@@ -858,23 +1092,27 @@ int main(int argc, char** argv) {
         (output_dir / "benchmark_holdout_points.csv").string(), report);
     ati::WriteStage5BenchmarkWorstCasesSummary(
         (output_dir / "benchmark_worst_cases_summary.txt").string(), report, 10);
-    if (report.diagnostic_compare.success) {
+    if (args.runtime_mode == ati::Stage5RuntimeMode::Research &&
+        report.diagnostic_compare.success) {
       ati::WriteKalibrBenchmarkIntrinsicsCsv(
           (output_dir / "benchmark_intrinsics_compare.csv").string(),
           report.diagnostic_compare);
     }
 
-    const cv::Mat projection_compare = benchmark.RenderProjectionComparison(report);
-    if (!projection_compare.empty()) {
-      cv::imwrite((output_dir / "benchmark_projection_compare.png").string(),
-                  projection_compare);
-      if (args.show) {
-        cv::imshow("stage5_benchmark_projection_compare", projection_compare);
-        cv::waitKey(0);
+    if (args.runtime_mode == ati::Stage5RuntimeMode::Research) {
+      const cv::Mat projection_compare = benchmark.RenderProjectionComparison(report);
+      if (!projection_compare.empty()) {
+        cv::imwrite((output_dir / "benchmark_projection_compare.png").string(),
+                    projection_compare);
+        if (args.show) {
+          cv::imshow("stage5_benchmark_projection_compare", projection_compare);
+          cv::waitKey(0);
+        }
       }
     }
 
     if (!report.success) {
+      write_runtime_summary();
       std::cout << "Stage 5 benchmark success: 0\n"
                 << "Protocol summary: "
                 << (output_dir / "benchmark_protocol_summary.txt").string() << "\n";
@@ -895,36 +1133,44 @@ int main(int argc, char** argv) {
     PrintEvaluationProgress("kalibr training", report.kalibr_training_evaluation);
     PrintEvaluationProgress("kalibr holdout", report.kalibr_holdout_evaluation);
 
-    ati::AslamBackendCalibrationOptions minimal_runner_options;
-    minimal_runner_options.max_iterations = 6;
-    minimal_runner_options.convergence_delta_j = 1e-3;
-    minimal_runner_options.convergence_delta_x = 1e-4;
-    minimal_runner_options.levenberg_marquardt_lambda_init = 1e-3;
-    minimal_runner_options.linear_solver = "cholmod";
-    minimal_runner_options.verbose = false;
-    minimal_runner_options.use_huber_loss = true;
-    minimal_runner_options.outer_huber_delta_pixels = 10.0;
-    minimal_runner_options.internal_huber_delta_pixels = 6.0;
-    minimal_runner_options.invalid_projection_penalty_pixels = 100.0;
-    minimal_runner_options.export_cost_parity_diagnostics = true;
-    minimal_runner_options.run_jacobian_consistency_check = true;
-    minimal_runner_options.jacobian_finite_difference_epsilon = 1e-6;
-    minimal_runner_options.debug_max_frames = 3;
-    minimal_runner_options.debug_max_nonreference_boards = 1;
-    minimal_runner_options.force_pose_only = true;
-    const ati::AslamBackendCalibrationRunner minimal_backend_runner(
-        minimal_runner_options);
-    PrintProgress("running minimal pose-only backend smoke check...");
-    const ati::AslamBackendCalibrationResult minimal_backend_result =
-        minimal_backend_runner.Run(report.backend_problem_input);
-    PrintBackendResultProgress(minimal_backend_result);
-    WriteBackendDiagnosticArtifacts(
-        output_dir, "backend_minimal_pose_only", minimal_backend_result);
+    if (args.runtime_mode == ati::Stage5RuntimeMode::Research) {
+      ati::AslamBackendCalibrationOptions minimal_runner_options;
+      minimal_runner_options.max_iterations = 6;
+      minimal_runner_options.convergence_delta_j = 1e-3;
+      minimal_runner_options.convergence_delta_x = 1e-4;
+      minimal_runner_options.levenberg_marquardt_lambda_init = 1e-3;
+      minimal_runner_options.linear_solver = "cholmod";
+      minimal_runner_options.verbose = false;
+      minimal_runner_options.use_huber_loss = true;
+      minimal_runner_options.outer_huber_delta_pixels = 10.0;
+      minimal_runner_options.internal_huber_delta_pixels = 6.0;
+      minimal_runner_options.invalid_projection_penalty_pixels = 100.0;
+      minimal_runner_options.export_cost_parity_diagnostics = true;
+      minimal_runner_options.run_jacobian_consistency_check = true;
+      minimal_runner_options.jacobian_finite_difference_epsilon = 1e-6;
+      minimal_runner_options.debug_max_frames = 3;
+      minimal_runner_options.debug_max_nonreference_boards = 1;
+      minimal_runner_options.force_pose_only = true;
+      const ati::AslamBackendCalibrationRunner minimal_backend_runner(
+          minimal_runner_options);
+      PrintProgress("running minimal pose-only backend smoke check...");
+      const auto minimal_stage_start = std::chrono::steady_clock::now();
+      const ati::AslamBackendCalibrationResult minimal_backend_result =
+          minimal_backend_runner.Run(report.backend_problem_input);
+      AddRuntimeStage(&runtime_summary, "backend_minimal_smoke",
+                      ElapsedSeconds(minimal_stage_start), false);
+      PrintBackendResultProgress(minimal_backend_result);
+      WriteBackendDiagnosticArtifacts(
+          output_dir, "backend_minimal_pose_only", minimal_backend_result);
 
-    if (!minimal_backend_result.success || !HasBackendCostDescent(minimal_backend_result)) {
-      std::cout << "Minimal pose-only backend summary: "
-                << (output_dir / "backend_minimal_pose_only_summary.txt").string() << "\n";
-      return 1;
+      if (!minimal_backend_result.success || !HasBackendCostDescent(minimal_backend_result)) {
+        write_runtime_summary();
+        std::cout << "Minimal pose-only backend summary: "
+                  << (output_dir / "backend_minimal_pose_only_summary.txt").string() << "\n";
+        return 1;
+      }
+    } else {
+      AddRuntimeStage(&runtime_summary, "backend_minimal_smoke", 0.0, true);
     }
 
     ati::AslamBackendCalibrationOptions runner_options;
@@ -938,11 +1184,15 @@ int main(int argc, char** argv) {
     runner_options.outer_huber_delta_pixels = 10.0;
     runner_options.internal_huber_delta_pixels = 6.0;
     runner_options.invalid_projection_penalty_pixels = 100.0;
-    runner_options.export_cost_parity_diagnostics = true;
+    runner_options.export_cost_parity_diagnostics =
+        args.runtime_mode == ati::Stage5RuntimeMode::Research;
     const ati::AslamBackendCalibrationRunner backend_runner(runner_options);
     PrintProgress("running full backend optimization...");
+    const auto backend_stage_start = std::chrono::steady_clock::now();
     const ati::AslamBackendCalibrationResult backend_result =
         backend_runner.Run(report.backend_problem_input);
+    AddRuntimeStage(&runtime_summary, "backend_full_optimization",
+                    ElapsedSeconds(backend_stage_start), false);
     PrintBackendResultProgress(backend_result);
     WriteBackendDiagnosticArtifacts(output_dir, "backend_optimization", backend_result);
     WriteExperimentConfigSummary(
@@ -952,24 +1202,38 @@ int main(int argc, char** argv) {
         &backend_result);
 
     if (!backend_result.success) {
+      write_runtime_summary();
       std::cout << "Backend summary: "
                 << (output_dir / "backend_optimization_summary.txt").string() << "\n";
       return 1;
     }
 
-    const ati::CameraModelRefitEvaluationResult backend_training_evaluation =
-        benchmark.EvaluateCameraModel(report.training_dataset,
-                                      backend_result.optimized_scene_state.camera,
-                                      "backend");
-    const ati::CameraModelRefitEvaluationResult backend_holdout_evaluation =
-        benchmark.EvaluateCameraModel(report.holdout_dataset,
-                                      backend_result.optimized_scene_state.camera,
-                                      "backend");
+    ati::CameraModelRefitEvaluationResult backend_training_evaluation;
+    ati::CameraModelRefitEvaluationResult backend_holdout_evaluation;
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      backend_training_evaluation = benchmark.EvaluateCameraModel(
+          report.training_dataset,
+          backend_result.optimized_scene_state.camera,
+          "backend");
+      AddRuntimeStage(&runtime_summary, "backend_training_evaluation",
+                      ElapsedSeconds(stage_start), false);
+    }
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      backend_holdout_evaluation = benchmark.EvaluateCameraModel(
+          report.holdout_dataset,
+          backend_result.optimized_scene_state.camera,
+          "backend");
+      AddRuntimeStage(&runtime_summary, "backend_holdout_evaluation",
+                      ElapsedSeconds(stage_start), false);
+    }
     if (!backend_training_evaluation.success || !backend_holdout_evaluation.success) {
       std::ofstream output((output_dir / "backend_vs_frontend_summary.txt").string().c_str());
       output << "backend_evaluation_failed: 1\n";
       output << "training_failure_reason: " << backend_training_evaluation.failure_reason << "\n";
       output << "holdout_failure_reason: " << backend_holdout_evaluation.failure_reason << "\n";
+      write_runtime_summary();
       return 1;
     }
     PrintEvaluationProgress("backend training", backend_training_evaluation);
@@ -997,146 +1261,154 @@ int main(int argc, char** argv) {
         output_dir / "backend_compare_outer_pose_frames";
     const fs::path compare_outer_board_dir =
         output_dir / "backend_compare_outer_pose_boards";
-    PrintProgress("rendering backend/frontend/Kalibr comparison overlays...");
-    EnsureDirectoryExists(compare_frame_dir);
-    EnsureDirectoryExists(compare_board_dir);
-    EnsureDirectoryExists(compare_outer_frame_dir);
-    EnsureDirectoryExists(compare_outer_board_dir);
+    if (args.runtime_mode == ati::Stage5RuntimeMode::Research) {
+      const auto overlay_stage_start = std::chrono::steady_clock::now();
+      PrintProgress("rendering backend/frontend/Kalibr comparison overlays...");
+      EnsureDirectoryExists(compare_frame_dir);
+      EnsureDirectoryExists(compare_board_dir);
+      EnsureDirectoryExists(compare_outer_frame_dir);
+      EnsureDirectoryExists(compare_outer_board_dir);
 
-    {
-      std::vector<ati::CameraModelRefitFrameDiagnostics> worst_frames =
-          report.our_holdout_evaluation.frame_diagnostics;
-      std::sort(worst_frames.begin(), worst_frames.end(),
-                [](const ati::CameraModelRefitFrameDiagnostics& lhs,
-                   const ati::CameraModelRefitFrameDiagnostics& rhs) {
-                  return lhs.rmse > rhs.rmse;
-                });
-      if (worst_frames.size() > 10) {
-        worst_frames.resize(10);
-      }
-      for (std::size_t rank = 0; rank < worst_frames.size(); ++rank) {
-        const ati::CameraModelRefitFrameDiagnostics& frame = worst_frames[rank];
-        const cv::Mat frontend_overlay = benchmark.RenderEvaluationFrameOverlay(
-            report, report.our_holdout_evaluation, frame.frame_index);
-        const cv::Mat backend_overlay = benchmark.RenderEvaluationFrameOverlay(
-            report, backend_holdout_evaluation, frame.frame_index);
-        const cv::Mat kalibr_overlay = benchmark.RenderEvaluationFrameOverlay(
-            report, report.kalibr_holdout_evaluation, frame.frame_index);
-        const cv::Mat compare = RenderLabeledCompare({
-            std::make_pair(frontend_overlay, "frontend"),
-            std::make_pair(backend_overlay, "backend"),
-            std::make_pair(kalibr_overlay, "kalibr"),
-        });
-        if (!compare.empty()) {
-          const std::string filename =
-              "rank" + std::to_string(static_cast<int>(rank + 1)) +
-              "_frame_" + std::to_string(frame.frame_index) + "_" + frame.frame_label + ".png";
-          cv::imwrite((compare_frame_dir / filename).string(), compare);
+      {
+        std::vector<ati::CameraModelRefitFrameDiagnostics> worst_frames =
+            report.our_holdout_evaluation.frame_diagnostics;
+        std::sort(worst_frames.begin(), worst_frames.end(),
+                  [](const ati::CameraModelRefitFrameDiagnostics& lhs,
+                     const ati::CameraModelRefitFrameDiagnostics& rhs) {
+                    return lhs.rmse > rhs.rmse;
+                  });
+        if (worst_frames.size() > 10) {
+          worst_frames.resize(10);
+        }
+        for (std::size_t rank = 0; rank < worst_frames.size(); ++rank) {
+          const ati::CameraModelRefitFrameDiagnostics& frame = worst_frames[rank];
+          const cv::Mat frontend_overlay = benchmark.RenderEvaluationFrameOverlay(
+              report, report.our_holdout_evaluation, frame.frame_index);
+          const cv::Mat backend_overlay = benchmark.RenderEvaluationFrameOverlay(
+              report, backend_holdout_evaluation, frame.frame_index);
+          const cv::Mat kalibr_overlay = benchmark.RenderEvaluationFrameOverlay(
+              report, report.kalibr_holdout_evaluation, frame.frame_index);
+          const cv::Mat compare = RenderLabeledCompare({
+              std::make_pair(frontend_overlay, "frontend"),
+              std::make_pair(backend_overlay, "backend"),
+              std::make_pair(kalibr_overlay, "kalibr"),
+          });
+          if (!compare.empty()) {
+            const std::string filename =
+                "rank" + std::to_string(static_cast<int>(rank + 1)) +
+                "_frame_" + std::to_string(frame.frame_index) + "_" + frame.frame_label + ".png";
+            cv::imwrite((compare_frame_dir / filename).string(), compare);
+          }
         }
       }
-    }
 
-    {
-      std::vector<ati::CameraModelRefitFrameDiagnostics> worst_frames =
-          report.our_holdout_evaluation.frame_diagnostics;
-      std::sort(worst_frames.begin(), worst_frames.end(),
-                [](const ati::CameraModelRefitFrameDiagnostics& lhs,
-                   const ati::CameraModelRefitFrameDiagnostics& rhs) {
-                  return lhs.rmse > rhs.rmse;
-                });
-      if (worst_frames.size() > 10) {
-        worst_frames.resize(10);
-      }
-      for (std::size_t rank = 0; rank < worst_frames.size(); ++rank) {
-        const ati::CameraModelRefitFrameDiagnostics& frame = worst_frames[rank];
-        const cv::Mat frontend_overlay = benchmark.RenderOuterPoseFitFrameOverlay(
-            report, report.our_holdout_evaluation, frame.frame_index);
-        const cv::Mat backend_overlay = benchmark.RenderOuterPoseFitFrameOverlay(
-            report, backend_holdout_evaluation, frame.frame_index);
-        const cv::Mat kalibr_overlay = benchmark.RenderOuterPoseFitFrameOverlay(
-            report, report.kalibr_holdout_evaluation, frame.frame_index);
-        const cv::Mat compare = RenderLabeledCompare({
-            std::make_pair(frontend_overlay, "frontend outer pose"),
-            std::make_pair(backend_overlay, "backend outer pose"),
-            std::make_pair(kalibr_overlay, "kalibr outer pose"),
-        });
-        if (!compare.empty()) {
-          const std::string filename =
-              "rank" + std::to_string(static_cast<int>(rank + 1)) +
-              "_frame_" + std::to_string(frame.frame_index) + "_" + frame.frame_label + ".png";
-          cv::imwrite((compare_outer_frame_dir / filename).string(), compare);
+      {
+        std::vector<ati::CameraModelRefitFrameDiagnostics> worst_frames =
+            report.our_holdout_evaluation.frame_diagnostics;
+        std::sort(worst_frames.begin(), worst_frames.end(),
+                  [](const ati::CameraModelRefitFrameDiagnostics& lhs,
+                     const ati::CameraModelRefitFrameDiagnostics& rhs) {
+                    return lhs.rmse > rhs.rmse;
+                  });
+        if (worst_frames.size() > 10) {
+          worst_frames.resize(10);
+        }
+        for (std::size_t rank = 0; rank < worst_frames.size(); ++rank) {
+          const ati::CameraModelRefitFrameDiagnostics& frame = worst_frames[rank];
+          const cv::Mat frontend_overlay = benchmark.RenderOuterPoseFitFrameOverlay(
+              report, report.our_holdout_evaluation, frame.frame_index);
+          const cv::Mat backend_overlay = benchmark.RenderOuterPoseFitFrameOverlay(
+              report, backend_holdout_evaluation, frame.frame_index);
+          const cv::Mat kalibr_overlay = benchmark.RenderOuterPoseFitFrameOverlay(
+              report, report.kalibr_holdout_evaluation, frame.frame_index);
+          const cv::Mat compare = RenderLabeledCompare({
+              std::make_pair(frontend_overlay, "frontend outer pose"),
+              std::make_pair(backend_overlay, "backend outer pose"),
+              std::make_pair(kalibr_overlay, "kalibr outer pose"),
+          });
+          if (!compare.empty()) {
+            const std::string filename =
+                "rank" + std::to_string(static_cast<int>(rank + 1)) +
+                "_frame_" + std::to_string(frame.frame_index) + "_" + frame.frame_label + ".png";
+            cv::imwrite((compare_outer_frame_dir / filename).string(), compare);
+          }
         }
       }
-    }
 
-    {
-      std::vector<ati::CameraModelRefitBoardObservationDiagnostics> worst_boards =
-          report.our_holdout_evaluation.board_observation_diagnostics;
-      std::sort(worst_boards.begin(), worst_boards.end(),
-                [](const ati::CameraModelRefitBoardObservationDiagnostics& lhs,
-                   const ati::CameraModelRefitBoardObservationDiagnostics& rhs) {
-                  return lhs.evaluation_rmse > rhs.evaluation_rmse;
-                });
-      if (worst_boards.size() > 10) {
-        worst_boards.resize(10);
-      }
-      for (std::size_t rank = 0; rank < worst_boards.size(); ++rank) {
-        const ati::CameraModelRefitBoardObservationDiagnostics& board = worst_boards[rank];
-        const cv::Mat frontend_overlay = benchmark.RenderEvaluationBoardObservationOverlay(
-            report, report.our_holdout_evaluation, board.frame_index, board.board_id);
-        const cv::Mat backend_overlay = benchmark.RenderEvaluationBoardObservationOverlay(
-            report, backend_holdout_evaluation, board.frame_index, board.board_id);
-        const cv::Mat kalibr_overlay = benchmark.RenderEvaluationBoardObservationOverlay(
-            report, report.kalibr_holdout_evaluation, board.frame_index, board.board_id);
-        const cv::Mat compare = RenderLabeledCompare({
-            std::make_pair(frontend_overlay, "frontend"),
-            std::make_pair(backend_overlay, "backend"),
-            std::make_pair(kalibr_overlay, "kalibr"),
-        });
-        if (!compare.empty()) {
-          const std::string filename =
-              "rank" + std::to_string(static_cast<int>(rank + 1)) +
-              "_frame_" + std::to_string(board.frame_index) +
-              "_board_" + std::to_string(board.board_id) + ".png";
-          cv::imwrite((compare_board_dir / filename).string(), compare);
+      {
+        std::vector<ati::CameraModelRefitBoardObservationDiagnostics> worst_boards =
+            report.our_holdout_evaluation.board_observation_diagnostics;
+        std::sort(worst_boards.begin(), worst_boards.end(),
+                  [](const ati::CameraModelRefitBoardObservationDiagnostics& lhs,
+                     const ati::CameraModelRefitBoardObservationDiagnostics& rhs) {
+                    return lhs.evaluation_rmse > rhs.evaluation_rmse;
+                  });
+        if (worst_boards.size() > 10) {
+          worst_boards.resize(10);
+        }
+        for (std::size_t rank = 0; rank < worst_boards.size(); ++rank) {
+          const ati::CameraModelRefitBoardObservationDiagnostics& board = worst_boards[rank];
+          const cv::Mat frontend_overlay = benchmark.RenderEvaluationBoardObservationOverlay(
+              report, report.our_holdout_evaluation, board.frame_index, board.board_id);
+          const cv::Mat backend_overlay = benchmark.RenderEvaluationBoardObservationOverlay(
+              report, backend_holdout_evaluation, board.frame_index, board.board_id);
+          const cv::Mat kalibr_overlay = benchmark.RenderEvaluationBoardObservationOverlay(
+              report, report.kalibr_holdout_evaluation, board.frame_index, board.board_id);
+          const cv::Mat compare = RenderLabeledCompare({
+              std::make_pair(frontend_overlay, "frontend"),
+              std::make_pair(backend_overlay, "backend"),
+              std::make_pair(kalibr_overlay, "kalibr"),
+          });
+          if (!compare.empty()) {
+            const std::string filename =
+                "rank" + std::to_string(static_cast<int>(rank + 1)) +
+                "_frame_" + std::to_string(board.frame_index) +
+                "_board_" + std::to_string(board.board_id) + ".png";
+            cv::imwrite((compare_board_dir / filename).string(), compare);
+          }
         }
       }
-    }
 
-    {
-      std::vector<ati::CameraModelRefitBoardObservationDiagnostics> worst_boards =
-          report.our_holdout_evaluation.board_observation_diagnostics;
-      std::sort(worst_boards.begin(), worst_boards.end(),
-                [](const ati::CameraModelRefitBoardObservationDiagnostics& lhs,
-                   const ati::CameraModelRefitBoardObservationDiagnostics& rhs) {
-                  return lhs.evaluation_rmse > rhs.evaluation_rmse;
-                });
-      if (worst_boards.size() > 10) {
-        worst_boards.resize(10);
-      }
-      for (std::size_t rank = 0; rank < worst_boards.size(); ++rank) {
-        const ati::CameraModelRefitBoardObservationDiagnostics& board = worst_boards[rank];
-        const cv::Mat frontend_overlay = benchmark.RenderOuterPoseFitBoardOverlay(
-            report, report.our_holdout_evaluation, board.frame_index, board.board_id);
-        const cv::Mat backend_overlay = benchmark.RenderOuterPoseFitBoardOverlay(
-            report, backend_holdout_evaluation, board.frame_index, board.board_id);
-        const cv::Mat kalibr_overlay = benchmark.RenderOuterPoseFitBoardOverlay(
-            report, report.kalibr_holdout_evaluation, board.frame_index, board.board_id);
-        const cv::Mat compare = RenderLabeledCompare({
-            std::make_pair(frontend_overlay, "frontend outer pose"),
-            std::make_pair(backend_overlay, "backend outer pose"),
-            std::make_pair(kalibr_overlay, "kalibr outer pose"),
-        });
-        if (!compare.empty()) {
-          const std::string filename =
-              "rank" + std::to_string(static_cast<int>(rank + 1)) +
-              "_frame_" + std::to_string(board.frame_index) +
-              "_board_" + std::to_string(board.board_id) + ".png";
-          cv::imwrite((compare_outer_board_dir / filename).string(), compare);
+      {
+        std::vector<ati::CameraModelRefitBoardObservationDiagnostics> worst_boards =
+            report.our_holdout_evaluation.board_observation_diagnostics;
+        std::sort(worst_boards.begin(), worst_boards.end(),
+                  [](const ati::CameraModelRefitBoardObservationDiagnostics& lhs,
+                     const ati::CameraModelRefitBoardObservationDiagnostics& rhs) {
+                    return lhs.evaluation_rmse > rhs.evaluation_rmse;
+                  });
+        if (worst_boards.size() > 10) {
+          worst_boards.resize(10);
+        }
+        for (std::size_t rank = 0; rank < worst_boards.size(); ++rank) {
+          const ati::CameraModelRefitBoardObservationDiagnostics& board = worst_boards[rank];
+          const cv::Mat frontend_overlay = benchmark.RenderOuterPoseFitBoardOverlay(
+              report, report.our_holdout_evaluation, board.frame_index, board.board_id);
+          const cv::Mat backend_overlay = benchmark.RenderOuterPoseFitBoardOverlay(
+              report, backend_holdout_evaluation, board.frame_index, board.board_id);
+          const cv::Mat kalibr_overlay = benchmark.RenderOuterPoseFitBoardOverlay(
+              report, report.kalibr_holdout_evaluation, board.frame_index, board.board_id);
+          const cv::Mat compare = RenderLabeledCompare({
+              std::make_pair(frontend_overlay, "frontend outer pose"),
+              std::make_pair(backend_overlay, "backend outer pose"),
+              std::make_pair(kalibr_overlay, "kalibr outer pose"),
+          });
+          if (!compare.empty()) {
+            const std::string filename =
+                "rank" + std::to_string(static_cast<int>(rank + 1)) +
+                "_frame_" + std::to_string(board.frame_index) +
+                "_board_" + std::to_string(board.board_id) + ".png";
+            cv::imwrite((compare_outer_board_dir / filename).string(), compare);
+          }
         }
       }
+      AddRuntimeStage(&runtime_summary, "overlay_export",
+                      ElapsedSeconds(overlay_stage_start), false);
+    } else {
+      AddRuntimeStage(&runtime_summary, "overlay_export", 0.0, true);
     }
 
+    write_runtime_summary();
     std::cout << "Stage 5 benchmark summary: "
               << (output_dir / "benchmark_protocol_summary.txt").string() << "\n"
               << "Backend optimization summary: "
@@ -1147,12 +1419,16 @@ int main(int argc, char** argv) {
               << (output_dir / "backend_holdout_summary.txt").string() << "\n"
               << "Backend vs frontend summary: "
               << (output_dir / "backend_vs_frontend_summary.txt").string() << "\n"
-              << "Backend compare frame overlays: " << compare_frame_dir.string() << "\n"
-              << "Backend compare board overlays: " << compare_board_dir.string() << "\n"
-              << "Backend compare outer-pose frames: "
-              << compare_outer_frame_dir.string() << "\n"
-              << "Backend compare outer-pose boards: "
-              << compare_outer_board_dir.string() << "\n";
+              << "Runtime summary: "
+              << (output_dir / "runtime_summary.txt").string() << "\n";
+    if (args.runtime_mode == ati::Stage5RuntimeMode::Research) {
+      std::cout << "Backend compare frame overlays: " << compare_frame_dir.string() << "\n"
+                << "Backend compare board overlays: " << compare_board_dir.string() << "\n"
+                << "Backend compare outer-pose frames: "
+                << compare_outer_frame_dir.string() << "\n"
+                << "Backend compare outer-pose boards: "
+                << compare_outer_board_dir.string() << "\n";
+    }
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "Error: " << error.what() << "\n";
