@@ -140,6 +140,10 @@ struct CameraModelRefitEvaluationResult {
   double overall_rmse = 0.0;
   double outer_only_rmse = 0.0;
   double internal_only_rmse = 0.0;
+  double mean_residual_x = 0.0;
+  double mean_residual_y = 0.0;
+  double std_residual_x = 0.0;
+  double std_residual_y = 0.0;
   std::vector<CameraModelRefitPointDiagnostics> point_diagnostics;
   std::vector<CameraModelRefitBoardObservationDiagnostics> board_observation_diagnostics;
   std::vector<CameraModelRefitFrameDiagnostics> frame_diagnostics;

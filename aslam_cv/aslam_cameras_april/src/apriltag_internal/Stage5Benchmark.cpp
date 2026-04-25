@@ -36,6 +36,56 @@ double ElapsedSeconds(const std::chrono::steady_clock::time_point& start_time) {
       .count();
 }
 
+void ComputeKalibrStyleResidualStatistics(
+    const std::vector<CameraModelRefitPointDiagnostics>& point_diagnostics,
+    double* mean_residual_x,
+    double* mean_residual_y,
+    double* std_residual_x,
+    double* std_residual_y) {
+  if (mean_residual_x == nullptr || mean_residual_y == nullptr ||
+      std_residual_x == nullptr || std_residual_y == nullptr) {
+    return;
+  }
+  *mean_residual_x = 0.0;
+  *mean_residual_y = 0.0;
+  *std_residual_x = 0.0;
+  *std_residual_y = 0.0;
+  if (point_diagnostics.empty()) {
+    return;
+  }
+
+  double sum_x = 0.0;
+  double sum_y = 0.0;
+  for (const CameraModelRefitPointDiagnostics& point_diag : point_diagnostics) {
+    sum_x += point_diag.residual_xy.x();
+    sum_y += point_diag.residual_xy.y();
+  }
+  const double count = static_cast<double>(point_diagnostics.size());
+  *mean_residual_x = sum_x / count;
+  *mean_residual_y = sum_y / count;
+
+  double sum_sq_x = 0.0;
+  double sum_sq_y = 0.0;
+  for (const CameraModelRefitPointDiagnostics& point_diag : point_diagnostics) {
+    const double dx = point_diag.residual_xy.x() - *mean_residual_x;
+    const double dy = point_diag.residual_xy.y() - *mean_residual_y;
+    sum_sq_x += dx * dx;
+    sum_sq_y += dy * dy;
+  }
+  *std_residual_x = std::sqrt(sum_sq_x / count);
+  *std_residual_y = std::sqrt(sum_sq_y / count);
+}
+
+void WriteKalibrStyleResidualStatistics(
+    std::ostream& output,
+    const std::string& prefix,
+    const CameraModelRefitEvaluationResult& evaluation) {
+  output << prefix << "_mean_residual_x: " << evaluation.mean_residual_x << "\n";
+  output << prefix << "_mean_residual_y: " << evaluation.mean_residual_y << "\n";
+  output << prefix << "_std_residual_x: " << evaluation.std_residual_x << "\n";
+  output << prefix << "_std_residual_y: " << evaluation.std_residual_y << "\n";
+}
+
 std::vector<int> NormalizeBoardIds(const std::vector<int>& configured_ids,
                                    int fallback_tag_id) {
   std::vector<int> board_ids;
@@ -797,6 +847,12 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
       internal_point_count > 0
           ? std::sqrt(internal_squared_error / static_cast<double>(internal_point_count))
           : 0.0;
+  ComputeKalibrStyleResidualStatistics(
+      result.point_diagnostics,
+      &result.mean_residual_x,
+      &result.mean_residual_y,
+      &result.std_residual_x,
+      &result.std_residual_y);
   result.success = true;
   return result;
 }
@@ -1291,6 +1347,8 @@ void WriteStage5BenchmarkTrainingSummary(const std::string& path,
          << "\n";
   output << "kalibr_internal_only_rmse: "
          << report.kalibr_training_evaluation.internal_only_rmse << "\n";
+  WriteKalibrStyleResidualStatistics(output, "our", report.our_training_evaluation);
+  WriteKalibrStyleResidualStatistics(output, "kalibr", report.kalibr_training_evaluation);
   output << "our_point_count: " << report.our_training_evaluation.point_count << "\n";
   output << "kalibr_point_count: " << report.kalibr_training_evaluation.point_count << "\n";
 }
@@ -1309,6 +1367,8 @@ void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
          << "\n";
   output << "kalibr_internal_only_rmse: "
          << report.kalibr_holdout_evaluation.internal_only_rmse << "\n";
+  WriteKalibrStyleResidualStatistics(output, "our", report.our_holdout_evaluation);
+  WriteKalibrStyleResidualStatistics(output, "kalibr", report.kalibr_holdout_evaluation);
   output << "our_point_count: " << report.our_holdout_evaluation.point_count << "\n";
   output << "kalibr_point_count: " << report.kalibr_holdout_evaluation.point_count << "\n";
 }

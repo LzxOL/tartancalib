@@ -442,6 +442,10 @@ void WriteEvaluationSummary(const std::string& path,
   output << "overall_rmse: " << evaluation.overall_rmse << "\n";
   output << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
   output << "internal_only_rmse: " << evaluation.internal_only_rmse << "\n";
+  output << "mean_residual_x: " << evaluation.mean_residual_x << "\n";
+  output << "mean_residual_y: " << evaluation.mean_residual_y << "\n";
+  output << "std_residual_x: " << evaluation.std_residual_x << "\n";
+  output << "std_residual_y: " << evaluation.std_residual_y << "\n";
   output << "point_count: " << evaluation.point_count << "\n";
   output << "outer_point_count: " << evaluation.outer_point_count << "\n";
   output << "internal_point_count: " << evaluation.internal_point_count << "\n";
@@ -484,6 +488,18 @@ void WriteBackendComparisonSummary(
          << backend_training.internal_only_rmse << "\n";
   output << "training_kalibr_internal_only_rmse: "
          << kalibr_training.internal_only_rmse << "\n";
+  output << "training_frontend_mean_residual_x: " << frontend_training.mean_residual_x << "\n";
+  output << "training_frontend_mean_residual_y: " << frontend_training.mean_residual_y << "\n";
+  output << "training_frontend_std_residual_x: " << frontend_training.std_residual_x << "\n";
+  output << "training_frontend_std_residual_y: " << frontend_training.std_residual_y << "\n";
+  output << "training_backend_mean_residual_x: " << backend_training.mean_residual_x << "\n";
+  output << "training_backend_mean_residual_y: " << backend_training.mean_residual_y << "\n";
+  output << "training_backend_std_residual_x: " << backend_training.std_residual_x << "\n";
+  output << "training_backend_std_residual_y: " << backend_training.std_residual_y << "\n";
+  output << "training_kalibr_mean_residual_x: " << kalibr_training.mean_residual_x << "\n";
+  output << "training_kalibr_mean_residual_y: " << kalibr_training.mean_residual_y << "\n";
+  output << "training_kalibr_std_residual_x: " << kalibr_training.std_residual_x << "\n";
+  output << "training_kalibr_std_residual_y: " << kalibr_training.std_residual_y << "\n";
   output << "holdout_frontend_overall_rmse: " << frontend_holdout.overall_rmse << "\n";
   output << "holdout_backend_overall_rmse: " << backend_holdout.overall_rmse << "\n";
   output << "holdout_kalibr_overall_rmse: " << kalibr_holdout.overall_rmse << "\n";
@@ -496,6 +512,18 @@ void WriteBackendComparisonSummary(
          << backend_holdout.internal_only_rmse << "\n";
   output << "holdout_kalibr_internal_only_rmse: "
          << kalibr_holdout.internal_only_rmse << "\n";
+  output << "holdout_frontend_mean_residual_x: " << frontend_holdout.mean_residual_x << "\n";
+  output << "holdout_frontend_mean_residual_y: " << frontend_holdout.mean_residual_y << "\n";
+  output << "holdout_frontend_std_residual_x: " << frontend_holdout.std_residual_x << "\n";
+  output << "holdout_frontend_std_residual_y: " << frontend_holdout.std_residual_y << "\n";
+  output << "holdout_backend_mean_residual_x: " << backend_holdout.mean_residual_x << "\n";
+  output << "holdout_backend_mean_residual_y: " << backend_holdout.mean_residual_y << "\n";
+  output << "holdout_backend_std_residual_x: " << backend_holdout.std_residual_x << "\n";
+  output << "holdout_backend_std_residual_y: " << backend_holdout.std_residual_y << "\n";
+  output << "holdout_kalibr_mean_residual_x: " << kalibr_holdout.mean_residual_x << "\n";
+  output << "holdout_kalibr_mean_residual_y: " << kalibr_holdout.mean_residual_y << "\n";
+  output << "holdout_kalibr_std_residual_x: " << kalibr_holdout.std_residual_x << "\n";
+  output << "holdout_kalibr_std_residual_y: " << kalibr_holdout.std_residual_y << "\n";
   output << "training_frontend_minus_kalibr: "
          << (frontend_training.overall_rmse - kalibr_training.overall_rmse) << "\n";
   output << "training_backend_minus_kalibr: "
