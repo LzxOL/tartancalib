@@ -39,6 +39,9 @@ struct InternalRegenerationRuntimeBreakdown {
   double image_evidence_seconds = 0.0;
   double subpix_seconds = 0.0;
   int pose_estimation_call_count = 0;
+  int pose_rescue_attempt_count = 0;
+  int pose_rescue_success_count = 0;
+  int pose_rescue_used_count = 0;
   int boundary_model_build_count = 0;
   int attempted_internal_corner_count = 0;
   int valid_internal_corner_count = 0;

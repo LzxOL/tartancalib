@@ -108,6 +108,12 @@ void AccumulateRuntimeBreakdown(
   frame_runtime->subpix_seconds += detection_runtime.subpix_seconds;
   frame_runtime->pose_estimation_call_count +=
       detection_runtime.pose_estimation_call_count;
+  frame_runtime->pose_rescue_attempt_count +=
+      detection_runtime.pose_rescue_attempt_count;
+  frame_runtime->pose_rescue_success_count +=
+      detection_runtime.pose_rescue_success_count;
+  frame_runtime->pose_rescue_used_count +=
+      detection_runtime.pose_rescue_used_count;
   frame_runtime->boundary_model_build_count +=
       detection_runtime.boundary_model_build_count;
   frame_runtime->attempted_internal_corner_count +=

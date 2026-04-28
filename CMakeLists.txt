@@ -255,6 +255,7 @@ add_library(tartancalib_apriltag_internal_core STATIC
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/CalibrationStateBundle.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/DoubleSphereCameraModel.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/FrozenRound2BaselinePipeline.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointMeasurementCuration.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointMeasurementSelection.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointReprojectionCostCore.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointReprojectionMeasurementBuilder.cpp"

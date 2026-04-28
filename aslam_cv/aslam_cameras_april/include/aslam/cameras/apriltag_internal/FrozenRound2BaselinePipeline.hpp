@@ -95,6 +95,11 @@ struct FrozenRound2BaselineOptions {
   int second_pass_intrinsics_release_iteration = 1;
   bool enable_residual_sanity_gate = true;
   bool enable_board_pose_fit_gate = false;
+  bool strict_board_observation_acceptance = false;
+  InternalPoseRescueMode internal_pose_rescue_mode =
+      InternalPoseRescueMode::Off;
+  double internal_pose_rescue_max_ray_angle_deg = 85.0;
+  double internal_pose_rescue_accept_max_outer_rmse = 8.0;
   std::string dataset_label;
   std::string training_split_signature = "all_frames";
   std::string baseline_protocol_label = "frozen_round2_v2_kalibr_corner_filter";

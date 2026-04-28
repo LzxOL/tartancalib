@@ -8,6 +8,7 @@
 #include <opencv2/core.hpp>
 
 #include <aslam/cameras/apriltag_internal/FrozenRound2BaselinePipeline.hpp>
+#include <aslam/cameras/apriltag_internal/JointMeasurementCuration.hpp>
 #include <aslam/cameras/apriltag_internal/KalibrBenchmark.hpp>
 #include <aslam/cameras/apriltag_internal/OuterDetectionCache.hpp>
 
@@ -78,6 +79,7 @@ struct CalibrationEvaluationDataset {
   int outer_point_count = 0;
   int internal_point_count = 0;
   int total_point_count = 0;
+  std::vector<InternalRegenerationFrameResult> internal_regeneration_results;
   std::vector<std::string> warnings;
   std::string failure_reason;
 };
@@ -164,6 +166,8 @@ struct Stage5BenchmarkRuntimeBreakdown {
   double training_dataset_build_seconds = 0.0;
   double holdout_dataset_build_seconds = 0.0;
   double diagnostic_compare_seconds = 0.0;
+  double pre_backend_filter_seconds = 0.0;
+  double internal_blur_filter_seconds = 0.0;
   OuterDetectionCacheStats holdout_detection_cache;
 };
 
@@ -171,6 +175,8 @@ struct Stage5BenchmarkInput {
   std::vector<FrozenRound2BaselineFrameSource> all_frames;
   FrozenRound2BaselineOptions baseline_options;
   BackendProblemOptions backend_options;
+  PreBackendObservationFilterOptions pre_backend_filter_options;
+  InternalBlurObservationFilterOptions internal_blur_filter_options;
   KalibrBenchmarkReference kalibr_reference;
   std::string dataset_label;
   bool enable_diagnostic_compare = true;
@@ -185,6 +191,8 @@ struct Stage5BenchmarkReport {
   std::string split_signature;
   CalibrationBenchmarkSplit split;
   FrozenRound2BaselineResult baseline_result;
+  PreBackendObservationFilterResult pre_backend_filter_result;
+  InternalBlurObservationFilterResult internal_blur_filter_result;
   CalibrationBackendProblemInput backend_problem_input;
   CalibrationEvaluationDataset training_dataset;
   CalibrationEvaluationDataset holdout_dataset;
@@ -264,6 +272,9 @@ void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
                                         const Stage5BenchmarkReport& report);
 void WriteStage5BenchmarkHoldoutPointsCsv(const std::string& path,
                                           const Stage5BenchmarkReport& report);
+void WriteCameraModelRefitPointsCsv(
+    const std::string& path,
+    const std::vector<CameraModelRefitEvaluationResult>& evaluations);
 void WriteStage5BenchmarkWorstCasesSummary(const std::string& path,
                                            const Stage5BenchmarkReport& report,
                                            int top_k = 10);

@@ -332,13 +332,21 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   }
 
   const ApriltagInternalConfig config = NormalizeConfig(options_.config);
-  const ApriltagInternalDetectionOptions detection_options = MakeDetectionOptions(config);
+  ApriltagInternalDetectionOptions detection_options = MakeDetectionOptions(config);
+  detection_options.internal_pose_rescue_mode =
+      options_.internal_pose_rescue_mode;
+  detection_options.internal_pose_rescue_max_ray_angle_deg =
+      options_.internal_pose_rescue_max_ray_angle_deg;
+  detection_options.internal_pose_rescue_accept_max_outer_rmse =
+      options_.internal_pose_rescue_accept_max_outer_rmse;
   const MultiScaleOuterTagDetector outer_detector(config.outer_detector_config);
   OuterBootstrapOptions bootstrap_options = MakeBootstrapOptions(config, options_);
   const MultiBoardOuterBootstrap bootstrap(config, bootstrap_options);
   const MultiBoardInternalMeasurementRegenerator regenerator(config, detection_options);
   JointMeasurementBuildOptions build_options;
   build_options.reference_board_id = options_.reference_board_id;
+  build_options.include_outer_when_internal_failed =
+      !options_.strict_board_observation_acceptance;
   const JointReprojectionMeasurementBuilder builder(config, build_options);
   JointResidualEvaluationOptions residual_options;
   const JointReprojectionResidualEvaluator residual_evaluator(residual_options);

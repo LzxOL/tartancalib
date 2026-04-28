@@ -317,6 +317,8 @@ const char* ToString(JointRejectionReasonCode reason_code) {
       return "outer_measurement_invalid";
     case JointRejectionReasonCode::MissingRegeneratedBoardResult:
       return "missing_regenerated_board_result";
+    case JointRejectionReasonCode::InternalRegenerationFailed:
+      return "internal_regeneration_failed";
     case JointRejectionReasonCode::InternalPointInvalid:
       return "internal_point_invalid";
     case JointRejectionReasonCode::InternalPointReprojectionOutlier:
@@ -434,6 +436,26 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
       int outer_measurement_index = -1;
       const OuterBoardMeasurement* outer_measurement =
           FindOuterBoardMeasurement(frame_input, board_id, &outer_measurement_index);
+      int regenerated_measurement_index = -1;
+      const RegeneratedBoardMeasurement* regenerated_measurement =
+          FindRegeneratedBoardMeasurement(frame_input, board_id,
+                                          &regenerated_measurement_index);
+      bool internal_regeneration_failed_for_board = false;
+      std::string internal_regeneration_failure_detail;
+      if (!options_.include_outer_when_internal_failed &&
+          outer_measurement != nullptr && outer_measurement->success) {
+        if (regenerated_measurement == nullptr) {
+          internal_regeneration_failed_for_board = true;
+          internal_regeneration_failure_detail =
+              "missing regenerated internal measurement";
+        } else if (!regenerated_measurement->detection.success) {
+          internal_regeneration_failed_for_board = true;
+          internal_regeneration_failure_detail =
+              regenerated_measurement->detection.failure_reason.empty()
+                  ? "internal regeneration failed"
+                  : regenerated_measurement->detection.failure_reason;
+        }
+      }
       if (options_.include_outer_points && outer_measurement != nullptr) {
         bool outer_measurement_valid = outer_measurement->success;
         for (bool valid : outer_measurement->refined_corner_valid) {
@@ -475,6 +497,10 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
                      << outer_measurement->valid_refined_corner_count;
               point.rejection_detail = detail.str();
             }
+          } else if (internal_regeneration_failed_for_board) {
+            point.rejection_reason_code =
+                JointRejectionReasonCode::InternalRegenerationFailed;
+            point.rejection_detail = internal_regeneration_failure_detail;
           } else {
             point.used_in_solver = true;
           }
@@ -483,9 +509,6 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
         }
       }
 
-      int regenerated_measurement_index = -1;
-      const RegeneratedBoardMeasurement* regenerated_measurement =
-          FindRegeneratedBoardMeasurement(frame_input, board_id, &regenerated_measurement_index);
       if (options_.include_internal_points) {
         if (regenerated_measurement == nullptr) {
           if (options_.include_outer_points && outer_measurement != nullptr) {
@@ -519,6 +542,14 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
             if (board_level_reason != JointRejectionReasonCode::None) {
               point.rejection_reason_code = board_level_reason;
               point.rejection_detail = board_level_detail;
+            } else if (!options_.include_outer_when_internal_failed &&
+                       !detection.success) {
+              point.rejection_reason_code =
+                  JointRejectionReasonCode::InternalRegenerationFailed;
+              point.rejection_detail =
+                  detection.failure_reason.empty()
+                      ? "internal regeneration failed"
+                      : detection.failure_reason;
             } else if (!measurement.valid) {
               point.rejection_reason_code = JointRejectionReasonCode::InternalPointInvalid;
               point.rejection_detail = "CornerMeasurement.valid is false";

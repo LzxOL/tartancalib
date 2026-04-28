@@ -42,6 +42,7 @@ add_library(${PROJECT_NAME}
   src/apriltag_internal/CalibrationStateBundle.cpp
   src/apriltag_internal/DoubleSphereCameraModel.cpp
   src/apriltag_internal/FrozenRound2BaselinePipeline.cpp
+  src/apriltag_internal/JointMeasurementCuration.cpp
   src/apriltag_internal/JointMeasurementSelection.cpp
   src/apriltag_internal/JointReprojectionCostCore.cpp
   src/apriltag_internal/JointReprojectionMeasurementBuilder.cpp

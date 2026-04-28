@@ -48,6 +48,7 @@ enum class JointRejectionReasonCode {
   MissingOuterBoardObservation,
   OuterMeasurementInvalid,
   MissingRegeneratedBoardResult,
+  InternalRegenerationFailed,
   InternalPointInvalid,
   InternalPointReprojectionOutlier,
 };

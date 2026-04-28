@@ -17,6 +17,15 @@ namespace aslam {
 namespace cameras {
 namespace apriltag_internal {
 
+enum class InternalPoseRescueMode {
+  Off,
+  Diagnostic,
+  Enabled,
+};
+
+const char* ToString(InternalPoseRescueMode mode);
+InternalPoseRescueMode ParseInternalPoseRescueMode(const std::string& value);
+
 struct ApriltagInternalDetectionOptions {
   bool do_subpix_refinement = true;
   double max_subpix_displacement2 = 0.0;
@@ -32,6 +41,10 @@ struct ApriltagInternalDetectionOptions {
   double virtual_patch_margin = 1.15;
   double internal_subpix_displacement_scale = 0.25;
   double max_internal_subpix_displacement = 6.0;
+  InternalPoseRescueMode internal_pose_rescue_mode =
+      InternalPoseRescueMode::Off;
+  double internal_pose_rescue_max_ray_angle_deg = 85.0;
+  double internal_pose_rescue_accept_max_outer_rmse = 8.0;
   MultiScaleOuterTagDetectorConfig outer_detector_config;
 };
 
@@ -104,6 +117,9 @@ struct ApriltagInternalRuntimeBreakdown {
   double image_evidence_seconds = 0.0;
   double subpix_seconds = 0.0;
   int pose_estimation_call_count = 0;
+  int pose_rescue_attempt_count = 0;
+  int pose_rescue_success_count = 0;
+  int pose_rescue_used_count = 0;
   int boundary_model_build_count = 0;
   int attempted_internal_corner_count = 0;
   int valid_internal_corner_count = 0;
@@ -126,6 +142,14 @@ struct ApriltagInternalDetectionResult {
   int expected_visible_point_count = 0;
   int valid_corner_count = 0;
   int valid_internal_corner_count = 0;
+  bool pose_rescue_attempted = false;
+  bool pose_rescue_success = false;
+  bool pose_rescue_used = false;
+  double pose_rescue_rmse = 0.0;
+  double pose_rescue_max_ray_angle_deg = 0.0;
+  double pose_rescue_ray_angle_limit_deg = 0.0;
+  double pose_rescue_accept_max_outer_rmse = 0.0;
+  std::string pose_rescue_failure_reason;
   bool border_boundary_model_valid = false;
   std::array<bool, 4> border_edge_valid{{false, false, false, false}};
   std::array<double, 4> border_edge_rms_residual{{0.0, 0.0, 0.0, 0.0}};

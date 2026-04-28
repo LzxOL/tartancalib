@@ -1682,6 +1682,276 @@ bool EstimateTargetPose(const DoubleSphereCameraModel& camera,
   return camera.estimateTransformation(object_points, image_points, rvec, tvec);
 }
 
+struct TargetPoseRescueDiagnostics {
+  bool attempted = false;
+  bool success = false;
+  bool used = false;
+  double rmse = 0.0;
+  double max_ray_angle_deg = 0.0;
+  double ray_angle_limit_deg = 0.0;
+  std::string failure_reason;
+};
+
+void BuildTargetPosePointSets(const std::array<cv::Point2f, 4>& outer_corners,
+                              const std::array<int, 4>& outer_point_ids,
+                              const ApriltagCanonicalModel& model,
+                              std::vector<cv::Point3f>* object_points,
+                              std::vector<cv::Point2f>* image_points) {
+  if (object_points == nullptr || image_points == nullptr) {
+    throw std::runtime_error("BuildTargetPosePointSets requires valid output pointers.");
+  }
+  object_points->clear();
+  image_points->clear();
+  object_points->reserve(4);
+  image_points->reserve(4);
+
+  for (int index = 0; index < 4; ++index) {
+    const CanonicalCorner& corner_info = model.corner(outer_point_ids[index]);
+    object_points->emplace_back(static_cast<float>(corner_info.target_xyz.x()),
+                                static_cast<float>(corner_info.target_xyz.y()),
+                                static_cast<float>(corner_info.target_xyz.z()));
+    image_points->push_back(outer_corners[index]);
+  }
+}
+
+bool EvaluateTargetPoseRmse(const DoubleSphereCameraModel& camera,
+                            const std::vector<cv::Point3f>& object_points,
+                            const std::vector<cv::Point2f>& image_points,
+                            const cv::Mat& rvec,
+                            const cv::Mat& tvec,
+                            double* rmse) {
+  if (rmse == nullptr || object_points.size() != image_points.size() ||
+      object_points.empty() || rvec.empty() || tvec.empty()) {
+    return false;
+  }
+
+  cv::Mat rotation_cv;
+  cv::Rodrigues(rvec, rotation_cv);
+  cv::Mat rotation64;
+  cv::Mat tvec64;
+  rotation_cv.convertTo(rotation64, CV_64F);
+  tvec.convertTo(tvec64, CV_64F);
+
+  double squared_error_sum = 0.0;
+  for (std::size_t index = 0; index < object_points.size(); ++index) {
+    const cv::Point3f& point = object_points[index];
+    Eigen::Vector3d point_camera;
+    for (int row = 0; row < 3; ++row) {
+      point_camera[row] =
+          rotation64.at<double>(row, 0) * static_cast<double>(point.x) +
+          rotation64.at<double>(row, 1) * static_cast<double>(point.y) +
+          rotation64.at<double>(row, 2) * static_cast<double>(point.z) +
+          tvec64.at<double>(row, 0);
+    }
+
+    Eigen::Vector2d projected;
+    if (!camera.vsEuclideanToKeypoint(point_camera, &projected)) {
+      squared_error_sum += 1e12;
+      continue;
+    }
+    const Eigen::Vector2d observed(image_points[index].x, image_points[index].y);
+    squared_error_sum += (projected - observed).squaredNorm();
+  }
+  *rmse = std::sqrt(squared_error_sum / static_cast<double>(object_points.size()));
+  return true;
+}
+
+bool TryWideFovTargetPoseRescue(const DoubleSphereCameraModel& camera,
+                                const std::vector<cv::Point3f>& object_points,
+                                const std::vector<cv::Point2f>& image_points,
+                                double max_ray_angle_deg,
+                                cv::Mat* rvec,
+                                cv::Mat* tvec,
+                                TargetPoseRescueDiagnostics* diagnostics) {
+  if (rvec == nullptr || tvec == nullptr || diagnostics == nullptr) {
+    throw std::runtime_error("TryWideFovTargetPoseRescue requires valid output pointers.");
+  }
+  diagnostics->attempted = true;
+  diagnostics->ray_angle_limit_deg = max_ray_angle_deg;
+  diagnostics->failure_reason.clear();
+
+  if (object_points.size() != image_points.size() || object_points.size() < 4) {
+    diagnostics->failure_reason = "insufficient_point_count";
+    return false;
+  }
+
+  const double clamped_angle_deg = std::max(1.0, std::min(179.0, max_ray_angle_deg));
+  const double max_ray_angle_radians =
+      clamped_angle_deg * 3.14159265358979323846 / 180.0;
+  const double min_ray_z = std::cos(max_ray_angle_radians);
+
+  std::vector<cv::Point3f> filtered_object_points;
+  std::vector<cv::Point2f> normalized_points;
+  filtered_object_points.reserve(object_points.size());
+  normalized_points.reserve(image_points.size());
+
+  for (std::size_t index = 0; index < image_points.size(); ++index) {
+    Eigen::Vector3d ray;
+    if (!camera.keypointToEuclidean(
+            Eigen::Vector2d(image_points[index].x, image_points[index].y), &ray)) {
+      continue;
+    }
+    const Eigen::Vector3d direction = ray.normalized();
+    const double clamped_z = std::max(-1.0, std::min(1.0, direction.z()));
+    const double ray_angle_deg =
+        std::acos(clamped_z) * 180.0 / 3.14159265358979323846;
+    diagnostics->max_ray_angle_deg =
+        std::max(diagnostics->max_ray_angle_deg, ray_angle_deg);
+    if (direction.z() <= min_ray_z) {
+      continue;
+    }
+
+    filtered_object_points.push_back(object_points[index]);
+    normalized_points.emplace_back(static_cast<float>(direction.x() / direction.z()),
+                                   static_cast<float>(direction.y() / direction.z()));
+  }
+
+  if (filtered_object_points.size() < 4) {
+    diagnostics->failure_reason = "insufficient_filtered_point_count";
+    return false;
+  }
+
+  const cv::Mat identity_camera = cv::Mat::eye(3, 3, CV_64F);
+  const cv::Mat dist_coeffs = cv::Mat::zeros(4, 1, CV_64F);
+  cv::Mat best_rvec;
+  cv::Mat best_tvec;
+  double best_rmse = std::numeric_limits<double>::infinity();
+
+  auto evaluate_candidate = [&](const cv::Mat& candidate_rvec,
+                                const cv::Mat& candidate_tvec) {
+    if (candidate_rvec.empty() || candidate_tvec.empty()) {
+      return;
+    }
+    cv::Mat candidate_tvec64;
+    candidate_tvec.convertTo(candidate_tvec64, CV_64F);
+    if (candidate_tvec64.at<double>(2, 0) <= 0.0) {
+      return;
+    }
+    double candidate_rmse = 0.0;
+    if (!EvaluateTargetPoseRmse(camera, object_points, image_points,
+                                candidate_rvec, candidate_tvec,
+                                &candidate_rmse)) {
+      return;
+    }
+    if (candidate_rmse < best_rmse) {
+      best_rmse = candidate_rmse;
+      best_rvec = candidate_rvec.clone();
+      best_tvec = candidate_tvec.clone();
+    }
+  };
+
+  auto refine_and_evaluate_candidate = [&](const cv::Mat& seed_rvec,
+                                           const cv::Mat& seed_tvec) {
+    evaluate_candidate(seed_rvec, seed_tvec);
+    cv::Mat refined_rvec = seed_rvec.clone();
+    cv::Mat refined_tvec = seed_tvec.clone();
+    if (cv::solvePnP(filtered_object_points, normalized_points, identity_camera,
+                     dist_coeffs, refined_rvec, refined_tvec, true,
+                     cv::SOLVEPNP_ITERATIVE)) {
+      evaluate_candidate(refined_rvec, refined_tvec);
+    }
+  };
+
+  if (filtered_object_points.size() == 4) {
+    std::vector<cv::Mat> ippe_rvecs;
+    std::vector<cv::Mat> ippe_tvecs;
+    cv::solvePnPGeneric(filtered_object_points, normalized_points, identity_camera,
+                        dist_coeffs, ippe_rvecs, ippe_tvecs, false,
+                        cv::SOLVEPNP_IPPE);
+    for (std::size_t index = 0; index < ippe_rvecs.size(); ++index) {
+      refine_and_evaluate_candidate(ippe_rvecs[index], ippe_tvecs[index]);
+    }
+  }
+
+  cv::Mat iterative_rvec;
+  cv::Mat iterative_tvec;
+  if (cv::solvePnP(filtered_object_points, normalized_points, identity_camera,
+                   dist_coeffs, iterative_rvec, iterative_tvec, false,
+                   cv::SOLVEPNP_ITERATIVE)) {
+    refine_and_evaluate_candidate(iterative_rvec, iterative_tvec);
+  }
+
+  if (!std::isfinite(best_rmse)) {
+    diagnostics->failure_reason = "no_valid_pose_candidate";
+    return false;
+  }
+
+  *rvec = best_rvec;
+  *tvec = best_tvec;
+  diagnostics->success = true;
+  diagnostics->rmse = best_rmse;
+  return true;
+}
+
+void CopyPoseRescueDiagnostics(const TargetPoseRescueDiagnostics& source,
+                               ApriltagInternalDetectionResult* result) {
+  if (result == nullptr) {
+    return;
+  }
+  result->pose_rescue_attempted = source.attempted;
+  result->pose_rescue_success = source.success;
+  result->pose_rescue_used = source.used;
+  result->pose_rescue_rmse = source.rmse;
+  result->pose_rescue_max_ray_angle_deg = source.max_ray_angle_deg;
+  result->pose_rescue_ray_angle_limit_deg = source.ray_angle_limit_deg;
+  result->pose_rescue_failure_reason = source.failure_reason;
+  result->runtime_breakdown.pose_rescue_attempt_count += source.attempted ? 1 : 0;
+  result->runtime_breakdown.pose_rescue_success_count += source.success ? 1 : 0;
+  result->runtime_breakdown.pose_rescue_used_count += source.used ? 1 : 0;
+}
+
+bool EstimateTargetPoseWithOptionalRescue(
+    const DoubleSphereCameraModel& camera,
+    const std::array<cv::Point2f, 4>& outer_corners,
+    const std::array<int, 4>& outer_point_ids,
+    const ApriltagCanonicalModel& model,
+    const ApriltagInternalDetectionOptions& options,
+    cv::Mat* rvec,
+    cv::Mat* tvec,
+    ApriltagInternalDetectionResult* result) {
+  if (EstimateTargetPose(camera, outer_corners, outer_point_ids, model, rvec, tvec)) {
+    return true;
+  }
+
+  if (options.internal_pose_rescue_mode == InternalPoseRescueMode::Off) {
+    return false;
+  }
+
+  std::vector<cv::Point3f> object_points;
+  std::vector<cv::Point2f> image_points;
+  BuildTargetPosePointSets(outer_corners, outer_point_ids, model,
+                           &object_points, &image_points);
+
+  TargetPoseRescueDiagnostics diagnostics;
+  cv::Mat rescue_rvec;
+  cv::Mat rescue_tvec;
+  const bool rescue_success = TryWideFovTargetPoseRescue(
+      camera, object_points, image_points,
+      options.internal_pose_rescue_max_ray_angle_deg,
+      &rescue_rvec, &rescue_tvec, &diagnostics);
+  if (result != nullptr) {
+    result->pose_rescue_accept_max_outer_rmse =
+        options.internal_pose_rescue_accept_max_outer_rmse;
+  }
+  if (rescue_success &&
+      options.internal_pose_rescue_mode == InternalPoseRescueMode::Enabled) {
+    if (diagnostics.rmse > options.internal_pose_rescue_accept_max_outer_rmse) {
+      diagnostics.failure_reason =
+          "rescue_outer_rmse_above_accept_threshold";
+      CopyPoseRescueDiagnostics(diagnostics, result);
+      return false;
+    }
+    diagnostics.used = true;
+    *rvec = rescue_rvec;
+    *tvec = rescue_tvec;
+    CopyPoseRescueDiagnostics(diagnostics, result);
+    return true;
+  }
+
+  CopyPoseRescueDiagnostics(diagnostics, result);
+  return false;
+}
+
 cv::Point2f ProjectTargetPointToVirtualPatch(const VirtualPatchContext& context,
                                              const cv::Point3f& target_point,
                                              bool* visible) {
@@ -3705,6 +3975,34 @@ void PopulateInternalCornersFromVirtualPatchBoundarySeed(
 
 }  // namespace
 
+const char* ToString(InternalPoseRescueMode mode) {
+  switch (mode) {
+    case InternalPoseRescueMode::Off:
+      return "off";
+    case InternalPoseRescueMode::Diagnostic:
+      return "diagnostic";
+    case InternalPoseRescueMode::Enabled:
+      return "enabled";
+  }
+  return "unknown";
+}
+
+InternalPoseRescueMode ParseInternalPoseRescueMode(const std::string& value) {
+  std::string lowered = value;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  if (lowered == "off") {
+    return InternalPoseRescueMode::Off;
+  }
+  if (lowered == "diagnostic" || lowered == "diag") {
+    return InternalPoseRescueMode::Diagnostic;
+  }
+  if (lowered == "enabled" || lowered == "enable" || lowered == "on") {
+    return InternalPoseRescueMode::Enabled;
+  }
+  throw std::runtime_error("Unsupported internal pose rescue mode: " + value);
+}
+
 ApriltagInternalDetector::ApriltagInternalDetector(
     ApriltagInternalConfig config, ApriltagInternalDetectionOptions options)
     : config_(std::move(config)), options_(options) {
@@ -3931,7 +4229,9 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
       const auto pose_start = std::chrono::steady_clock::now();
       cv::Mat rvec;
       cv::Mat tvec;
-      if (!EstimateTargetPose(camera, outer_corners, outer_point_ids, model, &rvec, &tvec)) {
+      if (!EstimateTargetPoseWithOptionalRescue(
+              camera, outer_corners, outer_point_ids, model, options_,
+              &rvec, &tvec, &result)) {
         result.failure_reason =
             "Failed to estimate target pose for " +
             std::string(ToString(board_config.internal_projection_mode)) + " mode.";
@@ -3975,7 +4275,9 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
                 target_to_camera_translation.z());
       } else {
         const auto pose_start = std::chrono::steady_clock::now();
-        if (!EstimateTargetPose(camera, outer_corners, outer_point_ids, model, &rvec, &tvec)) {
+        if (!EstimateTargetPoseWithOptionalRescue(
+                camera, outer_corners, outer_point_ids, model, options_,
+                &rvec, &tvec, &result)) {
           result.failure_reason =
               "Failed to estimate target pose for " +
               std::string(ToString(board_config.internal_projection_mode)) + " mode.";

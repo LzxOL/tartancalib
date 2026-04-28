@@ -14,6 +14,7 @@
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
 
 #include <aslam/cameras/apriltag_internal/ApriltagCanonicalModel.hpp>
 #include <aslam/cameras/apriltag_internal/DoubleSphereCameraModel.hpp>
@@ -29,6 +30,9 @@ namespace {
 constexpr double kInvalidProjectionPenaltyPixels = 100.0;
 constexpr double kKalibrCornerSigmaThreshold = 2.0;
 constexpr double kKalibrCornerMinReprojErrorPixels = 0.2;
+constexpr double kWideFovPoseRescueTriggerRmse = 50.0;
+constexpr double kWideFovPoseRescueMaxRayAngleRadians =
+    85.0 * 3.14159265358979323846 / 180.0;
 
 double ElapsedSeconds(const std::chrono::steady_clock::time_point& start_time) {
   return std::chrono::duration_cast<std::chrono::duration<double> >(
@@ -180,6 +184,200 @@ std::array<Eigen::Vector3d, 4> BuildOuterCornerTargets(const ApriltagInternalCon
   return points;
 }
 
+Eigen::Isometry3d PoseFromCv(const cv::Mat& rvec, const cv::Mat& tvec) {
+  cv::Mat rotation_cv;
+  cv::Rodrigues(rvec, rotation_cv);
+
+  cv::Mat rotation64;
+  cv::Mat tvec64;
+  rotation_cv.convertTo(rotation64, CV_64F);
+  tvec.convertTo(tvec64, CV_64F);
+
+  Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      pose.linear()(row, col) = rotation64.at<double>(row, col);
+    }
+    pose.translation()[row] = tvec64.at<double>(row, 0);
+  }
+  return pose;
+}
+
+bool EvaluatePoseRmse(
+    const DoubleSphereCameraModel& camera_model,
+    const std::vector<Eigen::Vector3d>& object_points,
+    const std::vector<cv::Point2f>& image_points,
+    const Eigen::Isometry3d& pose,
+    double* rmse) {
+  if (rmse == nullptr ||
+      object_points.size() != image_points.size() ||
+      object_points.empty()) {
+    return false;
+  }
+
+  double squared_error_sum = 0.0;
+  for (std::size_t index = 0; index < object_points.size(); ++index) {
+    Eigen::Vector2d projected;
+    if (!camera_model.vsEuclideanToKeypoint(pose * object_points[index], &projected)) {
+      squared_error_sum += 1e12;
+      continue;
+    }
+    const Eigen::Vector2d observed(image_points[index].x, image_points[index].y);
+    squared_error_sum += (projected - observed).squaredNorm();
+  }
+  *rmse = std::sqrt(squared_error_sum / static_cast<double>(object_points.size()));
+  return true;
+}
+
+bool TryWideFovOuterPoseRescue(
+    const OuterBootstrapCameraIntrinsics& camera,
+    const std::vector<Eigen::Vector3d>& object_points,
+    const std::vector<cv::Point2f>& image_points,
+    Eigen::Isometry3d* pose,
+    double* rmse) {
+  if (pose == nullptr || rmse == nullptr ||
+      object_points.size() != image_points.size() ||
+      object_points.size() < 4 || !camera.IsValid()) {
+    return false;
+  }
+
+  const DoubleSphereCameraModel camera_model =
+      DoubleSphereCameraModel::FromConfig(MakeIntermediateCameraConfig(camera));
+
+  std::vector<cv::Point3f> filtered_object_points;
+  std::vector<cv::Point2f> normalized_points;
+  filtered_object_points.reserve(object_points.size());
+  normalized_points.reserve(image_points.size());
+  for (std::size_t index = 0; index < image_points.size(); ++index) {
+    Eigen::Vector3d ray;
+    if (!camera_model.keypointToEuclidean(
+            Eigen::Vector2d(image_points[index].x, image_points[index].y), &ray)) {
+      continue;
+    }
+    const Eigen::Vector3d direction = ray.normalized();
+    if (direction.z() <= std::cos(kWideFovPoseRescueMaxRayAngleRadians)) {
+      continue;
+    }
+    filtered_object_points.emplace_back(
+        static_cast<float>(object_points[index].x()),
+        static_cast<float>(object_points[index].y()),
+        static_cast<float>(object_points[index].z()));
+    normalized_points.emplace_back(
+        static_cast<float>(direction.x() / direction.z()),
+        static_cast<float>(direction.y() / direction.z()));
+  }
+
+  if (filtered_object_points.size() < 4) {
+    return false;
+  }
+
+  const cv::Mat identity_camera = cv::Mat::eye(3, 3, CV_64F);
+  const cv::Mat dist_coeffs = cv::Mat::zeros(4, 1, CV_64F);
+  Eigen::Isometry3d best_pose = Eigen::Isometry3d::Identity();
+  double best_rmse = std::numeric_limits<double>::infinity();
+
+  auto evaluate_candidate = [&](const cv::Mat& candidate_rvec,
+                                const cv::Mat& candidate_tvec) {
+    if (candidate_rvec.empty() || candidate_tvec.empty()) {
+      return;
+    }
+    cv::Mat candidate_tvec64;
+    candidate_tvec.convertTo(candidate_tvec64, CV_64F);
+    if (candidate_tvec64.at<double>(2, 0) <= 0.0) {
+      return;
+    }
+    const Eigen::Isometry3d candidate_pose = PoseFromCv(candidate_rvec, candidate_tvec);
+    double candidate_rmse = 0.0;
+    if (!EvaluatePoseRmse(camera_model, object_points, image_points,
+                          candidate_pose, &candidate_rmse)) {
+      return;
+    }
+    if (candidate_rmse < best_rmse) {
+      best_rmse = candidate_rmse;
+      best_pose = candidate_pose;
+    }
+  };
+
+  auto refine_and_evaluate_candidate = [&](const cv::Mat& seed_rvec,
+                                           const cv::Mat& seed_tvec) {
+    evaluate_candidate(seed_rvec, seed_tvec);
+    cv::Mat refined_rvec = seed_rvec.clone();
+    cv::Mat refined_tvec = seed_tvec.clone();
+    if (cv::solvePnP(filtered_object_points, normalized_points, identity_camera,
+                     dist_coeffs, refined_rvec, refined_tvec, true,
+                     cv::SOLVEPNP_ITERATIVE)) {
+      evaluate_candidate(refined_rvec, refined_tvec);
+    }
+  };
+
+  if (filtered_object_points.size() == 4) {
+    std::vector<cv::Mat> ippe_rvecs;
+    std::vector<cv::Mat> ippe_tvecs;
+    cv::solvePnPGeneric(filtered_object_points, normalized_points, identity_camera,
+                        dist_coeffs, ippe_rvecs, ippe_tvecs, false,
+                        cv::SOLVEPNP_IPPE);
+    for (std::size_t index = 0; index < ippe_rvecs.size(); ++index) {
+      refine_and_evaluate_candidate(ippe_rvecs[index], ippe_tvecs[index]);
+    }
+  }
+
+  cv::Mat iterative_rvec;
+  cv::Mat iterative_tvec;
+  if (cv::solvePnP(filtered_object_points, normalized_points, identity_camera,
+                   dist_coeffs, iterative_rvec, iterative_tvec, false,
+                   cv::SOLVEPNP_ITERATIVE)) {
+    refine_and_evaluate_candidate(iterative_rvec, iterative_tvec);
+  }
+
+  if (!std::isfinite(best_rmse)) {
+    return false;
+  }
+
+  *pose = best_pose;
+  *rmse = best_rmse;
+  return true;
+}
+
+bool EstimatePoseForBenchmarkRefit(
+    const OuterBootstrapCameraIntrinsics& camera,
+    const std::vector<Eigen::Vector3d>& outer_targets,
+    const std::vector<cv::Point2f>& outer_pixels,
+    Eigen::Isometry3d* pose,
+    double* rmse) {
+  if (pose == nullptr || rmse == nullptr) {
+    return false;
+  }
+
+  Eigen::Isometry3d standard_pose = Eigen::Isometry3d::Identity();
+  double standard_rmse = std::numeric_limits<double>::infinity();
+  const bool standard_success =
+      EstimatePoseFromObjectPoints(camera, outer_targets, outer_pixels,
+                                   &standard_pose, &standard_rmse);
+  if (standard_success && standard_rmse <= kWideFovPoseRescueTriggerRmse) {
+    *pose = standard_pose;
+    *rmse = standard_rmse;
+    return true;
+  }
+
+  Eigen::Isometry3d rescue_pose = Eigen::Isometry3d::Identity();
+  double rescue_rmse = std::numeric_limits<double>::infinity();
+  const bool rescue_success =
+      TryWideFovOuterPoseRescue(camera, outer_targets, outer_pixels,
+                                &rescue_pose, &rescue_rmse);
+  if (rescue_success && (!standard_success || rescue_rmse < standard_rmse)) {
+    *pose = rescue_pose;
+    *rmse = rescue_rmse;
+    return true;
+  }
+
+  if (standard_success) {
+    *pose = standard_pose;
+    *rmse = standard_rmse;
+    return true;
+  }
+  return false;
+}
+
 bool IsOuterPoint(const CalibrationEvaluationPointObservation& point) {
   return point.point_type == JointPointType::Outer;
 }
@@ -309,8 +507,8 @@ void FilterInternalEvaluationPointsByReprojection(
 
   Eigen::Isometry3d T_camera_board = Eigen::Isometry3d::Identity();
   double pose_fit_rmse = 0.0;
-  if (!EstimatePoseFromObjectPoints(camera, outer_targets, outer_pixels,
-                                    &T_camera_board, &pose_fit_rmse)) {
+  if (!EstimatePoseForBenchmarkRefit(camera, outer_targets, outer_pixels,
+                                     &T_camera_board, &pose_fit_rmse)) {
     return;
   }
 
@@ -518,7 +716,13 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
   dataset.split_signature = split_signature;
 
   const ApriltagInternalConfig config = NormalizeConfig(baseline_options.config);
-  const ApriltagInternalDetectionOptions detection_options = MakeDetectionOptions(config);
+  ApriltagInternalDetectionOptions detection_options = MakeDetectionOptions(config);
+  detection_options.internal_pose_rescue_mode =
+      baseline_options.internal_pose_rescue_mode;
+  detection_options.internal_pose_rescue_max_ray_angle_deg =
+      baseline_options.internal_pose_rescue_max_ray_angle_deg;
+  detection_options.internal_pose_rescue_accept_max_outer_rmse =
+      baseline_options.internal_pose_rescue_accept_max_outer_rmse;
   const MultiScaleOuterTagDetector outer_detector(config.outer_detector_config);
   const MultiBoardInternalMeasurementRegenerator regenerator(config, detection_options);
   const OuterDetectionCache detection_cache(
@@ -571,6 +775,7 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
     for (const std::string& warning : regen_result.warnings) {
       dataset.warnings.push_back(warning);
     }
+    dataset.internal_regeneration_results.push_back(regen_result);
 
     CalibrationEvaluationFrameInput frame_input;
     frame_input.frame_index = frame_source.frame_index;
@@ -585,6 +790,20 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
       eval_board.frame_index = frame_source.frame_index;
       eval_board.frame_label = frame_source.frame_label;
       eval_board.board_id = outer_measurement.board_id;
+
+      const RegeneratedBoardMeasurement* regenerated_board = nullptr;
+      for (const RegeneratedBoardMeasurement& measurement : regen_result.board_measurements) {
+        if (measurement.board_id == outer_measurement.board_id) {
+          regenerated_board = &measurement;
+          break;
+        }
+      }
+      if (baseline_options.strict_board_observation_acceptance &&
+          outer_measurement.success &&
+          (regenerated_board == nullptr ||
+           !regenerated_board->detection.success)) {
+        continue;
+      }
 
       if (outer_measurement.success && outer_measurement.valid_refined_corner_count == 4) {
         const std::array<Eigen::Vector3d, 4> outer_targets =
@@ -615,13 +834,6 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
         AppendVisibleBoardId(outer_measurement.board_id, &frame_input.visible_board_ids);
       }
 
-      const RegeneratedBoardMeasurement* regenerated_board = nullptr;
-      for (const RegeneratedBoardMeasurement& measurement : regen_result.board_measurements) {
-        if (measurement.board_id == outer_measurement.board_id) {
-          regenerated_board = &measurement;
-          break;
-        }
-      }
       if (regenerated_board != nullptr) {
         for (std::size_t corner_index = 0;
              corner_index < regenerated_board->detection.corners.size();
@@ -730,8 +942,8 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
 
       Eigen::Isometry3d T_camera_board = Eigen::Isometry3d::Identity();
       double pose_fit_outer_rmse = 0.0;
-      if (!EstimatePoseFromObjectPoints(camera, outer_targets, outer_pixels,
-                                        &T_camera_board, &pose_fit_outer_rmse)) {
+      if (!EstimatePoseForBenchmarkRefit(camera, outer_targets, outer_pixels,
+                                         &T_camera_board, &pose_fit_outer_rmse)) {
         result.warnings.push_back(
             "Outer-only pose refit failed: frame=" + frame.frame_label + " board=" +
             std::to_string(board.board_id));
@@ -891,12 +1103,53 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
     return report;
   }
 
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    report.pre_backend_filter_result = ApplyPreBackendObservationFilter(
+        report.baseline_result.final_stage5_bundle,
+        input.pre_backend_filter_options);
+    report.runtime_breakdown.pre_backend_filter_seconds =
+        ElapsedSeconds(stage_start);
+  }
+  if (!report.pre_backend_filter_result.success) {
+    report.failure_reason =
+        report.pre_backend_filter_result.failure_reason.empty()
+            ? "Pre-backend observation filter failed."
+            : report.pre_backend_filter_result.failure_reason;
+    return report;
+  }
+
+  std::map<int, std::string> frame_image_paths;
+  for (const FrozenRound2BaselineFrameSource& frame : input.all_frames) {
+    frame_image_paths[frame.frame_index] = frame.image_path;
+  }
+  {
+    const auto stage_start = std::chrono::steady_clock::now();
+    report.internal_blur_filter_result = ApplyInternalBlurObservationFilter(
+        report.pre_backend_filter_result.curated_bundle,
+        frame_image_paths,
+        input.internal_blur_filter_options);
+    report.runtime_breakdown.internal_blur_filter_seconds =
+        ElapsedSeconds(stage_start);
+  }
+  if (!report.internal_blur_filter_result.success) {
+    report.failure_reason =
+        report.internal_blur_filter_result.failure_reason.empty()
+            ? "Internal blur observation filter failed."
+            : report.internal_blur_filter_result.failure_reason;
+    return report;
+  }
+
   report.backend_problem_input = BuildBackendProblemInput(
-      report.baseline_result.final_stage5_bundle, input.backend_options);
+      report.internal_blur_filter_result.curated_bundle, input.backend_options);
   {
     const auto stage_start = std::chrono::steady_clock::now();
     report.training_dataset =
         BuildTrainingEvaluationDataset(report.baseline_result.final_stage5_bundle);
+    report.training_dataset.internal_regeneration_results =
+        report.baseline_result.round2_available
+            ? report.baseline_result.round2.regeneration_results
+            : report.baseline_result.round1.regeneration_results;
     report.runtime_breakdown.training_dataset_build_seconds =
         ElapsedSeconds(stage_start);
   }
@@ -1375,6 +1628,16 @@ void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
 
 void WriteStage5BenchmarkHoldoutPointsCsv(const std::string& path,
                                           const Stage5BenchmarkReport& report) {
+  WriteCameraModelRefitPointsCsv(
+      path,
+      std::vector<CameraModelRefitEvaluationResult>{
+          report.our_holdout_evaluation,
+          report.kalibr_holdout_evaluation});
+}
+
+void WriteCameraModelRefitPointsCsv(
+    const std::string& path,
+    const std::vector<CameraModelRefitEvaluationResult>& evaluations) {
   std::ofstream output(path.c_str());
   output << "method,split,frame_index,frame_label,board_id,point_id,point_type,"
          << "observed_x,observed_y,predicted_x,predicted_y,target_x,target_y,target_z,"
@@ -1403,8 +1666,9 @@ void WriteStage5BenchmarkHoldoutPointsCsv(const std::string& path,
              << point.source_point_index << "\n";
     }
   };
-  write_points(report.our_holdout_evaluation);
-  write_points(report.kalibr_holdout_evaluation);
+  for (const CameraModelRefitEvaluationResult& evaluation : evaluations) {
+    write_points(evaluation);
+  }
 }
 
 void WriteStage5BenchmarkWorstCasesSummary(const std::string& path,
