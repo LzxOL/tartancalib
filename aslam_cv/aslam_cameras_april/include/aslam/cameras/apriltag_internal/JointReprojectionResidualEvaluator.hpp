@@ -29,6 +29,12 @@ struct JointResidualPointDiagnostics {
   Eigen::Vector3d target_xyz_board = Eigen::Vector3d::Zero();
   Eigen::Vector2d residual_xy = Eigen::Vector2d::Zero();
   double residual_norm = 0.0;
+  Eigen::Vector3d observed_ray = Eigen::Vector3d::Zero();
+  Eigen::Vector3d predicted_ray = Eigen::Vector3d::Zero();
+  Eigen::Vector2d angular_residual_xy = Eigen::Vector2d::Zero();
+  double angular_residual_norm = 0.0;
+  double polar_angle_deg = 0.0;
+  ResidualModel residual_model_used = ResidualModel::ImagePlane;
   double quality = 0.0;
   bool used_in_solver = false;
   int frame_storage_index = -1;
@@ -72,6 +78,12 @@ struct JointResidualEvaluationResult {
   double overall_rmse = 0.0;
   double outer_only_rmse = 0.0;
   double internal_only_rmse = 0.0;
+  double overall_image_plane_rmse = 0.0;
+  double outer_only_image_plane_rmse = 0.0;
+  double internal_only_image_plane_rmse = 0.0;
+  double overall_angular_rmse = 0.0;
+  double outer_only_angular_rmse = 0.0;
+  double internal_only_angular_rmse = 0.0;
   std::vector<JointResidualPointDiagnostics> point_diagnostics;
   std::vector<JointResidualBoardObservationDiagnostics> board_observation_diagnostics;
   std::vector<JointResidualBoardDiagnostics> board_diagnostics;

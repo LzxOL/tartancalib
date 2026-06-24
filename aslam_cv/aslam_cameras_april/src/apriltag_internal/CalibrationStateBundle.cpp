@@ -83,6 +83,28 @@ std::string GetStringValue(const std::map<std::string, std::string>& key_values,
   return it->second;
 }
 
+std::string JoinDoubles(const std::vector<double>& values) {
+  std::ostringstream stream;
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (index > 0) {
+      stream << ",";
+    }
+    stream << values[index];
+  }
+  return stream.str();
+}
+
+std::string JoinStrings(const std::vector<std::string>& values) {
+  std::ostringstream stream;
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (index > 0) {
+      stream << ",";
+    }
+    stream << values[index];
+  }
+  return stream.str();
+}
+
 }  // namespace
 
 std::string CalibrationStateBundle::SummaryString() const {
@@ -99,6 +121,8 @@ std::string CalibrationStateBundle::SummaryString() const {
   stream << "source_pipeline_label: " << scene_state.source_pipeline_label << "\n";
   stream << "source_stage_label: " << measurement_dataset.source_stage_label << "\n";
   stream << "camera_model: " << scene_state.camera_model << "\n";
+  stream << "distortion_model: " << scene_state.distortion_model << "\n";
+  stream << "camera_model_family: " << scene_state.camera.NormalizedFamilyString() << "\n";
   stream << "scene_state_level: " << scene_state.coarse_or_optimized_level << "\n";
   stream << "accepted_frame_count: " << measurement_dataset.accepted_frame_count << "\n";
   stream << "accepted_board_observation_count: "
@@ -110,12 +134,22 @@ std::string CalibrationStateBundle::SummaryString() const {
   stream << "overall_rmse: " << residual_result.overall_rmse << "\n";
   stream << "outer_only_rmse: " << residual_result.outer_only_rmse << "\n";
   stream << "internal_only_rmse: " << residual_result.internal_only_rmse << "\n";
-  stream << "camera_xi: " << scene_state.camera.xi << "\n";
-  stream << "camera_alpha: " << scene_state.camera.alpha << "\n";
-  stream << "camera_fu: " << scene_state.camera.fu << "\n";
-  stream << "camera_fv: " << scene_state.camera.fv << "\n";
-  stream << "camera_cu: " << scene_state.camera.cu << "\n";
-  stream << "camera_cv: " << scene_state.camera.cv << "\n";
+  stream << "camera_intrinsics_labels: "
+         << JoinStrings(scene_state.camera.IntrinsicsLabels()) << "\n";
+  stream << "camera_intrinsics_csv: "
+         << JoinDoubles(scene_state.camera.IntrinsicsVector()) << "\n";
+  stream << "camera_distortion_labels: "
+         << JoinStrings(scene_state.camera.DistortionLabels()) << "\n";
+  stream << "camera_distortion_csv: "
+         << JoinDoubles(scene_state.camera.DistortionVector()) << "\n";
+  if (scene_state.camera.NormalizedFamilyString() == "ds-none") {
+    stream << "camera_xi: " << scene_state.camera.xi << "\n";
+    stream << "camera_alpha: " << scene_state.camera.alpha << "\n";
+    stream << "camera_fu: " << scene_state.camera.fu << "\n";
+    stream << "camera_fv: " << scene_state.camera.fv << "\n";
+    stream << "camera_cu: " << scene_state.camera.cu << "\n";
+    stream << "camera_cv: " << scene_state.camera.cv << "\n";
+  }
   stream << "camera_resolution_width: " << scene_state.camera.resolution.width << "\n";
   stream << "camera_resolution_height: " << scene_state.camera.resolution.height << "\n";
   return stream.str();
@@ -127,7 +161,8 @@ CalibrationSceneState BuildCalibrationSceneState(
     const CalibrationBundleMetadata& metadata) {
   CalibrationSceneState result;
   result.reference_board_id = scene_state.reference_board_id;
-  result.camera_model = "ds";
+  result.camera_model = scene_state.camera.NormalizedCameraModel();
+  result.distortion_model = scene_state.camera.NormalizedDistortionModel();
   result.coarse_or_optimized_level = level;
   result.bundle_version = metadata.bundle_version;
   result.baseline_protocol_label = metadata.baseline_protocol_label;
@@ -262,6 +297,7 @@ CalibrationBackendProblemInput BuildBackendProblemInput(
   result.measurement_dataset = bundle.measurement_dataset;
   result.residual_result = bundle.residual_result;
   result.parameterization.camera_model = bundle.scene_state.camera_model;
+  result.parameterization.distortion_model = bundle.scene_state.distortion_model;
   result.parameterization.pose_parameterization = "se3";
   result.parameterization.reference_board_fixed = true;
   result.optimization_masks.optimize_frame_poses = options.optimize_frame_poses;
@@ -312,6 +348,9 @@ void WriteCalibrationBackendProblemSummary(
   output << "training_split_signature: " << backend_problem_input.training_split_signature << "\n";
   output << "dataset_label: " << backend_problem_input.dataset_label << "\n";
   output << "camera_model: " << backend_problem_input.scene_state.camera_model << "\n";
+  output << "distortion_model: " << backend_problem_input.scene_state.distortion_model << "\n";
+  output << "camera_model_family: "
+         << backend_problem_input.scene_state.camera.NormalizedFamilyString() << "\n";
   output << "scene_state_level: "
          << backend_problem_input.scene_state.coarse_or_optimized_level << "\n";
   output << "accepted_frame_count: "
@@ -370,8 +409,12 @@ bool LoadCalibrationStateBundleSummary(const std::string& path,
   bundle->scene_state.source_pipeline_label =
       GetStringValue(key_values, "source_pipeline_label", "");
   bundle->scene_state.camera_model = GetStringValue(key_values, "camera_model", "ds");
+  bundle->scene_state.distortion_model =
+      GetStringValue(key_values, "distortion_model", "none");
   bundle->scene_state.coarse_or_optimized_level =
       GetStringValue(key_values, "scene_state_level", "");
+  bundle->scene_state.camera.camera_model = bundle->scene_state.camera_model;
+  bundle->scene_state.camera.distortion_model = bundle->scene_state.distortion_model;
   bundle->scene_state.camera.xi = GetDoubleValue(key_values, "camera_xi", 0.0);
   bundle->scene_state.camera.alpha = GetDoubleValue(key_values, "camera_alpha", 0.0);
   bundle->scene_state.camera.fu = GetDoubleValue(key_values, "camera_fu", 0.0);

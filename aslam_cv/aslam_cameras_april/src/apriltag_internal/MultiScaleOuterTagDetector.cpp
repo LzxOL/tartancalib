@@ -456,33 +456,58 @@ bool BuildLocalSpherePatchFrame(const DoubleSphereCameraModel& camera,
 }
 
 std::vector<LocalSpherePatchPlan> BuildOuterLocalSpherePatchPlans() {
-  const std::array<std::pair<const char*, cv::Point2f>, 16> centers{{
-      {"top_inner", cv::Point2f(0.50f, 0.28f)},
-      {"bottom_inner", cv::Point2f(0.50f, 0.72f)},
-      {"left_inner", cv::Point2f(0.28f, 0.50f)},
-      {"right_inner", cv::Point2f(0.72f, 0.50f)},
-      {"top_left_inner", cv::Point2f(0.30f, 0.30f)},
-      {"top_right_inner", cv::Point2f(0.70f, 0.30f)},
-      {"bottom_left_inner", cv::Point2f(0.30f, 0.70f)},
-      {"bottom_right_inner", cv::Point2f(0.70f, 0.70f)},
-      {"top_outer", cv::Point2f(0.50f, 0.18f)},
-      {"bottom_outer", cv::Point2f(0.50f, 0.82f)},
-      {"left_outer", cv::Point2f(0.18f, 0.50f)},
-      {"right_outer", cv::Point2f(0.82f, 0.50f)},
-      {"top_left_outer", cv::Point2f(0.26f, 0.26f)},
-      {"top_right_outer", cv::Point2f(0.74f, 0.26f)},
-      {"bottom_left_outer", cv::Point2f(0.26f, 0.74f)},
-      {"bottom_right_outer", cv::Point2f(0.74f, 0.74f)},
+  struct PlanSeed {
+    const char* label = "";
+    cv::Point2f center{};
+    double fov_deg = 44.0;
+  };
+  const std::array<PlanSeed, 32> seeds{{
+      {"top_inner", cv::Point2f(0.50f, 0.28f), 44.0},
+      {"bottom_inner", cv::Point2f(0.50f, 0.72f), 44.0},
+      {"left_inner", cv::Point2f(0.28f, 0.50f), 44.0},
+      {"right_inner", cv::Point2f(0.72f, 0.50f), 44.0},
+      {"top_left_inner", cv::Point2f(0.30f, 0.30f), 44.0},
+      {"top_right_inner", cv::Point2f(0.70f, 0.30f), 44.0},
+      {"bottom_left_inner", cv::Point2f(0.30f, 0.70f), 44.0},
+      {"bottom_right_inner", cv::Point2f(0.70f, 0.70f), 44.0},
+      {"top_outer", cv::Point2f(0.50f, 0.18f), 44.0},
+      {"bottom_outer", cv::Point2f(0.50f, 0.82f), 44.0},
+      {"left_outer", cv::Point2f(0.18f, 0.50f), 44.0},
+      {"right_outer", cv::Point2f(0.82f, 0.50f), 44.0},
+      {"top_left_outer", cv::Point2f(0.26f, 0.26f), 44.0},
+      {"top_right_outer", cv::Point2f(0.74f, 0.26f), 44.0},
+      {"bottom_left_outer", cv::Point2f(0.26f, 0.74f), 44.0},
+      {"bottom_right_outer", cv::Point2f(0.74f, 0.74f), 44.0},
+      // Extra stress-case patches for close boards near the fisheye boundary.
+      // They are only used after ordinary multiscale detection sees tags but
+      // fails to decode the requested board id, so they do not change normal
+      // detections or relax the AprilTag id/hamming checks.
+      {"left_edge_mid", cv::Point2f(0.10f, 0.50f), 58.0},
+      {"left_edge_upper", cv::Point2f(0.10f, 0.38f), 58.0},
+      {"left_edge_lower", cv::Point2f(0.10f, 0.62f), 58.0},
+      {"left_edge_mid_wide", cv::Point2f(0.14f, 0.50f), 68.0},
+      {"left_edge_upper_wide", cv::Point2f(0.14f, 0.36f), 68.0},
+      {"left_edge_lower_wide", cv::Point2f(0.14f, 0.64f), 68.0},
+      {"bottom_edge_mid", cv::Point2f(0.50f, 0.90f), 58.0},
+      {"bottom_edge_left", cv::Point2f(0.38f, 0.90f), 58.0},
+      {"bottom_edge_right", cv::Point2f(0.62f, 0.90f), 58.0},
+      {"bottom_edge_mid_wide", cv::Point2f(0.50f, 0.86f), 68.0},
+      {"bottom_edge_left_wide", cv::Point2f(0.36f, 0.86f), 68.0},
+      {"bottom_edge_right_wide", cv::Point2f(0.64f, 0.86f), 68.0},
+      {"bottom_left_edge", cv::Point2f(0.18f, 0.86f), 62.0},
+      {"bottom_right_edge", cv::Point2f(0.82f, 0.86f), 62.0},
+      {"top_left_edge", cv::Point2f(0.18f, 0.14f), 62.0},
+      {"top_right_edge", cv::Point2f(0.82f, 0.14f), 62.0},
   }};
 
   std::vector<LocalSpherePatchPlan> plans;
-  plans.reserve(centers.size());
-  for (const auto& center : centers) {
+  plans.reserve(seeds.size());
+  for (const PlanSeed& seed : seeds) {
     LocalSpherePatchPlan plan;
-    plan.label = center.first;
-    plan.normalized_x = center.second.x;
-    plan.normalized_y = center.second.y;
-    plan.fov_deg = 44.0;
+    plan.label = seed.label;
+    plan.normalized_x = seed.center.x;
+    plan.normalized_y = seed.center.y;
+    plan.fov_deg = seed.fov_deg;
     plans.push_back(plan);
   }
   return plans;
@@ -692,6 +717,21 @@ MultiScaleOuterTagDetectorConfig ParseConfig(const std::string& yaml_path) {
       config.outer_corner_marker_ratio = ParseDouble(key, value);
     } else if (key == "outerSubpixScale" || key == "outer_subpix_scale") {
       config.outer_subpix_scale = ParseDouble(key, value);
+    } else if (key == "enableCloseEdgeOuterSubpixBoost" ||
+               key == "enable_close_edge_outer_subpix_boost") {
+      config.enable_close_edge_outer_subpix_boost = ParseBool(key, value);
+    } else if (key == "closeEdgeOuterSubpixAreaRatio" ||
+               key == "close_edge_outer_subpix_area_ratio") {
+      config.close_edge_outer_subpix_area_ratio = ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixMinPolarDeg" ||
+               key == "close_edge_outer_subpix_min_polar_deg") {
+      config.close_edge_outer_subpix_min_polar_deg = ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixBorderRatio" ||
+               key == "close_edge_outer_subpix_border_ratio") {
+      config.close_edge_outer_subpix_border_ratio = ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixMultiplier" ||
+               key == "close_edge_outer_subpix_multiplier") {
+      config.close_edge_outer_subpix_multiplier = ParseDouble(key, value);
     } else if (key == "outerRefineGateScale" || key == "outer_refine_gate_scale") {
       config.outer_refine_gate_scale = ParseDouble(key, value);
     } else if (key == "outerRefineGateMin" || key == "outer_refine_gate_min") {
@@ -728,6 +768,21 @@ MultiScaleOuterTagDetectorConfig ParseConfig(const std::string& yaml_path) {
       config.blur_kernel = ParseInt(key, value);
     } else if (key == "blurSigma" || key == "blur_sigma") {
       config.blur_sigma = ParseDouble(key, value);
+    } else if (key == "enableAnonymousTagLikeGeometryRescue" ||
+               key == "enable_anonymous_tag_like_geometry_rescue") {
+      config.enable_anonymous_tag_like_geometry_rescue = ParseBool(key, value);
+    } else if (key == "enableInterpolatedMissingBoardGeometryRescue" ||
+               key == "enable_interpolated_missing_board_geometry_rescue") {
+      config.enable_interpolated_missing_board_geometry_rescue = ParseBool(key, value);
+    } else if (key == "anonymousTagLikeRescueMaxCenterErrorScale" ||
+               key == "anonymous_tag_like_rescue_max_center_error_scale") {
+      config.anonymous_tag_like_rescue_max_center_error_scale = ParseDouble(key, value);
+    } else if (key == "anonymousTagLikeRescueMinAreaRatio" ||
+               key == "anonymous_tag_like_rescue_min_area_ratio") {
+      config.anonymous_tag_like_rescue_min_area_ratio = ParseDouble(key, value);
+    } else if (key == "anonymousTagLikeRescueMaxAreaRatio" ||
+               key == "anonymous_tag_like_rescue_max_area_ratio") {
+      config.anonymous_tag_like_rescue_max_area_ratio = ParseDouble(key, value);
     } else if (key == "camera_model") {
       config.refine_camera.camera_model = value;
     } else if (key == "distortion_model") {
@@ -805,6 +860,16 @@ MultiScaleOuterTagDetectorConfig ParseConfig(const std::string& yaml_path) {
     throw std::runtime_error("Outer detector config requires at least one valid tag id.");
   }
   config.tag_id = config.tag_ids.front();
+  if (config.anonymous_tag_like_rescue_max_center_error_scale < 0.0) {
+    throw std::runtime_error(
+        "anonymous_tag_like_rescue_max_center_error_scale must be non-negative.");
+  }
+  if (config.anonymous_tag_like_rescue_min_area_ratio < 0.0 ||
+      config.anonymous_tag_like_rescue_max_area_ratio <
+          config.anonymous_tag_like_rescue_min_area_ratio) {
+    throw std::runtime_error(
+        "anonymous_tag_like_rescue area ratio bounds must be non-negative and ordered.");
+  }
 
   return config;
 }
@@ -924,22 +989,210 @@ double ComputeOuterCornerMarkerWidth(double local_scale,
   return std::max(0.0, local_scale);
 }
 
+struct OuterSubpixRadiusComputation {
+  double configured_scale = 0.0;
+  double configured_window_scale = 0.0;
+  int configured_fixed_radius = 0;
+  int configured_min_radius = 0;
+  int configured_max_radius = 0;
+  double corner_marker_width = 0.0;
+  double scaled_radius = 0.0;
+  int raw_radius = 0;
+  int clamp_limit = 0;
+  int final_radius = 0;
+  bool fixed_radius_mode = false;
+  bool clamped = false;
+};
+
+OuterSubpixRadiusComputation ComputeAdaptiveOuterSubpixRadiusDebug(
+    double local_scale,
+    int verification_roi_radius,
+    const MultiScaleOuterTagDetectorConfig& config) {
+  OuterSubpixRadiusComputation result;
+  result.configured_scale = config.outer_subpix_scale;
+  result.configured_window_scale = config.outer_subpix_window_scale;
+  result.configured_fixed_radius = config.outer_subpix_window_radius;
+  result.configured_min_radius = config.outer_subpix_window_min;
+  result.configured_max_radius = config.outer_subpix_window_max;
+  result.corner_marker_width = ComputeOuterCornerMarkerWidth(local_scale, config);
+  (void)verification_roi_radius;
+  result.clamp_limit = 0;
+  if (config.outer_subpix_window_radius > 0) {
+    result.fixed_radius_mode = true;
+    result.scaled_radius = static_cast<double>(config.outer_subpix_window_radius);
+    result.raw_radius = std::max(2, config.outer_subpix_window_radius);
+    result.final_radius = result.raw_radius;
+    result.clamped = false;
+    return result;
+  }
+
+  result.scaled_radius =
+      config.outer_subpix_scale > 0.0
+          ? config.outer_subpix_scale * result.corner_marker_width
+          : static_cast<double>(kOuterSubpixRadiusMin);
+  result.raw_radius =
+      std::max(kOuterSubpixRadiusMin,
+               static_cast<int>(std::lround(result.scaled_radius)));
+  result.final_radius = result.raw_radius;
+  result.clamped = false;
+  return result;
+}
+
 int ComputeAdaptiveOuterSubpixRadius(double local_scale,
                                      int verification_roi_radius,
                                      const MultiScaleOuterTagDetectorConfig& config) {
-  if (config.outer_subpix_window_radius > 0) {
-    const int radius = std::max(2, config.outer_subpix_window_radius);
-    return std::min(radius, std::max(2, verification_roi_radius - 2));
-  }
+  return ComputeAdaptiveOuterSubpixRadiusDebug(local_scale,
+                                               verification_roi_radius,
+                                               config)
+      .final_radius;
+}
 
-  const double corner_marker_width = ComputeOuterCornerMarkerWidth(local_scale, config);
-  const double scaled =
-      config.outer_subpix_scale > 0.0
-          ? config.outer_subpix_scale * corner_marker_width
-          : static_cast<double>(kOuterSubpixRadiusMin);
-  int radius = std::max(kOuterSubpixRadiusMin, static_cast<int>(std::lround(scaled)));
-  radius = std::min(radius, std::max(2, verification_roi_radius - 2));
-  return std::max(2, radius);
+void PopulateOuterSubpixRadiusDebug(
+    const OuterSubpixRadiusComputation& computation,
+    OuterCornerVerificationDebugInfo* debug) {
+  if (debug == nullptr) {
+    return;
+  }
+  debug->configured_outer_subpix_scale = computation.configured_scale;
+  debug->configured_outer_subpix_window_scale =
+      computation.configured_window_scale;
+  debug->configured_outer_subpix_window_radius =
+      computation.configured_fixed_radius;
+  debug->configured_outer_subpix_window_min =
+      computation.configured_min_radius;
+  debug->configured_outer_subpix_window_max =
+      computation.configured_max_radius;
+  debug->corner_marker_width = computation.corner_marker_width;
+  debug->raw_subpix_window_radius = computation.raw_radius;
+  debug->pre_boost_subpix_window_radius = computation.final_radius;
+  debug->subpix_window_clamp_limit = computation.clamp_limit;
+  debug->subpix_window_clamped = computation.clamped;
+}
+
+double MinDistanceToImageBorder(const std::array<cv::Point2f, 4>& corners,
+                                const cv::Size& image_size) {
+  double min_distance = std::numeric_limits<double>::infinity();
+  for (const cv::Point2f& corner : corners) {
+    min_distance = std::min(min_distance, static_cast<double>(corner.x));
+    min_distance = std::min(min_distance, static_cast<double>(corner.y));
+    min_distance = std::min(min_distance,
+                            static_cast<double>(image_size.width - 1) -
+                                static_cast<double>(corner.x));
+    min_distance = std::min(min_distance,
+                            static_cast<double>(image_size.height - 1) -
+                                static_cast<double>(corner.y));
+  }
+  return min_distance;
+}
+
+bool ComputeMaxPolarAngleDeg(const std::array<cv::Point2f, 4>& corners,
+                             const DoubleSphereCameraModel* sphere_camera,
+                             double* max_polar_deg) {
+  if (max_polar_deg == nullptr) {
+    return false;
+  }
+  *max_polar_deg = 0.0;
+  if (sphere_camera == nullptr) {
+    return false;
+  }
+  bool has_valid_ray = false;
+  for (const cv::Point2f& corner : corners) {
+    Eigen::Vector3d ray = Eigen::Vector3d::Zero();
+    if (!sphere_camera->keypointToEuclidean(Eigen::Vector2d(corner.x, corner.y), &ray) ||
+        !NormalizeRay(&ray)) {
+      continue;
+    }
+    const double radial_norm = std::hypot(ray.x(), ray.y());
+    const double polar_rad = std::atan2(radial_norm, ray.z());
+    const double polar_deg = polar_rad * 180.0 / kPi;
+    if (std::isfinite(polar_deg)) {
+      *max_polar_deg = std::max(*max_polar_deg, polar_deg);
+      has_valid_ray = true;
+    }
+  }
+  return has_valid_ray;
+}
+
+double ComputeMaxImageCenterPolarProxyDeg(const std::array<cv::Point2f, 4>& corners,
+                                          const cv::Size& image_size) {
+  if (image_size.width <= 0 || image_size.height <= 0) {
+    return 0.0;
+  }
+  const cv::Point2d center(0.5 * static_cast<double>(image_size.width - 1),
+                           0.5 * static_cast<double>(image_size.height - 1));
+  const double half_diagonal = std::hypot(center.x, center.y);
+  if (half_diagonal <= 1e-9) {
+    return 0.0;
+  }
+  double max_normalized_radius = 0.0;
+  for (const cv::Point2f& corner : corners) {
+    const double radius =
+        std::hypot(static_cast<double>(corner.x) - center.x,
+                   static_cast<double>(corner.y) - center.y);
+    max_normalized_radius =
+        std::max(max_normalized_radius, radius / half_diagonal);
+  }
+  // Fallback only: map image-center radius to a polar-like score so close
+  // border observations can still trigger the adaptive subpixel window when
+  // no DS camera is available at this frontend stage.
+  return 90.0 * std::min(1.0, std::max(0.0, max_normalized_radius));
+}
+
+bool ComputeMaxPolarOrImageProxyDeg(const std::array<cv::Point2f, 4>& corners,
+                                    const cv::Size& image_size,
+                                    const DoubleSphereCameraModel* sphere_camera,
+                                    double* max_polar_deg) {
+  if (ComputeMaxPolarAngleDeg(corners, sphere_camera, max_polar_deg)) {
+    return true;
+  }
+  if (max_polar_deg != nullptr) {
+    *max_polar_deg = ComputeMaxImageCenterPolarProxyDeg(corners, image_size);
+  }
+  return image_size.width > 0 && image_size.height > 0;
+}
+
+double ComputeAreaRatio(const std::array<cv::Point2f, 4>& corners,
+                        const cv::Size& image_size) {
+  if (image_size.width <= 0 || image_size.height <= 0) {
+    return 0.0;
+  }
+  const double image_area =
+      static_cast<double>(image_size.width) * static_cast<double>(image_size.height);
+  return image_area > 0.0 ? ComputeQuadArea(corners) / image_area : 0.0;
+}
+
+bool IsCloseEdgeOuterSubpixBoostCase(
+    const std::array<cv::Point2f, 4>& corners,
+    const cv::Size& image_size,
+    const MultiScaleOuterTagDetectorConfig& config,
+    const DoubleSphereCameraModel* sphere_camera) {
+  if (!config.enable_close_edge_outer_subpix_boost ||
+      config.close_edge_outer_subpix_multiplier <= 1.0 ||
+      image_size.width <= 0 || image_size.height <= 0) {
+    return false;
+  }
+  const double area_ratio = ComputeAreaRatio(corners, image_size);
+  const bool near_board_by_area =
+      area_ratio >= config.close_edge_outer_subpix_area_ratio;
+
+  double max_polar_deg = 0.0;
+  const bool have_polar =
+      ComputeMaxPolarOrImageProxyDeg(corners, image_size, sphere_camera,
+                                     &max_polar_deg);
+  const bool high_polar =
+      have_polar && max_polar_deg >= config.close_edge_outer_subpix_min_polar_deg;
+
+  const double min_border_distance = MinDistanceToImageBorder(corners, image_size);
+  const double border_threshold =
+      config.close_edge_outer_subpix_border_ratio *
+      static_cast<double>(std::min(image_size.width, image_size.height));
+  const bool near_border = min_border_distance <= border_threshold;
+
+  // The main reason to enlarge the outer-corner subpixel window is close range:
+  // a near board occupies a larger image footprint, so the normal local window
+  // can be too small for the true outer corner.  High-polar / near-border cases
+  // are still useful auxiliary triggers, but they should not be mandatory.
+  return near_board_by_area || (high_polar && near_border);
 }
 
 cv::Rect MakeCornerVerificationRoi(const cv::Point2f& corner,
@@ -2139,6 +2392,15 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
 
   std::array<bool, 4> method_valid{{false, false, false, false}};
   std::array<double, 4> method_quality{{0.0, 0.0, 0.0, 0.0}};
+  const bool close_edge_subpix_boost =
+      IsCloseEdgeOuterSubpixBoostCase(coarse_original, gray_original.size(),
+                                      config, sphere_camera);
+  const double close_edge_area_ratio =
+      ComputeAreaRatio(coarse_original, gray_original.size());
+  double close_edge_max_polar_deg = 0.0;
+  (void)ComputeMaxPolarOrImageProxyDeg(coarse_original, gray_original.size(),
+                                       sphere_camera,
+                                       &close_edge_max_polar_deg);
 
   for (int index = 0; index < 4; ++index) {
     refined_candidate.verification_debug[static_cast<std::size_t>(index)] =
@@ -2152,8 +2414,36 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
     const double local_scale =
         debug.local_scale > 0.0 ? debug.local_scale : ComputeCornerLocalScale(coarse_original, index);
     debug.corner_marker_width = ComputeOuterCornerMarkerWidth(local_scale, config);
-    debug.subpix_window_radius =
-        ComputeAdaptiveOuterSubpixRadius(local_scale, debug.verification_roi_radius, config);
+    debug.close_edge_subpix_boost_applied = close_edge_subpix_boost;
+    debug.close_edge_subpix_area_ratio = close_edge_area_ratio;
+    debug.close_edge_subpix_max_polar_deg = close_edge_max_polar_deg;
+    if (close_edge_subpix_boost) {
+      debug.verification_roi_radius = std::max(
+          debug.verification_roi_radius,
+          static_cast<int>(std::lround(
+              static_cast<double>(debug.verification_roi_radius) *
+              config.close_edge_outer_subpix_multiplier)));
+      debug.verification_roi =
+          MakeCornerVerificationRoi(debug.coarse_corner, gray_original.size(),
+                                    debug.verification_roi_radius);
+    }
+    const OuterSubpixRadiusComputation subpix_computation =
+        ComputeAdaptiveOuterSubpixRadiusDebug(local_scale,
+                                              debug.verification_roi_radius,
+                                              config);
+    PopulateOuterSubpixRadiusDebug(subpix_computation, &debug);
+    int subpix_radius = subpix_computation.final_radius;
+    if (close_edge_subpix_boost) {
+      subpix_radius = std::max(
+          subpix_radius,
+          static_cast<int>(std::lround(
+              static_cast<double>(subpix_radius) *
+              config.close_edge_outer_subpix_multiplier)));
+      debug.boosted_raw_subpix_window_radius = subpix_radius;
+    } else {
+      debug.boosted_raw_subpix_window_radius = 0;
+    }
+    debug.subpix_window_radius = std::max(2, subpix_radius);
     debug.spherical_corner = coarse_original[static_cast<std::size_t>(index)];
 
     const int prev_index = (index + 3) % 4;
@@ -2181,6 +2471,8 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
 
     OuterCornerVerificationDebugInfo& debug =
         refined_candidate.verification_debug[static_cast<std::size_t>(index)];
+    const int prev_index = (index + 3) % 4;
+    const int next_index = (index + 1) % 4;
     if (config.enable_outer_spherical_refinement &&
         sphere_camera != nullptr && sphere_camera->IsValid()) {
       const SphericalCornerRefinement spherical_refinement =
@@ -2245,12 +2537,115 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
     debug.line_inside = line_inside;
     debug.line_seed_gap = line_seed_gap;
 
-    if (line_refinement.success &&
+    bool accepted_line_seed =
+        line_refinement.success &&
         line_refinement.quality >= kOuterLineMinQuality &&
-        line_inside) {
-      refined_candidate.refined_original[static_cast<std::size_t>(index)] = line_refinement.refined_corner;
+        line_inside;
+    cv::Point2f accepted_line_corner = line_refinement.refined_corner;
+    double accepted_line_quality = line_refinement.quality;
+
+    // The legacy local line intersection can fail on close/edge boards when a
+    // single bad branch intersects far outside the image.  Refit the local
+    // marker-edge support sets and use that intersection as a conservative
+    // fallback seed before the final cornerSubPix step.  This fallback is
+    // intentionally independent of close-edge window boosting: it improves the
+    // seed without requiring a larger subpixel window.
+    if (!accepted_line_seed) {
+      const ImageLineCornerRefinement image_line_refinement =
+          RefineCornerByImageLineSupportIntersection(
+              debug.prev_marker_support_points,
+              debug.next_marker_support_points);
+      debug.image_line_valid = image_line_refinement.success;
+      debug.image_line_corner = image_line_refinement.success
+                                    ? image_line_refinement.refined_corner
+                                    : coarse_original[static_cast<std::size_t>(index)];
+      debug.prev_image_line_residual = image_line_refinement.prev_line.rms_residual;
+      debug.next_image_line_residual = image_line_refinement.next_line.rms_residual;
+      debug.prev_image_line_support_count =
+          image_line_refinement.prev_line.support_count;
+      debug.next_image_line_support_count =
+          image_line_refinement.next_line.support_count;
+
+      const cv::Point2f image_line_delta =
+          image_line_refinement.refined_corner - coarse_corner;
+      const double image_line_gap =
+          std::hypot(image_line_delta.x, image_line_delta.y);
+      const bool image_line_inside =
+          image_line_refinement.refined_corner.x >= config.min_border_distance &&
+          image_line_refinement.refined_corner.x <=
+              static_cast<float>(gray_original.cols) - config.min_border_distance &&
+          image_line_refinement.refined_corner.y >= config.min_border_distance &&
+          image_line_refinement.refined_corner.y <=
+              static_cast<float>(gray_original.rows) - config.min_border_distance;
+      const double fallback_gap_limit =
+          std::max(static_cast<double>(debug.verification_roi_radius),
+                   1.5 * static_cast<double>(debug.subpix_window_radius));
+      if (image_line_refinement.success &&
+          image_line_refinement.quality >= kOuterLineMinQuality &&
+          image_line_inside &&
+          image_line_gap <= fallback_gap_limit) {
+        accepted_line_seed = true;
+        accepted_line_corner = image_line_refinement.refined_corner;
+        accepted_line_quality = image_line_refinement.quality;
+      } else {
+        FittedLine prev_fallback_line = image_line_refinement.prev_line;
+        FittedLine next_fallback_line = image_line_refinement.next_line;
+        if (!prev_fallback_line.valid && next_fallback_line.valid) {
+          prev_fallback_line.valid = true;
+          prev_fallback_line.anchor =
+              refined_candidate.refined_original[static_cast<std::size_t>(prev_index)];
+          prev_fallback_line.direction =
+              NormalizeVector(coarse_corner -
+                              coarse_original[static_cast<std::size_t>(prev_index)]);
+          prev_fallback_line.support_count = 2;
+          prev_fallback_line.rms_residual = 0.0;
+        }
+        if (!next_fallback_line.valid && prev_fallback_line.valid) {
+          next_fallback_line.valid = true;
+          next_fallback_line.anchor =
+              refined_candidate.refined_original[static_cast<std::size_t>(next_index)];
+          next_fallback_line.direction =
+              NormalizeVector(coarse_original[static_cast<std::size_t>(next_index)] -
+                              coarse_corner);
+          next_fallback_line.support_count = 2;
+          next_fallback_line.rms_residual = 0.0;
+        }
+        cv::Point2f geometric_image_line_corner;
+        if (prev_fallback_line.valid &&
+            next_fallback_line.valid &&
+            IntersectLines(prev_fallback_line, next_fallback_line,
+                           &geometric_image_line_corner)) {
+          const cv::Point2f geometric_delta =
+              geometric_image_line_corner - coarse_corner;
+          const double geometric_gap =
+              std::hypot(geometric_delta.x, geometric_delta.y);
+          const bool geometric_inside =
+              geometric_image_line_corner.x >= config.min_border_distance &&
+              geometric_image_line_corner.x <=
+                  static_cast<float>(gray_original.cols) - config.min_border_distance &&
+              geometric_image_line_corner.y >= config.min_border_distance &&
+              geometric_image_line_corner.y <=
+                  static_cast<float>(gray_original.rows) - config.min_border_distance;
+          if (geometric_inside && geometric_gap <= fallback_gap_limit) {
+            accepted_line_seed = true;
+            accepted_line_corner = geometric_image_line_corner;
+            accepted_line_quality =
+                std::max(kOuterLineMinQuality,
+                         image_line_refinement.quality);
+            debug.image_line_valid = true;
+            debug.image_line_corner = geometric_image_line_corner;
+          }
+        }
+      }
+    }
+
+    if (accepted_line_seed) {
+      refined_candidate.refined_original[static_cast<std::size_t>(index)] =
+          accepted_line_corner;
       method_quality[static_cast<std::size_t>(index)] =
-          std::min(std::max(method_quality[static_cast<std::size_t>(index)], line_refinement.quality), 1.0);
+          std::min(std::max(method_quality[static_cast<std::size_t>(index)],
+                            accepted_line_quality),
+                   1.0);
       debug.line_seed_accepted = true;
     }
     debug.subpix_corner = refined_candidate.refined_original[static_cast<std::size_t>(index)];
@@ -2313,6 +2708,59 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
   return refined_candidate;
 }
 
+OuterSphericalQuadRefinementResult RefineOuterCornersBySphericalPlanesImpl(
+    const cv::Mat& gray,
+    const DoubleSphereCameraModel& camera,
+    const std::array<cv::Point2f, 4>& corner_seeds,
+    const MultiScaleOuterTagDetectorConfig& config) {
+  OuterSphericalQuadRefinementResult result;
+  result.refined_corners = corner_seeds;
+  result.min_quality = 1.0;
+  if (gray.empty() || !camera.IsValid()) {
+    result.min_quality = 0.0;
+    for (auto& debug : result.corner_debug) {
+      debug.failure_reason = gray.empty() ? "empty_image" : "invalid_camera";
+    }
+    return result;
+  }
+
+  for (int index = 0; index < 4; ++index) {
+    const SphericalCornerRefinement refinement =
+        RefineCornerBySphericalPlanes(gray, camera, corner_seeds, index, config);
+    OuterSphericalCornerRefinementDebug& debug =
+        result.corner_debug[static_cast<std::size_t>(index)];
+    debug.success = refinement.success;
+    debug.refined_corner = refinement.success
+                               ? refinement.refined_corner
+                               : corner_seeds[static_cast<std::size_t>(index)];
+    debug.quality = refinement.quality;
+    debug.prev_edge_residual = refinement.prev_edge_fit.rms_residual;
+    debug.next_edge_residual = refinement.next_edge_fit.rms_residual;
+    debug.prev_edge_support_count = refinement.prev_edge_fit.support_count;
+    debug.next_edge_support_count = refinement.next_edge_fit.support_count;
+    debug.failure_reason = refinement.failure_reason;
+    debug.displacement_px =
+        Norm(debug.refined_corner - corner_seeds[static_cast<std::size_t>(index)]);
+
+    if (refinement.success) {
+      result.refined_corners[static_cast<std::size_t>(index)] =
+          refinement.refined_corner;
+      result.max_displacement_px =
+          std::max(result.max_displacement_px, debug.displacement_px);
+      result.min_quality = std::min(result.min_quality, refinement.quality);
+      ++result.successful_corner_count;
+    } else {
+      result.min_quality = 0.0;
+    }
+  }
+  result.success = result.successful_corner_count == 4;
+  // Keep per-corner successful spherical refinements even when not all four
+  // corners pass. The normal outer detector applies this refinement per corner;
+  // geometry-prior rescue needs the same behavior so partially reliable board
+  // edges can still improve the subsequent subpixel and pose checks.
+  return result;
+}
+
 }  // namespace
 
 std::string ToString(OuterTagFailureReason reason) {
@@ -2331,6 +2779,14 @@ std::string ToString(OuterTagFailureReason reason) {
       return "MatchingTagIdButAllScalesUnstable";
   }
   return "Unknown";
+}
+
+OuterSphericalQuadRefinementResult RefineOuterCornersBySphericalPlanes(
+    const cv::Mat& gray,
+    const DoubleSphereCameraModel& camera,
+    const std::array<cv::Point2f, 4>& corner_seeds,
+    const MultiScaleOuterTagDetectorConfig& config) {
+  return RefineOuterCornersBySphericalPlanesImpl(gray, camera, corner_seeds, config);
 }
 
 MultiScaleOuterTagDetector::MultiScaleOuterTagDetector(MultiScaleOuterTagDetectorConfig config)
@@ -2356,6 +2812,18 @@ MultiScaleOuterTagDetector::MultiScaleOuterTagDetector(MultiScaleOuterTagDetecto
   if (config_.outer_subpix_scale < 0.0) {
     throw std::runtime_error("outer_subpix_scale must be non-negative.");
   }
+  if (config_.close_edge_outer_subpix_area_ratio < 0.0) {
+    throw std::runtime_error("close_edge_outer_subpix_area_ratio must be non-negative.");
+  }
+  if (config_.close_edge_outer_subpix_min_polar_deg < 0.0) {
+    throw std::runtime_error("close_edge_outer_subpix_min_polar_deg must be non-negative.");
+  }
+  if (config_.close_edge_outer_subpix_border_ratio < 0.0) {
+    throw std::runtime_error("close_edge_outer_subpix_border_ratio must be non-negative.");
+  }
+  if (config_.close_edge_outer_subpix_multiplier <= 0.0) {
+    throw std::runtime_error("close_edge_outer_subpix_multiplier must be positive.");
+  }
   if (config_.outer_refine_gate_scale < 0.0) {
     throw std::runtime_error("outer_refine_gate_scale must be non-negative.");
   }
@@ -2367,6 +2835,16 @@ MultiScaleOuterTagDetector::MultiScaleOuterTagDetector(MultiScaleOuterTagDetecto
   }
   if (config_.min_detection_quality < 0.0 || config_.min_detection_quality > 1.0) {
     throw std::runtime_error("min_detection_quality must be in [0, 1].");
+  }
+  if (config_.anonymous_tag_like_rescue_max_center_error_scale < 0.0) {
+    throw std::runtime_error(
+        "anonymous_tag_like_rescue_max_center_error_scale must be non-negative.");
+  }
+  if (config_.anonymous_tag_like_rescue_min_area_ratio < 0.0 ||
+      config_.anonymous_tag_like_rescue_max_area_ratio <
+          config_.anonymous_tag_like_rescue_min_area_ratio) {
+    throw std::runtime_error(
+        "anonymous_tag_like_rescue area ratio bounds must be non-negative and ordered.");
   }
 
   detector_ = std::make_unique<AprilTags::TagDetector>(AprilTags::tagCodes36h11, 2);
@@ -2428,6 +2906,417 @@ ScaleCandidate BuildScaleCandidateFromDetection(const AprilTags::TagDetection& d
   candidate.shape_quality =
       candidate.max_edge > 1e-6 ? ClampUnit(candidate.min_edge / candidate.max_edge) : 0.0;
   return candidate;
+}
+
+const ScaleCandidate* BestCoarseCandidate(const PerTagOuterAggregationState& state) {
+  const ScaleCandidate* best = nullptr;
+  for (const ScaleCandidate& candidate : state.coarse_candidates) {
+    if (best == nullptr || IsCandidateBetter(candidate, *best)) {
+      best = &candidate;
+    }
+  }
+  return best;
+}
+
+struct ResolvedBoardGeometry {
+  int board_id = -1;
+  cv::Point2f center{};
+  double area = 0.0;
+  double mean_edge = 0.0;
+  double max_edge = 0.0;
+};
+
+bool BuildResolvedBoardGeometry(const PerTagOuterAggregationState& state,
+                                ResolvedBoardGeometry* geometry) {
+  if (geometry == nullptr) {
+    return false;
+  }
+  const ScaleCandidate* candidate = BestCoarseCandidate(state);
+  if (candidate == nullptr) {
+    return false;
+  }
+  geometry->board_id = state.result.board_id;
+  geometry->center = ComputeQuadCenter(candidate->original_corners);
+  geometry->area = ComputeQuadArea(candidate->original_corners);
+  const std::pair<double, double> edge_range = ComputeEdgeRange(candidate->original_corners);
+  geometry->mean_edge = 0.25 * (
+      Norm(candidate->original_corners[1] - candidate->original_corners[0]) +
+      Norm(candidate->original_corners[2] - candidate->original_corners[1]) +
+      Norm(candidate->original_corners[3] - candidate->original_corners[2]) +
+      Norm(candidate->original_corners[0] - candidate->original_corners[3]));
+  geometry->max_edge = edge_range.second;
+  return geometry->area >= kMinQuadAreaPixels &&
+         geometry->mean_edge >= kMinQuadEdgePixels;
+}
+
+ScaleCandidate MakeSyntheticAnonymousCandidateForTarget(
+    const ScaleCandidate& anonymous_candidate,
+    int target_board_id,
+    const std::string& rescue_label) {
+  ScaleCandidate synthetic = anonymous_candidate;
+  synthetic.detection = AprilTags::TagDetection(target_board_id);
+  synthetic.detection.good = true;
+  synthetic.detection.id = target_board_id;
+  // Keep anonymous-ID rescues lower ranked than true decoded IDs while still
+  // allowing the normal refinement and quality gates to verify the quad.
+  synthetic.detection.hammingDistance = 2;
+  synthetic.detection.rotation = anonymous_candidate.detection.rotation;
+  synthetic.detection.observedPerimeter = anonymous_candidate.detection.observedPerimeter;
+  synthetic.detection.cxy = anonymous_candidate.detection.cxy;
+  for (int index = 0; index < 4; ++index) {
+    synthetic.detection.p[index] = anonymous_candidate.detection.p[index];
+  }
+  synthetic.from_local_patch_rescue = true;
+  synthetic.local_patch_label = rescue_label;
+  return synthetic;
+}
+
+void TryAnonymousTagLikeGeometryRescue(
+    const cv::Size& image_size,
+    const MultiScaleOuterTagDetectorConfig& config,
+    const std::vector<ScaleCandidate>& anonymous_candidates,
+    std::vector<PerTagOuterAggregationState>* states) {
+  if (!config.enable_anonymous_tag_like_geometry_rescue || states == nullptr ||
+      anonymous_candidates.empty() || states->size() < 3) {
+    return;
+  }
+
+  std::vector<ResolvedBoardGeometry> resolved_boards;
+  resolved_boards.reserve(states->size());
+  for (const PerTagOuterAggregationState& state : *states) {
+    if (state.coarse_candidates.empty()) {
+      continue;
+    }
+    ResolvedBoardGeometry geometry;
+    if (BuildResolvedBoardGeometry(state, &geometry)) {
+      resolved_boards.push_back(geometry);
+    }
+  }
+  if (resolved_boards.size() < 2) {
+    return;
+  }
+  std::sort(resolved_boards.begin(), resolved_boards.end(),
+            [](const ResolvedBoardGeometry& lhs, const ResolvedBoardGeometry& rhs) {
+              return lhs.board_id < rhs.board_id;
+            });
+
+  std::vector<bool> anonymous_used(anonymous_candidates.size(), false);
+  for (PerTagOuterAggregationState& state : *states) {
+    if (!state.saw_any_detection || state.saw_matching_tag_id ||
+        !state.coarse_candidates.empty()) {
+      continue;
+    }
+
+    const int target_board_id = state.result.board_id;
+    const ResolvedBoardGeometry* lower = nullptr;
+    const ResolvedBoardGeometry* upper = nullptr;
+    for (const ResolvedBoardGeometry& resolved : resolved_boards) {
+      if (resolved.board_id < target_board_id) {
+        if (lower == nullptr || resolved.board_id > lower->board_id) {
+          lower = &resolved;
+        }
+      } else if (resolved.board_id > target_board_id) {
+        if (upper == nullptr || resolved.board_id < upper->board_id) {
+          upper = &resolved;
+        }
+      }
+    }
+    if (lower == nullptr || upper == nullptr || lower->board_id == upper->board_id) {
+      continue;
+    }
+
+    const double id_alpha =
+        static_cast<double>(target_board_id - lower->board_id) /
+        static_cast<double>(upper->board_id - lower->board_id);
+    if (id_alpha <= 0.0 || id_alpha >= 1.0) {
+      continue;
+    }
+    const cv::Point2f expected_center =
+        lower->center + (upper->center - lower->center) * static_cast<float>(id_alpha);
+    const double expected_area =
+        std::max(1.0, (1.0 - id_alpha) * lower->area + id_alpha * upper->area);
+    const double expected_edge =
+        std::max(kMinQuadEdgePixels,
+                 (1.0 - id_alpha) * lower->mean_edge + id_alpha * upper->mean_edge);
+    const double neighbor_span = Norm(upper->center - lower->center);
+    const double max_center_error = std::max(
+        config.anonymous_tag_like_rescue_max_center_error_scale * expected_edge,
+        0.30 * neighbor_span);
+
+    int best_index = -1;
+    double best_score = std::numeric_limits<double>::infinity();
+    double best_center_error = 0.0;
+    double best_area_ratio = 0.0;
+    for (std::size_t candidate_index = 0; candidate_index < anonymous_candidates.size();
+         ++candidate_index) {
+      if (anonymous_used[candidate_index]) {
+        continue;
+      }
+      const ScaleCandidate& candidate = anonymous_candidates[candidate_index];
+      if (!candidate.detection.good ||
+          candidate.scaled_area < kMinQuadAreaPixels ||
+          candidate.min_edge < kMinQuadEdgePixels ||
+          candidate.shape_quality <= 0.10 ||
+          !PassesBorderCheck(candidate.original_corners, image_size,
+                             config.min_border_distance)) {
+        continue;
+      }
+
+      const cv::Point2f candidate_center = ComputeQuadCenter(candidate.original_corners);
+      bool overlaps_resolved_board = false;
+      for (const ResolvedBoardGeometry& resolved : resolved_boards) {
+        const double overlap_distance = Norm(candidate_center - resolved.center);
+        const double overlap_limit = 0.35 * (candidate.max_edge + resolved.max_edge);
+        if (overlap_distance < overlap_limit) {
+          overlaps_resolved_board = true;
+          break;
+        }
+      }
+      if (overlaps_resolved_board) {
+        continue;
+      }
+
+      const double candidate_area = std::max(1.0, ComputeQuadArea(candidate.original_corners));
+      const double area_ratio = candidate_area / expected_area;
+      if (area_ratio < config.anonymous_tag_like_rescue_min_area_ratio ||
+          area_ratio > config.anonymous_tag_like_rescue_max_area_ratio) {
+        continue;
+      }
+      const double center_error = Norm(candidate_center - expected_center);
+      if (center_error > max_center_error) {
+        continue;
+      }
+      const double score = center_error / std::max(1.0, max_center_error) +
+                           0.25 * std::abs(std::log(area_ratio)) +
+                           0.20 * (1.0 - candidate.shape_quality);
+      if (score < best_score) {
+        best_score = score;
+        best_index = static_cast<int>(candidate_index);
+        best_center_error = center_error;
+        best_area_ratio = area_ratio;
+      }
+    }
+
+    if (best_index < 0) {
+      continue;
+    }
+
+    anonymous_used[static_cast<std::size_t>(best_index)] = true;
+    std::ostringstream rescue_summary;
+    rescue_summary << "anonymous_tag_like_geometry_rescue target_id=" << target_board_id
+                   << " decoded_id=" << anonymous_candidates[static_cast<std::size_t>(best_index)].detection.id
+                   << " bracket=" << lower->board_id << "," << upper->board_id
+                   << " center_error_px=" << std::fixed << std::setprecision(2)
+                   << best_center_error
+                   << " max_center_error_px=" << max_center_error
+                   << " area_ratio=" << best_area_ratio
+                   << " score=" << best_score;
+    state.saw_matching_tag_id = true;
+    state.attempted_local_patch_rescue = true;
+    state.coarse_candidates.push_back(MakeSyntheticAnonymousCandidateForTarget(
+        anonymous_candidates[static_cast<std::size_t>(best_index)], target_board_id,
+        rescue_summary.str()));
+    state.result.successful_scale_longest_sides.push_back(
+        anonymous_candidates[static_cast<std::size_t>(best_index)].target_longest_side);
+    state.local_patch_rescue_summaries.push_back(rescue_summary.str());
+  }
+}
+
+ScaleCandidate BuildSyntheticCandidateFromOriginalCorners(
+    int target_board_id,
+    const cv::Size& image_size,
+    const std::array<cv::Point2f, 4>& original_corners,
+    int hamming_distance,
+    const std::string& rescue_label) {
+  ScaleCandidate candidate;
+  candidate.target_longest_side = std::max(image_size.width, image_size.height);
+  candidate.scale_factor = 1.0;
+  candidate.configured_scale_divisor = 0.0;
+  candidate.scaled_size = image_size;
+  candidate.detection = AprilTags::TagDetection(target_board_id);
+  candidate.detection.good = true;
+  candidate.detection.id = target_board_id;
+  candidate.detection.hammingDistance = hamming_distance;
+  candidate.scaled_corners = original_corners;
+  candidate.original_corners = original_corners;
+  const cv::Point2f center = ComputeQuadCenter(original_corners);
+  candidate.detection.cxy = {center.x, center.y};
+  candidate.detection.observedPerimeter = 0.0f;
+  for (int index = 0; index < 4; ++index) {
+    const cv::Point2f& corner = original_corners[static_cast<std::size_t>(index)];
+    candidate.detection.p[index] = {corner.x, corner.y};
+    const cv::Point2f& next = original_corners[static_cast<std::size_t>((index + 1) % 4)];
+    candidate.detection.observedPerimeter += static_cast<float>(Norm(next - corner));
+  }
+  candidate.scaled_area = ComputeQuadArea(candidate.scaled_corners);
+  const std::pair<double, double> edge_range = ComputeEdgeRange(candidate.scaled_corners);
+  candidate.min_edge = edge_range.first;
+  candidate.max_edge = edge_range.second;
+  candidate.shape_quality =
+      candidate.max_edge > 1e-6 ? ClampUnit(candidate.min_edge / candidate.max_edge) : 0.0;
+  candidate.from_local_patch_rescue = true;
+  candidate.local_patch_label = rescue_label;
+  return candidate;
+}
+
+void TryInterpolatedMissingBoardGeometryRescue(
+    const cv::Mat& gray_original,
+    const MultiScaleOuterTagDetectorConfig& config,
+    const DoubleSphereCameraModel* sphere_camera,
+    std::vector<PerTagOuterAggregationState>* states) {
+  if (!config.enable_interpolated_missing_board_geometry_rescue ||
+      states == nullptr || states->size() < 3) {
+    return;
+  }
+
+  std::vector<ResolvedBoardGeometry> resolved_boards;
+  resolved_boards.reserve(states->size());
+  for (const PerTagOuterAggregationState& state : *states) {
+    if (state.coarse_candidates.empty()) {
+      continue;
+    }
+    ResolvedBoardGeometry geometry;
+    if (BuildResolvedBoardGeometry(state, &geometry)) {
+      resolved_boards.push_back(geometry);
+    }
+  }
+  if (resolved_boards.size() < 2) {
+    return;
+  }
+  std::sort(resolved_boards.begin(), resolved_boards.end(),
+            [](const ResolvedBoardGeometry& lhs, const ResolvedBoardGeometry& rhs) {
+              return lhs.board_id < rhs.board_id;
+            });
+
+  auto find_state_by_board = [&](int board_id) -> const PerTagOuterAggregationState* {
+    for (const PerTagOuterAggregationState& state : *states) {
+      if (state.result.board_id == board_id) {
+        return &state;
+      }
+    }
+    return nullptr;
+  };
+
+  for (PerTagOuterAggregationState& state : *states) {
+    if (!state.saw_any_detection || state.saw_matching_tag_id ||
+        !state.coarse_candidates.empty()) {
+      continue;
+    }
+
+    const int target_board_id = state.result.board_id;
+    const ResolvedBoardGeometry* lower = nullptr;
+    const ResolvedBoardGeometry* upper = nullptr;
+    for (const ResolvedBoardGeometry& resolved : resolved_boards) {
+      if (resolved.board_id < target_board_id) {
+        if (lower == nullptr || resolved.board_id > lower->board_id) {
+          lower = &resolved;
+        }
+      } else if (resolved.board_id > target_board_id) {
+        if (upper == nullptr || resolved.board_id < upper->board_id) {
+          upper = &resolved;
+        }
+      }
+    }
+    if (lower == nullptr || upper == nullptr || lower->board_id == upper->board_id) {
+      continue;
+    }
+
+    const PerTagOuterAggregationState* lower_state = find_state_by_board(lower->board_id);
+    const PerTagOuterAggregationState* upper_state = find_state_by_board(upper->board_id);
+    const ScaleCandidate* lower_candidate =
+        lower_state == nullptr ? nullptr : BestCoarseCandidate(*lower_state);
+    const ScaleCandidate* upper_candidate =
+        upper_state == nullptr ? nullptr : BestCoarseCandidate(*upper_state);
+    if (lower_candidate == nullptr || upper_candidate == nullptr) {
+      continue;
+    }
+
+    const double id_alpha =
+        static_cast<double>(target_board_id - lower->board_id) /
+        static_cast<double>(upper->board_id - lower->board_id);
+    if (id_alpha <= 0.0 || id_alpha >= 1.0) {
+      continue;
+    }
+    std::array<cv::Point2f, 4> predicted_corners{};
+    for (int corner_index = 0; corner_index < 4; ++corner_index) {
+      predicted_corners[static_cast<std::size_t>(corner_index)] =
+          lower_candidate->original_corners[static_cast<std::size_t>(corner_index)] +
+          (upper_candidate->original_corners[static_cast<std::size_t>(corner_index)] -
+           lower_candidate->original_corners[static_cast<std::size_t>(corner_index)]) *
+              static_cast<float>(id_alpha);
+    }
+    if (!PassesBorderCheck(predicted_corners, gray_original.size(),
+                           config.min_border_distance) ||
+        ComputeQuadArea(predicted_corners) < kMinQuadAreaPixels) {
+      continue;
+    }
+
+    std::ostringstream seed_label;
+    seed_label << "interpolated_missing_board_geometry_seed target_id=" << target_board_id
+               << " bracket=" << lower->board_id << "," << upper->board_id;
+    ScaleCandidate seed_candidate = BuildSyntheticCandidateFromOriginalCorners(
+        target_board_id, gray_original.size(), predicted_corners, 3, seed_label.str());
+
+    const RefinedCandidate refined_candidate =
+        RefineCoarseCandidate(gray_original, seed_candidate, predicted_corners,
+                              config, sphere_camera);
+    int image_evidence_corner_count = 0;
+    double max_displacement = 0.0;
+    for (int corner_index = 0; corner_index < 4; ++corner_index) {
+      const OuterCornerVerificationDebugInfo& debug =
+          refined_candidate.verification_debug[static_cast<std::size_t>(corner_index)];
+      if (debug.line_seed_accepted || debug.spherical_refinement_applied ||
+          debug.image_line_valid) {
+        ++image_evidence_corner_count;
+      }
+      max_displacement = std::max(
+          max_displacement,
+          Norm(refined_candidate.refined_original[static_cast<std::size_t>(corner_index)] -
+               predicted_corners[static_cast<std::size_t>(corner_index)]));
+    }
+    const double expected_edge = std::max(
+        kMinQuadEdgePixels, (1.0 - id_alpha) * lower->mean_edge + id_alpha * upper->mean_edge);
+    const bool refined_inside =
+        PassesBorderCheck(refined_candidate.refined_original, gray_original.size(),
+                          config.min_border_distance);
+    const double refined_area = ComputeQuadArea(refined_candidate.refined_original);
+    const double max_allowed_displacement = std::max(18.0, 0.35 * expected_edge);
+    if (image_evidence_corner_count < 3 ||
+        max_displacement > max_allowed_displacement ||
+        !refined_inside ||
+        refined_area < kMinQuadAreaPixels) {
+      state.attempted_local_patch_rescue = true;
+      std::ostringstream reject_summary;
+      reject_summary << "interpolated_missing_board_geometry_rejected target_id="
+                     << target_board_id
+                     << " bracket=" << lower->board_id << "," << upper->board_id
+                     << " evidence_corners=" << image_evidence_corner_count
+                     << " max_refine_displacement_px=" << std::fixed << std::setprecision(2)
+                     << max_displacement
+                     << " max_allowed_px=" << max_allowed_displacement
+                     << " refined_inside=" << (refined_inside ? 1 : 0)
+                     << " refined_area=" << refined_area;
+      state.local_patch_rescue_summaries.push_back(reject_summary.str());
+      continue;
+    }
+
+    std::ostringstream rescue_summary;
+    rescue_summary << "interpolated_missing_board_geometry_rescue target_id=" << target_board_id
+                   << " bracket=" << lower->board_id << "," << upper->board_id
+                   << " evidence_corners=" << image_evidence_corner_count
+                   << " max_refine_displacement_px=" << std::fixed << std::setprecision(2)
+                   << max_displacement
+                   << " quality=" << refined_candidate.quality;
+    ScaleCandidate accepted_candidate = BuildSyntheticCandidateFromOriginalCorners(
+        target_board_id, gray_original.size(), refined_candidate.refined_original,
+        3, rescue_summary.str());
+    state.saw_matching_tag_id = true;
+    state.attempted_local_patch_rescue = true;
+    state.coarse_candidates.push_back(accepted_candidate);
+    state.result.successful_scale_longest_sides.push_back(
+        accepted_candidate.target_longest_side);
+    state.local_patch_rescue_summaries.push_back(rescue_summary.str());
+  }
 }
 
 void TryLocalSpherePatchRescue(
@@ -2657,9 +3546,13 @@ OuterBoardMeasurement BuildOuterBoardMeasurement(const OuterTagDetectionResult& 
   measurement.board_id = detection.board_id;
   measurement.detected_tag_id = detection.detected_tag_id;
   measurement.success = detection.success;
+  measurement.attempted_local_patch_rescue = detection.attempted_local_patch_rescue;
+  measurement.used_local_patch_rescue = detection.used_local_patch_rescue;
+  measurement.local_patch_rescue_summary = detection.local_patch_rescue_summary;
   measurement.detection_quality = detection.quality;
   measurement.refined_outer_corners_original_image = detection.refined_corners_original_image;
   measurement.refined_corner_valid = detection.refined_valid;
+  measurement.corner_verification_debug = detection.corner_verification_debug;
   measurement.valid_refined_corner_count = CountValidCorners(detection.refined_valid);
   measurement.failure_reason = detection.failure_reason;
   measurement.failure_reason_text = detection.failure_reason_text;
@@ -2718,6 +3611,7 @@ std::vector<OuterTagDetectionResult> MultiScaleOuterTagDetector::DetectMultiple(
 
   std::vector<PerTagOuterAggregationState> states(normalized_tag_ids.size());
   std::map<int, std::size_t> requested_index_by_id;
+  std::vector<ScaleCandidate> anonymous_tag_like_candidates;
   for (std::size_t index = 0; index < normalized_tag_ids.size(); ++index) {
     requested_index_by_id[normalized_tag_ids[index]] = index;
     states[index].result.board_id = normalized_tag_ids[index];
@@ -2769,6 +3663,19 @@ std::vector<OuterTagDetectionResult> MultiScaleOuterTagDetector::DetectMultiple(
         scale_state.debug.raw_detection_summaries.push_back(detection_summary);
         if (detection.good) {
           ++scale_state.debug.raw_good_detection_count;
+        }
+      }
+      if (config_.enable_anonymous_tag_like_geometry_rescue && detection.good &&
+          !scale_states.empty()) {
+        ScaleCandidate anonymous_candidate =
+            BuildScaleCandidateFromDetection(detection, scale_states.front().debug,
+                                             gray_original.size());
+        if (PassesBorderCheck(anonymous_candidate.scaled_corners, scaled_gray.size(),
+                              config_.min_border_distance) &&
+            anonymous_candidate.scaled_area >= kMinQuadAreaPixels &&
+            anonymous_candidate.min_edge >= kMinQuadEdgePixels &&
+            anonymous_candidate.shape_quality > 0.10) {
+          anonymous_tag_like_candidates.push_back(anonymous_candidate);
         }
       }
     }
@@ -2838,6 +3745,10 @@ std::vector<OuterTagDetectionResult> MultiScaleOuterTagDetector::DetectMultiple(
 
   TryLocalSpherePatchRescue(gray_original, config_, sphere_camera_.get(),
                             requested_index_by_id, detector_.get(), &states);
+  TryAnonymousTagLikeGeometryRescue(gray_original.size(), config_,
+                                    anonymous_tag_like_candidates, &states);
+  TryInterpolatedMissingBoardGeometryRescue(gray_original, config_, sphere_camera_.get(),
+                                            &states);
 
   std::vector<OuterTagDetectionResult> results;
   results.reserve(states.size());
@@ -2986,9 +3897,10 @@ void MultiScaleOuterTagDetector::DrawDetectionImpl(const OuterTagDetectionResult
             verification.spherical_refinement_valid ? spherical : coarse;
         cv::line(*output_image, subpix_start, subpix, cv::Scalar(255, 220, 0), line_thickness,
                  cv::LINE_AA);
+        // subpix_window_radius is already expressed in original-image pixels.
+        // Keep it unscaled here; render_scale is only for marker/text sizes.
         const int subpix_window_radius_px =
-            std::max(2, static_cast<int>(std::lround(
-                            verification.subpix_window_radius * render_scale)));
+            std::max(2, verification.subpix_window_radius);
         cv::rectangle(
             *output_image,
             cv::Rect(static_cast<int>(std::lround(subpix.x)) - subpix_window_radius_px,

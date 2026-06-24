@@ -41,8 +41,30 @@ bool ClampIntrinsicsInPlace(OuterBootstrapCameraIntrinsics* intrinsics) {
   if (intrinsics == nullptr) {
     throw std::runtime_error("ClampIntrinsicsInPlace requires a valid pointer.");
   }
-  intrinsics->xi = std::max(-0.95, std::min(2.5, intrinsics->xi));
-  intrinsics->alpha = std::max(0.05, std::min(0.95, intrinsics->alpha));
+  const std::string family = intrinsics->NormalizedFamilyString();
+  if (family == "ds-none") {
+    intrinsics->xi = std::max(-0.95, std::min(2.5, intrinsics->xi));
+    intrinsics->alpha = std::max(0.05, std::min(0.95, intrinsics->alpha));
+    intrinsics->beta = 1.0;
+    intrinsics->distortion_coeffs.clear();
+  } else if (family == "eucm-none") {
+    intrinsics->alpha = std::max(0.05, std::min(0.95, intrinsics->alpha));
+    intrinsics->beta = std::max(0.25, std::min(3.0, intrinsics->beta));
+    intrinsics->xi = 0.0;
+    intrinsics->distortion_coeffs.clear();
+  } else if (family == "pinhole-equi") {
+    intrinsics->xi = 0.0;
+    intrinsics->alpha = 0.0;
+    intrinsics->beta = 0.0;
+    if (intrinsics->distortion_coeffs.size() != 4) {
+      intrinsics->distortion_coeffs.resize(4, 0.0);
+    }
+    for (double& coefficient : intrinsics->distortion_coeffs) {
+      coefficient = std::max(-1.5, std::min(1.5, coefficient));
+    }
+  } else {
+    return false;
+  }
   intrinsics->fu = std::max(50.0, std::min(3.0 * intrinsics->resolution.width, intrinsics->fu));
   intrinsics->fv = std::max(50.0, std::min(3.0 * intrinsics->resolution.height, intrinsics->fv));
   intrinsics->cu =
@@ -56,15 +78,30 @@ OuterBootstrapCameraIntrinsics MakeGenericSeedIntrinsics(
     const cv::Size& resolution,
     const ApriltagInternalConfig& config) {
   OuterBootstrapCameraIntrinsics intrinsics;
+  intrinsics.camera_model =
+      config.intermediate_camera.camera_model.empty()
+          ? "ds"
+          : config.intermediate_camera.camera_model;
+  intrinsics.distortion_model =
+      config.intermediate_camera.distortion_model.empty()
+          ? (intrinsics.camera_model == "pinhole" ? "equi" : "none")
+          : config.intermediate_camera.distortion_model;
   intrinsics.resolution = resolution;
-  intrinsics.xi = config.sphere_lattice_init_xi;
-  intrinsics.alpha = config.sphere_lattice_init_alpha;
   intrinsics.fu = config.sphere_lattice_init_fu_scale * static_cast<double>(resolution.width);
   intrinsics.fv = config.sphere_lattice_init_fv_scale * static_cast<double>(resolution.height);
   intrinsics.cu = 0.5 * static_cast<double>(resolution.width) +
                   config.sphere_lattice_init_cu_offset;
   intrinsics.cv = 0.5 * static_cast<double>(resolution.height) +
                   config.sphere_lattice_init_cv_offset;
+  if (intrinsics.NormalizedFamilyString() == "ds-none") {
+    intrinsics.xi = config.sphere_lattice_init_xi;
+    intrinsics.alpha = config.sphere_lattice_init_alpha;
+  } else if (intrinsics.NormalizedFamilyString() == "eucm-none") {
+    intrinsics.alpha = config.sphere_lattice_init_alpha;
+    intrinsics.beta = 1.0;
+  } else if (intrinsics.NormalizedFamilyString() == "pinhole-equi") {
+    intrinsics.distortion_coeffs = {0.0, 0.0, 0.0, 0.0};
+  }
   ClampIntrinsicsInPlace(&intrinsics);
   return intrinsics;
 }
@@ -72,12 +109,10 @@ OuterBootstrapCameraIntrinsics MakeGenericSeedIntrinsics(
 OuterBootstrapCameraIntrinsics MakeIntermediateIntrinsics(
     const IntermediateCameraConfig& camera_config) {
   OuterBootstrapCameraIntrinsics intrinsics;
-  intrinsics.xi = camera_config.intrinsics[0];
-  intrinsics.alpha = camera_config.intrinsics[1];
-  intrinsics.fu = camera_config.intrinsics[2];
-  intrinsics.fv = camera_config.intrinsics[3];
-  intrinsics.cu = camera_config.intrinsics[4];
-  intrinsics.cv = camera_config.intrinsics[5];
+  intrinsics.camera_model = camera_config.camera_model;
+  intrinsics.distortion_model = camera_config.distortion_model;
+  intrinsics.SetIntrinsicsVector(camera_config.intrinsics);
+  intrinsics.SetDistortionVector(camera_config.distortion_coeffs);
   intrinsics.resolution =
       cv::Size(camera_config.resolution[0], camera_config.resolution[1]);
   return intrinsics;
@@ -101,8 +136,6 @@ OuterBootstrapCameraIntrinsics BuildManualInitialCamera(
   }
 
   if (config.intermediate_camera.IsConfigured() &&
-      config.intermediate_camera.camera_model == "ds" &&
-      config.intermediate_camera.intrinsics.size() == 6 &&
       config.intermediate_camera.resolution.size() == 2) {
     const cv::Size configured_size(config.intermediate_camera.resolution[0],
                                    config.intermediate_camera.resolution[1]);
@@ -120,7 +153,7 @@ OuterBootstrapCameraIntrinsics BuildManualInitialCamera(
       }
       AppendUniqueWarning(
           "Configured intermediate_camera is invalid after clamping; using generic "
-          "sphere_lattice seed instead.",
+          "outer-only seed instead.",
           warnings);
     } else {
       std::ostringstream stream;
@@ -128,7 +161,7 @@ OuterBootstrapCameraIntrinsics BuildManualInitialCamera(
              << configured_size.width << "x" << configured_size.height
              << " does not match image resolution " << image_size.width << "x"
              << image_size.height
-             << "; using generic sphere_lattice seed instead.";
+             << "; using generic outer-only seed instead.";
       AppendUniqueWarning(stream.str(), warnings);
     }
   }
@@ -346,6 +379,37 @@ double ParameterStep(double value, double fallback_step) {
   return std::max(std::abs(value) * 0.05, fallback_step);
 }
 
+Eigen::VectorXd ToEigenVector(const std::vector<double>& values) {
+  Eigen::VectorXd vector(values.size());
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    vector[static_cast<Eigen::Index>(index)] = values[index];
+  }
+  return vector;
+}
+
+std::vector<double> ToStdVector(const Eigen::VectorXd& values) {
+  std::vector<double> vector(static_cast<std::size_t>(values.rows()), 0.0);
+  for (Eigen::Index index = 0; index < values.rows(); ++index) {
+    vector[static_cast<std::size_t>(index)] = values[index];
+  }
+  return vector;
+}
+
+double ParameterFallbackStep(const std::string& label,
+                             const OuterBootstrapCameraIntrinsics& camera) {
+  if (label == "fu" || label == "fv") {
+    return 40.0;
+  }
+  if (label == "cu" || label == "cv") {
+    return 20.0;
+  }
+  if (label == "xi" || label == "alpha" || label == "beta") {
+    return 0.08;
+  }
+  (void)camera;
+  return 0.02;
+}
+
 OuterBootstrapCameraIntrinsics RefineCandidateCamera(
     const OuterBootstrapCameraIntrinsics& initial_camera,
     const std::vector<OuterObservationRecord>& observations) {
@@ -357,42 +421,26 @@ OuterBootstrapCameraIntrinsics RefineCandidateCamera(
     return initial_camera;
   }
 
-  const double base_steps[6] = {
-      0.15,
-      0.10,
-      ParameterStep(best.fu, 40.0),
-      ParameterStep(best.fv, 40.0),
-      ParameterStep(best.cu, 20.0),
-      ParameterStep(best.cv, 20.0),
-  };
+  const std::vector<std::string> labels = best.CombinedParameterLabels();
+  Eigen::VectorXd best_vector = ToEigenVector(best.CombinedParameterVector());
+  std::vector<double> base_steps(labels.size(), 0.05);
+  for (std::size_t index = 0; index < labels.size(); ++index) {
+    base_steps[index] =
+        ParameterStep(best_vector[static_cast<Eigen::Index>(index)],
+                      ParameterFallbackStep(labels[index], best));
+  }
 
   for (int round = 0; round < 4; ++round) {
     const double round_scale = std::pow(0.5, round);
-    for (int parameter_index = 0; parameter_index < 6; ++parameter_index) {
+    for (std::size_t parameter_index = 0; parameter_index < labels.size(); ++parameter_index) {
       for (int direction = -1; direction <= 1; direction += 2) {
         OuterBootstrapCameraIntrinsics candidate = best;
+        Eigen::VectorXd candidate_vector =
+            ToEigenVector(candidate.CombinedParameterVector());
         const double delta = static_cast<double>(direction) *
                              base_steps[parameter_index] * round_scale;
-        switch (parameter_index) {
-          case 0:
-            candidate.xi += delta;
-            break;
-          case 1:
-            candidate.alpha += delta;
-            break;
-          case 2:
-            candidate.fu += delta;
-            break;
-          case 3:
-            candidate.fv += delta;
-            break;
-          case 4:
-            candidate.cu += delta;
-            break;
-          case 5:
-            candidate.cv += delta;
-            break;
-        }
+        candidate_vector[static_cast<Eigen::Index>(parameter_index)] += delta;
+        candidate.SetCombinedParameterVector(ToStdVector(candidate_vector));
         if (!ClampIntrinsicsInPlace(&candidate)) {
           continue;
         }
@@ -478,23 +526,59 @@ void ApplySelectedResidualStats(
 
 std::vector<AutoCameraInitializationCandidate> GenerateCandidateGrid(
     const cv::Size& image_size,
+    const ApriltagInternalConfig& config,
     const AutoCameraInitializationOptions& options) {
   std::vector<AutoCameraInitializationCandidate> candidates;
   const double center_u = 0.5 * static_cast<double>(image_size.width);
   const double center_v = 0.5 * static_cast<double>(image_size.height);
+  OuterBootstrapCameraIntrinsics seed = MakeGenericSeedIntrinsics(image_size, config);
+  const std::string family = seed.NormalizedFamilyString();
   for (double focal_scale : options.focal_scale_candidates) {
-    for (double xi : options.xi_candidates) {
-      for (double alpha : options.alpha_candidates) {
+    if (family == "ds-none") {
+      for (double xi : options.xi_candidates) {
+        for (double alpha : options.alpha_candidates) {
+          AutoCameraInitializationCandidate candidate;
+          candidate.source_label = "auto_grid";
+          candidate.evaluation_scope = "sampled";
+          candidate.camera = seed;
+          candidate.camera.xi = xi;
+          candidate.camera.alpha = alpha;
+          candidate.camera.fu = focal_scale * static_cast<double>(image_size.width);
+          candidate.camera.fv = focal_scale * static_cast<double>(image_size.height);
+          candidate.camera.cu = center_u;
+          candidate.camera.cv = center_v;
+          ClampIntrinsicsInPlace(&candidate.camera);
+          candidates.push_back(candidate);
+        }
+      }
+    } else if (family == "eucm-none") {
+      for (double alpha : options.eucm_alpha_candidates) {
+        for (double beta : options.eucm_beta_candidates) {
+          AutoCameraInitializationCandidate candidate;
+          candidate.source_label = "auto_grid";
+          candidate.evaluation_scope = "sampled";
+          candidate.camera = seed;
+          candidate.camera.alpha = alpha;
+          candidate.camera.beta = beta;
+          candidate.camera.fu = focal_scale * static_cast<double>(image_size.width);
+          candidate.camera.fv = focal_scale * static_cast<double>(image_size.height);
+          candidate.camera.cu = center_u;
+          candidate.camera.cv = center_v;
+          ClampIntrinsicsInPlace(&candidate.camera);
+          candidates.push_back(candidate);
+        }
+      }
+    } else if (family == "pinhole-equi") {
+      for (double k1 : options.equidistant_k1_candidates) {
         AutoCameraInitializationCandidate candidate;
         candidate.source_label = "auto_grid";
         candidate.evaluation_scope = "sampled";
-        candidate.camera.resolution = image_size;
-        candidate.camera.xi = xi;
-        candidate.camera.alpha = alpha;
+        candidate.camera = seed;
         candidate.camera.fu = focal_scale * static_cast<double>(image_size.width);
         candidate.camera.fv = focal_scale * static_cast<double>(image_size.height);
         candidate.camera.cu = center_u;
         candidate.camera.cv = center_v;
+        candidate.camera.distortion_coeffs = {k1, 0.0, 0.0, 0.0};
         ClampIntrinsicsInPlace(&candidate.camera);
         candidates.push_back(candidate);
       }
@@ -571,7 +655,7 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
         static_cast<int>(sampled_observations.size());
 
     std::vector<AutoCameraInitializationCandidate> candidates =
-        GenerateCandidateGrid(result.image_size, options_);
+        GenerateCandidateGrid(result.image_size, config_, options_);
     for (AutoCameraInitializationCandidate& candidate : candidates) {
       candidate = EvaluateCandidateOnObservations(
           candidate.camera, candidate.source_label, "sampled", sampled_observations);
@@ -632,7 +716,7 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
     } else if (!candidates.empty()) {
       result.failure_reason =
           "Automatic outer-only camera initialization did not find a sufficiently "
-          "stable DS candidate.";
+          "stable outer-only camera candidate.";
     }
   }
 
@@ -691,6 +775,39 @@ void WriteAutoCameraInitializationSummary(
   output << "selected_source_label: " << result.selected_source_label << "\n";
   output << "image_width: " << result.image_size.width << "\n";
   output << "image_height: " << result.image_size.height << "\n";
+  output << "selected_camera_model_family: "
+         << result.selected_camera.NormalizedFamilyString() << "\n";
+  output << "selected_camera_model: " << result.selected_camera.NormalizedCameraModel() << "\n";
+  output << "selected_distortion_model: "
+         << result.selected_camera.NormalizedDistortionModel() << "\n";
+  output << "selected_intrinsics_labels: ";
+  for (const std::string& label : result.selected_camera.IntrinsicsLabels()) {
+    output << label << " ";
+  }
+  output << "\n";
+  output << "selected_intrinsics_csv: ";
+  const std::vector<double> selected_intrinsics = result.selected_camera.IntrinsicsVector();
+  for (std::size_t index = 0; index < selected_intrinsics.size(); ++index) {
+    if (index > 0) {
+      output << ",";
+    }
+    output << selected_intrinsics[index];
+  }
+  output << "\n";
+  output << "selected_distortion_labels: ";
+  for (const std::string& label : result.selected_camera.DistortionLabels()) {
+    output << label << " ";
+  }
+  output << "\n";
+  output << "selected_distortion_csv: ";
+  const std::vector<double> selected_distortion = result.selected_camera.DistortionVector();
+  for (std::size_t index = 0; index < selected_distortion.size(); ++index) {
+    if (index > 0) {
+      output << ",";
+    }
+    output << selected_distortion[index];
+  }
+  output << "\n";
   output << "selected_xi: " << result.selected_camera.xi << "\n";
   output << "selected_alpha: " << result.selected_camera.alpha << "\n";
   output << "selected_fu: " << result.selected_camera.fu << "\n";
@@ -718,16 +835,58 @@ void WriteAutoCameraInitializationCandidatesCsv(
     const std::string& path,
     const AutoCameraInitializationResult& result) {
   std::ofstream output(path.c_str());
-  output << "rank,source_label,evaluation_scope,xi,alpha,fu,fv,cu,cv,"
+  output << "rank,source_label,evaluation_scope,camera_model_family,camera_model,"
+         << "distortion_model,intrinsics_labels,intrinsics_csv,distortion_labels,distortion_csv,"
+         << "xi,alpha,beta,fu,fv,cu,cv,"
          << "observation_count,pose_success_count,pose_failure_count,"
          << "successful_frame_count,successful_board_count,success_rate,"
          << "mean_observation_rmse,valid,failure_reason\n";
   for (const AutoCameraInitializationCandidate& candidate : result.candidates) {
+    std::ostringstream intrinsics_labels_stream;
+    const std::vector<std::string> intrinsics_labels = candidate.camera.IntrinsicsLabels();
+    for (std::size_t index = 0; index < intrinsics_labels.size(); ++index) {
+      if (index > 0) {
+        intrinsics_labels_stream << "|";
+      }
+      intrinsics_labels_stream << intrinsics_labels[index];
+    }
+    std::ostringstream intrinsics_values_stream;
+    const std::vector<double> intrinsics_values = candidate.camera.IntrinsicsVector();
+    for (std::size_t index = 0; index < intrinsics_values.size(); ++index) {
+      if (index > 0) {
+        intrinsics_values_stream << "|";
+      }
+      intrinsics_values_stream << intrinsics_values[index];
+    }
+    std::ostringstream distortion_labels_stream;
+    const std::vector<std::string> distortion_labels = candidate.camera.DistortionLabels();
+    for (std::size_t index = 0; index < distortion_labels.size(); ++index) {
+      if (index > 0) {
+        distortion_labels_stream << "|";
+      }
+      distortion_labels_stream << distortion_labels[index];
+    }
+    std::ostringstream distortion_values_stream;
+    const std::vector<double> distortion_values = candidate.camera.DistortionVector();
+    for (std::size_t index = 0; index < distortion_values.size(); ++index) {
+      if (index > 0) {
+        distortion_values_stream << "|";
+      }
+      distortion_values_stream << distortion_values[index];
+    }
     output << candidate.rank << ","
            << candidate.source_label << ","
            << candidate.evaluation_scope << ","
+           << candidate.camera.NormalizedFamilyString() << ","
+           << candidate.camera.NormalizedCameraModel() << ","
+           << candidate.camera.NormalizedDistortionModel() << ","
+           << intrinsics_labels_stream.str() << ","
+           << intrinsics_values_stream.str() << ","
+           << distortion_labels_stream.str() << ","
+           << distortion_values_stream.str() << ","
            << candidate.camera.xi << ","
            << candidate.camera.alpha << ","
+           << candidate.camera.beta << ","
            << candidate.camera.fu << ","
            << candidate.camera.fv << ","
            << candidate.camera.cu << ","

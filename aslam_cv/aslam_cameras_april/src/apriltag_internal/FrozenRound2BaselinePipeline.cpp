@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cmath>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -96,6 +98,20 @@ std::vector<int> NormalizeBoardIds(const std::vector<int>& configured_ids,
   return board_ids;
 }
 
+void PopulateOuterRefineCameraFromIntermediate(
+    const IntermediateCameraConfig& intermediate_camera,
+    OuterRefineCameraConfig* refine_camera) {
+  if (refine_camera == nullptr || refine_camera->IsConfigured() ||
+      !intermediate_camera.IsConfigured()) {
+    return;
+  }
+  refine_camera->camera_model = intermediate_camera.camera_model;
+  refine_camera->distortion_model = intermediate_camera.distortion_model;
+  refine_camera->intrinsics = intermediate_camera.intrinsics;
+  refine_camera->distortion_coeffs = intermediate_camera.distortion_coeffs;
+  refine_camera->resolution = intermediate_camera.resolution;
+}
+
 ApriltagInternalConfig NormalizeConfig(ApriltagInternalConfig config) {
   config.tag_ids = NormalizeBoardIds(config.tag_ids, config.tag_id);
   if (!config.tag_ids.empty()) {
@@ -103,6 +119,8 @@ ApriltagInternalConfig NormalizeConfig(ApriltagInternalConfig config) {
   }
   config.outer_detector_config.tag_ids = config.tag_ids;
   config.outer_detector_config.tag_id = config.tag_id;
+  PopulateOuterRefineCameraFromIntermediate(
+      config.intermediate_camera, &config.outer_detector_config.refine_camera);
   return config;
 }
 
@@ -119,6 +137,12 @@ ApriltagInternalDetectionOptions MakeDetectionOptions(
   options.internal_subpix_window_max = config.internal_subpix_window_max;
   options.internal_subpix_displacement_scale = config.internal_subpix_displacement_scale;
   options.max_internal_subpix_displacement = config.max_internal_subpix_displacement;
+  options.ignore_image_evidence_min_quality =
+      config.ignore_image_evidence_min_quality;
+  options.force_internal_seed_from_prediction =
+      config.force_internal_seed_from_prediction;
+  options.bypass_internal_seed_filters =
+      config.bypass_internal_seed_filters;
   options.outer_detector_config = config.outer_detector_config;
   return options;
 }
@@ -128,26 +152,21 @@ OuterBootstrapOptions MakeBootstrapOptions(const ApriltagInternalConfig& config,
   OuterBootstrapOptions bootstrap_options;
   bootstrap_options.reference_board_id = options.reference_board_id;
   if (config.intermediate_camera.IsConfigured() &&
-      config.intermediate_camera.camera_model == "ds" &&
-      config.intermediate_camera.intrinsics.size() == 6 &&
       config.intermediate_camera.resolution.size() == 2 &&
       config.intermediate_camera.resolution[0] > 0 &&
       config.intermediate_camera.resolution[1] > 0) {
-    bootstrap_options.init_xi = config.intermediate_camera.intrinsics[0];
-    bootstrap_options.init_alpha = config.intermediate_camera.intrinsics[1];
-    bootstrap_options.init_fu_scale =
-        config.intermediate_camera.intrinsics[2] /
-        static_cast<double>(config.intermediate_camera.resolution[0]);
-    bootstrap_options.init_fv_scale =
-        config.intermediate_camera.intrinsics[3] /
-        static_cast<double>(config.intermediate_camera.resolution[1]);
-    bootstrap_options.init_cu_offset =
-        config.intermediate_camera.intrinsics[4] -
-        0.5 * static_cast<double>(config.intermediate_camera.resolution[0]);
-    bootstrap_options.init_cv_offset =
-        config.intermediate_camera.intrinsics[5] -
-        0.5 * static_cast<double>(config.intermediate_camera.resolution[1]);
+    OuterBootstrapCameraIntrinsics initial_camera;
+    initial_camera.camera_model = config.intermediate_camera.camera_model;
+    initial_camera.distortion_model = config.intermediate_camera.distortion_model;
+    initial_camera.resolution = cv::Size(config.intermediate_camera.resolution[0],
+                                         config.intermediate_camera.resolution[1]);
+    initial_camera.SetIntrinsicsVector(config.intermediate_camera.intrinsics);
+    initial_camera.SetDistortionVector(config.intermediate_camera.distortion_coeffs);
+    bootstrap_options.initial_camera = initial_camera;
   } else {
+    bootstrap_options.initial_camera.camera_model = "ds";
+    bootstrap_options.initial_camera.distortion_model = "none";
+    bootstrap_options.initial_camera.resolution = cv::Size();
     bootstrap_options.init_xi = config.sphere_lattice_init_xi;
     bootstrap_options.init_alpha = config.sphere_lattice_init_alpha;
     bootstrap_options.init_fu_scale = config.sphere_lattice_init_fu_scale;
@@ -164,6 +183,7 @@ void SetBootstrapInitFromIntrinsics(const OuterBootstrapCameraIntrinsics& intrin
   if (options == nullptr) {
     throw std::runtime_error("SetBootstrapInitFromIntrinsics requires a valid options pointer.");
   }
+  options->initial_camera = intrinsics;
   options->init_xi = intrinsics.xi;
   options->init_alpha = intrinsics.alpha;
   options->init_fu_scale =
@@ -310,6 +330,282 @@ bool ComputeStage42ValidationPass(const JointMeasurementSelectionResult& round1_
          selected_data_present;
 }
 
+void RecomputeMeasurementCounts(JointMeasurementBuildResult* result) {
+  if (result == nullptr) {
+    return;
+  }
+
+  result->solver_observations.clear();
+  result->used_frame_count = 0;
+  result->accepted_outer_board_observation_count = 0;
+  result->accepted_internal_board_observation_count = 0;
+  result->used_board_observation_count = 0;
+  result->used_outer_point_count = 0;
+  result->used_internal_point_count = 0;
+  result->used_total_point_count = 0;
+
+  std::set<int> used_frames;
+  std::set<std::pair<int, int> > used_board_keys;
+  std::set<std::pair<int, int> > accepted_outer_keys;
+  std::set<std::pair<int, int> > accepted_internal_keys;
+  for (JointMeasurementFrameResult& frame_result : result->frames) {
+    for (JointBoardObservation& board_observation :
+         frame_result.board_observations) {
+      board_observation.used_in_solver = false;
+      board_observation.outer_point_count = 0;
+      board_observation.internal_point_count = 0;
+      for (JointPointObservation& point : board_observation.points) {
+        if (!point.used_in_solver) {
+          continue;
+        }
+        result->solver_observations.push_back(point);
+        board_observation.used_in_solver = true;
+        used_frames.insert(frame_result.frame_index);
+        used_board_keys.insert(
+            std::make_pair(frame_result.frame_index, board_observation.board_id));
+        if (point.point_type == JointPointType::Outer) {
+          ++board_observation.outer_point_count;
+          ++result->used_outer_point_count;
+          accepted_outer_keys.insert(
+              std::make_pair(frame_result.frame_index, board_observation.board_id));
+        } else {
+          ++board_observation.internal_point_count;
+          ++result->used_internal_point_count;
+          accepted_internal_keys.insert(
+              std::make_pair(frame_result.frame_index, board_observation.board_id));
+        }
+      }
+    }
+  }
+
+  result->used_frame_count = static_cast<int>(used_frames.size());
+  result->used_board_observation_count =
+      static_cast<int>(used_board_keys.size());
+  result->accepted_outer_board_observation_count =
+      static_cast<int>(accepted_outer_keys.size());
+  result->accepted_internal_board_observation_count =
+      static_cast<int>(accepted_internal_keys.size());
+  result->used_total_point_count =
+      result->used_outer_point_count + result->used_internal_point_count;
+  result->success = result->used_total_point_count > 0;
+}
+
+std::vector<JointMeasurementFrameInput> BuildOuterOnlyIntermediateInputs(
+    const std::vector<InternalRegenerationFrameInput>& regeneration_inputs) {
+  std::vector<JointMeasurementFrameInput> joint_inputs;
+  joint_inputs.reserve(regeneration_inputs.size());
+  for (const InternalRegenerationFrameInput& input : regeneration_inputs) {
+    InternalRegenerationFrameResult regeneration_result;
+    regeneration_result.frame_index = input.frame_index;
+    regeneration_result.frame_label = input.frame_label;
+    regeneration_result.frame_bootstrap_initialized = true;
+    regeneration_result.state_source_label = "outer_only_intermediate_no_internal";
+    regeneration_result.visible_board_ids =
+        input.outer_detections.requested_board_ids;
+
+    JointMeasurementFrameInput joint_input;
+    joint_input.frame_index = input.frame_index;
+    joint_input.frame_label = input.frame_label;
+    joint_input.outer_detections = input.outer_detections;
+    joint_input.regenerated_internal = regeneration_result;
+    joint_inputs.push_back(joint_input);
+  }
+  return joint_inputs;
+}
+
+JointMeasurementSelectionResult SelectOuterOnlyIntermediateObservations(
+    const JointMeasurementBuildResult& measurement_result,
+    const JointResidualEvaluationResult& residual_result,
+    const JointReprojectionSceneState& scene_state,
+    double max_outer_rmse_px,
+    int min_visible_boards) {
+  JointMeasurementSelectionResult result;
+  result.reference_board_id = scene_state.reference_board_id;
+  result.selected_measurement_result = measurement_result;
+
+  if (!measurement_result.success) {
+    result.failure_reason =
+        "outer-only intermediate measurement_result.success is false";
+    return result;
+  }
+  if (!residual_result.success) {
+    result.failure_reason =
+        "outer-only intermediate residual_result.success is false";
+    return result;
+  }
+
+  std::map<std::pair<int, int>, const JointResidualBoardObservationDiagnostics*>
+      residual_by_key;
+  for (const JointResidualBoardObservationDiagnostics& diagnostics :
+       residual_result.board_observation_diagnostics) {
+    residual_by_key[std::make_pair(diagnostics.frame_index,
+                                   diagnostics.board_id)] = &diagnostics;
+  }
+
+  std::set<std::pair<int, int> > candidate_keys;
+  std::map<int, std::vector<int> > candidate_boards_by_frame;
+  for (const JointMeasurementFrameResult& frame_result :
+       measurement_result.frames) {
+    const JointSceneFrameState* scene_frame =
+        FindJointSceneFrameState(scene_state, frame_result.frame_index);
+    JointFrameSelectionDecision frame_decision;
+    frame_decision.frame_index = frame_result.frame_index;
+    frame_decision.frame_label = frame_result.frame_label;
+
+    for (const JointBoardObservation& board_observation :
+         frame_result.board_observations) {
+      JointBoardObservationSelectionDecision decision;
+      decision.frame_index = frame_result.frame_index;
+      decision.frame_label = frame_result.frame_label;
+      decision.board_id = board_observation.board_id;
+
+      const std::pair<int, int> key(frame_result.frame_index,
+                                   board_observation.board_id);
+      const auto residual_it = residual_by_key.find(key);
+      if (residual_it != residual_by_key.end()) {
+        decision.rmse = residual_it->second->rmse;
+        decision.point_count = residual_it->second->point_count;
+        decision.outer_point_count = residual_it->second->outer_point_count;
+        decision.internal_point_count =
+            residual_it->second->internal_point_count;
+      }
+
+      const JointSceneBoardState* scene_board =
+          FindJointSceneBoardState(scene_state, board_observation.board_id);
+      const bool solver_ready = board_observation.used_in_solver &&
+          scene_frame != nullptr && scene_frame->initialized &&
+          (board_observation.board_id == scene_state.reference_board_id ||
+           (scene_board != nullptr && scene_board->initialized));
+      const bool outer_only =
+          decision.outer_point_count > 0 && decision.internal_point_count == 0;
+      const bool residual_ok =
+          std::isfinite(decision.rmse) &&
+          (max_outer_rmse_px <= 0.0 || decision.rmse <= max_outer_rmse_px);
+      if (!solver_ready || !outer_only || !residual_ok) {
+        decision.accepted = false;
+        decision.reason_code =
+            JointBoardObservationSelectionReasonCode::RejectedNotSolverReady;
+        if (!solver_ready) {
+          decision.reason_detail = "not solver-ready for intermediate";
+        } else if (!outer_only) {
+          decision.reason_detail =
+              "intermediate requires outer-only real detections";
+        } else {
+          decision.reason_code =
+              JointBoardObservationSelectionReasonCode::RejectedResidualSanity;
+          decision.reason_detail = "outer rmse exceeds intermediate threshold";
+        }
+        result.board_observation_decisions.push_back(decision);
+        continue;
+      }
+
+      candidate_keys.insert(key);
+      candidate_boards_by_frame[frame_result.frame_index].push_back(
+          board_observation.board_id);
+      result.board_observation_decisions.push_back(decision);
+    }
+    result.frame_decisions.push_back(frame_decision);
+  }
+
+  const int min_boards = std::max(1, min_visible_boards);
+  for (const auto& entry : candidate_boards_by_frame) {
+    if (static_cast<int>(entry.second.size()) < min_boards) {
+      continue;
+    }
+    result.accepted_frame_indices.insert(entry.first);
+    for (int board_id : entry.second) {
+      result.accepted_board_observation_keys.insert(
+          std::make_pair(entry.first, board_id));
+    }
+  }
+
+  for (JointBoardObservationSelectionDecision& decision :
+       result.board_observation_decisions) {
+    const std::pair<int, int> key(decision.frame_index, decision.board_id);
+    if (result.accepted_board_observation_keys.find(key) !=
+        result.accepted_board_observation_keys.end()) {
+      decision.accepted = true;
+      decision.reason_code = JointBoardObservationSelectionReasonCode::Accepted;
+      decision.reason_detail = "accepted by outer-only intermediate gate";
+    } else if (candidate_keys.find(key) != candidate_keys.end()) {
+      decision.accepted = false;
+      decision.reason_code =
+          JointBoardObservationSelectionReasonCode::RejectedFrameRejected;
+      decision.reason_detail =
+          "frame has fewer than intermediate_min_visible_boards accepted boards";
+    }
+  }
+
+  for (JointFrameSelectionDecision& frame_decision : result.frame_decisions) {
+    const auto frame_it =
+        candidate_boards_by_frame.find(frame_decision.frame_index);
+    if (frame_it != candidate_boards_by_frame.end()) {
+      frame_decision.usable_board_ids = frame_it->second;
+      std::sort(frame_decision.usable_board_ids.begin(),
+                frame_decision.usable_board_ids.end());
+      frame_decision.usable_board_observation_count =
+          static_cast<int>(frame_decision.usable_board_ids.size());
+    }
+    frame_decision.accepted =
+        result.accepted_frame_indices.find(frame_decision.frame_index) !=
+        result.accepted_frame_indices.end();
+    if (frame_decision.accepted) {
+      frame_decision.accepted_board_ids = frame_decision.usable_board_ids;
+      frame_decision.accepted_board_observation_count =
+          static_cast<int>(frame_decision.accepted_board_ids.size());
+      frame_decision.reason_codes.push_back(
+          JointFrameSelectionReasonCode::AcceptedMinViewsPerBoard);
+      frame_decision.reason_detail = "accepted by outer-only intermediate gate";
+    } else if (frame_decision.usable_board_observation_count > 0) {
+      frame_decision.reason_codes.push_back(
+          JointFrameSelectionReasonCode::RejectedRedundantView);
+      frame_decision.reason_detail =
+          "insufficient visible boards for outer-only intermediate";
+    } else {
+      frame_decision.reason_codes.push_back(
+          JointFrameSelectionReasonCode::NoUsableBoardObservations);
+      frame_decision.reason_detail =
+          "no usable outer-only board observations";
+    }
+  }
+
+  for (JointMeasurementFrameResult& frame_result :
+       result.selected_measurement_result.frames) {
+    for (JointBoardObservation& board_observation :
+         frame_result.board_observations) {
+      const bool selected =
+          result.accepted_board_observation_keys.find(
+              std::make_pair(frame_result.frame_index,
+                             board_observation.board_id)) !=
+          result.accepted_board_observation_keys.end();
+      for (JointPointObservation& point : board_observation.points) {
+        point.used_in_solver = point.used_in_solver && selected;
+      }
+    }
+  }
+  RecomputeMeasurementCounts(&result.selected_measurement_result);
+
+  result.accepted_frame_count =
+      static_cast<int>(result.accepted_frame_indices.size());
+  result.accepted_board_observation_count =
+      static_cast<int>(result.accepted_board_observation_keys.size());
+  result.accepted_outer_point_count =
+      result.selected_measurement_result.used_outer_point_count;
+  result.accepted_internal_point_count =
+      result.selected_measurement_result.used_internal_point_count;
+
+  if (result.accepted_board_observation_count <= 0 ||
+      result.selected_measurement_result.used_total_point_count <= 0) {
+    result.failure_reason =
+        "outer-only intermediate gate produced no accepted observations";
+    result.selected_measurement_result.success = false;
+    return result;
+  }
+
+  result.success = true;
+  return result;
+}
+
 }  // namespace
 
 FrozenRound2BaselinePipeline::FrozenRound2BaselinePipeline(
@@ -339,21 +635,92 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       options_.internal_pose_rescue_max_ray_angle_deg;
   detection_options.internal_pose_rescue_accept_max_outer_rmse =
       options_.internal_pose_rescue_accept_max_outer_rmse;
+  detection_options.ignore_image_evidence_min_quality =
+      options_.ignore_image_evidence_min_quality;
+  detection_options.force_internal_seed_from_prediction =
+      options_.force_internal_seed_from_prediction;
+  detection_options.bypass_internal_seed_filters =
+      options_.bypass_internal_seed_filters;
+  detection_options.enable_geometry_prior_outer_seed =
+      options_.enable_geometry_prior_outer_seed;
+  detection_options.geometry_prior_rescue_diagnostic_only =
+      options_.geometry_prior_rescue_diagnostic_only;
+  detection_options.geometry_prior_rescue_use_as_observation =
+      options_.geometry_prior_rescue_use_as_observation;
+  detection_options.geometry_prior_rescue_allow_geometry_only_pose_refit =
+      options_.geometry_prior_rescue_allow_geometry_only_pose_refit;
+  detection_options.geometry_prior_rescue_subpix_window_radius =
+      options_.geometry_prior_rescue_subpix_window_radius;
+  detection_options.geometry_prior_rescue_max_corner_displacement_px =
+      options_.geometry_prior_rescue_max_corner_displacement_px;
+  detection_options.geometry_prior_rescue_min_corner_response_ratio =
+      options_.geometry_prior_rescue_min_corner_response_ratio;
+  detection_options.geometry_prior_rescue_enable_spherical_refine =
+      options_.geometry_prior_rescue_enable_spherical_refine;
+  detection_options.geometry_prior_rescue_edge_sample_count =
+      options_.geometry_prior_rescue_edge_sample_count;
+  detection_options.geometry_prior_rescue_edge_search_half_width_px =
+      options_.geometry_prior_rescue_edge_search_half_width_px;
+  detection_options.geometry_prior_rescue_min_edge_support_ratio =
+      options_.geometry_prior_rescue_min_edge_support_ratio;
+  detection_options.geometry_prior_rescue_min_edge_gradient_ratio =
+      options_.geometry_prior_rescue_min_edge_gradient_ratio;
+  detection_options.geometry_prior_rescue_accept_max_outer_rmse =
+      options_.geometry_prior_rescue_accept_max_outer_rmse;
+  detection_options.geometry_prior_rescue_accept_max_rotation_error_deg =
+      options_.geometry_prior_rescue_accept_max_rotation_error_deg;
+  detection_options.geometry_prior_rescue_accept_max_translation_error =
+      options_.geometry_prior_rescue_accept_max_translation_error;
   const MultiScaleOuterTagDetector outer_detector(config.outer_detector_config);
   OuterBootstrapOptions bootstrap_options = MakeBootstrapOptions(config, options_);
   const MultiBoardOuterBootstrap bootstrap(config, bootstrap_options);
   const MultiBoardInternalMeasurementRegenerator regenerator(config, detection_options);
   JointMeasurementBuildOptions build_options;
   build_options.reference_board_id = options_.reference_board_id;
+  build_options.include_internal_points = options_.include_internal_points;
   build_options.include_outer_when_internal_failed =
+      options_.outer_only_ablation_mode ||
       !options_.strict_board_observation_acceptance;
+  build_options.include_rescued_outer_when_internal_failed =
+      options_.geometry_prior_rescue_keep_outer_on_internal_failure;
+  build_options.enable_internal_observation_quality_weighting =
+      options_.enable_internal_observation_quality_weighting;
+  build_options.internal_observation_low_quality_quantile =
+      options_.internal_observation_low_quality_quantile;
+  build_options.internal_observation_min_weight =
+      options_.internal_observation_min_weight;
+  build_options.internal_observation_quality_exponent =
+      options_.internal_observation_quality_exponent;
+  build_options.filter_internal_corner_mode =
+      options_.internal_corner_filter_mode;
+  build_options.filter_internal_corner_max_reproj_error =
+      options_.internal_corner_filter_max_reproj_error;
+  build_options.filter_internal_corner_quality_min =
+      options_.internal_corner_filter_quality_min;
+  build_options.filter_internal_corner_quality_relaxation_px =
+      options_.internal_corner_filter_quality_relaxation_px;
+  build_options.filter_internal_corner_adaptive_min_threshold_px =
+      options_.internal_corner_filter_adaptive_min_threshold_px;
   const JointReprojectionMeasurementBuilder builder(config, build_options);
   JointResidualEvaluationOptions residual_options;
   const JointReprojectionResidualEvaluator residual_evaluator(residual_options);
   JointMeasurementSelectionOptions selection_options;
   selection_options.reference_board_id = options_.reference_board_id;
+  selection_options.selection_mode = options_.selection_mode;
   selection_options.enable_residual_sanity_gate = options_.enable_residual_sanity_gate;
   selection_options.enable_board_pose_fit_gate = options_.enable_board_pose_fit_gate;
+  selection_options.residual_sanity_factor =
+      options_.selection_residual_sanity_factor;
+  selection_options.max_board_observation_rmse =
+      options_.selection_max_board_observation_rmse;
+  selection_options.kalibr_style_outlier_sigma =
+      options_.selection_kalibr_style_outlier_sigma;
+  selection_options.kalibr_style_min_abs_threshold_px =
+      options_.selection_kalibr_style_min_abs_threshold_px;
+  selection_options.kalibr_style_min_views_before_filter =
+      options_.selection_kalibr_style_min_views_before_filter;
+  selection_options.preserve_frame_board_cohesion =
+      options_.preserve_frame_board_cohesion;
   const JointMeasurementSelection selector(selection_options);
   JointOptimizationOptions optimization_options;
   optimization_options.reference_board_id = options_.reference_board_id;
@@ -449,9 +816,198 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
     return result;
   }
 
+  const JointReprojectionSceneState initial_scene_state =
+      BuildSceneStateFromBootstrap(result.bootstrap_result);
+
+  result.outer_only_intermediate.enabled =
+      options_.enable_outer_only_intermediate_calibration;
+  result.outer_only_intermediate.diagnostic_only =
+      options_.intermediate_diagnostic_only;
+  result.outer_only_intermediate.use_for_round1_requested =
+      options_.use_intermediate_for_round1_internal_regeneration;
+  result.outer_only_intermediate.use_for_full_frontend_regeneration_requested =
+      options_.use_intermediate_for_full_frontend_regeneration;
+  result.outer_only_intermediate.max_outer_rmse_px =
+      options_.intermediate_max_outer_rmse_px;
+  result.outer_only_intermediate.min_visible_boards =
+      options_.intermediate_min_visible_boards;
+  if (options_.enable_outer_only_intermediate_calibration) {
+    std::vector<JointMeasurementFrameInput> intermediate_inputs =
+        BuildOuterOnlyIntermediateInputs(regeneration_inputs);
+    JointMeasurementBuildOptions intermediate_build_options = build_options;
+    intermediate_build_options.include_outer_points = true;
+    intermediate_build_options.include_internal_points = false;
+    intermediate_build_options.include_outer_when_internal_failed = true;
+    intermediate_build_options.include_rescued_outer_when_internal_failed = false;
+    intermediate_build_options.use_regenerated_rescued_outer_measurements = false;
+    intermediate_build_options.filter_internal_corner_outliers = false;
+    const JointReprojectionMeasurementBuilder intermediate_builder(
+        config, intermediate_build_options);
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      result.outer_only_intermediate.measurement_result =
+          intermediate_builder.Build(intermediate_inputs, result.bootstrap_result);
+      result.runtime_breakdown
+          .outer_only_intermediate_measurement_build_seconds =
+          ElapsedSeconds(stage_start);
+    }
+    result.outer_only_intermediate.total_outer_board_observation_count =
+        result.outer_only_intermediate.measurement_result
+            .accepted_outer_board_observation_count;
+    if (!result.outer_only_intermediate.measurement_result.success) {
+      result.outer_only_intermediate.failure_reason =
+          result.outer_only_intermediate.measurement_result.failure_reason.empty()
+              ? "outer-only intermediate measurement build failed"
+              : result.outer_only_intermediate.measurement_result.failure_reason;
+      AppendWarnings(result.outer_only_intermediate.measurement_result.warnings,
+                     &result.outer_only_intermediate.warnings);
+      AppendWarnings(result.outer_only_intermediate.warnings, &result.warnings);
+    } else {
+      {
+        const auto stage_start = std::chrono::steady_clock::now();
+        result.outer_only_intermediate.initial_residual_result =
+            residual_evaluator.Evaluate(
+                result.outer_only_intermediate.measurement_result,
+                initial_scene_state);
+        result.runtime_breakdown
+            .outer_only_intermediate_residual_evaluation_seconds =
+            ElapsedSeconds(stage_start);
+      }
+      if (!result.outer_only_intermediate.initial_residual_result.success) {
+        result.outer_only_intermediate.failure_reason =
+            result.outer_only_intermediate.initial_residual_result
+                    .failure_reason.empty()
+                ? "outer-only intermediate initial residual evaluation failed"
+                : result.outer_only_intermediate.initial_residual_result
+                      .failure_reason;
+        AppendWarnings(
+            result.outer_only_intermediate.initial_residual_result.warnings,
+            &result.outer_only_intermediate.warnings);
+        AppendWarnings(result.outer_only_intermediate.warnings, &result.warnings);
+      } else {
+        {
+          const auto stage_start = std::chrono::steady_clock::now();
+          result.outer_only_intermediate.selection_result =
+              SelectOuterOnlyIntermediateObservations(
+                  result.outer_only_intermediate.measurement_result,
+                  result.outer_only_intermediate.initial_residual_result,
+                  initial_scene_state,
+                  options_.intermediate_max_outer_rmse_px,
+                  options_.intermediate_min_visible_boards);
+          result.runtime_breakdown
+              .outer_only_intermediate_selection_seconds =
+              ElapsedSeconds(stage_start);
+        }
+        result.outer_only_intermediate.used_outer_board_observation_count =
+            result.outer_only_intermediate.selection_result
+                .accepted_board_observation_count;
+        result.outer_only_intermediate.used_outer_point_count =
+            result.outer_only_intermediate.selection_result
+                .accepted_outer_point_count;
+        result.outer_only_intermediate.used_internal_point_count =
+            result.outer_only_intermediate.selection_result
+                .accepted_internal_point_count;
+        result.outer_only_intermediate.rejected_outer_board_observation_count =
+            std::max(0,
+                     result.outer_only_intermediate
+                             .total_outer_board_observation_count -
+                         result.outer_only_intermediate
+                             .used_outer_board_observation_count);
+        if (!result.outer_only_intermediate.selection_result.success) {
+          result.outer_only_intermediate.failure_reason =
+              result.outer_only_intermediate.selection_result
+                      .failure_reason.empty()
+                  ? "outer-only intermediate selection failed"
+                  : result.outer_only_intermediate.selection_result
+                        .failure_reason;
+          AppendWarnings(result.outer_only_intermediate.selection_result.warnings,
+                         &result.outer_only_intermediate.warnings);
+          AppendWarnings(result.outer_only_intermediate.warnings,
+                         &result.warnings);
+        } else {
+          JointOptimizationOptions intermediate_options = optimization_options;
+          intermediate_options.optimize_intrinsics =
+              options_.intermediate_optimize_intrinsics;
+          intermediate_options.optimize_board_poses =
+              options_.intermediate_optimize_board_poses;
+          intermediate_options.optimize_frame_poses =
+              options_.intermediate_optimize_frame_poses;
+          intermediate_options.intrinsics_release_iteration =
+              options_.intermediate_intrinsics_release_iteration;
+          intermediate_options.cost_options.residual_model =
+              ResidualModel::ImagePlane;
+          const JointReprojectionOptimizer intermediate_optimizer(
+              intermediate_options);
+          {
+            const auto stage_start = std::chrono::steady_clock::now();
+            result.outer_only_intermediate.optimization_result =
+                intermediate_optimizer.Optimize(
+                    result.outer_only_intermediate.selection_result,
+                    initial_scene_state);
+            result.runtime_breakdown
+                .outer_only_intermediate_optimization_seconds =
+                ElapsedSeconds(stage_start);
+          }
+          result.outer_only_intermediate.success =
+              result.outer_only_intermediate.optimization_result.success;
+          if (result.outer_only_intermediate.success) {
+            result.outer_only_intermediate.state_source_label =
+                "outer_only_intermediate";
+          } else {
+            result.outer_only_intermediate.failure_reason =
+                result.outer_only_intermediate.optimization_result
+                        .failure_reason.empty()
+                    ? "outer-only intermediate optimization failed"
+                    : result.outer_only_intermediate.optimization_result
+                          .failure_reason;
+          }
+          AppendWarnings(
+              result.outer_only_intermediate.optimization_result.warnings,
+              &result.outer_only_intermediate.warnings);
+          AppendWarnings(result.outer_only_intermediate.warnings,
+                         &result.warnings);
+        }
+      }
+    }
+  }
+
+  const bool use_intermediate_for_round1 =
+      options_.enable_outer_only_intermediate_calibration &&
+      !options_.intermediate_diagnostic_only &&
+      (options_.use_intermediate_for_round1_internal_regeneration ||
+       options_.use_intermediate_for_full_frontend_regeneration) &&
+      result.outer_only_intermediate.success;
+  result.outer_only_intermediate.used_for_round1_internal_regeneration =
+      use_intermediate_for_round1;
+  result.outer_only_intermediate.used_for_full_frontend_regeneration =
+      use_intermediate_for_round1 &&
+      options_.use_intermediate_for_full_frontend_regeneration;
+  const JointReprojectionSceneState* round1_regeneration_state =
+      use_intermediate_for_round1
+          ? &result.outer_only_intermediate.optimization_result.optimized_state
+          : nullptr;
+
   result.round1.regeneration_results.reserve(frame_sources.size());
   result.round1.joint_inputs.reserve(frame_sources.size());
-  {
+  if (options_.outer_only_ablation_mode) {
+    for (std::size_t frame_index = 0; frame_index < frame_sources.size(); ++frame_index) {
+      InternalRegenerationFrameResult regeneration_result;
+      regeneration_result.frame_index = regeneration_inputs[frame_index].frame_index;
+      regeneration_result.frame_label = regeneration_inputs[frame_index].frame_label;
+      regeneration_result.frame_bootstrap_initialized = true;
+      regeneration_result.state_source_label = "outer_only_ablation_skipped";
+      regeneration_result.visible_board_ids =
+          regeneration_inputs[frame_index].outer_detections.requested_board_ids;
+      result.round1.regeneration_results.push_back(regeneration_result);
+
+      JointMeasurementFrameInput joint_input;
+      joint_input.frame_index = regeneration_inputs[frame_index].frame_index;
+      joint_input.frame_label = regeneration_inputs[frame_index].frame_label;
+      joint_input.outer_detections = regeneration_inputs[frame_index].outer_detections;
+      joint_input.regenerated_internal = regeneration_result;
+      result.round1.joint_inputs.push_back(joint_input);
+    }
+  } else {
     const auto stage_start = std::chrono::steady_clock::now();
     for (std::size_t frame_index = 0; frame_index < frame_sources.size(); ++frame_index) {
       const cv::Mat image =
@@ -461,9 +1017,17 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
         return result;
       }
 
-      const InternalRegenerationFrameResult regeneration_result =
-          regenerator.RegenerateFrame(image, regeneration_inputs[frame_index],
-                                      result.bootstrap_result);
+      InternalRegenerationFrameResult regeneration_result;
+      if (round1_regeneration_state != nullptr) {
+        regeneration_result =
+            regenerator.RegenerateFrame(image, regeneration_inputs[frame_index],
+                                        *round1_regeneration_state);
+        regeneration_result.state_source_label = "outer_only_intermediate";
+      } else {
+        regeneration_result =
+            regenerator.RegenerateFrame(image, regeneration_inputs[frame_index],
+                                        result.bootstrap_result);
+      }
       AccumulateRegenerationRuntime(
           regeneration_result.runtime_breakdown,
           &result.runtime_breakdown.round1_regeneration_pose_estimation_seconds,
@@ -508,8 +1072,6 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
     return result;
   }
 
-  const JointReprojectionSceneState initial_scene_state =
-      BuildSceneStateFromBootstrap(result.bootstrap_result);
   {
     const auto stage_start = std::chrono::steady_clock::now();
     result.round1.residual_result =

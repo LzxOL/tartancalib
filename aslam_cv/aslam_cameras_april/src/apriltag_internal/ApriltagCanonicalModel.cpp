@@ -68,6 +68,8 @@ const char* ToString(InternalProjectionMode mode) {
       return "sphere_lattice";
     case InternalProjectionMode::SphereBorderLattice:
       return "sphere_border_lattice";
+    case InternalProjectionMode::PureSphericalBoundarySeed:
+      return "pure_spherical_boundary_seed";
     case InternalProjectionMode::SphereRayRefine:
       return "sphere_ray_refine";
   }

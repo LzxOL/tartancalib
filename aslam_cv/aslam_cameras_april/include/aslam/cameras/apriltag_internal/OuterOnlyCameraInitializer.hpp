@@ -76,6 +76,9 @@ struct AutoCameraInitializationOptions {
       0.18, 0.22, 0.26, 0.30, 0.34, 0.40, 0.50, 0.60};
   std::vector<double> xi_candidates{-0.4, -0.2, 0.0, 0.2, 0.5, 1.0};
   std::vector<double> alpha_candidates{0.35, 0.45, 0.55, 0.65, 0.75};
+  std::vector<double> eucm_alpha_candidates{0.35, 0.45, 0.55, 0.65, 0.75};
+  std::vector<double> eucm_beta_candidates{0.6, 0.8, 1.0, 1.2, 1.5};
+  std::vector<double> equidistant_k1_candidates{-0.15, 0.0, 0.15};
 };
 
 class OuterOnlyCameraInitializer {

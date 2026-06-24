@@ -38,6 +38,7 @@ add_library(${PROJECT_NAME}
   src/apriltag_internal/ApriltagCanonicalModel.cpp
   src/apriltag_internal/ApriltagInternalDetector.cpp
   src/apriltag_internal/ApriltagInternalDebugVisualization.cpp
+  src/apriltag_internal/AngularResidualGeometry.cpp
   src/apriltag_internal/AslamBackendCalibrationRunner.cpp
   src/apriltag_internal/CalibrationStateBundle.cpp
   src/apriltag_internal/DoubleSphereCameraModel.cpp
@@ -49,13 +50,20 @@ add_library(${PROJECT_NAME}
   src/apriltag_internal/JointReprojectionOptimizer.cpp
   src/apriltag_internal/JointReprojectionResidualEvaluator.cpp
   src/apriltag_internal/KalibrBenchmark.cpp
+  src/apriltag_internal/KalibrStyleBatchAcceptance.cpp
   src/apriltag_internal/MultiBoardInternalMeasurementRegenerator.cpp
   src/apriltag_internal/MultiBoardOuterBootstrap.cpp
   src/apriltag_internal/MultiScaleOuterTagDetector.cpp
   src/apriltag_internal/OuterDetectionCache.cpp
   src/apriltag_internal/OuterOnlyCameraInitializer.cpp
+  src/apriltag_internal/PolarAngleResidualDiagnostics.cpp
   src/apriltag_internal/Stage5Runtime.cpp
   src/apriltag_internal/Stage5Benchmark.cpp
+  src/apriltag_internal/Stage5BackendDiagnosticWriters.cpp
+  src/apriltag_internal/Stage6IncrementalBatchEstimator.cpp
+  src/apriltag_internal/StereoResidualEvaluator.cpp
+  src/apriltag_internal/StereoExtrinsicCalibrationRunner.cpp
+  src/apriltag_internal/StereoExtrinsicProblemBuilder.cpp
   src/apriltag_internal/IterativeCoarseCalibrationExperiment.cpp
 )
 target_link_libraries(${PROJECT_NAME} ${catkin_LIBRARIES} ${OpenCV_LIBS} ${Boost_LIBRARIES})
@@ -114,6 +122,12 @@ add_executable(run_stage5_backend
 target_link_libraries(run_stage5_backend ${PROJECT_NAME} ${OpenCV_LIBS} ${Boost_LIBRARIES})
 target_compile_features(run_stage5_backend PUBLIC cxx_std_14)
 
+add_executable(run_stage6_stereo_extrinsic
+  src/run_stage6_stereo_extrinsic_main.cpp
+)
+target_link_libraries(run_stage6_stereo_extrinsic ${PROJECT_NAME} ${OpenCV_LIBS} ${Boost_LIBRARIES})
+target_compile_features(run_stage6_stereo_extrinsic PUBLIC cxx_std_14)
+
 add_executable(run_iterative_apriltag_internal_experiment
   src/run_iterative_apriltag_internal_experiment_main.cpp
 )
@@ -142,7 +156,7 @@ target_compile_features(run_compare_outer_adaptive_subpix_vs_sphere PUBLIC cxx_s
 ## Installation ##
 ##################
 
-install(TARGETS ${PROJECT_NAME} detect_apriltag_internal run_multi_board_outer_bootstrap run_multi_board_internal_regeneration run_joint_reprojection_measurement_prep run_joint_reprojection_optimization run_compare_stage5_with_kalibr run_stage5_benchmark run_stage5_backend run_iterative_apriltag_internal_experiment run_compare_internal_seed_methods run_compare_outer_geometry run_compare_outer_adaptive_subpix_vs_sphere
+install(TARGETS ${PROJECT_NAME} detect_apriltag_internal run_multi_board_outer_bootstrap run_multi_board_internal_regeneration run_joint_reprojection_measurement_prep run_joint_reprojection_optimization run_compare_stage5_with_kalibr run_stage5_benchmark run_stage5_backend run_stage6_stereo_extrinsic run_iterative_apriltag_internal_experiment run_compare_internal_seed_methods run_compare_outer_geometry run_compare_outer_adaptive_subpix_vs_sphere
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

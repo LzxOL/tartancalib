@@ -232,11 +232,13 @@ void DrawSphereBorderCurves(cv::Mat* image,
 bool UsesSphereSeedPipeline(InternalProjectionMode mode) {
   return mode == InternalProjectionMode::SphereLattice ||
          mode == InternalProjectionMode::SphereBorderLattice ||
+         mode == InternalProjectionMode::PureSphericalBoundarySeed ||
          mode == InternalProjectionMode::SphereRayRefine;
 }
 
 bool UsesBorderConditionedSeedPipeline(InternalProjectionMode mode) {
-  return mode == InternalProjectionMode::SphereBorderLattice;
+  return mode == InternalProjectionMode::SphereBorderLattice ||
+         mode == InternalProjectionMode::PureSphericalBoundarySeed;
 }
 
 bool HasExplicitSeedStage(InternalProjectionMode mode) {
@@ -270,7 +272,7 @@ cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
                outer_outline_color, 2, cv::LINE_AA);
     }
   }
-  if (result.projection_mode == InternalProjectionMode::SphereBorderLattice) {
+  if (UsesBorderConditionedSeedPipeline(result.projection_mode)) {
     DrawImageBorderCurves(&overlay, result);
   }
 
@@ -397,6 +399,10 @@ cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
     title = "Internal Border-Seed Overlay: P -> BC -> SS -> R";
     legend =
         "Legend: P orange cross, BC blue triangle, SS magenta diamond, R green square, colored curves: top/right/bottom/left outer boundaries, gray cross: aligned lattice boundaries";
+  } else if (result.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed) {
+    title = "Internal Pure Boundary-Seed Overlay: P -> BC -> R";
+    legend =
+        "Legend: P orange cross, BC/SS blue-magenta seed, R green square, colored curves: top/right/bottom/left outer boundaries, gray cross: aligned lattice boundaries";
   } else if (result.projection_mode == InternalProjectionMode::SphereRayRefine) {
     title = "Internal Ray-Seed Overlay: P -> SS(ray) -> R(subpix)";
     legend =
@@ -441,15 +447,19 @@ cv::Mat BuildInternalSphereDebugView(const ApriltagInternalDetectionResult& resu
   const std::string header =
       result.projection_mode == InternalProjectionMode::SphereBorderLattice
           ? "Internal Sphere View: predicted ray -> border-conditioned ray -> sphere seed -> refined ray"
-          : result.projection_mode == InternalProjectionMode::SphereRayRefine
-                ? "Internal Sphere View: predicted ray -> ray-domain seed -> subpixel refined ray"
-                : "Internal Sphere View: predicted ray -> sphere seed -> refined ray";
+          : result.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed
+                ? "Internal Sphere View: predicted ray -> pure boundary seed -> refined ray"
+                : result.projection_mode == InternalProjectionMode::SphereRayRefine
+                      ? "Internal Sphere View: predicted ray -> ray-domain seed -> subpixel refined ray"
+                      : "Internal Sphere View: predicted ray -> sphere seed -> refined ray";
   const std::string subtitle =
       result.projection_mode == InternalProjectionMode::SphereBorderLattice
           ? "P orange, BC blue, SS magenta, R green. Gray arrow: P->BC, violet arrow: BC->SS, green arrow: SS->R. Colored curves: top/right/bottom/left outer sphere boundaries. Thin gray lines: border-conditioned lattice cross."
-          : result.projection_mode == InternalProjectionMode::SphereRayRefine
-                ? "P orange, SS magenta, R green. Gray arrow: P->SS, green arrow: SS->R. Gray cross: aligned lattice boundaries. Gray ring: predicted-ray trust region."
-                : "P orange, SS magenta, R green. Gray arrow: P->SS, green arrow: SS->R. Gray cross: aligned lattice boundaries.";
+          : result.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed
+                ? "P orange, BC blue, seed magenta, R green. Gray arrow: P->BC, green arrow: BC->R. Colored curves: top/right/bottom/left outer sphere boundaries."
+                : result.projection_mode == InternalProjectionMode::SphereRayRefine
+                      ? "P orange, SS magenta, R green. Gray arrow: P->SS, green arrow: SS->R. Gray cross: aligned lattice boundaries. Gray ring: predicted-ray trust region."
+                      : "P orange, SS magenta, R green. Gray arrow: P->SS, green arrow: SS->R. Gray cross: aligned lattice boundaries.";
   cv::putText(canvas, header,
               cv::Point(28, 40), cv::FONT_HERSHEY_SIMPLEX, 0.85, cv::Scalar(20, 20, 20), 2);
   cv::putText(canvas, subtitle,
@@ -495,7 +505,7 @@ cv::Mat BuildInternalSphereDebugView(const ApriltagInternalDetectionResult& resu
              cv::Point(static_cast<int>(std::lround(center.x)),
                        static_cast<int>(std::lround(center.y + radius))),
              cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
-    if (result.projection_mode == InternalProjectionMode::SphereBorderLattice) {
+    if (UsesBorderConditionedSeedPipeline(result.projection_mode)) {
       DrawSphereBorderCurves(&canvas, center, radius, result);
     }
 

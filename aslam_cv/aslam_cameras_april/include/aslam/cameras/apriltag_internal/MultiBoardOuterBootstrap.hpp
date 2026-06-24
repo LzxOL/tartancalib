@@ -16,21 +16,41 @@ namespace cameras {
 namespace apriltag_internal {
 
 struct OuterBootstrapCameraIntrinsics {
+  std::string camera_model = "ds";
+  std::string distortion_model = "none";
   double xi = 0.0;
   double alpha = 0.0;
+  double beta = 1.0;
   double fu = 0.0;
   double fv = 0.0;
   double cu = 0.0;
   double cv = 0.0;
+  std::vector<double> distortion_coeffs;
   cv::Size resolution;
 
   bool IsValid() const {
-    return resolution.width > 0 && resolution.height > 0 && fu > 0.0 && fv > 0.0;
+    return resolution.width > 0 && resolution.height > 0 &&
+           fu > 0.0 && fv > 0.0 &&
+           !NormalizedFamilyString().empty();
   }
+
+  std::string NormalizedCameraModel() const;
+  std::string NormalizedDistortionModel() const;
+  std::string NormalizedFamilyString() const;
+  std::vector<double> IntrinsicsVector() const;
+  std::vector<double> DistortionVector() const;
+  std::vector<double> CombinedParameterVector() const;
+  std::vector<std::string> IntrinsicsLabels() const;
+  std::vector<std::string> DistortionLabels() const;
+  std::vector<std::string> CombinedParameterLabels() const;
+  bool SetIntrinsicsVector(const std::vector<double>& values);
+  bool SetDistortionVector(const std::vector<double>& values);
+  bool SetCombinedParameterVector(const std::vector<double>& values);
 };
 
 struct OuterBootstrapOptions {
   int reference_board_id = 1;
+  OuterBootstrapCameraIntrinsics initial_camera;
   double init_xi = -0.2;
   double init_alpha = 0.6;
   double init_fu_scale = 0.55;

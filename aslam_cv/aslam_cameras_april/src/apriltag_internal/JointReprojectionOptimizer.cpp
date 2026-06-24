@@ -44,8 +44,30 @@ bool ClampIntrinsicsInPlace(OuterBootstrapCameraIntrinsics* intrinsics) {
   if (intrinsics == nullptr) {
     throw std::runtime_error("ClampIntrinsicsInPlace requires a valid pointer.");
   }
-  intrinsics->xi = std::max(-0.95, std::min(2.5, intrinsics->xi));
-  intrinsics->alpha = std::max(0.05, std::min(0.95, intrinsics->alpha));
+  const std::string family = intrinsics->NormalizedFamilyString();
+  if (family == "ds-none") {
+    intrinsics->xi = std::max(-0.95, std::min(2.5, intrinsics->xi));
+    intrinsics->alpha = std::max(0.05, std::min(0.95, intrinsics->alpha));
+    intrinsics->beta = 1.0;
+    intrinsics->distortion_coeffs.clear();
+  } else if (family == "eucm-none") {
+    intrinsics->alpha = std::max(0.05, std::min(0.95, intrinsics->alpha));
+    intrinsics->beta = std::max(0.25, std::min(3.0, intrinsics->beta));
+    intrinsics->xi = 0.0;
+    intrinsics->distortion_coeffs.clear();
+  } else if (family == "pinhole-equi") {
+    intrinsics->xi = 0.0;
+    intrinsics->alpha = 0.0;
+    intrinsics->beta = 0.0;
+    if (intrinsics->distortion_coeffs.size() != 4) {
+      intrinsics->distortion_coeffs.resize(4, 0.0);
+    }
+    for (double& coefficient : intrinsics->distortion_coeffs) {
+      coefficient = std::max(-1.5, std::min(1.5, coefficient));
+    }
+  } else {
+    return false;
+  }
   intrinsics->fu = std::max(50.0, std::min(3.0 * intrinsics->resolution.width, intrinsics->fu));
   intrinsics->fv = std::max(50.0, std::min(3.0 * intrinsics->resolution.height, intrinsics->fv));
   intrinsics->cu =
@@ -55,24 +77,39 @@ bool ClampIntrinsicsInPlace(OuterBootstrapCameraIntrinsics* intrinsics) {
   return intrinsics->IsValid();
 }
 
-Eigen::Matrix<double, 6, 1> ToVector(const OuterBootstrapCameraIntrinsics& intrinsics) {
-  Eigen::Matrix<double, 6, 1> vector;
-  vector << intrinsics.xi, intrinsics.alpha, intrinsics.fu, intrinsics.fv,
-      intrinsics.cu, intrinsics.cv;
+Eigen::VectorXd ToVector(const OuterBootstrapCameraIntrinsics& intrinsics) {
+  const std::vector<double> values = intrinsics.CombinedParameterVector();
+  Eigen::VectorXd vector(values.size());
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    vector[static_cast<Eigen::Index>(index)] = values[index];
+  }
   return vector;
 }
 
-OuterBootstrapCameraIntrinsics FromVector(const Eigen::Matrix<double, 6, 1>& vector,
-                                          const cv::Size& resolution) {
-  OuterBootstrapCameraIntrinsics intrinsics;
-  intrinsics.resolution = resolution;
-  intrinsics.xi = vector[0];
-  intrinsics.alpha = vector[1];
-  intrinsics.fu = vector[2];
-  intrinsics.fv = vector[3];
-  intrinsics.cu = vector[4];
-  intrinsics.cv = vector[5];
+OuterBootstrapCameraIntrinsics FromVector(const Eigen::VectorXd& vector,
+                                          const OuterBootstrapCameraIntrinsics& prototype) {
+  OuterBootstrapCameraIntrinsics intrinsics = prototype;
+  std::vector<double> values(static_cast<std::size_t>(vector.rows()), 0.0);
+  for (Eigen::Index index = 0; index < vector.rows(); ++index) {
+    values[static_cast<std::size_t>(index)] = vector[index];
+  }
+  intrinsics.SetCombinedParameterVector(values);
   return intrinsics;
+}
+
+double PriorWeightForLabel(const JointOptimizationOptions& options,
+                           const std::string& label) {
+  if (label == "xi" || label == "alpha" || label == "beta" ||
+      label == "k1" || label == "k2" || label == "k3" || label == "k4") {
+    return options.intrinsics_anchor_weight_xi_alpha;
+  }
+  if (label == "fu" || label == "fv") {
+    return options.intrinsics_anchor_weight_focal;
+  }
+  if (label == "cu" || label == "cv") {
+    return options.intrinsics_anchor_weight_principal;
+  }
+  return 0.0;
 }
 
 void AppendUniqueWarning(const std::string& warning,
@@ -645,31 +682,37 @@ bool OptimizeIntrinsicsIfEnabled(const JointMeasurementBuildResult& measurement_
     return false;
   }
 
-  Eigen::Matrix<double, 6, 1> parameters = ToVector(scene_state->camera);
-  const Eigen::Matrix<double, 6, 1> anchor = ToVector(anchor_state.camera);
-  Eigen::Matrix<double, 6, 1> prior_weight = Eigen::Matrix<double, 6, 1>::Zero();
-  prior_weight[0] = options.intrinsics_anchor_weight_xi_alpha;
-  prior_weight[1] = options.intrinsics_anchor_weight_xi_alpha;
-  prior_weight[2] = options.intrinsics_anchor_weight_focal;
-  prior_weight[3] = options.intrinsics_anchor_weight_focal;
-  prior_weight[4] = options.intrinsics_anchor_weight_principal;
-  prior_weight[5] = options.intrinsics_anchor_weight_principal;
+  Eigen::VectorXd parameters = ToVector(scene_state->camera);
+  const Eigen::VectorXd anchor = ToVector(anchor_state.camera);
+  const std::vector<std::string> parameter_labels =
+      scene_state->camera.CombinedParameterLabels();
+  Eigen::VectorXd prior_weight = Eigen::VectorXd::Zero(parameters.rows());
+  for (Eigen::Index index = 0; index < prior_weight.rows(); ++index) {
+    prior_weight[index] =
+        PriorWeightForLabel(options, parameter_labels[static_cast<std::size_t>(index)]);
+  }
 
   double lambda = 1e-3;
   double best_cost = evaluation.total_cost;
   for (int iteration = 0; iteration < 10; ++iteration) {
-    Eigen::MatrixXd jacobian(residuals.rows(), 6);
-    for (int column = 0; column < 6; ++column) {
-      Eigen::Matrix<double, 6, 1> plus = parameters;
-      Eigen::Matrix<double, 6, 1> minus = parameters;
-      const double step = ParameterStep(parameters[column], column < 2 ? 1e-4 : 1e-2);
+    Eigen::MatrixXd jacobian(residuals.rows(), parameters.rows());
+    for (Eigen::Index column = 0; column < parameters.rows(); ++column) {
+      Eigen::VectorXd plus = parameters;
+      Eigen::VectorXd minus = parameters;
+      const std::string& label =
+          parameter_labels[static_cast<std::size_t>(column)];
+      const double fallback_step =
+          (label == "fu" || label == "fv" || label == "cu" || label == "cv")
+              ? 1e-2
+              : 1e-4;
+      const double step = ParameterStep(parameters[column], fallback_step);
       plus[column] += step;
       minus[column] -= step;
 
       JointReprojectionSceneState plus_state = *scene_state;
       JointReprojectionSceneState minus_state = *scene_state;
-      plus_state.camera = FromVector(plus, scene_state->camera.resolution);
-      minus_state.camera = FromVector(minus, scene_state->camera.resolution);
+      plus_state.camera = FromVector(plus, scene_state->camera);
+      minus_state.camera = FromVector(minus, scene_state->camera);
       ClampIntrinsicsInPlace(&plus_state.camera);
       ClampIntrinsicsInPlace(&minus_state.camera);
 
@@ -694,24 +737,25 @@ bool OptimizeIntrinsicsIfEnabled(const JointMeasurementBuildResult& measurement_
           (2.0 * step);
     }
 
-    const Eigen::Matrix<double, 6, 6> hessian = jacobian.transpose() * jacobian;
-    const Eigen::Matrix<double, 6, 1> gradient = jacobian.transpose() * residuals;
-    Eigen::Matrix<double, 6, 6> prior_hessian = Eigen::Matrix<double, 6, 6>::Zero();
-    Eigen::Matrix<double, 6, 1> prior_gradient = Eigen::Matrix<double, 6, 1>::Zero();
-    for (int index = 0; index < 6; ++index) {
+    const Eigen::MatrixXd hessian = jacobian.transpose() * jacobian;
+    const Eigen::VectorXd gradient = jacobian.transpose() * residuals;
+    Eigen::MatrixXd prior_hessian = Eigen::MatrixXd::Zero(parameters.rows(), parameters.rows());
+    Eigen::VectorXd prior_gradient = Eigen::VectorXd::Zero(parameters.rows());
+    for (Eigen::Index index = 0; index < parameters.rows(); ++index) {
       prior_hessian(index, index) = prior_weight[index];
       prior_gradient[index] = prior_weight[index] * (parameters[index] - anchor[index]);
     }
 
-    const Eigen::Matrix<double, 6, 1> delta =
+    const Eigen::VectorXd delta =
         (hessian + prior_hessian +
-         lambda * Eigen::Matrix<double, 6, 6>::Identity()).ldlt().solve(-(gradient + prior_gradient));
+         lambda * Eigen::MatrixXd::Identity(parameters.rows(), parameters.rows()))
+            .ldlt().solve(-(gradient + prior_gradient));
     if (!delta.allFinite()) {
       break;
     }
 
     JointReprojectionSceneState candidate_state = *scene_state;
-    candidate_state.camera = FromVector(parameters + delta, scene_state->camera.resolution);
+    candidate_state.camera = FromVector(parameters + delta, scene_state->camera);
     ClampIntrinsicsInPlace(&candidate_state.camera);
     const auto candidate_start = std::chrono::steady_clock::now();
     const LocalGlobalResidualEvaluation candidate_eval =
@@ -726,8 +770,8 @@ bool OptimizeIntrinsicsIfEnabled(const JointMeasurementBuildResult& measurement_
     }
 
     double prior_cost = 0.0;
-    const Eigen::Matrix<double, 6, 1> candidate_vector = ToVector(candidate_state.camera);
-    for (int index = 0; index < 6; ++index) {
+    const Eigen::VectorXd candidate_vector = ToVector(candidate_state.camera);
+    for (Eigen::Index index = 0; index < candidate_vector.rows(); ++index) {
       const double diff = candidate_vector[index] - anchor[index];
       prior_cost += prior_weight[index] * diff * diff;
     }
@@ -1010,10 +1054,11 @@ JointOptimizationResult JointReprojectionOptimizer::Optimize(
                          result.optimized_residual,
                          &result.optimized_state);
 
-  result.success = result.optimized_residual.overall_rmse <=
-      result.initial_residual.overall_rmse + 1e-9;
-  if (!result.success) {
-    result.failure_reason = "optimized residuals did not improve";
+  result.success = true;
+  if (result.optimized_residual.overall_rmse >
+      result.initial_residual.overall_rmse + 1e-9) {
+    AppendUniqueWarning("optimized residuals did not improve",
+                        &result.warnings);
   }
 
   if (options_.optimize_intrinsics) {

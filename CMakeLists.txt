@@ -253,6 +253,7 @@ add_library(tartancalib_apriltag_internal_core STATIC
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/ApriltagInternalDebugVisualization.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/ApriltagInternalDetector.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/CalibrationStateBundle.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/AngularResidualGeometry.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/DoubleSphereCameraModel.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/FrozenRound2BaselinePipeline.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointMeasurementCuration.cpp"
@@ -262,13 +263,22 @@ add_library(tartancalib_apriltag_internal_core STATIC
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointReprojectionOptimizer.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointReprojectionResidualEvaluator.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/KalibrBenchmark.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/KalibrStyleBatchAcceptance.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/MultiBoardConsistencyDiagnostics.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/MultiBoardCoObservationConsistency.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/MultiBoardInternalMeasurementRegenerator.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/MultiBoardOuterBootstrap.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/MultiScaleOuterTagDetector.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/OuterDetectionCache.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/OuterOnlyCameraInitializer.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/PolarAngleResidualDiagnostics.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/Stage6IncrementalBatchEstimator.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/StereoResidualEvaluator.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/StereoExtrinsicCalibrationRunner.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/StereoExtrinsicProblemBuilder.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/Stage5Runtime.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/Stage5Benchmark.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/Stage5BackendDiagnosticWriters.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/IterativeCoarseCalibrationExperiment.cpp"
 )
 target_include_directories(tartancalib_apriltag_internal_core PUBLIC
@@ -357,10 +367,28 @@ target_link_libraries(run_stage5_benchmark PRIVATE
   Boost::filesystem
 )
 
+add_executable(run_intrinsics_reprojection_benchmark
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_intrinsics_reprojection_benchmark_main.cpp"
+)
+target_link_libraries(run_intrinsics_reprojection_benchmark PRIVATE
+  tartancalib_apriltag_internal_core
+  ${OpenCV_LIBS}
+  Boost::filesystem
+)
+
 add_executable(run_stage5_backend
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_stage5_backend_main.cpp"
 )
 target_link_libraries(run_stage5_backend PRIVATE
+  tartancalib_apriltag_internal_core
+  ${OpenCV_LIBS}
+  Boost::filesystem
+)
+
+add_executable(run_stage6_stereo_extrinsic
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_stage6_stereo_extrinsic_main.cpp"
+)
+target_link_libraries(run_stage6_stereo_extrinsic PRIVATE
   tartancalib_apriltag_internal_core
   ${OpenCV_LIBS}
   Boost::filesystem

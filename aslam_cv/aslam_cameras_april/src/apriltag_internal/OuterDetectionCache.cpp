@@ -15,7 +15,7 @@ namespace {
 
 namespace fs = boost::filesystem;
 
-constexpr const char kCacheFormatVersion[] = "outer_detection_cache_v2";
+constexpr const char kCacheFormatVersion[] = "outer_detection_cache_v3_subpix_debug";
 
 std::uint64_t HashBytes(const std::string& text) {
   std::uint64_t hash = 1469598103934665603ull;
@@ -68,6 +68,16 @@ std::string MakeConfigSignature(const MultiScaleOuterTagDetectorConfig& config) 
          << "|outer_subpix_window_scale=" << config.outer_subpix_window_scale
          << "|outer_subpix_window_min=" << config.outer_subpix_window_min
          << "|outer_subpix_window_max=" << config.outer_subpix_window_max
+         << "|enable_close_edge_outer_subpix_boost="
+         << (config.enable_close_edge_outer_subpix_boost ? 1 : 0)
+         << "|close_edge_outer_subpix_area_ratio="
+         << config.close_edge_outer_subpix_area_ratio
+         << "|close_edge_outer_subpix_min_polar_deg="
+         << config.close_edge_outer_subpix_min_polar_deg
+         << "|close_edge_outer_subpix_border_ratio="
+         << config.close_edge_outer_subpix_border_ratio
+         << "|close_edge_outer_subpix_multiplier="
+         << config.close_edge_outer_subpix_multiplier
          << "|max_outer_refine_displacement=" << config.max_outer_refine_displacement
          << "|outer_refine_displacement_scale="
          << config.outer_refine_displacement_scale
@@ -332,6 +342,26 @@ void WriteOuterCornerVerificationDebug(
   *storage << "spherical_refinement_valid" << (debug.spherical_refinement_valid ? 1 : 0);
   *storage << "spherical_refinement_applied" << (debug.spherical_refinement_applied ? 1 : 0);
   *storage << "spherical_failure_reason" << debug.spherical_failure_reason;
+  *storage << "close_edge_subpix_boost_applied"
+           << (debug.close_edge_subpix_boost_applied ? 1 : 0);
+  *storage << "close_edge_subpix_area_ratio" << debug.close_edge_subpix_area_ratio;
+  *storage << "close_edge_subpix_max_polar_deg" << debug.close_edge_subpix_max_polar_deg;
+  *storage << "configured_outer_subpix_scale" << debug.configured_outer_subpix_scale;
+  *storage << "configured_outer_subpix_window_scale"
+           << debug.configured_outer_subpix_window_scale;
+  *storage << "configured_outer_subpix_window_radius"
+           << debug.configured_outer_subpix_window_radius;
+  *storage << "configured_outer_subpix_window_min"
+           << debug.configured_outer_subpix_window_min;
+  *storage << "configured_outer_subpix_window_max"
+           << debug.configured_outer_subpix_window_max;
+  *storage << "raw_subpix_window_radius" << debug.raw_subpix_window_radius;
+  *storage << "pre_boost_subpix_window_radius"
+           << debug.pre_boost_subpix_window_radius;
+  *storage << "boosted_raw_subpix_window_radius"
+           << debug.boosted_raw_subpix_window_radius;
+  *storage << "subpix_window_clamp_limit" << debug.subpix_window_clamp_limit;
+  *storage << "subpix_window_clamped" << (debug.subpix_window_clamped ? 1 : 0);
   *storage << "subpix_window_radius" << debug.subpix_window_radius;
   *storage << "refine_displacement_limit" << debug.refine_displacement_limit;
   *storage << "refined_valid" << (debug.refined_valid ? 1 : 0);
@@ -409,6 +439,32 @@ void ReadOuterCornerVerificationDebug(
       static_cast<int>(node["spherical_refinement_applied"]) != 0;
   debug->spherical_failure_reason =
       static_cast<std::string>(node["spherical_failure_reason"]);
+  debug->close_edge_subpix_boost_applied =
+      static_cast<int>(node["close_edge_subpix_boost_applied"]) != 0;
+  debug->close_edge_subpix_area_ratio =
+      static_cast<double>(node["close_edge_subpix_area_ratio"]);
+  debug->close_edge_subpix_max_polar_deg =
+      static_cast<double>(node["close_edge_subpix_max_polar_deg"]);
+  debug->configured_outer_subpix_scale =
+      static_cast<double>(node["configured_outer_subpix_scale"]);
+  debug->configured_outer_subpix_window_scale =
+      static_cast<double>(node["configured_outer_subpix_window_scale"]);
+  debug->configured_outer_subpix_window_radius =
+      static_cast<int>(node["configured_outer_subpix_window_radius"]);
+  debug->configured_outer_subpix_window_min =
+      static_cast<int>(node["configured_outer_subpix_window_min"]);
+  debug->configured_outer_subpix_window_max =
+      static_cast<int>(node["configured_outer_subpix_window_max"]);
+  debug->raw_subpix_window_radius =
+      static_cast<int>(node["raw_subpix_window_radius"]);
+  debug->pre_boost_subpix_window_radius =
+      static_cast<int>(node["pre_boost_subpix_window_radius"]);
+  debug->boosted_raw_subpix_window_radius =
+      static_cast<int>(node["boosted_raw_subpix_window_radius"]);
+  debug->subpix_window_clamp_limit =
+      static_cast<int>(node["subpix_window_clamp_limit"]);
+  debug->subpix_window_clamped =
+      static_cast<int>(node["subpix_window_clamped"]) != 0;
   debug->subpix_window_radius = static_cast<int>(node["subpix_window_radius"]);
   debug->refine_displacement_limit =
       static_cast<double>(node["refine_displacement_limit"]);
@@ -450,10 +506,14 @@ OuterBoardMeasurement BuildBoardMeasurement(const OuterTagDetectionResult& detec
   measurement.board_id = detection.board_id;
   measurement.detected_tag_id = detection.detected_tag_id;
   measurement.success = detection.success;
+  measurement.attempted_local_patch_rescue = detection.attempted_local_patch_rescue;
+  measurement.used_local_patch_rescue = detection.used_local_patch_rescue;
+  measurement.local_patch_rescue_summary = detection.local_patch_rescue_summary;
   measurement.detection_quality = detection.quality;
   measurement.refined_outer_corners_original_image =
       detection.refined_corners_original_image;
   measurement.refined_corner_valid = detection.refined_valid;
+  measurement.corner_verification_debug = detection.corner_verification_debug;
   measurement.valid_refined_corner_count = CountValidCorners(detection.refined_valid);
   measurement.failure_reason = detection.failure_reason;
   measurement.failure_reason_text = detection.failure_reason_text;

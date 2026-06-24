@@ -61,6 +61,106 @@ int CountUsedPoints(const JointBoardObservation& board_observation,
   return count;
 }
 
+double ComputeInternalObservationQualityWeight(
+    double quality,
+    double quality_threshold,
+    const JointMeasurementBuildOptions& options) {
+  if (!options.enable_internal_observation_quality_weighting) {
+    return 1.0;
+  }
+  const double bounded_quality =
+      std::max(0.0, std::min(1.0, std::isfinite(quality) ? quality : 0.0));
+  if (bounded_quality > quality_threshold) {
+    return 1.0;
+  }
+  const double min_weight =
+      std::max(0.0, std::min(1.0, options.internal_observation_min_weight));
+  const double exponent =
+      options.internal_observation_quality_exponent > 0.0
+          ? options.internal_observation_quality_exponent
+          : 1.0;
+  return min_weight + (1.0 - min_weight) *
+                          std::pow(bounded_quality, exponent);
+}
+
+double Quantile(std::vector<double> values, double q) {
+  if (values.empty()) {
+    return 0.0;
+  }
+  if (q <= 0.0) {
+    return *std::min_element(values.begin(), values.end());
+  }
+  if (q >= 1.0) {
+    return *std::max_element(values.begin(), values.end());
+  }
+  std::sort(values.begin(), values.end());
+  const double scaled = q * static_cast<double>(values.size() - 1);
+  const std::size_t lower = static_cast<std::size_t>(std::floor(scaled));
+  const std::size_t upper = static_cast<std::size_t>(std::ceil(scaled));
+  if (lower == upper) {
+    return values[lower];
+  }
+  const double t = scaled - static_cast<double>(lower);
+  return (1.0 - t) * values[lower] + t * values[upper];
+}
+
+double ClampUnitLocal(double value) {
+  if (!std::isfinite(value)) {
+    return 0.0;
+  }
+  return std::max(0.0, std::min(1.0, value));
+}
+
+void ApplyInternalObservationQualityWeightsToResult(
+    JointMeasurementBuildResult* result,
+    const JointMeasurementBuildOptions& options) {
+  if (result == nullptr || !options.enable_internal_observation_quality_weighting) {
+    return;
+  }
+
+  std::vector<double> qualities;
+  for (const JointMeasurementFrameResult& frame : result->frames) {
+    for (const JointBoardObservation& board : frame.board_observations) {
+      for (const JointPointObservation& point : board.points) {
+        if (point.used_in_solver && point.point_type == JointPointType::Internal) {
+          qualities.push_back(
+              std::max(0.0, std::min(1.0, std::isfinite(point.quality) ? point.quality : 0.0)));
+        }
+      }
+    }
+  }
+  if (qualities.empty()) {
+    return;
+  }
+
+  const double threshold = Quantile(
+      qualities,
+      std::max(0.0, std::min(1.0, options.internal_observation_low_quality_quantile)));
+
+  result->solver_observations.clear();
+  result->used_internal_point_count = 0;
+  result->used_total_point_count = 0;
+  for (JointMeasurementFrameResult& frame : result->frames) {
+    for (JointBoardObservation& board : frame.board_observations) {
+      for (JointPointObservation& point : board.points) {
+        if (point.point_type == JointPointType::Internal) {
+          point.observation_weight = point.used_in_solver
+                                         ? ComputeInternalObservationQualityWeight(
+                                               point.quality, threshold, options)
+                                         : 1.0;
+        }
+        if (point.used_in_solver) {
+          result->solver_observations.push_back(point);
+          ++result->used_total_point_count;
+          if (point.point_type == JointPointType::Internal) {
+            ++result->used_internal_point_count;
+          }
+        }
+      }
+    }
+  }
+}
+
 std::vector<int> CollectBoardIds(const JointMeasurementFrameInput& frame_input) {
   std::vector<int> board_ids;
   for (int board_id : frame_input.outer_detections.requested_board_ids) {
@@ -98,6 +198,29 @@ const OuterBoardMeasurement* FindOuterBoardMeasurement(
     *measurement_index = -1;
   }
   return nullptr;
+}
+
+OuterBoardMeasurement BuildOuterBoardMeasurementFromDetection(
+    const OuterTagDetectionResult& detection) {
+  OuterBoardMeasurement measurement;
+  measurement.board_id = detection.board_id;
+  measurement.detected_tag_id = detection.detected_tag_id;
+  measurement.success = detection.success;
+  measurement.attempted_local_patch_rescue = detection.attempted_local_patch_rescue;
+  measurement.used_local_patch_rescue = detection.used_local_patch_rescue;
+  measurement.local_patch_rescue_summary = detection.local_patch_rescue_summary;
+  measurement.detection_quality = detection.quality;
+  measurement.valid_refined_corner_count = 0;
+  measurement.refined_outer_corners_original_image =
+      detection.refined_corners_original_image;
+  measurement.refined_corner_valid = detection.refined_valid;
+  measurement.corner_verification_debug = detection.corner_verification_debug;
+  for (bool valid : detection.refined_valid) {
+    measurement.valid_refined_corner_count += valid ? 1 : 0;
+  }
+  measurement.failure_reason = detection.failure_reason;
+  measurement.failure_reason_text = detection.failure_reason_text;
+  return measurement;
 }
 
 const RegeneratedBoardMeasurement* FindRegeneratedBoardMeasurement(
@@ -258,13 +381,63 @@ void FilterInternalPointsByReprojectionError(
   const double std_residual = std::sqrt(std::max(0.0, variance));
   const double threshold =
       mean_residual + options.filter_internal_corner_sigma_threshold * std_residual;
+  double effective_threshold = threshold;
+  const bool has_absolute_cap =
+      options.filter_internal_corner_max_reproj_error > 0.0;
+  const bool use_quality_residual_adaptive =
+      options.filter_internal_corner_mode == "quality_residual_adaptive";
+  if (options.filter_internal_corner_mode == "local_residual_cap" &&
+      has_absolute_cap) {
+    effective_threshold = options.filter_internal_corner_max_reproj_error;
+  } else if (options.filter_internal_corner_mode == "sigma_with_cap" &&
+             has_absolute_cap) {
+    effective_threshold =
+        std::min(threshold, options.filter_internal_corner_max_reproj_error);
+  } else if (use_quality_residual_adaptive) {
+    const double robust_base =
+        Quantile(residual_norms, 0.75) +
+        options.filter_internal_corner_sigma_threshold *
+            std::max(0.0, Quantile(residual_norms, 0.75) -
+                              Quantile(residual_norms, 0.25));
+    effective_threshold = std::max(
+        std::max(threshold, robust_base),
+        options.filter_internal_corner_adaptive_min_threshold_px);
+    if (has_absolute_cap) {
+      effective_threshold = std::min(
+          effective_threshold, options.filter_internal_corner_max_reproj_error);
+    }
+  }
 
   for (std::size_t index = 0; index < internal_points.size(); ++index) {
     JointPointObservation* point = internal_points[index];
     const double residual = per_point_residuals[index];
+    double per_point_threshold = effective_threshold;
+    bool low_quality = false;
+    if (use_quality_residual_adaptive) {
+      const double quality = ClampUnitLocal(point->quality);
+      low_quality = quality < options.filter_internal_corner_quality_min;
+      if (low_quality) {
+        const double low_quality_threshold = std::max(
+            options.filter_internal_corner_min_reproj_error,
+            0.5 * effective_threshold);
+        per_point_threshold = std::min(per_point_threshold, low_quality_threshold);
+      } else {
+        const double relaxation =
+            options.filter_internal_corner_quality_relaxation_px *
+            (quality - options.filter_internal_corner_quality_min) /
+            std::max(1e-9, 1.0 - options.filter_internal_corner_quality_min);
+        per_point_threshold += std::max(0.0, relaxation);
+        if (has_absolute_cap) {
+          per_point_threshold =
+              std::min(per_point_threshold,
+                       options.filter_internal_corner_max_reproj_error +
+                           std::max(0.0, options.filter_internal_corner_quality_relaxation_px));
+        }
+      }
+    }
     const bool invalid_projection = !std::isfinite(residual);
     const bool over_threshold =
-        residual > threshold &&
+        residual > per_point_threshold &&
         residual > options.filter_internal_corner_min_reproj_error;
     if (!invalid_projection && !over_threshold) {
       continue;
@@ -276,10 +449,22 @@ void FilterInternalPointsByReprojectionError(
       detail << "projection invalid under outer-only pose refit";
     } else {
       detail << "reprojection_error=" << residual
-             << " threshold=" << threshold
+             << " threshold=" << per_point_threshold
+             << " sigma_threshold=" << threshold
+             << " filter_mode=" << options.filter_internal_corner_mode
              << " mean=" << mean_residual
              << " std=" << std_residual
              << " pose_fit_outer_rmse=" << pose_fit_rmse;
+      if (use_quality_residual_adaptive) {
+        detail << " base_threshold=" << effective_threshold
+               << " point_quality=" << ClampUnitLocal(point->quality)
+               << " low_quality=" << (low_quality ? 1 : 0)
+               << " quality_min=" << options.filter_internal_corner_quality_min
+               << " quality_relaxation_px="
+               << options.filter_internal_corner_quality_relaxation_px
+               << " adaptive_min_threshold_px="
+               << options.filter_internal_corner_adaptive_min_threshold_px;
+      }
     }
     point->rejection_detail = detail.str();
   }
@@ -440,6 +625,18 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
       const RegeneratedBoardMeasurement* regenerated_measurement =
           FindRegeneratedBoardMeasurement(frame_input, board_id,
                                           &regenerated_measurement_index);
+      OuterBoardMeasurement regenerated_rescued_outer_measurement;
+      if (options_.use_regenerated_rescued_outer_measurements &&
+          regenerated_measurement != nullptr &&
+          regenerated_measurement->detection.outer_detection.success &&
+          regenerated_measurement->detection.outer_detection.used_local_patch_rescue &&
+          (outer_measurement == nullptr || !outer_measurement->success)) {
+        regenerated_rescued_outer_measurement =
+            BuildOuterBoardMeasurementFromDetection(
+                regenerated_measurement->detection.outer_detection);
+        outer_measurement = &regenerated_rescued_outer_measurement;
+        outer_measurement_index = regenerated_measurement_index;
+      }
       bool internal_regeneration_failed_for_board = false;
       std::string internal_regeneration_failure_detail;
       if (!options_.include_outer_when_internal_failed &&
@@ -478,6 +675,19 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
           point.source_board_observation_index = outer_measurement_index;
           point.source_point_index = corner_index;
           point.source_kind = JointObservationSourceKind::OuterMeasurement;
+          const OuterCornerVerificationDebugInfo& outer_debug =
+              outer_measurement->corner_verification_debug[static_cast<std::size_t>(corner_index)];
+          point.outer_subpix_window_radius = outer_debug.subpix_window_radius;
+          point.outer_pre_boost_subpix_window_radius =
+              outer_debug.pre_boost_subpix_window_radius;
+          point.outer_boosted_raw_subpix_window_radius =
+              outer_debug.boosted_raw_subpix_window_radius;
+          point.outer_close_edge_subpix_boost_applied =
+              outer_debug.close_edge_subpix_boost_applied;
+          point.outer_close_edge_subpix_area_ratio =
+              outer_debug.close_edge_subpix_area_ratio;
+          point.outer_close_edge_subpix_max_polar_deg =
+              outer_debug.close_edge_subpix_max_polar_deg;
 
           if (label_mismatch) {
             point.rejection_detail = BuildBoardLevelReasonDetail(
@@ -497,12 +707,20 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
                      << outer_measurement->valid_refined_corner_count;
               point.rejection_detail = detail.str();
             }
-          } else if (internal_regeneration_failed_for_board) {
+          } else if (internal_regeneration_failed_for_board &&
+                     !(options_.include_rescued_outer_when_internal_failed &&
+                       outer_measurement->used_local_patch_rescue)) {
             point.rejection_reason_code =
                 JointRejectionReasonCode::InternalRegenerationFailed;
             point.rejection_detail = internal_regeneration_failure_detail;
           } else {
             point.used_in_solver = true;
+            if (internal_regeneration_failed_for_board &&
+                outer_measurement->used_local_patch_rescue) {
+              point.rejection_detail =
+                  "rescued outer retained despite internal regeneration failure: " +
+                  internal_regeneration_failure_detail;
+            }
           }
 
           board_observation.points.push_back(point);
@@ -534,6 +752,7 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
             point.image_xy = measurement.image_xy;
             point.target_xyz_board = measurement.target_xyz;
             point.quality = measurement.quality;
+            point.observation_weight = 1.0;
             point.frame_storage_index = static_cast<int>(frame_storage_index);
             point.source_board_observation_index = regenerated_measurement_index;
             point.source_point_index = static_cast<int>(point_index);
@@ -624,6 +843,8 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
     result.failure_reason = "No solver-ready joint observations were built.";
     return result;
   }
+
+  ApplyInternalObservationQualityWeightsToResult(&result, options_);
 
   result.success = true;
   return result;

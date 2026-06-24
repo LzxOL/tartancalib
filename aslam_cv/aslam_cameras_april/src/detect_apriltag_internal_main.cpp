@@ -21,6 +21,11 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "apriltags/TagFamily.h"
+#include "apriltags/Tag36h11.h"
+#include "apriltags/TagDetection.h"
+#include "apriltags/TagDetector.h"
+
 namespace {
 
 namespace ati = aslam::cameras::apriltag_internal;
@@ -33,6 +38,15 @@ struct CmdArgs {
   bool all = false;
   bool show = false;
   bool no_subpix = false;
+  bool no_output_images = false;
+  bool no_debug_output = false;
+  bool final_corners_only = false;
+  bool rectified_roi_demo = false;
+  double rectified_roi_crop_offset_x = 0.0;
+  double rectified_roi_crop_offset_y = 0.0;
+  double rectified_roi_fov_deg = 44.0;
+  int rectified_roi_patch_size = 800;
+  int corner_radius = 2;
 };
 
 struct InternalMetricsSummary {
@@ -76,6 +90,7 @@ std::string BuildOuterChainLabel(const ati::OuterCornerVerificationDebugInfo& de
 bool UsesSphereSeedPipelineLocal(ati::InternalProjectionMode mode) {
   return mode == ati::InternalProjectionMode::SphereLattice ||
          mode == ati::InternalProjectionMode::SphereBorderLattice ||
+         mode == ati::InternalProjectionMode::PureSphericalBoundarySeed ||
          mode == ati::InternalProjectionMode::SphereRayRefine;
 }
 
@@ -90,6 +105,12 @@ ati::ApriltagInternalDetectionOptions MakeDetectionOptionsFromConfig(
   options.max_subpix_displacement2 = config.max_subpix_displacement2;
   options.internal_subpix_displacement_scale = config.internal_subpix_displacement_scale;
   options.max_internal_subpix_displacement = config.max_internal_subpix_displacement;
+  options.ignore_image_evidence_min_quality =
+      config.ignore_image_evidence_min_quality;
+  options.force_internal_seed_from_prediction =
+      config.force_internal_seed_from_prediction;
+  options.bypass_internal_seed_filters =
+      config.bypass_internal_seed_filters;
   return options;
 }
 
@@ -98,7 +119,12 @@ void PrintUsage(const char* program) {
       << "Usage:\n"
       << "  " << program
       << " --image IMAGE_OR_DIR --config APRILTAG_INTERNAL_YAML [--output PNG_OR_DIR]"
-      << " [--mode MODE] [--all] [--show] [--no-subpix]\n\n"
+      << " [--mode MODE] [--all] [--show] [--no-subpix]"
+      << " [--no-output-images] [--no-debug-output]"
+      << " [--final-corners-only] [--corner-radius N]"
+      << " [--rectified-roi-demo] [--rectified-roi-patch-size N]"
+      << " [--rectified-roi-fov-deg DEG]"
+      << " [--rectified-roi-crop-offset-x X --rectified-roi-crop-offset-y Y]\n\n"
       << "Example:\n"
       << "  " << program
       << " --image /data/frame.png --config ./config/example_apriltag_internal.yaml"
@@ -126,6 +152,24 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.show = true;
     } else if (token == "--no-subpix") {
       args.no_subpix = true;
+    } else if (token == "--no-output-images") {
+      args.no_output_images = true;
+    } else if (token == "--no-debug-output") {
+      args.no_debug_output = true;
+    } else if (token == "--final-corners-only") {
+      args.final_corners_only = true;
+    } else if (token == "--rectified-roi-demo") {
+      args.rectified_roi_demo = true;
+    } else if (token == "--rectified-roi-patch-size" && i + 1 < argc) {
+      args.rectified_roi_patch_size = std::max(128, std::stoi(argv[++i]));
+    } else if (token == "--rectified-roi-fov-deg" && i + 1 < argc) {
+      args.rectified_roi_fov_deg = std::max(5.0, std::stod(argv[++i]));
+    } else if (token == "--rectified-roi-crop-offset-x" && i + 1 < argc) {
+      args.rectified_roi_crop_offset_x = std::stod(argv[++i]);
+    } else if (token == "--rectified-roi-crop-offset-y" && i + 1 < argc) {
+      args.rectified_roi_crop_offset_y = std::stod(argv[++i]);
+    } else if (token == "--corner-radius" && i + 1 < argc) {
+      args.corner_radius = std::max(1, std::stoi(argv[++i]));
     } else if (token == "--help" || token == "-h") {
       PrintUsage(argv[0]);
       std::exit(0);
@@ -159,6 +203,12 @@ ati::InternalProjectionMode ParseProjectionModeOrThrow(const std::string& value)
   }
   if (lowered == "sphere_border_lattice" || lowered == "sphere-border-lattice") {
     return ati::InternalProjectionMode::SphereBorderLattice;
+  }
+  if (lowered == "pure_spherical_boundary_seed" ||
+      lowered == "pure-spherical-boundary-seed" ||
+      lowered == "sphere_boundary_seed" ||
+      lowered == "sphere-boundary-seed") {
+    return ati::InternalProjectionMode::PureSphericalBoundarySeed;
   }
   if (lowered == "sphere_ray_refine" || lowered == "sphere-ray-refine") {
     return ati::InternalProjectionMode::SphereRayRefine;
@@ -382,6 +432,73 @@ cv::Mat ToGray(const cv::Mat& image) {
   return gray;
 }
 
+cv::Mat EnsureBgr(const cv::Mat& image) {
+  cv::Mat bgr;
+  if (image.channels() == 1) {
+    cv::cvtColor(image, bgr, cv::COLOR_GRAY2BGR);
+  } else if (image.channels() == 4) {
+    cv::cvtColor(image, bgr, cv::COLOR_BGRA2BGR);
+  } else {
+    bgr = image.clone();
+  }
+  return bgr;
+}
+
+void DrawTinyCorner(cv::Mat* image,
+                    const cv::Point2f& point,
+                    const cv::Scalar& color,
+                    int radius) {
+  if (image == nullptr) {
+    return;
+  }
+  cv::circle(*image, point, radius, color, cv::FILLED, cv::LINE_AA);
+  if (radius >= 2) {
+    cv::circle(*image, point, 1, cv::Scalar(255, 255, 255), cv::FILLED, cv::LINE_AA);
+  }
+}
+
+cv::Mat BuildFinalCornersOnlyOverlay(
+    const ati::ApriltagInternalDetectionResult& result,
+    const cv::Mat& image,
+    int corner_radius) {
+  cv::Mat overlay = EnsureBgr(image);
+  if (!result.tag_detected) {
+    return overlay;
+  }
+
+  const cv::Scalar kOuterColor(0, 255, 255);
+  const cv::Scalar kLCornerColor(0, 220, 0);
+  const cv::Scalar kXCornerColor(255, 0, 255);
+
+  for (const auto& measurement : result.corners) {
+    if (!measurement.valid) {
+      continue;
+    }
+    const cv::Point2f point(static_cast<float>(measurement.image_xy.x()),
+                            static_cast<float>(measurement.image_xy.y()));
+    cv::Scalar color = kLCornerColor;
+    if (measurement.corner_type == ati::CornerType::Outer) {
+      color = kOuterColor;
+    } else if (measurement.corner_type == ati::CornerType::XCorner) {
+      color = kXCornerColor;
+    }
+    DrawTinyCorner(&overlay, point, color, corner_radius);
+  }
+
+  return overlay;
+}
+
+cv::Mat BuildFinalCornersOnlyOverlay(
+    const ati::ApriltagInternalMultiDetectionResult& multi_result,
+    const cv::Mat& image,
+    int corner_radius) {
+  cv::Mat overlay = EnsureBgr(image);
+  for (const ati::ApriltagInternalDetectionResult& result : multi_result.detections) {
+    overlay = BuildFinalCornersOnlyOverlay(result, overlay, corner_radius);
+  }
+  return overlay;
+}
+
 cv::Mat BuildCanonicalPatch(const cv::Mat& image,
                             const ati::ApriltagInternalDetector& detector,
                             const ati::ApriltagInternalDetectionResult& result) {
@@ -407,6 +524,374 @@ cv::Mat BuildCanonicalPatch(const cv::Mat& image,
   cv::warpPerspective(gray, patch, image_to_patch, cv::Size(patch_extent + 1, patch_extent + 1),
                       cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(255));
   return patch;
+}
+
+bool OrderQuadClockwise(const std::vector<cv::Point>& contour,
+                        std::array<cv::Point2f, 4>* ordered) {
+  if (ordered == nullptr || contour.size() < 4) {
+    return false;
+  }
+
+  cv::RotatedRect rect = cv::minAreaRect(contour);
+  cv::Point2f points[4];
+  rect.points(points);
+  std::vector<cv::Point2f> corners(points, points + 4);
+
+  std::sort(corners.begin(), corners.end(),
+            [](const cv::Point2f& lhs, const cv::Point2f& rhs) {
+              return lhs.y < rhs.y;
+            });
+  std::array<cv::Point2f, 2> top{{corners[0], corners[1]}};
+  std::array<cv::Point2f, 2> bottom{{corners[2], corners[3]}};
+  if (top[0].x > top[1].x) {
+    std::swap(top[0], top[1]);
+  }
+  if (bottom[0].x > bottom[1].x) {
+    std::swap(bottom[0], bottom[1]);
+  }
+
+  // The rectified patch convention here is top-left, top-right,
+  // bottom-right, bottom-left. It is only for the demo patch.
+  (*ordered)[0] = top[0];
+  (*ordered)[1] = top[1];
+  (*ordered)[2] = bottom[1];
+  (*ordered)[3] = bottom[0];
+  return true;
+}
+
+bool EstimateBrightBoardQuad(const cv::Mat& gray,
+                             std::array<cv::Point2f, 4>* quad,
+                             cv::Mat* mask_out = nullptr) {
+  if (quad == nullptr || gray.empty()) {
+    return false;
+  }
+
+  cv::Mat blurred;
+  cv::GaussianBlur(gray, blurred, cv::Size(5, 5), 0.0);
+
+  cv::Mat mask;
+  cv::threshold(blurred, mask, 0.0, 255.0, cv::THRESH_BINARY | cv::THRESH_OTSU);
+  cv::morphologyEx(mask, mask, cv::MORPH_CLOSE,
+                   cv::getStructuringElement(cv::MORPH_RECT, cv::Size(21, 21)));
+  cv::morphologyEx(mask, mask, cv::MORPH_OPEN,
+                   cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5)));
+
+  std::vector<std::vector<cv::Point>> contours;
+  cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+  if (contours.empty()) {
+    if (mask_out != nullptr) {
+      *mask_out = mask;
+    }
+    return false;
+  }
+
+  const double image_area = static_cast<double>(gray.cols) * gray.rows;
+  int best_index = -1;
+  double best_area = 0.0;
+  for (std::size_t index = 0; index < contours.size(); ++index) {
+    const double area = std::fabs(cv::contourArea(contours[index]));
+    if (area > best_area && area > image_area * 0.05) {
+      best_area = area;
+      best_index = static_cast<int>(index);
+    }
+  }
+  if (best_index < 0) {
+    if (mask_out != nullptr) {
+      *mask_out = mask;
+    }
+    return false;
+  }
+
+  if (mask_out != nullptr) {
+    *mask_out = mask;
+  }
+  return OrderQuadClockwise(contours[static_cast<std::size_t>(best_index)], quad);
+}
+
+bool NormalizeRay(Eigen::Vector3d* ray) {
+  if (ray == nullptr) {
+    return false;
+  }
+  const double norm = ray->norm();
+  if (!std::isfinite(norm) || norm <= 1e-12) {
+    return false;
+  }
+  *ray /= norm;
+  return true;
+}
+
+bool BuildLocalDsPatchFrame(const ati::DoubleSphereCameraModel& camera,
+                            const cv::Point2f& full_image_center,
+                            Eigen::Vector3d* center_ray,
+                            Eigen::Vector3d* tangent_x,
+                            Eigen::Vector3d* tangent_y) {
+  if (center_ray == nullptr || tangent_x == nullptr || tangent_y == nullptr) {
+    return false;
+  }
+  if (!camera.keypointToEuclidean(
+          Eigen::Vector2d(full_image_center.x, full_image_center.y), center_ray) ||
+      !NormalizeRay(center_ray)) {
+    return false;
+  }
+
+  Eigen::Vector3d ray_x = Eigen::Vector3d::Zero();
+  Eigen::Vector3d ray_y = Eigen::Vector3d::Zero();
+  constexpr double kDeltaPx = 24.0;
+  if (!camera.keypointToEuclidean(
+          Eigen::Vector2d(full_image_center.x + kDeltaPx, full_image_center.y),
+          &ray_x) ||
+      !camera.keypointToEuclidean(
+          Eigen::Vector2d(full_image_center.x, full_image_center.y + kDeltaPx),
+          &ray_y) ||
+      !NormalizeRay(&ray_x) || !NormalizeRay(&ray_y)) {
+    return false;
+  }
+
+  *tangent_x = ray_x - (*center_ray) * center_ray->dot(ray_x);
+  if (!NormalizeRay(tangent_x)) {
+    return false;
+  }
+  *tangent_y = ray_y - (*center_ray) * center_ray->dot(ray_y);
+  *tangent_y -= (*tangent_x) * tangent_x->dot(*tangent_y);
+  if (!NormalizeRay(tangent_y)) {
+    return false;
+  }
+  if (center_ray->dot(tangent_x->cross(*tangent_y)) < 0.0) {
+    *tangent_y = -*tangent_y;
+  }
+  return true;
+}
+
+bool BuildDsRaySpacePatch(const cv::Mat& gray_crop,
+                          const ati::DoubleSphereCameraModel& camera,
+                          const cv::Point2f& crop_center,
+                          const cv::Point2f& crop_offset_in_full_image,
+                          double fov_deg,
+                          int patch_size,
+                          cv::Mat* patch) {
+  if (patch == nullptr || gray_crop.empty()) {
+    return false;
+  }
+  patch->release();
+  const cv::Point2f full_center = crop_center + crop_offset_in_full_image;
+
+  Eigen::Vector3d center_ray = Eigen::Vector3d::Zero();
+  Eigen::Vector3d tangent_x = Eigen::Vector3d::Zero();
+  Eigen::Vector3d tangent_y = Eigen::Vector3d::Zero();
+  if (!BuildLocalDsPatchFrame(camera, full_center, &center_ray, &tangent_x, &tangent_y)) {
+    return false;
+  }
+
+  const double fov_rad = fov_deg * 3.14159265358979323846 / 180.0;
+  const double focal = 0.5 * static_cast<double>(patch_size) / std::tan(0.5 * fov_rad);
+  const double cx = 0.5 * static_cast<double>(patch_size - 1);
+  const double cy = 0.5 * static_cast<double>(patch_size - 1);
+
+  cv::Mat map_x(patch_size, patch_size, CV_32F);
+  cv::Mat map_y(patch_size, patch_size, CV_32F);
+  for (int y = 0; y < patch_size; ++y) {
+    for (int x = 0; x < patch_size; ++x) {
+      const double nx = (static_cast<double>(x) - cx) / focal;
+      const double ny = (static_cast<double>(y) - cy) / focal;
+      Eigen::Vector3d ray = center_ray + nx * tangent_x + ny * tangent_y;
+      if (!NormalizeRay(&ray)) {
+        map_x.at<float>(y, x) = -1.0f;
+        map_y.at<float>(y, x) = -1.0f;
+        continue;
+      }
+
+      Eigen::Vector2d full_keypoint = Eigen::Vector2d::Zero();
+      if (!camera.vsEuclideanToKeypoint(ray, &full_keypoint)) {
+        map_x.at<float>(y, x) = -1.0f;
+        map_y.at<float>(y, x) = -1.0f;
+        continue;
+      }
+
+      map_x.at<float>(y, x) =
+          static_cast<float>(full_keypoint.x() - crop_offset_in_full_image.x);
+      map_y.at<float>(y, x) =
+          static_cast<float>(full_keypoint.y() - crop_offset_in_full_image.y);
+    }
+  }
+
+  cv::remap(gray_crop, *patch, map_x, map_y, cv::INTER_LINEAR,
+            cv::BORDER_CONSTANT, cv::Scalar(127));
+  return !patch->empty();
+}
+
+std::string RectifiedRoiPatchPathForRequestedOutput(const std::string& requested_output_path) {
+  return AppendStemSuffix(requested_output_path, "_rectified_roi_patch");
+}
+
+std::string RectifiedRoiOverlayPathForRequestedOutput(const std::string& requested_output_path) {
+  return AppendStemSuffix(requested_output_path, "_rectified_roi_overlay");
+}
+
+std::string RectifiedRoiSourcePathForRequestedOutput(const std::string& requested_output_path) {
+  return AppendStemSuffix(requested_output_path, "_rectified_roi_source");
+}
+
+void RunRectifiedRoiDemo(const cv::Mat& image,
+                         const std::string& requested_output_path,
+                         const ati::DoubleSphereCameraModel* camera,
+                         const cv::Point2f& crop_offset_in_full_image,
+                         double fov_deg,
+                         int patch_size) {
+  const cv::Mat gray = ToGray(image);
+  std::array<cv::Point2f, 4> quad{};
+  cv::Mat mask;
+  if (!EstimateBrightBoardQuad(gray, &quad, &mask)) {
+    std::cout << "Rectified ROI demo\n";
+    std::cout << "  status: failed_to_estimate_board_quad\n";
+    return;
+  }
+
+  const int size = std::max(128, patch_size);
+  cv::Point2f quad_center(0.0f, 0.0f);
+  for (const cv::Point2f& corner : quad) {
+    quad_center += corner;
+  }
+  quad_center *= 0.25f;
+
+  std::vector<cv::Point2f> src(quad.begin(), quad.end());
+  std::vector<cv::Point2f> dst{
+      cv::Point2f(0.0f, 0.0f),
+      cv::Point2f(static_cast<float>(size - 1), 0.0f),
+      cv::Point2f(static_cast<float>(size - 1), static_cast<float>(size - 1)),
+      cv::Point2f(0.0f, static_cast<float>(size - 1)),
+  };
+  const cv::Mat H = cv::getPerspectiveTransform(src, dst);
+  cv::Mat patch;
+  cv::warpPerspective(gray, patch, H, cv::Size(size, size), cv::INTER_LINEAR,
+                      cv::BORDER_CONSTANT, cv::Scalar(255));
+
+  AprilTags::TagDetector tag_detector(AprilTags::tagCodes36h11, 2);
+  const std::vector<AprilTags::TagDetection> perspective_detections =
+      tag_detector.extractTags(patch);
+
+  cv::Mat ds_patch;
+  std::vector<AprilTags::TagDetection> ds_detections;
+  bool ds_patch_success = false;
+  if (camera != nullptr && camera->IsValid()) {
+    ds_patch_success = BuildDsRaySpacePatch(gray, *camera, quad_center,
+                                            crop_offset_in_full_image, fov_deg,
+                                            size, &ds_patch);
+    if (ds_patch_success) {
+      ds_detections = tag_detector.extractTags(ds_patch);
+    }
+  }
+
+  cv::Mat source_overlay = EnsureBgr(image);
+  for (int index = 0; index < 4; ++index) {
+    cv::line(source_overlay, quad[static_cast<std::size_t>(index)],
+             quad[static_cast<std::size_t>((index + 1) % 4)],
+             cv::Scalar(0, 255, 255), 3, cv::LINE_AA);
+    cv::putText(source_overlay, std::to_string(index),
+                quad[static_cast<std::size_t>(index)] + cv::Point2f(8.0f, -8.0f),
+                cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2,
+                cv::LINE_AA);
+  }
+
+  auto draw_detections_on_patch = [](const cv::Mat& gray_patch,
+                                     const std::vector<AprilTags::TagDetection>& detections) {
+    cv::Mat overlay;
+    cv::cvtColor(gray_patch, overlay, cv::COLOR_GRAY2BGR);
+    for (const AprilTags::TagDetection& detection : detections) {
+      std::array<cv::Point2f, 4> corners{};
+      for (int index = 0; index < 4; ++index) {
+        corners[static_cast<std::size_t>(index)] =
+            cv::Point2f(detection.p[index].first, detection.p[index].second);
+      }
+      const cv::Scalar color = detection.good ? cv::Scalar(0, 220, 0)
+                                              : cv::Scalar(0, 165, 255);
+      for (int index = 0; index < 4; ++index) {
+        cv::line(overlay, corners[static_cast<std::size_t>(index)],
+                 corners[static_cast<std::size_t>((index + 1) % 4)],
+                 color, 2, cv::LINE_AA);
+      }
+      cv::putText(overlay,
+                  "id=" + std::to_string(detection.id) +
+                      " h=" + std::to_string(detection.hammingDistance),
+                  cv::Point(static_cast<int>(std::lround(detection.cxy.first)) + 8,
+                            static_cast<int>(std::lround(detection.cxy.second)) + 8),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv::LINE_AA);
+    }
+    return overlay;
+  };
+
+  cv::Mat patch_overlay = draw_detections_on_patch(patch, perspective_detections);
+  cv::putText(patch_overlay, "homography rectified patch", cv::Point(12, 28),
+              cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 255, 255), 2,
+              cv::LINE_AA);
+
+  cv::Mat ds_patch_overlay;
+  if (ds_patch_success) {
+    ds_patch_overlay = draw_detections_on_patch(ds_patch, ds_detections);
+    cv::putText(ds_patch_overlay, "DS ray-space local patch", cv::Point(12, 28),
+                cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 255, 255), 2,
+                cv::LINE_AA);
+  }
+
+  const std::string source_path =
+      RectifiedRoiSourcePathForRequestedOutput(requested_output_path);
+  const std::string patch_path =
+      RectifiedRoiPatchPathForRequestedOutput(requested_output_path);
+  const std::string overlay_path =
+      RectifiedRoiOverlayPathForRequestedOutput(requested_output_path);
+  const std::string ds_patch_path =
+      AppendStemSuffix(requested_output_path, "_ds_ray_patch");
+  const std::string ds_overlay_path =
+      AppendStemSuffix(requested_output_path, "_ds_ray_overlay");
+  cv::imwrite(source_path, source_overlay);
+  cv::imwrite(patch_path, patch);
+  cv::imwrite(overlay_path, patch_overlay);
+  if (ds_patch_success) {
+    cv::imwrite(ds_patch_path, ds_patch);
+    cv::imwrite(ds_overlay_path, ds_patch_overlay);
+  }
+
+  std::cout << "Rectified ROI demo\n";
+  std::cout << "  estimated_board_quad: ";
+  for (int index = 0; index < 4; ++index) {
+    if (index > 0) {
+      std::cout << " ";
+    }
+    std::cout << "(" << std::lround(quad[static_cast<std::size_t>(index)].x)
+              << "," << std::lround(quad[static_cast<std::size_t>(index)].y)
+              << ")";
+  }
+  std::cout << "\n";
+  std::cout << "  patch_size: " << size << "\n";
+  std::cout << "  homography_detection_count: "
+            << perspective_detections.size() << "\n";
+  for (const AprilTags::TagDetection& detection : perspective_detections) {
+    std::cout << "    id=" << detection.id
+              << " good=" << (detection.good ? 1 : 0)
+              << " hamming=" << detection.hammingDistance
+              << " center=(" << std::lround(detection.cxy.first)
+              << "," << std::lround(detection.cxy.second) << ")\n";
+  }
+  std::cout << "  ds_ray_patch_success: " << (ds_patch_success ? 1 : 0)
+            << "\n";
+  std::cout << "  ds_ray_fov_deg: " << fov_deg << "\n";
+  std::cout << "  crop_offset_full_image: ("
+            << crop_offset_in_full_image.x << ","
+            << crop_offset_in_full_image.y << ")\n";
+  std::cout << "  ds_ray_detection_count: " << ds_detections.size() << "\n";
+  for (const AprilTags::TagDetection& detection : ds_detections) {
+    std::cout << "    id=" << detection.id
+              << " good=" << (detection.good ? 1 : 0)
+              << " hamming=" << detection.hammingDistance
+              << " center=(" << std::lround(detection.cxy.first)
+              << "," << std::lround(detection.cxy.second) << ")\n";
+  }
+  std::cout << "  source_overlay: " << source_path << "\n";
+  std::cout << "  rectified_patch: " << patch_path << "\n";
+  std::cout << "  rectified_overlay: " << overlay_path << "\n";
+  if (ds_patch_success) {
+    std::cout << "  ds_ray_patch: " << ds_patch_path << "\n";
+    std::cout << "  ds_ray_overlay: " << ds_overlay_path << "\n";
+  }
 }
 
 bool UnprojectImagePointsToRays(const ati::DoubleSphereCameraModel& camera,
@@ -937,6 +1422,7 @@ cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
   }
 
   const cv::Scalar kPredictedColor(0, 165, 255);
+  const cv::Scalar kBorderSeedColor(255, 180, 60);
   const cv::Scalar kSeedColor(255, 80, 255);
   const cv::Scalar kRefinedColor(0, 220, 80);
   const cv::Scalar kBoundaryUColor(190, 190, 190);
@@ -961,10 +1447,16 @@ cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
                          debug.sphere_seed_image.x < static_cast<float>(result.image_size.width) &&
                          debug.sphere_seed_image.y >= 0.0f &&
                          debug.sphere_seed_image.y < static_cast<float>(result.image_size.height);
-    const bool refined_ok = debug.refined_image.x >= 0.0f &&
-                            debug.refined_image.x < static_cast<float>(result.image_size.width) &&
-                            debug.refined_image.y >= 0.0f &&
-                            debug.refined_image.y < static_cast<float>(result.image_size.height);
+    const bool border_seed_ok =
+        debug.border_seed_valid &&
+        debug.border_seed_image.x >= 0.0f &&
+        debug.border_seed_image.x < static_cast<float>(result.image_size.width) &&
+        debug.border_seed_image.y >= 0.0f &&
+        debug.border_seed_image.y < static_cast<float>(result.image_size.height);
+	    const bool refined_ok = debug.refined_image.x >= 0.0f &&
+	                            debug.refined_image.x < static_cast<float>(result.image_size.width) &&
+	                            debug.refined_image.y >= 0.0f &&
+	                            debug.refined_image.y < static_cast<float>(result.image_size.height);
     if (!predicted_ok) {
       continue;
     }
@@ -997,9 +1489,17 @@ cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
     cv::circle(overlay, debug.predicted_image, 2, cv::Scalar(255, 255, 255), cv::FILLED, cv::LINE_AA);
     cv::circle(overlay, debug.predicted_image, 1, kPredictedColor, cv::FILLED, cv::LINE_AA);
 
-    if (seed_ok) {
-      cv::arrowedLine(overlay, debug.predicted_image, debug.sphere_seed_image,
-                      kArrow1Color, 1, cv::LINE_AA, 0, 0.15);
+    if (border_seed_ok) {
+      cv::arrowedLine(overlay, debug.predicted_image, debug.border_seed_image,
+                      kArrow1Color, 1, cv::LINE_AA, 0, 0.12);
+      cv::drawMarker(overlay, debug.border_seed_image, cv::Scalar(255, 255, 255),
+                     cv::MARKER_TRIANGLE_UP, 8, 3, cv::LINE_AA);
+      cv::drawMarker(overlay, debug.border_seed_image, kBorderSeedColor,
+                     cv::MARKER_TRIANGLE_UP, 6, 1, cv::LINE_AA);
+    }
+	    if (seed_ok) {
+      cv::arrowedLine(overlay, border_seed_ok ? debug.border_seed_image : debug.predicted_image,
+                      debug.sphere_seed_image, kArrow1Color, 1, cv::LINE_AA, 0, 0.15);
       if (result.projection_mode == ati::InternalProjectionMode::SphereRayRefine &&
           debug.ray_refine_trust_radius > 0.0) {
         const int trust_radius_px = std::max(
@@ -1009,12 +1509,12 @@ cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
       }
       cv::drawMarker(overlay, debug.sphere_seed_image, cv::Scalar(255, 255, 255),
                      cv::MARKER_DIAMOND, 8, 3, cv::LINE_AA);
-      cv::drawMarker(overlay, debug.sphere_seed_image, kSeedColor,
-                     cv::MARKER_DIAMOND, 6, 1, cv::LINE_AA);
-    }
-    if (seed_ok && refined_ok) {
+	      cv::drawMarker(overlay, debug.sphere_seed_image, kSeedColor,
+	                     cv::MARKER_DIAMOND, 6, 1, cv::LINE_AA);
+	    }
+	    if (seed_ok && refined_ok) {
       cv::arrowedLine(overlay, debug.sphere_seed_image, debug.refined_image,
-                      kArrow2Color, 1, cv::LINE_AA, 0, 0.15);
+	                      kArrow2Color, 1, cv::LINE_AA, 0, 0.15);
     } else if (predicted_ok && refined_ok) {
       cv::arrowedLine(overlay, debug.predicted_image, debug.refined_image,
                       kArrow2Color, 1, cv::LINE_AA, 0, 0.15);
@@ -1029,12 +1529,12 @@ cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
 
   const std::string title =
       result.projection_mode == ati::InternalProjectionMode::SphereRayRefine
-          ? "Internal Ray-Seed Overlay: P -> SS(ray) -> R(subpix)"
-          : "Internal Sphere Seed Overlay: P -> SS -> R";
+          ? "Internal Ray-Seed Overlay: P -> BC -> SS(ray) -> R(subpix)"
+          : "Internal Sphere Seed Overlay: P -> BC -> SS -> R";
   const std::string legend =
       result.projection_mode == ati::InternalProjectionMode::SphereRayRefine
-          ? "Legend: P orange cross, SS magenta diamond, R green square, gray circle: predicted-ray trust region, gray cross: aligned lattice boundaries"
-          : "Legend: P orange cross, SS magenta diamond, R green square, gray cross: aligned lattice boundaries";
+          ? "Legend: P orange cross, BC blue triangle, SS magenta diamond, R green square, gray circle: predicted-ray trust region"
+          : "Legend: P orange cross, BC blue triangle, SS magenta diamond, R green square, gray cross: aligned lattice boundaries";
   cv::putText(overlay, title,
               cv::Point(20, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 3,
               cv::LINE_AA);
@@ -1555,7 +2055,8 @@ InternalMetricsSummary SummarizeInternalCorners(
 }
 
 void PrintBorderConditionedDiagnostics(const ati::ApriltagInternalDetectionResult& result) {
-  if (result.projection_mode != ati::InternalProjectionMode::SphereBorderLattice) {
+  if (result.projection_mode != ati::InternalProjectionMode::SphereBorderLattice &&
+      result.projection_mode != ati::InternalProjectionMode::PureSphericalBoundarySeed) {
     return;
   }
 
@@ -1567,7 +2068,6 @@ void PrintBorderConditionedDiagnostics(const ati::ApriltagInternalDetectionResul
   } else {
     std::cout << "  mean |P-BC|: (no valid BC points)\n";
   }
-
   const std::array<const char*, 4> edge_names{{"top", "right", "bottom", "left"}};
   for (std::size_t edge_index = 0; edge_index < edge_names.size(); ++edge_index) {
     std::cout << "  BC edge " << edge_names[edge_index] << ": ";
@@ -1593,11 +2093,20 @@ int main(int argc, char** argv) {
     if (!args.mode_override.empty()) {
       config.internal_projection_mode = ParseProjectionModeOrThrow(args.mode_override);
     }
+    if (args.no_debug_output) {
+      config.enable_debug_output = false;
+    }
     // Respect the method configured in YAML unless --mode explicitly overrides it.
     // This entry point still fixes the outer path to the interactive default:
     // outer: C -> adaptive subpixel. Internal mode is now whatever the config requests.
     config.outer_detector_config.enable_outer_spherical_refinement = false;
     config.outer_detector_config.do_outer_subpix_refinement = true;
+    ati::DoubleSphereCameraModel rectified_roi_camera =
+        ati::DoubleSphereCameraModel::FromConfig(config.intermediate_camera);
+    if (args.rectified_roi_demo && !rectified_roi_camera.IsValid()) {
+      std::cout << "warning: --rectified-roi-demo could not build a valid DS "
+                   "camera from config; DS ray-space patch will be skipped.\n";
+    }
     ati::ApriltagInternalDetectionOptions options = MakeDetectionOptionsFromConfig(config);
     options.do_subpix_refinement = !args.no_subpix;
 
@@ -1610,7 +2119,6 @@ int main(int argc, char** argv) {
         throw std::runtime_error("Failed to read image: " + image_path);
       }
 
-      EnsureParentDirectoryExists(requested_output_path);
       const std::string minute_stamp = BuildMinuteStamp();
 
       std::cout << "\n==================================================\n";
@@ -1620,15 +2128,62 @@ int main(int argc, char** argv) {
         const ati::ApriltagInternalMultiDetectionResult multi_result =
             detector.DetectMultiple(image);
 
-        cv::Mat combined_overlay = image.clone();
-        detector.DrawDetections(multi_result, &combined_overlay);
+        std::string output_path;
+        cv::Mat combined_overlay;
+        if (!args.no_output_images || show_image || args.rectified_roi_demo) {
+          EnsureParentDirectoryExists(requested_output_path);
+          combined_overlay = args.final_corners_only
+                                 ? BuildFinalCornersOnlyOverlay(
+                                       multi_result, image, args.corner_radius)
+                                 : image.clone();
+          if (!args.final_corners_only) {
+            detector.DrawDetections(multi_result, &combined_overlay);
+          }
 
-        const std::string output_path = AppendMinuteStamp(requested_output_path, minute_stamp);
-        if (!cv::imwrite(output_path, combined_overlay)) {
-          throw std::runtime_error("Failed to write output image: " + output_path);
+          output_path = AppendMinuteStamp(requested_output_path, minute_stamp);
+          if (!cv::imwrite(output_path, combined_overlay)) {
+            throw std::runtime_error("Failed to write output image: " + output_path);
+          }
+          if (config.enable_debug_output) {
+            for (const ati::ApriltagInternalDetectionResult& board_result :
+                 multi_result.detections) {
+              cv::Mat internal_seed_overlay =
+                  ati::BuildInternalSeedOverlay(image, board_result);
+              if (!internal_seed_overlay.empty()) {
+                const std::string seed_path = AppendStemSuffix(
+                    output_path,
+                    "_board" + std::to_string(board_result.board_id) +
+                        "_internal_seed");
+                if (!cv::imwrite(seed_path, internal_seed_overlay)) {
+                  throw std::runtime_error(
+                      "Failed to write internal seed overlay: " + seed_path);
+                }
+              }
+              cv::Mat internal_sphere_view =
+                  ati::BuildInternalSphereDebugView(board_result);
+              if (!internal_sphere_view.empty()) {
+                const std::string sphere_path = AppendStemSuffix(
+                    output_path,
+                    "_board" + std::to_string(board_result.board_id) +
+                        "_internal_sphere");
+                if (!cv::imwrite(sphere_path, internal_sphere_view)) {
+                  throw std::runtime_error(
+                      "Failed to write internal sphere view: " + sphere_path);
+                }
+              }
+            }
+          }
+          if (args.rectified_roi_demo) {
+            RunRectifiedRoiDemo(
+                image, output_path,
+                rectified_roi_camera.IsValid() ? &rectified_roi_camera : nullptr,
+                cv::Point2f(static_cast<float>(args.rectified_roi_crop_offset_x),
+                            static_cast<float>(args.rectified_roi_crop_offset_y)),
+                args.rectified_roi_fov_deg, args.rectified_roi_patch_size);
+          }
         }
 
-        std::cout << "Detection summary\n";
+      std::cout << "Detection summary\n";
         std::cout << "  requested boards: [" << JoinBoardIds(multi_result.requested_board_ids)
                   << "]\n";
         std::cout << "  any detected: " << (multi_result.AnyTagDetected() ? "yes" : "no")
@@ -1636,7 +2191,8 @@ int main(int argc, char** argv) {
         std::cout << "  any success: " << (multi_result.AnySuccess() ? "yes" : "no") << "\n";
         std::cout << "  projection mode: " << ati::ToString(config.internal_projection_mode)
                   << "\n";
-        std::cout << "  combined overlay: " << output_path << "\n";
+        std::cout << "  combined overlay: "
+                  << (output_path.empty() ? "disabled" : output_path) << "\n";
 
         for (const ati::ApriltagInternalDetectionResult& board_result :
              multi_result.detections) {
@@ -1686,6 +2242,15 @@ int main(int argc, char** argv) {
                         << " line_inside=" << (debug.line_inside ? "yes" : "no")
                         << " line_gap=" << debug.line_seed_gap
                         << " line_seed=" << (debug.line_seed_accepted ? "used" : "rejected")
+                        << " image_line=" << (debug.image_line_valid ? "yes" : "no")
+                        << " image_line_corner=("
+                        << std::lround(debug.image_line_corner.x) << ","
+                        << std::lround(debug.image_line_corner.y) << ")"
+                        << " image_line_res=(" << debug.prev_image_line_residual
+                        << "," << debug.next_image_line_residual << ")"
+                        << " image_line_support=("
+                        << debug.prev_image_line_support_count << ","
+                        << debug.next_image_line_support_count << ")"
                         << "\n";
             }
             std::cout << std::defaultfloat << std::setprecision(6);
@@ -1703,12 +2268,30 @@ int main(int argc, char** argv) {
 
       const ati::ApriltagInternalDetectionResult result = detector.Detect(image);
 
-      cv::Mat overlay = image.clone();
-      detector.DrawDetections(result, &overlay);
+      std::string output_path;
+      cv::Mat overlay;
+      if (!args.no_output_images || show_image || args.rectified_roi_demo) {
+        EnsureParentDirectoryExists(requested_output_path);
+        overlay = args.final_corners_only
+                      ? BuildFinalCornersOnlyOverlay(
+                            result, image, args.corner_radius)
+                      : image.clone();
+        if (!args.final_corners_only) {
+          detector.DrawDetections(result, &overlay);
+        }
 
-      const std::string output_path = AppendMinuteStamp(requested_output_path, minute_stamp);
-      if (!cv::imwrite(output_path, overlay)) {
-        throw std::runtime_error("Failed to write output image: " + output_path);
+        output_path = AppendMinuteStamp(requested_output_path, minute_stamp);
+        if (!cv::imwrite(output_path, overlay)) {
+          throw std::runtime_error("Failed to write output image: " + output_path);
+        }
+        if (args.rectified_roi_demo) {
+          RunRectifiedRoiDemo(
+              image, output_path,
+              rectified_roi_camera.IsValid() ? &rectified_roi_camera : nullptr,
+              cv::Point2f(static_cast<float>(args.rectified_roi_crop_offset_x),
+                          static_cast<float>(args.rectified_roi_crop_offset_y)),
+              args.rectified_roi_fov_deg, args.rectified_roi_patch_size);
+        }
       }
 
       std::cout << "Detection summary\n";
@@ -1729,7 +2312,8 @@ int main(int argc, char** argv) {
       std::cout << "  projection mode: " << ati::ToString(result.projection_mode) << "\n";
       std::cout << "  valid points: " << result.valid_corner_count << "\n";
       std::cout << "  valid internal points: " << result.valid_internal_corner_count << "\n";
-      std::cout << "  output image: " << output_path << "\n";
+      std::cout << "  output image: "
+                << (output_path.empty() ? "disabled" : output_path) << "\n";
 
       const InternalMetricsSummary metrics =
           SummarizeInternalCorners(result.internal_corner_debug);
@@ -1760,6 +2344,15 @@ int main(int argc, char** argv) {
                     << " line_inside=" << (debug.line_inside ? "yes" : "no")
                     << " line_gap=" << debug.line_seed_gap
                     << " line_seed=" << (debug.line_seed_accepted ? "used" : "rejected")
+                    << " image_line=" << (debug.image_line_valid ? "yes" : "no")
+                    << " image_line_corner=("
+                    << std::lround(debug.image_line_corner.x) << ","
+                    << std::lround(debug.image_line_corner.y) << ")"
+                    << " image_line_res=(" << debug.prev_image_line_residual
+                    << "," << debug.next_image_line_residual << ")"
+                    << " image_line_support=("
+                    << debug.prev_image_line_support_count << ","
+                    << debug.next_image_line_support_count << ")"
                     << "\n";
         }
         std::cout << std::defaultfloat << std::setprecision(6);

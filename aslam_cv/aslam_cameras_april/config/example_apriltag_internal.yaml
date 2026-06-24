@@ -35,9 +35,26 @@ enable_outer_spherical_refinement: false
 outer_spherical_use_initial_camera: true # 使用粗初始值
 do_outer_subpix_refinement: true
 # If outer subpix is enabled, subpix radius = outer_subpix_scale * (tagSpacing * local_scale)
-outer_subpix_scale: 0.15
+outer_subpix_scale: 0.3
+# Near-board outer-corner protection: keep normal-area boards on
+# outer_subpix_scale, but enlarge the verification/subpix window when a board
+# occupies a large image footprint.  This primarily handles close-distance
+# frames, where the true outer corner can fall outside the normal local window.
+# High-polar + near-border observations are auxiliary triggers, not mandatory
+# conditions for the boost.
+enable_close_edge_outer_subpix_boost: true
+close_edge_outer_subpix_area_ratio: 0.012
+close_edge_outer_subpix_min_polar_deg: 40.0
+close_edge_outer_subpix_border_ratio: 0.25
+close_edge_outer_subpix_multiplier: 1.3
 outer_refine_gate_scale: 0.025
 outer_refine_gate_min: 6.0
+
+# Keep detector-local id-bracket rescue disabled for the multi-board rig.
+# Board ids are not a spatial ordering; layout-aware rescue is handled by
+# Stage5/Stage6 geometry-prior code using T_reference_board(board_id).
+enable_anonymous_tag_like_geometry_rescue: false
+enable_interpolated_missing_board_geometry_rescue: false
 
 # Manual intermediate camera is now fallback/debug input, not the default primary path.
 # Either keep the inline Kalibr DS model below, or replace it with:

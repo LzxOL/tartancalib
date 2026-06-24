@@ -483,6 +483,7 @@ int main(int argc, char** argv) {
     benchmark_input.all_frames = all_frames;
     benchmark_input.baseline_options = baseline_options;
     benchmark_input.backend_options = backend_options;
+    benchmark_input.final_backend_options = backend_options;
     benchmark_input.kalibr_reference = kalibr_reference;
     benchmark_input.dataset_label = dataset_label;
 

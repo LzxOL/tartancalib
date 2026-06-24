@@ -79,14 +79,10 @@ bool RefineBoardPoseFromInitializedFrames(const SolverState& state,
 
 IntermediateCameraConfig MakeCameraConfig(const OuterBootstrapCameraIntrinsics& intrinsics) {
   IntermediateCameraConfig config;
-  config.camera_model = "ds";
-  config.distortion_model = "none";
-  config.intrinsics.push_back(intrinsics.xi);
-  config.intrinsics.push_back(intrinsics.alpha);
-  config.intrinsics.push_back(intrinsics.fu);
-  config.intrinsics.push_back(intrinsics.fv);
-  config.intrinsics.push_back(intrinsics.cu);
-  config.intrinsics.push_back(intrinsics.cv);
+  config.camera_model = intrinsics.camera_model;
+  config.distortion_model = intrinsics.distortion_model;
+  config.intrinsics = intrinsics.IntrinsicsVector();
+  config.distortion_coeffs = intrinsics.DistortionVector();
   config.resolution.push_back(intrinsics.resolution.width);
   config.resolution.push_back(intrinsics.resolution.height);
   return config;
@@ -94,7 +90,14 @@ IntermediateCameraConfig MakeCameraConfig(const OuterBootstrapCameraIntrinsics& 
 
 OuterBootstrapCameraIntrinsics MakeInitialIntrinsics(const cv::Size& resolution,
                                                      const OuterBootstrapOptions& options) {
+  if (options.initial_camera.IsValid()) {
+    OuterBootstrapCameraIntrinsics initial = options.initial_camera;
+    initial.resolution = resolution;
+    return initial;
+  }
   OuterBootstrapCameraIntrinsics intrinsics;
+  intrinsics.camera_model = "ds";
+  intrinsics.distortion_model = "none";
   intrinsics.resolution = resolution;
   intrinsics.xi = options.init_xi;
   intrinsics.alpha = options.init_alpha;
@@ -109,34 +112,51 @@ bool ClampIntrinsicsInPlace(OuterBootstrapCameraIntrinsics* intrinsics) {
   if (intrinsics == nullptr) {
     throw std::runtime_error("ClampIntrinsicsInPlace requires a valid pointer.");
   }
-  intrinsics->xi = std::max(-0.95, std::min(2.5, intrinsics->xi));
-  intrinsics->alpha = std::max(0.05, std::min(0.95, intrinsics->alpha));
   intrinsics->fu = std::max(50.0, std::min(3.0 * intrinsics->resolution.width, intrinsics->fu));
   intrinsics->fv = std::max(50.0, std::min(3.0 * intrinsics->resolution.height, intrinsics->fv));
   intrinsics->cu =
       std::max(0.0, std::min(static_cast<double>(intrinsics->resolution.width), intrinsics->cu));
   intrinsics->cv =
       std::max(0.0, std::min(static_cast<double>(intrinsics->resolution.height), intrinsics->cv));
+  const std::string family = intrinsics->NormalizedFamilyString();
+  if (family == "ds-none") {
+    intrinsics->xi = std::max(-0.95, std::min(2.5, intrinsics->xi));
+    intrinsics->alpha = std::max(0.05, std::min(0.95, intrinsics->alpha));
+    intrinsics->distortion_coeffs.clear();
+  } else if (family == "eucm-none") {
+    intrinsics->alpha = std::max(0.05, std::min(0.95, intrinsics->alpha));
+    intrinsics->beta = std::max(0.05, std::min(2.5, intrinsics->beta));
+    intrinsics->distortion_coeffs.clear();
+  } else if (family == "pinhole-equi") {
+    std::vector<double> clamped = intrinsics->distortion_coeffs;
+    clamped.resize(4, 0.0);
+    for (double& coeff : clamped) {
+      coeff = std::max(-2.0, std::min(2.0, coeff));
+    }
+    intrinsics->distortion_coeffs = clamped;
+  } else {
+    return false;
+  }
   return intrinsics->IsValid();
 }
 
-Eigen::Matrix<double, 6, 1> ToVector(const OuterBootstrapCameraIntrinsics& intrinsics) {
-  Eigen::Matrix<double, 6, 1> vector;
-  vector << intrinsics.xi, intrinsics.alpha, intrinsics.fu, intrinsics.fv, intrinsics.cu,
-      intrinsics.cv;
+Eigen::VectorXd ToVector(const OuterBootstrapCameraIntrinsics& intrinsics) {
+  const std::vector<double> parameters = intrinsics.CombinedParameterVector();
+  Eigen::VectorXd vector(static_cast<int>(parameters.size()));
+  for (int index = 0; index < vector.rows(); ++index) {
+    vector[index] = parameters[static_cast<std::size_t>(index)];
+  }
   return vector;
 }
 
-OuterBootstrapCameraIntrinsics FromVector(const Eigen::Matrix<double, 6, 1>& vector,
-                                          const cv::Size& resolution) {
-  OuterBootstrapCameraIntrinsics intrinsics;
-  intrinsics.resolution = resolution;
-  intrinsics.xi = vector[0];
-  intrinsics.alpha = vector[1];
-  intrinsics.fu = vector[2];
-  intrinsics.fv = vector[3];
-  intrinsics.cu = vector[4];
-  intrinsics.cv = vector[5];
+OuterBootstrapCameraIntrinsics FromVector(const Eigen::VectorXd& vector,
+                                          const OuterBootstrapCameraIntrinsics& prototype) {
+  OuterBootstrapCameraIntrinsics intrinsics = prototype;
+  std::vector<double> parameters(static_cast<std::size_t>(vector.rows()));
+  for (int index = 0; index < vector.rows(); ++index) {
+    parameters[static_cast<std::size_t>(index)] = vector[index];
+  }
+  intrinsics.SetCombinedParameterVector(parameters);
   return intrinsics;
 }
 
@@ -1166,31 +1186,47 @@ bool OptimizeIntrinsics(const SolverState& state,
 
   double lambda = 1e-3;
   double best_cost = residuals.squaredNorm();
-  Eigen::Matrix<double, 6, 1> parameters = ToVector(*intrinsics);
-  const Eigen::Matrix<double, 6, 1> anchor = ToVector(anchor_intrinsics);
-  Eigen::Matrix<double, 6, 1> prior_sigma;
-  prior_sigma << 0.20, 0.12,
-      0.20 * static_cast<double>(intrinsics->resolution.width),
-      0.20 * static_cast<double>(intrinsics->resolution.height),
-      0.03 * static_cast<double>(intrinsics->resolution.width),
-      0.03 * static_cast<double>(intrinsics->resolution.height);
-  Eigen::Matrix<double, 6, 1> prior_weight;
-  for (int index = 0; index < 6; ++index) {
+  Eigen::VectorXd parameters = ToVector(*intrinsics);
+  const Eigen::VectorXd anchor = ToVector(anchor_intrinsics);
+  const std::vector<std::string> parameter_labels =
+      intrinsics->CombinedParameterLabels();
+  Eigen::VectorXd prior_sigma(parameters.rows());
+  for (int index = 0; index < parameters.rows(); ++index) {
+    const std::string& label = parameter_labels[static_cast<std::size_t>(index)];
+    if (label == "xi" || label == "alpha" || label == "beta" ||
+        label == "k1" || label == "k2" || label == "k3" || label == "k4") {
+      prior_sigma[index] = 0.20;
+    } else if (label == "fu") {
+      prior_sigma[index] = 0.20 * static_cast<double>(intrinsics->resolution.width);
+    } else if (label == "fv") {
+      prior_sigma[index] = 0.20 * static_cast<double>(intrinsics->resolution.height);
+    } else if (label == "cu") {
+      prior_sigma[index] = 0.03 * static_cast<double>(intrinsics->resolution.width);
+    } else if (label == "cv") {
+      prior_sigma[index] = 0.03 * static_cast<double>(intrinsics->resolution.height);
+    } else {
+      prior_sigma[index] = 0.20;
+    }
+  }
+  Eigen::VectorXd prior_weight(parameters.rows());
+  for (int index = 0; index < parameters.rows(); ++index) {
     prior_weight[index] = 1.0 / std::max(1e-9, prior_sigma[index] * prior_sigma[index]);
   }
 
   for (int iteration = 0; iteration < 18; ++iteration) {
-    Eigen::MatrixXd jacobian(residuals.rows(), 6);
-    for (int column = 0; column < 6; ++column) {
-      Eigen::Matrix<double, 6, 1> plus = parameters;
-      Eigen::Matrix<double, 6, 1> minus = parameters;
-      const double step = column <= 1 ? ParameterStep(parameters[column], 1e-3)
-                                      : ParameterStep(parameters[column], 1e-1);
+    Eigen::MatrixXd jacobian(residuals.rows(), parameters.rows());
+    for (int column = 0; column < parameters.rows(); ++column) {
+      Eigen::VectorXd plus = parameters;
+      Eigen::VectorXd minus = parameters;
+      const std::string& label = parameter_labels[static_cast<std::size_t>(column)];
+      const double fallback_step =
+          (label == "fu" || label == "fv" || label == "cu" || label == "cv") ? 1e-1 : 1e-3;
+      const double step = ParameterStep(parameters[column], fallback_step);
       plus[column] += step;
       minus[column] -= step;
 
-      OuterBootstrapCameraIntrinsics plus_intrinsics = FromVector(plus, intrinsics->resolution);
-      OuterBootstrapCameraIntrinsics minus_intrinsics = FromVector(minus, intrinsics->resolution);
+      OuterBootstrapCameraIntrinsics plus_intrinsics = FromVector(plus, *intrinsics);
+      OuterBootstrapCameraIntrinsics minus_intrinsics = FromVector(minus, *intrinsics);
       ClampIntrinsicsInPlace(&plus_intrinsics);
       ClampIntrinsicsInPlace(&minus_intrinsics);
 
@@ -1200,29 +1236,30 @@ bool OptimizeIntrinsics(const SolverState& state,
           (2.0 * step);
     }
 
-    const Eigen::Matrix<double, 6, 6> hessian = jacobian.transpose() * jacobian;
-    const Eigen::Matrix<double, 6, 1> gradient = jacobian.transpose() * residuals;
-    Eigen::Matrix<double, 6, 6> prior_hessian = Eigen::Matrix<double, 6, 6>::Zero();
-    Eigen::Matrix<double, 6, 1> prior_gradient = Eigen::Matrix<double, 6, 1>::Zero();
-    for (int index = 0; index < 6; ++index) {
+    const Eigen::MatrixXd hessian = jacobian.transpose() * jacobian;
+    const Eigen::VectorXd gradient = jacobian.transpose() * residuals;
+    Eigen::MatrixXd prior_hessian =
+        Eigen::MatrixXd::Zero(parameters.rows(), parameters.rows());
+    Eigen::VectorXd prior_gradient = Eigen::VectorXd::Zero(parameters.rows());
+    for (int index = 0; index < parameters.rows(); ++index) {
       prior_hessian(index, index) = prior_weight[index];
       prior_gradient[index] = prior_weight[index] * (parameters[index] - anchor[index]);
     }
-    const Eigen::Matrix<double, 6, 6> damped =
-        hessian + prior_hessian + lambda * Eigen::Matrix<double, 6, 6>::Identity();
-    const Eigen::Matrix<double, 6, 1> delta =
+    const Eigen::MatrixXd damped =
+        hessian + prior_hessian + lambda * Eigen::MatrixXd::Identity(parameters.rows(), parameters.rows());
+    const Eigen::VectorXd delta =
         damped.ldlt().solve(-(gradient + prior_gradient));
     if (!delta.allFinite()) {
       break;
     }
 
-    OuterBootstrapCameraIntrinsics candidate = FromVector(parameters + delta, intrinsics->resolution);
+    OuterBootstrapCameraIntrinsics candidate = FromVector(parameters + delta, *intrinsics);
     ClampIntrinsicsInPlace(&candidate);
     const Eigen::VectorXd candidate_residuals =
         BuildResidualVector(state, candidate, boards, frames, nullptr);
-    const Eigen::Matrix<double, 6, 1> candidate_vector = ToVector(candidate);
+    const Eigen::VectorXd candidate_vector = ToVector(candidate);
     double prior_cost = 0.0;
-    for (int index = 0; index < 6; ++index) {
+    for (int index = 0; index < parameters.rows(); ++index) {
       const double diff = candidate_vector[index] - anchor[index];
       prior_cost += prior_weight[index] * diff * diff;
     }

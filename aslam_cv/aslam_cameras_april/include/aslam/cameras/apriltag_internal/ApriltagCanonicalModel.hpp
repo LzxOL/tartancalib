@@ -23,6 +23,7 @@ enum class InternalProjectionMode {
   VirtualPinholePatchBoundarySeed,
   SphereLattice,
   SphereBorderLattice,
+  PureSphericalBoundarySeed,
   SphereRayRefine,
 };
 
@@ -67,6 +68,9 @@ struct ApriltagInternalConfig {
   double internal_subpix_displacement_scale = 0.25;
   double max_internal_subpix_displacement = 6.0;
   bool enable_debug_output = false;
+  bool ignore_image_evidence_min_quality = false;
+  bool force_internal_seed_from_prediction = false;
+  bool bypass_internal_seed_filters = false;
   InternalProjectionMode internal_projection_mode = InternalProjectionMode::SphereLattice;
   bool sphere_lattice_use_initial_camera = false;
   bool outer_spherical_use_initial_camera = false;

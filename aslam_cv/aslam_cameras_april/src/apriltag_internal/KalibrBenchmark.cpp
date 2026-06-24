@@ -19,11 +19,10 @@ namespace {
 
 IntermediateCameraConfig MakeCameraConfig(const OuterBootstrapCameraIntrinsics& intrinsics) {
   IntermediateCameraConfig config;
-  config.camera_model = "ds";
-  config.distortion_model = "none";
-  config.intrinsics = {intrinsics.xi, intrinsics.alpha, intrinsics.fu, intrinsics.fv,
-                       intrinsics.cu, intrinsics.cv};
-  config.distortion_coeffs.clear();
+  config.camera_model = intrinsics.NormalizedCameraModel();
+  config.distortion_model = intrinsics.NormalizedDistortionModel();
+  config.intrinsics = intrinsics.IntrinsicsVector();
+  config.distortion_coeffs = intrinsics.DistortionVector();
   config.resolution = {intrinsics.resolution.width, intrinsics.resolution.height};
   return config;
 }
@@ -89,6 +88,7 @@ bool LoadKalibrCamchainIntrinsics(const std::string& yaml_path,
   std::string camera_model;
   std::string distortion_model;
   std::vector<double> intrinsics_values;
+  std::vector<double> distortion_values;
   std::vector<int> resolution_values;
   std::string line;
   while (std::getline(input, line)) {
@@ -107,6 +107,8 @@ bool LoadKalibrCamchainIntrinsics(const std::string& yaml_path,
       camera_model = Trim(trimmed.substr(std::string("camera_model:").size()));
     } else if (trimmed.find("distortion_model:") == 0) {
       distortion_model = Trim(trimmed.substr(std::string("distortion_model:").size()));
+    } else if (trimmed.find("distortion_coeffs:") == 0) {
+      distortion_values = ParseDoubleList(trimmed);
     } else if (trimmed.find("intrinsics:") == 0) {
       intrinsics_values = ParseDoubleList(trimmed);
     } else if (trimmed.find("resolution:") == 0) {
@@ -123,27 +125,25 @@ bool LoadKalibrCamchainIntrinsics(const std::string& yaml_path,
     return false;
   }
 
-  if (camera_model != "ds" || distortion_model != "none") {
-    if (error_message != nullptr) {
-      *error_message = "Kalibr benchmark v1 expects cam0 with ds / none.";
-    }
-    return false;
-  }
-  if (intrinsics_values.size() != 6 || resolution_values.size() != 2) {
+  if (resolution_values.size() != 2) {
     if (error_message != nullptr) {
       *error_message = "Kalibr camchain yaml intrinsics/resolution are malformed.";
     }
     return false;
   }
-
-  intrinsics->xi = intrinsics_values[0];
-  intrinsics->alpha = intrinsics_values[1];
-  intrinsics->fu = intrinsics_values[2];
-  intrinsics->fv = intrinsics_values[3];
-  intrinsics->cu = intrinsics_values[4];
-  intrinsics->cv = intrinsics_values[5];
+  intrinsics->camera_model = camera_model;
+  intrinsics->distortion_model = distortion_model;
   intrinsics->resolution = cv::Size(resolution_values[0], resolution_values[1]);
-  return intrinsics->IsValid();
+  intrinsics->SetIntrinsicsVector(intrinsics_values);
+  intrinsics->SetDistortionVector(distortion_values);
+  if (!intrinsics->IsValid()) {
+    if (error_message != nullptr) {
+      *error_message =
+          "Kalibr camchain yaml contains malformed or unsupported intrinsics.";
+    }
+    return false;
+  }
+  return true;
 }
 
 namespace {
@@ -163,11 +163,7 @@ KalibrBenchmarkReport KalibrBenchmark::Compare(const KalibrBenchmarkInput& input
   report.our_reference_board_id = input.our_bundle.scene_state.reference_board_id;
 
   if (!input.our_bundle.scene_state.IsValid()) {
-    report.failure_reason = "Our Stage 5 bundle does not contain a valid DS scene state.";
-    return report;
-  }
-  if (input.camera_model != "ds") {
-    report.failure_reason = "Kalibr benchmark v1 only supports camera_model=ds.";
+    report.failure_reason = "Our Stage 5 bundle does not contain a valid scene state.";
     return report;
   }
 
@@ -179,19 +175,32 @@ KalibrBenchmarkReport KalibrBenchmark::Compare(const KalibrBenchmarkInput& input
   }
 
   report.our_intrinsics = input.our_bundle.scene_state.camera;
+  const std::string our_family = report.our_intrinsics.NormalizedFamilyString();
+  const std::string kalibr_family = report.kalibr_intrinsics.NormalizedFamilyString();
+  if (our_family != kalibr_family) {
+    report.failure_reason =
+        "Kalibr benchmark requires matching camera families; ours=" + our_family +
+        " kalibr=" + kalibr_family;
+    return report;
+  }
   report.intrinsics_delta.xi = report.our_intrinsics.xi - report.kalibr_intrinsics.xi;
   report.intrinsics_delta.alpha = report.our_intrinsics.alpha - report.kalibr_intrinsics.alpha;
   report.intrinsics_delta.fu = report.our_intrinsics.fu - report.kalibr_intrinsics.fu;
   report.intrinsics_delta.fv = report.our_intrinsics.fv - report.kalibr_intrinsics.fv;
   report.intrinsics_delta.cu = report.our_intrinsics.cu - report.kalibr_intrinsics.cu;
   report.intrinsics_delta.cv = report.our_intrinsics.cv - report.kalibr_intrinsics.cv;
-  report.intrinsics_delta.l2_norm =
-      std::sqrt(report.intrinsics_delta.xi * report.intrinsics_delta.xi +
-                report.intrinsics_delta.alpha * report.intrinsics_delta.alpha +
-                report.intrinsics_delta.fu * report.intrinsics_delta.fu +
-                report.intrinsics_delta.fv * report.intrinsics_delta.fv +
-                report.intrinsics_delta.cu * report.intrinsics_delta.cu +
-                report.intrinsics_delta.cv * report.intrinsics_delta.cv);
+  report.intrinsics_delta.labels = report.our_intrinsics.CombinedParameterLabels();
+  const std::vector<double> our_parameters = report.our_intrinsics.CombinedParameterVector();
+  const std::vector<double> kalibr_parameters =
+      report.kalibr_intrinsics.CombinedParameterVector();
+  report.intrinsics_delta.deltas.resize(report.intrinsics_delta.labels.size(), 0.0);
+  double generic_squared_norm = 0.0;
+  for (std::size_t index = 0; index < report.intrinsics_delta.labels.size(); ++index) {
+    const double delta = our_parameters[index] - kalibr_parameters[index];
+    report.intrinsics_delta.deltas[index] = delta;
+    generic_squared_norm += delta * delta;
+  }
+  report.intrinsics_delta.l2_norm = std::sqrt(generic_squared_norm);
 
   report.residual_summary.our_overall_rmse = input.our_bundle.residual_result.overall_rmse;
   report.residual_summary.our_outer_only_rmse = input.our_bundle.residual_result.outer_only_rmse;
@@ -201,7 +210,7 @@ KalibrBenchmarkReport KalibrBenchmark::Compare(const KalibrBenchmarkInput& input
   report.residual_summary.note =
       "Kalibr camchain.yaml does not expose directly comparable reprojection residual "
       "statistics, so this Stage 5 v1 benchmark reports our optimized residuals plus "
-      "camera-model/output-level DS intrinsics and projection comparison.";
+      "camera-model/output-level intrinsics and projection comparison.";
 
   try {
     const DoubleSphereCameraModel our_camera =
@@ -320,6 +329,9 @@ void WriteKalibrBenchmarkSummary(const std::string& path,
   output << "failure_reason: " << report.failure_reason << "\n";
   output << "dataset_label: " << report.dataset_label << "\n";
   output << "our_reference_board_id: " << report.our_reference_board_id << "\n";
+  output << "camera_model_family: " << report.our_intrinsics.NormalizedFamilyString() << "\n";
+  output << "camera_model: " << report.our_intrinsics.NormalizedCameraModel() << "\n";
+  output << "distortion_model: " << report.our_intrinsics.NormalizedDistortionModel() << "\n";
   output << "our_xi: " << report.our_intrinsics.xi << "\n";
   output << "our_alpha: " << report.our_intrinsics.alpha << "\n";
   output << "our_fu: " << report.our_intrinsics.fu << "\n";
@@ -333,6 +345,19 @@ void WriteKalibrBenchmarkSummary(const std::string& path,
   output << "kalibr_cu: " << report.kalibr_intrinsics.cu << "\n";
   output << "kalibr_cv: " << report.kalibr_intrinsics.cv << "\n";
   output << "delta_l2_norm: " << report.intrinsics_delta.l2_norm << "\n";
+  output << "parameter_labels:";
+  for (const std::string& label : report.intrinsics_delta.labels) {
+    output << " " << label;
+  }
+  output << "\n";
+  output << "parameter_deltas_csv: ";
+  for (std::size_t index = 0; index < report.intrinsics_delta.deltas.size(); ++index) {
+    if (index > 0) {
+      output << ",";
+    }
+    output << report.intrinsics_delta.deltas[index];
+  }
+  output << "\n";
   output << "projection_mean_pixel_delta: "
          << report.distortion_or_projection_compare.mean_pixel_delta << "\n";
   output << "projection_max_pixel_delta: "
@@ -348,18 +373,15 @@ void WriteKalibrBenchmarkIntrinsicsCsv(const std::string& path,
                                        const KalibrBenchmarkReport& report) {
   std::ofstream output(path.c_str());
   output << "parameter,our_value,kalibr_value,delta\n";
-  output << "xi," << report.our_intrinsics.xi << "," << report.kalibr_intrinsics.xi << ","
-         << report.intrinsics_delta.xi << "\n";
-  output << "alpha," << report.our_intrinsics.alpha << "," << report.kalibr_intrinsics.alpha
-         << "," << report.intrinsics_delta.alpha << "\n";
-  output << "fu," << report.our_intrinsics.fu << "," << report.kalibr_intrinsics.fu << ","
-         << report.intrinsics_delta.fu << "\n";
-  output << "fv," << report.our_intrinsics.fv << "," << report.kalibr_intrinsics.fv << ","
-         << report.intrinsics_delta.fv << "\n";
-  output << "cu," << report.our_intrinsics.cu << "," << report.kalibr_intrinsics.cu << ","
-         << report.intrinsics_delta.cu << "\n";
-  output << "cv," << report.our_intrinsics.cv << "," << report.kalibr_intrinsics.cv << ","
-         << report.intrinsics_delta.cv << "\n";
+  const std::vector<double> our_parameters = report.our_intrinsics.CombinedParameterVector();
+  const std::vector<double> kalibr_parameters =
+      report.kalibr_intrinsics.CombinedParameterVector();
+  for (std::size_t index = 0; index < report.intrinsics_delta.labels.size(); ++index) {
+    output << report.intrinsics_delta.labels[index] << ","
+           << our_parameters[index] << ","
+           << kalibr_parameters[index] << ","
+           << report.intrinsics_delta.deltas[index] << "\n";
+  }
 }
 
 void WriteKalibrBenchmarkResidualSummary(const std::string& path,

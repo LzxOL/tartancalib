@@ -52,13 +52,25 @@ struct MultiScaleOuterTagDetectorConfig {
   bool do_outer_subpix_refinement = true;
   double outer_local_context_scale = 0.05;
   double outer_corner_marker_ratio = 0.0;
-  double outer_subpix_scale = 0.025;
+  double outer_subpix_scale = 0.35;
+  bool enable_close_edge_outer_subpix_boost = true;
+  double close_edge_outer_subpix_area_ratio = 0.02;
+  double close_edge_outer_subpix_min_polar_deg = 50.0;
+  double close_edge_outer_subpix_border_ratio = 0.15;
+  double close_edge_outer_subpix_multiplier = 1.4;
   double outer_refine_gate_scale = 0.025;
   double outer_refine_gate_min = 6.0;
   double min_detection_quality = 0.0;
   bool blur_before_detect = false;
   int blur_kernel = 7;
   double blur_sigma = 1.6;
+  // Legacy detector-local id-bracket rescue is unsafe for the multi-board
+  // calibration rig because board ids do not encode spatial order.
+  bool enable_anonymous_tag_like_geometry_rescue = false;
+  bool enable_interpolated_missing_board_geometry_rescue = false;
+  double anonymous_tag_like_rescue_max_center_error_scale = 0.90;
+  double anonymous_tag_like_rescue_min_area_ratio = 0.30;
+  double anonymous_tag_like_rescue_max_area_ratio = 3.50;
   OuterRefineCameraConfig refine_camera;
 
   // Legacy compatibility fields. Old YAML keys may still populate these,
@@ -68,7 +80,7 @@ struct MultiScaleOuterTagDetectorConfig {
   int outer_subpix_window_radius = 0;
   double outer_subpix_window_scale = 0.015;
   int outer_subpix_window_min = 4;
-  int outer_subpix_window_max = 16;
+  int outer_subpix_window_max = 48;
   double max_outer_refine_displacement = 6.0;
   double outer_refine_displacement_scale = 0.025;
   bool enable_outer_corner_layout_check = false;
@@ -158,6 +170,19 @@ struct OuterCornerVerificationDebugInfo {
   bool spherical_refinement_valid = false;
   bool spherical_refinement_applied = false;
   std::string spherical_failure_reason;
+  bool close_edge_subpix_boost_applied = false;
+  double close_edge_subpix_area_ratio = 0.0;
+  double close_edge_subpix_max_polar_deg = 0.0;
+  double configured_outer_subpix_scale = 0.0;
+  double configured_outer_subpix_window_scale = 0.0;
+  int configured_outer_subpix_window_radius = 0;
+  int configured_outer_subpix_window_min = 0;
+  int configured_outer_subpix_window_max = 0;
+  int raw_subpix_window_radius = 0;
+  int pre_boost_subpix_window_radius = 0;
+  int boosted_raw_subpix_window_radius = 0;
+  int subpix_window_clamp_limit = 0;
+  bool subpix_window_clamped = false;
   int subpix_window_radius = 0;
   double refine_displacement_limit = 0.0;
   bool refined_valid = false;
@@ -165,6 +190,33 @@ struct OuterCornerVerificationDebugInfo {
   bool subpix_applied = false;
   std::string failure_reason;
 };
+
+struct OuterSphericalCornerRefinementDebug {
+  bool success = false;
+  cv::Point2f refined_corner{};
+  double quality = 0.0;
+  double displacement_px = 0.0;
+  double prev_edge_residual = 0.0;
+  double next_edge_residual = 0.0;
+  int prev_edge_support_count = 0;
+  int next_edge_support_count = 0;
+  std::string failure_reason;
+};
+
+struct OuterSphericalQuadRefinementResult {
+  bool success = false;
+  std::array<cv::Point2f, 4> refined_corners{};
+  std::array<OuterSphericalCornerRefinementDebug, 4> corner_debug{};
+  double max_displacement_px = 0.0;
+  double min_quality = 0.0;
+  int successful_corner_count = 0;
+};
+
+OuterSphericalQuadRefinementResult RefineOuterCornersBySphericalPlanes(
+    const cv::Mat& gray,
+    const DoubleSphereCameraModel& camera,
+    const std::array<cv::Point2f, 4>& corner_seeds,
+    const MultiScaleOuterTagDetectorConfig& config);
 
 struct OuterTagScaleDebugInfo {
   int target_longest_side = 0;
@@ -214,10 +266,14 @@ struct OuterBoardMeasurement {
   int board_id = -1;
   int detected_tag_id = -1;
   bool success = false;
+  bool attempted_local_patch_rescue = false;
+  bool used_local_patch_rescue = false;
+  std::string local_patch_rescue_summary;
   double detection_quality = 0.0;
   int valid_refined_corner_count = 0;
   std::array<Eigen::Vector2d, 4> refined_outer_corners_original_image{};
   std::array<bool, 4> refined_corner_valid{{false, false, false, false}};
+  std::array<OuterCornerVerificationDebugInfo, 4> corner_verification_debug{};
   OuterTagFailureReason failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
   std::string failure_reason_text;
 };

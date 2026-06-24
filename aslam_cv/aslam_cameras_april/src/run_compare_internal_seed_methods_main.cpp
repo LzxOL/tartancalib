@@ -325,6 +325,12 @@ ati::InternalProjectionMode ParseProjectionModeOrThrow(const std::string& value)
   if (lowered == "sphere_border_lattice" || lowered == "sphere-border-lattice") {
     return ati::InternalProjectionMode::SphereBorderLattice;
   }
+  if (lowered == "pure_spherical_boundary_seed" ||
+      lowered == "pure-spherical-boundary-seed" ||
+      lowered == "sphere_boundary_seed" ||
+      lowered == "sphere-boundary-seed") {
+    return ati::InternalProjectionMode::PureSphericalBoundarySeed;
+  }
   if (lowered == "sphere_ray_refine" || lowered == "sphere-ray-refine") {
     return ati::InternalProjectionMode::SphereRayRefine;
   }
@@ -335,6 +341,7 @@ bool HasExplicitSphereSeedStage(ati::InternalProjectionMode mode) {
   return mode == ati::InternalProjectionMode::VirtualPinholePatchBoundarySeed ||
          mode == ati::InternalProjectionMode::SphereLattice ||
          mode == ati::InternalProjectionMode::SphereBorderLattice ||
+         mode == ati::InternalProjectionMode::PureSphericalBoundarySeed ||
          mode == ati::InternalProjectionMode::SphereRayRefine;
 }
 
@@ -350,6 +357,8 @@ std::string DescribeMethodForReport(ati::InternalProjectionMode mode) {
       return "先由位姿与相机模型给出预测射线，再在局部球面晶格候选中搜索 seed，最后在原图做 cornerSubPix。";
     case ati::InternalProjectionMode::SphereBorderLattice:
       return "先用外边界构造 border-conditioned ray seed，再围绕该 seed 做局部球面搜索，最后在原图做 cornerSubPix。";
+    case ati::InternalProjectionMode::PureSphericalBoundarySeed:
+      return "先用外四角点和边界 support rays 在球面上插值得到内点 seed，不做大范围 SS 搜索，只在原图做小窗口 cornerSubPix。";
     case ati::InternalProjectionMode::SphereRayRefine:
       return "先由位姿与相机模型给出预测射线，再在球面上做 ray-domain 连续 seed refinement，最后在原图做 cornerSubPix。";
     case ati::InternalProjectionMode::Homography:

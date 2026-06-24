@@ -9,12 +9,14 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <Eigen/Cholesky>
 #include <Eigen/Eigenvalues>
 #include <Eigen/Geometry>
 #include <boost/filesystem.hpp>
@@ -145,6 +147,8 @@ struct BoardBoundaryEdgeModel {
   bool valid = false;
   std::vector<cv::Point2f> support_points;
   std::vector<Eigen::Vector3d> support_rays;
+  std::vector<double> sample_alphas;
+  std::vector<Eigen::Vector3d> sample_rays;
   Eigen::Vector3d plane_normal = Eigen::Vector3d::Zero();
   Eigen::Vector3d start_ray = Eigen::Vector3d::Zero();
   Eigen::Vector3d end_ray = Eigen::Vector3d::Zero();
@@ -165,6 +169,34 @@ struct BorderConditionedSeed {
   Eigen::Vector3d bottom_ray = Eigen::Vector3d::Zero();
   Eigen::Vector3d left_ray = Eigen::Vector3d::Zero();
   Eigen::Vector3d right_ray = Eigen::Vector3d::Zero();
+};
+
+struct VerticalOnlyImageOffset {
+  bool valid = false;
+  double fallback_delta_v_px = 0.0;
+  double clamp_limit_px = 0.0;
+  int support_count = 0;
+  std::vector<std::pair<int, double> > row_delta_v_px;
+};
+
+struct RowImageEvidenceOffset {
+  bool valid = false;
+  bool group_by_column = false;
+  bool apply_along_x = false;
+  double aggregate_gain = 0.0;
+  int support_count = 0;
+  std::vector<std::pair<int, double> > row_delta_v_px;
+};
+
+struct RowEvidenceSeedSample {
+  int point_id = -1;
+  int row = 0;
+  int col = 0;
+  cv::Point2f seed_image{};
+  cv::Point2f unit_v{};
+  cv::Point2f module_u_axis{};
+  cv::Point2f module_v_axis{};
+  double local_module_scale = 0.0;
 };
 
 constexpr double kSphereLatticeSearchRadiusScale = 0.5;
@@ -199,10 +231,26 @@ constexpr double kBorderConditionedPlaneResidualThreshold = 0.035;
 constexpr int kBorderBoundaryCurveSampleCount = 33;
 constexpr double kBorderConditionedSearchRadiusGain = 0.75;
 constexpr double kBorderConditionedSearchRadiusMaxScale = 3.0;
+constexpr int kRescuedBoundaryFallbackSupportSamples = 12;
+constexpr int kVerticalOnlyOffsetMinSupport = 8;
+constexpr int kVerticalOnlyOffsetMinRowSupport = 2;
+constexpr double kVerticalOnlyOffsetClampModuleScale = 0.35;
+constexpr double kVerticalOnlyOffsetMadScale = 3.0;
+constexpr int kRowImageEvidenceMinSupport = 3;
+constexpr double kRowImageEvidenceSearchRadiusScale = 0.45;
+constexpr double kRowImageEvidenceMinGain = 0.02;
+constexpr int kRowStructureMinSupport = 3;
+constexpr double kRowStructureSearchRadiusScale = 0.65;
+constexpr double kRowStructureMinRelativeGain = 0.08;
 
 bool NormalizeRay(Eigen::Vector3d* ray);
 Eigen::Vector3d ProjectOntoTangentPlane(const Eigen::Vector3d& vector,
                                         const Eigen::Vector3d& ray_anchor);
+bool ImageEvidencePassesQualityGate(const ApriltagInternalDetectionOptions& options,
+                                    double image_final_quality) {
+  return options.ignore_image_evidence_min_quality ||
+         image_final_quality >= options.min_quality;
+}
 bool BuildLocalSphereOffsetRay(const Eigen::Vector3d& anchor_ray,
                                const Eigen::Vector3d& tangent_u,
                                const Eigen::Vector3d& tangent_v,
@@ -340,6 +388,12 @@ InternalProjectionMode ParseProjectionMode(const std::string& value) {
   if (lowered == "sphere_border_lattice" || lowered == "sphere-border-lattice") {
     return InternalProjectionMode::SphereBorderLattice;
   }
+  if (lowered == "pure_spherical_boundary_seed" ||
+      lowered == "pure-spherical-boundary-seed" ||
+      lowered == "sphere_boundary_seed" ||
+      lowered == "sphere-boundary-seed") {
+    return InternalProjectionMode::PureSphericalBoundarySeed;
+  }
   if (lowered == "sphere_ray_refine" || lowered == "sphere-ray-refine") {
     return InternalProjectionMode::SphereRayRefine;
   }
@@ -349,11 +403,13 @@ InternalProjectionMode ParseProjectionMode(const std::string& value) {
 bool UsesSphereSeedPipeline(InternalProjectionMode mode) {
   return mode == InternalProjectionMode::SphereLattice ||
          mode == InternalProjectionMode::SphereBorderLattice ||
+         mode == InternalProjectionMode::PureSphericalBoundarySeed ||
          mode == InternalProjectionMode::SphereRayRefine;
 }
 
 bool UsesBorderConditionedSphereSeed(InternalProjectionMode mode) {
-  return mode == InternalProjectionMode::SphereBorderLattice;
+  return mode == InternalProjectionMode::SphereBorderLattice ||
+         mode == InternalProjectionMode::PureSphericalBoundarySeed;
 }
 
 std::string ResolvePath(const std::string& path, const std::string& reference_yaml_path) {
@@ -390,7 +446,8 @@ void ApplyCameraField(IntermediateCameraConfig* config,
   }
 }
 
-IntermediateCameraConfig LoadExternalCameraConfig(const std::string& camera_yaml_path) {
+IntermediateCameraConfig LoadExternalCameraConfigImpl(
+    const std::string& camera_yaml_path) {
   std::ifstream stream(camera_yaml_path);
   if (!stream.is_open()) {
     throw std::runtime_error("Could not open camera config file: " + camera_yaml_path);
@@ -525,6 +582,21 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
     } else if (key == "maxInternalSubpixDisplacement" ||
                key == "max_internal_subpix_displacement") {
       config.max_internal_subpix_displacement = ParseDouble(key, value);
+    } else if (key == "ignoreImageEvidenceMinQuality" ||
+               key == "ignore_image_evidence_min_quality") {
+      config.ignore_image_evidence_min_quality =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "forceInternalSeedFromPrediction" ||
+               key == "force_internal_seed_from_prediction") {
+      config.force_internal_seed_from_prediction =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "bypassInternalSeedFilters" ||
+               key == "bypass_internal_seed_filters") {
+      config.bypass_internal_seed_filters =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
     } else if (key == "enableDebugOutput" || key == "enable_debug_output") {
       config.enable_debug_output =
           Lowercase(value) == "1" || Lowercase(value) == "true" ||
@@ -577,6 +649,27 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.outer_detector_config.outer_corner_marker_ratio = ParseDouble(key, value);
     } else if (key == "outerSubpixScale" || key == "outer_subpix_scale") {
       config.outer_detector_config.outer_subpix_scale = ParseDouble(key, value);
+    } else if (key == "enableCloseEdgeOuterSubpixBoost" ||
+               key == "enable_close_edge_outer_subpix_boost") {
+      config.outer_detector_config.enable_close_edge_outer_subpix_boost =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "closeEdgeOuterSubpixAreaRatio" ||
+               key == "close_edge_outer_subpix_area_ratio") {
+      config.outer_detector_config.close_edge_outer_subpix_area_ratio =
+          ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixMinPolarDeg" ||
+               key == "close_edge_outer_subpix_min_polar_deg") {
+      config.outer_detector_config.close_edge_outer_subpix_min_polar_deg =
+          ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixBorderRatio" ||
+               key == "close_edge_outer_subpix_border_ratio") {
+      config.outer_detector_config.close_edge_outer_subpix_border_ratio =
+          ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixMultiplier" ||
+               key == "close_edge_outer_subpix_multiplier") {
+      config.outer_detector_config.close_edge_outer_subpix_multiplier =
+          ParseDouble(key, value);
     } else if (key == "outerRefineGateScale" || key == "outer_refine_gate_scale") {
       config.outer_detector_config.outer_refine_gate_scale = ParseDouble(key, value);
     } else if (key == "outerRefineGateMin" || key == "outer_refine_gate_min") {
@@ -686,7 +779,8 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
   }
 
   if (!config.intermediate_camera.camera_yaml.empty()) {
-    IntermediateCameraConfig loaded = LoadExternalCameraConfig(config.intermediate_camera.camera_yaml);
+    IntermediateCameraConfig loaded =
+        LoadExternalCameraConfig(config.intermediate_camera.camera_yaml);
     if (!config.intermediate_camera.camera_model.empty()) {
       loaded.camera_model = config.intermediate_camera.camera_model;
     }
@@ -3134,7 +3228,7 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
         IsInsideImageWithBorder(refined_image, gray.size(), options.min_border_distance);
     const bool image_evidence_valid =
         IsInsideImageWithBorder(refined_image, gray.size(), options.min_border_distance) &&
-        image_final_quality >= options.min_quality;
+        ImageEvidencePassesQualityGate(options, image_final_quality);
 
     CornerMeasurement& measurement = result->corners[static_cast<std::size_t>(point_id)];
     measurement.image_xy = Eigen::Vector2d(refined_image.x, refined_image.y);
@@ -3595,7 +3689,7 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
     const bool image_evidence_valid =
         refined_visible &&
         IsInsideImageWithBorder(refined_image, result->image_size, options.min_border_distance) &&
-        image_final_quality >= options.min_quality;
+        ImageEvidencePassesQualityGate(options, image_final_quality);
 
     CornerMeasurement& measurement = result->corners[static_cast<std::size_t>(point_id)];
     measurement.image_xy = Eigen::Vector2d(refined_image.x, refined_image.y);
@@ -3743,7 +3837,7 @@ void PopulateInternalCornersFromVirtualPatchImageSubpix(
     const bool image_evidence_valid =
         predicted_visible && predicted_image_visible && has_image_axes &&
         IsInsideImageWithBorder(refined_image, result->image_size, options.min_border_distance) &&
-        image_final_quality >= options.min_quality;
+        ImageEvidencePassesQualityGate(options, image_final_quality);
 
     CornerMeasurement& measurement = result->corners[static_cast<std::size_t>(point_id)];
     measurement.image_xy = Eigen::Vector2d(refined_image.x, refined_image.y);
@@ -3917,7 +4011,7 @@ void PopulateInternalCornersFromVirtualPatchBoundarySeed(
     const bool image_evidence_valid =
         predicted_visible && predicted_image_visible && has_image_axes &&
         IsInsideImageWithBorder(refined_image, result->image_size, options.min_border_distance) &&
-        image_final_quality >= options.min_quality;
+        ImageEvidencePassesQualityGate(options, image_final_quality);
 
     CornerMeasurement& measurement = result->corners[static_cast<std::size_t>(point_id)];
     measurement.image_xy = Eigen::Vector2d(refined_image.x, refined_image.y);
@@ -3974,6 +4068,10 @@ void PopulateInternalCornersFromVirtualPatchBoundarySeed(
 }
 
 }  // namespace
+
+IntermediateCameraConfig LoadExternalCameraConfig(const std::string& camera_yaml_path) {
+  return LoadExternalCameraConfigImpl(camera_yaml_path);
+}
 
 const char* ToString(InternalPoseRescueMode mode) {
   switch (mode) {
@@ -4053,8 +4151,7 @@ ApriltagInternalDetector::ApriltagInternalDetector(
   options_.outer_detector_config.do_outer_subpix_refinement =
       options_.do_subpix_refinement && config_.outer_detector_config.do_outer_subpix_refinement;
   IntermediateCameraConfig outer_refine_camera = config_.intermediate_camera;
-  if (config_.outer_spherical_use_initial_camera &&
-      options_.outer_detector_config.enable_outer_spherical_refinement) {
+  if (config_.outer_spherical_use_initial_camera) {
     if (config_.intermediate_camera.resolution.size() != 2) {
       throw std::runtime_error(
           "outer_spherical_use_initial_camera requires a configured image resolution.");
@@ -4453,7 +4550,8 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
   }
 
   if (config_.enable_debug_output) {
-    if (detections.projection_mode == InternalProjectionMode::SphereBorderLattice &&
+    if ((detections.projection_mode == InternalProjectionMode::SphereBorderLattice ||
+         detections.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed) &&
         detections.border_boundary_model_valid) {
       const std::array<cv::Scalar, 4> border_curve_colors{
           cv::Scalar(110, 110, 230),
@@ -4482,9 +4580,9 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
 
     for (const auto& debug : detections.internal_corner_debug) {
       const cv::Scalar predicted_color(0, 165, 255);
-      const cv::Scalar border_seed_color(255, 180, 0);
-      const cv::Scalar seed_color(255, 80, 255);
-      const cv::Scalar refined_color(0, 220, 80);
+  const cv::Scalar border_seed_color(255, 180, 0);
+  const cv::Scalar seed_color(255, 80, 255);
+  const cv::Scalar refined_color(0, 220, 80);
       const cv::Scalar arrow2_color(120, 190, 120);
       const cv::Scalar border_arrow_color(160, 160, 160);
       const cv::Scalar seed_arrow_color(160, 110, 200);
@@ -4493,7 +4591,8 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
           detections.projection_mode ==
               InternalProjectionMode::VirtualPinholePatchBoundarySeed;
       const bool has_border_seed_stage =
-          detections.projection_mode == InternalProjectionMode::SphereBorderLattice &&
+          (detections.projection_mode == InternalProjectionMode::SphereBorderLattice ||
+           detections.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed) &&
           debug.border_seed_valid;
       if (IsInsideImage(debug.predicted_image, detections.image_size)) {
         cv::drawMarker(*output_image, debug.predicted_image, cv::Scalar(255, 255, 255),
@@ -4651,7 +4750,8 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
       if (debug_info != nullptr && measurement.corner_type != CornerType::Outer) {
         if (UsesSphereSeedPipeline(detections.projection_mode)) {
           label << ":" << std::lround(measurement.quality * 100.0);
-          if (detections.projection_mode == InternalProjectionMode::SphereBorderLattice &&
+          if ((detections.projection_mode == InternalProjectionMode::SphereBorderLattice ||
+               detections.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed) &&
               debug_info->border_seed_valid) {
             label << " dPB=" << std::fixed << std::setprecision(1)
                   << debug_info->predicted_to_border_seed_displacement;
@@ -4695,7 +4795,8 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
         (UsesSphereSeedPipeline(detections.projection_mode) ||
          detections.projection_mode == InternalProjectionMode::VirtualPinholePatchBoundarySeed)) {
       const std::string legend =
-          detections.projection_mode == InternalProjectionMode::SphereBorderLattice
+          (detections.projection_mode == InternalProjectionMode::SphereBorderLattice ||
+           detections.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed)
               ? "internal legend: P orange cross, BC blue triangle, SS magenta diamond, R green square"
               : "internal legend: P orange cross, SS magenta diamond, R green square";
       cv::putText(*output_image, legend, cv::Point(20, 112), cv::FONT_HERSHEY_SIMPLEX, 0.48,
@@ -4706,7 +4807,8 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
   }
 
   if (config_.enable_debug_output &&
-      detections.projection_mode == InternalProjectionMode::SphereBorderLattice) {
+      (detections.projection_mode == InternalProjectionMode::SphereBorderLattice ||
+       detections.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed)) {
     const std::array<const char*, 4> edge_names{{"T", "R", "B", "L"}};
     int diagnostics_y = static_cast<int>(detections.tag_center.y) - 42;
     diagnostics_y = std::max(diagnostics_y, include_status_text ? 138 : 24);
@@ -4808,7 +4910,8 @@ void ApriltagInternalDetector::DrawDetections(
 
   if (config_.enable_debug_output) {
     const std::string legend =
-        config_.internal_projection_mode == InternalProjectionMode::SphereBorderLattice
+        (config_.internal_projection_mode == InternalProjectionMode::SphereBorderLattice ||
+         config_.internal_projection_mode == InternalProjectionMode::PureSphericalBoundarySeed)
             ? "internal legend: P orange cross, BC blue triangle, SS magenta diamond, R green square"
             : "internal legend: P orange cross, SS magenta diamond, R green square";
     cv::putText(*output_image, legend, cv::Point(20, 114), cv::FONT_HERSHEY_SIMPLEX, 0.48,

@@ -41,10 +41,40 @@ struct ApriltagInternalDetectionOptions {
   double virtual_patch_margin = 1.15;
   double internal_subpix_displacement_scale = 0.25;
   double max_internal_subpix_displacement = 6.0;
+  bool ignore_image_evidence_min_quality = false;
+  bool force_internal_seed_from_prediction = false;
+  // Experimental mode: skip SearchSphereLatticeSeed /
+  // RefineSphereSeedRayLocally acceptance gates and start directly from the
+  // predicted lattice ray. This is intentionally explicit because it bypasses
+  // the normal image-evidence seed validation path.
+  bool bypass_internal_seed_filters = false;
   InternalPoseRescueMode internal_pose_rescue_mode =
       InternalPoseRescueMode::Off;
   double internal_pose_rescue_max_ray_angle_deg = 85.0;
   double internal_pose_rescue_accept_max_outer_rmse = 8.0;
+  bool enable_geometry_prior_outer_seed = false;
+  bool geometry_prior_rescue_diagnostic_only = true;
+  bool geometry_prior_rescue_use_as_observation = false;
+  // Experimental and opt-in: if tag decoding/raw-quad context validation fails,
+  // allow a geometry-prior seed to continue to pose refit only when strong
+  // image edge evidence is present. Pure projected corners are still not
+  // accepted without image evidence and pose consistency checks.
+  bool geometry_prior_rescue_allow_geometry_only_pose_refit = false;
+  // 0 means adapt from the predicted board pixel scale, positive forces a
+  // fixed radius, and negative disables geometry-prior subpixel refinement.
+  int geometry_prior_rescue_subpix_window_radius = 0;
+  // <= 0 disables the displacement upper bound. Geometry-prior rescue often
+  // starts farther from the true corner than normal decoded-tag refinement.
+  double geometry_prior_rescue_max_corner_displacement_px = 0.0;
+  double geometry_prior_rescue_min_corner_response_ratio = 0.03;
+  bool geometry_prior_rescue_enable_spherical_refine = false;
+  int geometry_prior_rescue_edge_sample_count = 80;
+  int geometry_prior_rescue_edge_search_half_width_px = 6;
+  double geometry_prior_rescue_min_edge_support_ratio = 0.45;
+  double geometry_prior_rescue_min_edge_gradient_ratio = 0.02;
+  double geometry_prior_rescue_accept_max_outer_rmse = 8.0;
+  double geometry_prior_rescue_accept_max_rotation_error_deg = 5.0;
+  double geometry_prior_rescue_accept_max_translation_error = 0.08;
   MultiScaleOuterTagDetectorConfig outer_detector_config;
 };
 
@@ -103,6 +133,11 @@ struct InternalCornerDebugInfo {
   double seed_to_refined_angular = 0.0;
   double predicted_to_refined_displacement = 0.0;
   bool border_seed_valid = false;
+  bool forced_prediction_seed = false;
+  bool bypass_seed_filters = false;
+  bool original_seed_filter_success = false;
+  bool original_seed_filter_would_reject = false;
+  cv::Point2f original_seed_filter_image{};
   bool border_seed_fallback_to_sphere_lattice = false;
   bool valid = false;
   bool image_evidence_valid = false;
@@ -151,9 +186,11 @@ struct ApriltagInternalDetectionResult {
   double pose_rescue_accept_max_outer_rmse = 0.0;
   std::string pose_rescue_failure_reason;
   bool border_boundary_model_valid = false;
+  std::string border_boundary_model_failure_reason;
   std::array<bool, 4> border_edge_valid{{false, false, false, false}};
   std::array<double, 4> border_edge_rms_residual{{0.0, 0.0, 0.0, 0.0}};
   std::array<int, 4> border_edge_support_count{{0, 0, 0, 0}};
+  std::array<int, 4> border_edge_support_ray_count{{0, 0, 0, 0}};
   std::array<std::vector<cv::Point2f>, 4> border_support_points{};
   std::array<std::vector<cv::Point2f>, 4> border_curves_image{};
   std::array<std::vector<cv::Vec3d>, 4> border_curves_ray{};
@@ -255,6 +292,8 @@ class ApriltagInternalDetector {
   std::size_t default_board_index_ = 0;
   std::unique_ptr<MultiScaleOuterTagDetector> outer_detector_;
 };
+
+IntermediateCameraConfig LoadExternalCameraConfig(const std::string& camera_yaml_path);
 
 }  // namespace apriltag_internal
 }  // namespace cameras

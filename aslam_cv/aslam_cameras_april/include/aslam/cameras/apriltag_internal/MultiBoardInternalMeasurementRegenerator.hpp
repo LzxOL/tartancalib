@@ -1,6 +1,7 @@
 #ifndef ASLAM_CAMERAS_APRILTAG_INTERNAL_MULTI_BOARD_INTERNAL_MEASUREMENT_REGENERATOR_HPP
 #define ASLAM_CAMERAS_APRILTAG_INTERNAL_MULTI_BOARD_INTERNAL_MEASUREMENT_REGENERATOR_HPP
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,59 @@ struct RegeneratedBoardMeasurement {
   ApriltagInternalDetectionResult detection;
 };
 
+struct GeometryPriorOuterSeedCandidate {
+  int frame_index = -1;
+  std::string frame_label;
+  int missing_board_id = -1;
+  std::string prediction_source_label;
+  int frame_pose_refit_source_board_id = -1;
+  double frame_pose_refit_outer_rmse = 0.0;
+  std::vector<int> visible_boards_used;
+  std::array<cv::Point2f, 4> predicted_corners{};
+  std::array<cv::Point2f, 4> refined_corners{};
+  double predicted_area_px = 0.0;
+  double local_corner_scale_px = 0.0;
+  int subpix_window_radius = 0;
+  bool spherical_refine_attempted = false;
+  bool spherical_refine_success = false;
+  int spherical_refine_successful_corner_count = 0;
+  double spherical_refine_max_displacement_px = 0.0;
+  double spherical_refine_min_quality = 0.0;
+  double spherical_refine_min_support_count = 0.0;
+  double spherical_refine_max_residual = 0.0;
+  std::string spherical_refine_failure_summary;
+  double max_corner_displacement_px = 0.0;
+  double min_corner_response_ratio = 0.0;
+  double edge_support_ratio = 0.0;
+  double mean_edge_gradient_ratio = 0.0;
+  bool rectified_patch_checked = false;
+  bool rectified_patch_decode_success = false;
+  int rectified_patch_detected_tag_id = -1;
+  int rectified_patch_hamming = -1;
+  std::string rectified_patch_summary;
+  bool roi_redetect_checked = false;
+  bool roi_redetect_success = false;
+  int roi_redetect_detected_tag_id = -1;
+  int roi_redetect_hamming = -1;
+  cv::Rect roi_redetect_bbox;
+  std::string roi_redetect_summary;
+  bool roi_valid = false;
+  bool image_evidence_checked = false;
+  bool image_evidence_success = false;
+  bool local_redetect_success = false;
+  bool local_corner_refine_success = false;
+  bool pose_refit_success = false;
+  double local_vs_global_rotation_error_deg = 0.0;
+  double local_vs_global_translation_error = 0.0;
+  double outer_reprojection_rmse = 0.0;
+  double frame_normal_outer_refit_rmse_median =
+      std::numeric_limits<double>::quiet_NaN();
+  double adaptive_accept_max_outer_rmse =
+      std::numeric_limits<double>::quiet_NaN();
+  bool accepted_as_rescued_observation = false;
+  std::string reject_reason;
+};
+
 struct InternalRegenerationRuntimeBreakdown {
   double pose_estimation_seconds = 0.0;
   double boundary_model_seconds = 0.0;
@@ -56,6 +110,7 @@ struct InternalRegenerationFrameResult {
   std::vector<int> visible_board_ids;
   std::vector<std::string> warnings;
   std::vector<RegeneratedBoardMeasurement> board_measurements;
+  std::vector<GeometryPriorOuterSeedCandidate> geometry_prior_outer_seed_candidates;
   InternalRegenerationRuntimeBreakdown runtime_breakdown;
 
   int SuccessfulBoardCount() const;

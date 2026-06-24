@@ -15,6 +15,7 @@ namespace apriltag_internal {
 struct CalibrationSceneState {
   int reference_board_id = 1;
   std::string camera_model = "ds";
+  std::string distortion_model = "none";
   std::string coarse_or_optimized_level;
   std::string bundle_version = "stage5_bundle_v1";
   std::string baseline_protocol_label = "frozen_round2_v1";
@@ -27,7 +28,11 @@ struct CalibrationSceneState {
   std::vector<std::string> warnings;
   std::string failure_reason;
 
-  bool IsValid() const { return camera_model == "ds" && camera.IsValid(); }
+  bool IsValid() const {
+    return camera.IsValid() &&
+           camera.NormalizedCameraModel() == camera_model &&
+           camera.NormalizedDistortionModel() == distortion_model;
+  }
 };
 
 struct CalibrationMeasurementDataset {
@@ -70,6 +75,7 @@ struct CalibrationStateBundle {
 
 struct CalibrationBackendParameterization {
   std::string camera_model = "ds";
+  std::string distortion_model = "none";
   std::string pose_parameterization = "se3";
   bool reference_board_fixed = true;
 };

@@ -1,0 +1,20 @@
+# Stage5 Baseline mono intrinsics, left camera.
+# Source:
+#   result_may/stage5_baseline_v2_134853_left_val_144419_left_debug_capture
+# Dataset:
+#   train image/datatset_5_1/stereo_dataset_20260430_134853/left
+#   holdout image/datatset_5_1/stereo_dataset_20260430_144419/left
+# Note:
+#   No trusted left Kalibr camchain was available during this run. The values
+#   below are the Stage5 optimized mono intrinsics, not a Kalibr reference.
+# Camera model follows the repository DS/no-distortion convention:
+#   intrinsics = [xi, alpha, fu, fv, cu, cv]
+cam0:
+  cam_overlaps: []
+  camera_model: ds
+  distortion_coeffs: []
+  distortion_model: none
+  intrinsics: [-0.190521, 0.615209, 1179.28, 1178.5, 2263.34, 2215.66]
+  resolution: [4512, 4512]
+  rostopic: /left/image_raw
+
