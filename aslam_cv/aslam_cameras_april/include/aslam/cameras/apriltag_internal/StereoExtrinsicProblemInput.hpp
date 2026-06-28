@@ -226,6 +226,7 @@ struct StereoExtrinsicSolverOptions {
   StereoViewSelectionMode view_selection_mode = StereoViewSelectionMode::Off;
   int selected_pair_count = 0;
   StereoSolverMode solver_mode = StereoSolverMode::GlobalSparseBa;
+  std::string ba_mode_label = "pixel";
   StereoFinalBaResidualMode final_ba_residual_mode =
       StereoFinalBaResidualMode::Pixel;
   StereoFinalBaResidualMode selection_ba_residual_mode =

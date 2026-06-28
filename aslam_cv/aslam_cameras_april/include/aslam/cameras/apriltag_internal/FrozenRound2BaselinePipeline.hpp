@@ -142,6 +142,11 @@ struct FrozenRound2BaselineOptions {
   double internal_corner_filter_quality_min = 0.35;
   double internal_corner_filter_quality_relaxation_px = 1.0;
   double internal_corner_filter_adaptive_min_threshold_px = 1.0;
+  bool use_explicit_initial_camera = false;
+  OuterBootstrapCameraIntrinsics explicit_initial_camera;
+  std::string explicit_initial_camera_source_label = "explicit_initial_camera";
+  AutoCameraInitializationRefineMode camera_initialization_refine_mode =
+      AutoCameraInitializationRefineMode::KalibrOuterLm;
   bool enable_internal_observation_quality_weighting = false;
   double internal_observation_low_quality_quantile = 0.2;
   double internal_observation_min_weight = 0.25;

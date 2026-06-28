@@ -43,6 +43,7 @@ struct ApriltagInternalDetectionOptions {
   double max_internal_subpix_displacement = 6.0;
   bool ignore_image_evidence_min_quality = false;
   bool force_internal_seed_from_prediction = false;
+  bool enable_internal_structure_correction_after_ss = true;
   // Experimental mode: skip SearchSphereLatticeSeed /
   // RefineSphereSeedRayLocally acceptance gates and start directly from the
   // predicted lattice ray. This is intentionally explicit because it bypasses
@@ -84,6 +85,7 @@ struct InternalCornerDebugInfo {
   cv::Point2f predicted_image{};
   cv::Point2f border_seed_image{};
   cv::Point2f sphere_seed_image{};
+  cv::Point2f structure_corrected_image{};
   cv::Point2f refined_image{};
   cv::Point2f predicted_patch{};
   cv::Point2f sphere_seed_patch{};
@@ -129,10 +131,14 @@ struct InternalCornerDebugInfo {
   double predicted_to_border_seed_displacement = 0.0;
   double predicted_to_seed_displacement = 0.0;
   double border_seed_to_sphere_seed_displacement = 0.0;
+  double sphere_seed_to_structure_corrected_displacement = 0.0;
   double seed_to_refined_displacement = 0.0;
   double seed_to_refined_angular = 0.0;
   double predicted_to_refined_displacement = 0.0;
   bool border_seed_valid = false;
+  bool structure_correction_valid = false;
+  bool structure_correction_group_by_column = false;
+  double structure_correction_delta_px = 0.0;
   bool forced_prediction_seed = false;
   bool bypass_seed_filters = false;
   bool original_seed_filter_success = false;

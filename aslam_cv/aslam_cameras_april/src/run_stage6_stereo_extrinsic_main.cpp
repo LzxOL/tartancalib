@@ -69,6 +69,7 @@ struct CmdArgs {
   std::string stage6_view_selection_mode = "off";
   int stage6_selected_pair_count = 0;
   std::string stage6_solver_mode = "global_sparse_ba";
+  std::string stage6_ba_mode = "pixel";
   std::string stage6_final_ba_residual_mode = "pixel";
   std::string stage6_selection_ba_residual_mode = "pixel";
   bool stage6_fixed_intrinsics_for_spherical = true;
@@ -343,6 +344,7 @@ void PrintUsage(const char* program) {
       << " [--stage6-view-selection-mode off|topk]"
       << " [--stage6-selected-pair-count N]"
       << " [--stage6-solver-mode alternating|global_sparse_ba|shared_only_global_sparse_ba]"
+      << " [--stage6-ba-mode pixel|angular|hybrid_polar]"
       << " [--stage6-residual-mode pixel|spherical_chordal|spherical_tangent|hybrid_pixel_spherical]"
       << " [--stage6-final-ba-residual-mode pixel|spherical_chordal|spherical_tangent|hybrid_pixel_spherical]"
       << " [--stage6-selection-ba-residual-mode pixel|spherical_chordal|spherical_tangent|hybrid_pixel_spherical]"
@@ -460,6 +462,46 @@ void PrintUsage(const char* program) {
       << "  --stage6-stereo-visualization-top-k 0 exports all available side-by-side visualizations.\n";
 }
 
+void ApplyStage6BaMode(CmdArgs* args, const std::string& mode) {
+  if (args == nullptr) {
+    return;
+  }
+  std::string normalized = mode;
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char ch) {
+                   return static_cast<char>(std::tolower(ch));
+                 });
+  args->stage6_ba_mode = normalized;
+  args->stage6_fixed_intrinsics_for_spherical = true;
+  args->stage6_spherical_uncertainty_mode = "none";
+  args->stage6_spherical_use_normalize_jacobian = false;
+  if (normalized == "pixel") {
+    args->stage6_final_ba_residual_mode = "pixel";
+    args->stage6_selection_ba_residual_mode = "pixel";
+    args->stage6_spherical_weight = 1.0;
+    args->stage6_spherical_polar_weighting = false;
+  } else if (normalized == "angular" ||
+             normalized == "spherical_tangent") {
+    args->stage6_final_ba_residual_mode = "spherical_tangent";
+    args->stage6_selection_ba_residual_mode = "spherical_tangent";
+    args->stage6_spherical_weight = 1.0;
+    args->stage6_spherical_polar_weighting = false;
+  } else if (normalized == "hybrid" ||
+             normalized == "hybrid_polar" ||
+             normalized == "hybrid_pixel_spherical") {
+    args->stage6_final_ba_residual_mode = "hybrid_pixel_spherical";
+    args->stage6_selection_ba_residual_mode = "hybrid_pixel_spherical";
+    args->stage6_spherical_weight = 0.25;
+    args->stage6_spherical_polar_weighting = true;
+    args->stage6_spherical_min_polar_deg = 50.0;
+    args->stage6_spherical_max_weight = 4.0;
+  } else {
+    throw std::runtime_error(
+        "Unsupported --stage6-ba-mode: " + mode +
+        " (expected pixel, angular, or hybrid_polar)");
+  }
+}
+
 CmdArgs ParseArgs(int argc, char** argv) {
   CmdArgs args;
   for (int i = 1; i < argc; ++i) {
@@ -543,6 +585,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.stage6_selected_pair_count = std::stoi(argv[++i]);
     } else if (token == "--stage6-solver-mode" && i + 1 < argc) {
       args.stage6_solver_mode = argv[++i];
+    } else if (token == "--stage6-ba-mode" && i + 1 < argc) {
+      ApplyStage6BaMode(&args, argv[++i]);
     } else if ((token == "--stage6-final-ba-residual-mode" ||
                 token == "--stage6-residual-mode") &&
                i + 1 < argc) {
@@ -1737,11 +1781,33 @@ MonocularFrontendBundleResult RunFixedIntrinsicsMonocularFrontend(
     const std::string& cache_dir,
     const CmdArgs& args) {
   ati::ApriltagInternalConfig config = ati::ApriltagInternalDetector::LoadConfig(config_path);
-  config.intermediate_camera = ati::LoadExternalCameraConfig(intrinsics_path);
+  const ati::IntermediateCameraConfig fixed_intrinsics =
+      ati::LoadExternalCameraConfig(intrinsics_path);
+  if (!fixed_intrinsics.IsConfigured()) {
+    throw std::runtime_error(
+        "Stage6 fixed-intrinsics frontend requires a complete camera model in " +
+        intrinsics_path);
+  }
+  config.intermediate_camera = fixed_intrinsics;
   config.camera_initialization_mode = ati::CameraInitializationMode::Manual;
+
+  ati::OuterBootstrapCameraIntrinsics explicit_initial_camera;
+  explicit_initial_camera.camera_model = fixed_intrinsics.camera_model;
+  explicit_initial_camera.distortion_model = fixed_intrinsics.distortion_model;
+  explicit_initial_camera.SetIntrinsicsVector(fixed_intrinsics.intrinsics);
+  explicit_initial_camera.SetDistortionVector(fixed_intrinsics.distortion_coeffs);
+  if (fixed_intrinsics.resolution.size() == 2) {
+    explicit_initial_camera.resolution =
+        cv::Size(fixed_intrinsics.resolution[0],
+                 fixed_intrinsics.resolution[1]);
+  }
 
   ati::FrozenRound2BaselineOptions options;
   options.config = config;
+  options.use_explicit_initial_camera = true;
+  options.explicit_initial_camera = explicit_initial_camera;
+  options.explicit_initial_camera_source_label =
+      "stage6_explicit_fixed_intrinsics";
   options.optimize_intrinsics = false;
   options.run_second_pass = true;
   options.strict_board_observation_acceptance = true;
@@ -2270,6 +2336,7 @@ int main(int argc, char** argv) {
         args.stage6_selected_pair_count;
     problem_input.solver_options.solver_mode =
         ParseSolverMode(args.stage6_solver_mode);
+    problem_input.solver_options.ba_mode_label = args.stage6_ba_mode;
     problem_input.solver_options.final_ba_residual_mode =
         ParseFinalBaResidualMode(args.stage6_final_ba_residual_mode);
     problem_input.solver_options.selection_ba_residual_mode =

@@ -151,29 +151,13 @@ OuterBootstrapOptions MakeBootstrapOptions(const ApriltagInternalConfig& config,
                                            const FrozenRound2BaselineOptions& options) {
   OuterBootstrapOptions bootstrap_options;
   bootstrap_options.reference_board_id = options.reference_board_id;
-  if (config.intermediate_camera.IsConfigured() &&
-      config.intermediate_camera.resolution.size() == 2 &&
-      config.intermediate_camera.resolution[0] > 0 &&
-      config.intermediate_camera.resolution[1] > 0) {
-    OuterBootstrapCameraIntrinsics initial_camera;
-    initial_camera.camera_model = config.intermediate_camera.camera_model;
-    initial_camera.distortion_model = config.intermediate_camera.distortion_model;
-    initial_camera.resolution = cv::Size(config.intermediate_camera.resolution[0],
-                                         config.intermediate_camera.resolution[1]);
-    initial_camera.SetIntrinsicsVector(config.intermediate_camera.intrinsics);
-    initial_camera.SetDistortionVector(config.intermediate_camera.distortion_coeffs);
-    bootstrap_options.initial_camera = initial_camera;
-  } else {
-    bootstrap_options.initial_camera.camera_model = "ds";
-    bootstrap_options.initial_camera.distortion_model = "none";
-    bootstrap_options.initial_camera.resolution = cv::Size();
-    bootstrap_options.init_xi = config.sphere_lattice_init_xi;
-    bootstrap_options.init_alpha = config.sphere_lattice_init_alpha;
-    bootstrap_options.init_fu_scale = config.sphere_lattice_init_fu_scale;
-    bootstrap_options.init_fv_scale = config.sphere_lattice_init_fv_scale;
-    bootstrap_options.init_cu_offset = config.sphere_lattice_init_cu_offset;
-    bootstrap_options.init_cv_offset = config.sphere_lattice_init_cv_offset;
-  }
+  bootstrap_options.initial_camera = OuterBootstrapCameraIntrinsics();
+  bootstrap_options.init_xi = config.sphere_lattice_init_xi;
+  bootstrap_options.init_alpha = config.sphere_lattice_init_alpha;
+  bootstrap_options.init_fu_scale = config.sphere_lattice_init_fu_scale;
+  bootstrap_options.init_fv_scale = config.sphere_lattice_init_fv_scale;
+  bootstrap_options.init_cu_offset = config.sphere_lattice_init_cu_offset;
+  bootstrap_options.init_cv_offset = config.sphere_lattice_init_cv_offset;
   bootstrap_options.min_detection_quality = config.outer_detector_config.min_detection_quality;
   return bootstrap_options;
 }
@@ -673,7 +657,6 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       options_.geometry_prior_rescue_accept_max_translation_error;
   const MultiScaleOuterTagDetector outer_detector(config.outer_detector_config);
   OuterBootstrapOptions bootstrap_options = MakeBootstrapOptions(config, options_);
-  const MultiBoardOuterBootstrap bootstrap(config, bootstrap_options);
   const MultiBoardInternalMeasurementRegenerator regenerator(config, detection_options);
   JointMeasurementBuildOptions build_options;
   build_options.reference_board_id = options_.reference_board_id;
@@ -786,6 +769,13 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
   AutoCameraInitializationOptions initialization_options;
   initialization_options.mode = config.camera_initialization_mode;
+  initialization_options.refine_mode = options_.camera_initialization_refine_mode;
+  initialization_options.use_explicit_initial_camera =
+      options_.use_explicit_initial_camera;
+  initialization_options.explicit_initial_camera =
+      options_.explicit_initial_camera;
+  initialization_options.explicit_initial_camera_source_label =
+      options_.explicit_initial_camera_source_label;
   const OuterOnlyCameraInitializer camera_initializer(config, initialization_options);
   {
     const auto stage_start = std::chrono::steady_clock::now();
@@ -805,6 +795,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
   {
     const auto stage_start = std::chrono::steady_clock::now();
+    const MultiBoardOuterBootstrap bootstrap(config, bootstrap_options);
     result.bootstrap_result = bootstrap.Solve(bootstrap_frames);
     result.runtime_breakdown.outer_bootstrap_seconds = ElapsedSeconds(stage_start);
   }

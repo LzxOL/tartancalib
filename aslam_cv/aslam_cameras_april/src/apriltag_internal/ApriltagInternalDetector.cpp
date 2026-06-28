@@ -199,7 +199,7 @@ struct RowEvidenceSeedSample {
   double local_module_scale = 0.0;
 };
 
-constexpr double kSphereLatticeSearchRadiusScale = 0.5;
+constexpr double kSphereLatticeSearchRadiusScale = 1.0;
 constexpr double kSphereLatticeSearchRadiusMin = 1e-3;
 constexpr int kSphereLatticeCoarseGridSize = 9;
 constexpr int kSphereLatticeFineGridSize = 5;
@@ -597,6 +597,11 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.bypass_internal_seed_filters =
           Lowercase(value) == "1" || Lowercase(value) == "true" ||
           Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "enableInternalStructureCorrectionAfterSs" ||
+               key == "enable_internal_structure_correction_after_ss") {
+      config.enable_internal_structure_correction_after_ss =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
     } else if (key == "enableDebugOutput" || key == "enable_debug_output") {
       config.enable_debug_output =
           Lowercase(value) == "1" || Lowercase(value) == "true" ||
@@ -616,6 +621,11 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
     } else if (key == "enableOuterSphericalRefinement" ||
                key == "enable_outer_spherical_refinement") {
       config.outer_detector_config.enable_outer_spherical_refinement =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "enableAnonymousTagLikeGeometryRescue" ||
+               key == "enable_anonymous_tag_like_geometry_rescue") {
+      config.outer_detector_config.enable_anonymous_tag_like_geometry_rescue =
           Lowercase(value) == "1" || Lowercase(value) == "true" ||
           Lowercase(value) == "yes" || Lowercase(value) == "on";
     } else if (key == "sphereLatticeEnableSeedSearch" ||
@@ -3000,6 +3010,253 @@ bool BuildBorderConditionedSeed(const BoardSphereBoundaryModel& boundary_model,
   return true;
 }
 
+struct InternalStructureCorrectionSample {
+  int point_id = -1;
+  int row = 0;
+  int col = 0;
+  cv::Point2f seed_image{};
+  cv::Point2f module_u_axis{};
+  cv::Point2f module_v_axis{};
+  double local_module_scale = 0.0;
+  const CanonicalCorner* corner_info = nullptr;
+};
+
+struct InternalStructureCorrectionModel {
+  bool valid = false;
+  bool group_by_column = false;
+  double aggregate_gain = 0.0;
+  std::vector<std::pair<int, double> > group_delta_px;
+};
+
+bool NormalizeImageAxis(const cv::Point2f& axis, cv::Point2f* unit_axis) {
+  if (unit_axis == nullptr) {
+    throw std::runtime_error("NormalizeImageAxis requires an output pointer.");
+  }
+  const double norm = std::hypot(axis.x, axis.y);
+  if (!std::isfinite(norm) || norm <= 1e-9) {
+    return false;
+  }
+  *unit_axis = cv::Point2f(static_cast<float>(axis.x / norm),
+                           static_cast<float>(axis.y / norm));
+  return true;
+}
+
+double InternalStructureRawEvidence(
+    const cv::Mat& gray,
+    const IntegralMeanImage& gray_integral,
+    const InternalStructureCorrectionSample& sample,
+    const cv::Point2f& image_point,
+    double min_template_contrast) {
+  if (sample.corner_info == nullptr) {
+    return 0.0;
+  }
+  const TemplateScore score = ComputeImageEvidenceScoreAtPoint(
+      gray, *sample.corner_info, image_point, sample.module_u_axis,
+      sample.module_v_axis, min_template_contrast, 1.0, &gray_integral);
+  return std::min(score.template_quality, score.gradient_quality);
+}
+
+InternalStructureCorrectionModel EstimateInternalStructureCorrectionModel(
+    const cv::Mat& gray,
+    const IntegralMeanImage& gray_integral,
+    const std::vector<InternalStructureCorrectionSample>& samples,
+    const ApriltagInternalDetectionOptions& options,
+    bool group_by_column) {
+  InternalStructureCorrectionModel model;
+  model.group_by_column = group_by_column;
+  if (samples.empty()) {
+    return model;
+  }
+
+  std::map<int, std::vector<const InternalStructureCorrectionSample*> > groups;
+  for (const InternalStructureCorrectionSample& sample : samples) {
+    groups[group_by_column ? sample.col : sample.row].push_back(&sample);
+  }
+
+  constexpr int kMinGroupSupport = 3;
+  constexpr double kSearchRadiusScale = 0.65;
+  constexpr double kMinAverageGain = 0.015;
+  for (const auto& group_entry : groups) {
+    const std::vector<const InternalStructureCorrectionSample*>& group_samples =
+        group_entry.second;
+    if (group_samples.size() < static_cast<std::size_t>(kMinGroupSupport)) {
+      continue;
+    }
+
+    double median_scale = 0.0;
+    std::vector<double> scales;
+    scales.reserve(group_samples.size());
+    for (const InternalStructureCorrectionSample* sample : group_samples) {
+      scales.push_back(std::max(1.0, sample->local_module_scale));
+    }
+    std::sort(scales.begin(), scales.end());
+    median_scale = scales[scales.size() / 2];
+    const int search_radius =
+        std::max(1, static_cast<int>(std::lround(kSearchRadiusScale * median_scale)));
+
+    double base_sum = 0.0;
+    for (const InternalStructureCorrectionSample* sample : group_samples) {
+      base_sum += InternalStructureRawEvidence(
+          gray, gray_integral, *sample, sample->seed_image,
+          options.min_template_contrast);
+    }
+    const double base_average =
+        base_sum / static_cast<double>(group_samples.size());
+
+    double best_average = base_average;
+    int best_delta = 0;
+    for (int delta = -search_radius; delta <= search_radius; ++delta) {
+      if (delta == 0) {
+        continue;
+      }
+      double score_sum = 0.0;
+      int valid_count = 0;
+      for (const InternalStructureCorrectionSample* sample : group_samples) {
+        cv::Point2f unit_axis{};
+        const cv::Point2f& axis =
+            group_by_column ? sample->module_u_axis : sample->module_v_axis;
+        if (!NormalizeImageAxis(axis, &unit_axis)) {
+          continue;
+        }
+        const cv::Point2f candidate =
+            sample->seed_image +
+            static_cast<float>(delta) * unit_axis;
+        if (!IsInsideImageWithBorder(candidate, gray.size(),
+                                     options.min_border_distance)) {
+          continue;
+        }
+        score_sum += InternalStructureRawEvidence(
+            gray, gray_integral, *sample, candidate,
+            options.min_template_contrast);
+        ++valid_count;
+      }
+      if (valid_count < kMinGroupSupport) {
+        continue;
+      }
+      const double average = score_sum / static_cast<double>(valid_count);
+      if (average > best_average + 1e-9 ||
+          (std::abs(average - best_average) <= 1e-9 &&
+           std::abs(delta) < std::abs(best_delta))) {
+        best_average = average;
+        best_delta = delta;
+      }
+    }
+
+    const double gain = best_average - base_average;
+    if (best_delta != 0 && gain >= kMinAverageGain) {
+      model.group_delta_px.emplace_back(group_entry.first,
+                                        static_cast<double>(best_delta));
+      model.aggregate_gain += gain * static_cast<double>(group_samples.size());
+    }
+  }
+
+  model.valid = model.group_delta_px.size() >= 2;
+  return model;
+}
+
+InternalStructureCorrectionModel EstimateInternalStructureCorrection(
+    const cv::Mat& gray,
+    const IntegralMeanImage& gray_integral,
+    const std::vector<InternalStructureCorrectionSample>& samples,
+    const ApriltagInternalDetectionOptions& options) {
+  const InternalStructureCorrectionModel row_model =
+      EstimateInternalStructureCorrectionModel(gray, gray_integral, samples, options,
+                                               false);
+  const InternalStructureCorrectionModel column_model =
+      EstimateInternalStructureCorrectionModel(gray, gray_integral, samples, options,
+                                               true);
+  if (!row_model.valid) {
+    return column_model;
+  }
+  if (!column_model.valid) {
+    return row_model;
+  }
+  return column_model.aggregate_gain > row_model.aggregate_gain ? column_model
+                                                                : row_model;
+}
+
+bool LookupInternalStructureDelta(const InternalStructureCorrectionModel& model,
+                                  const CanonicalCorner& corner_info,
+                                  double* delta_px) {
+  if (delta_px == nullptr) {
+    throw std::runtime_error("LookupInternalStructureDelta requires output.");
+  }
+  if (!model.valid) {
+    return false;
+  }
+  const int group_key = model.group_by_column
+                            ? static_cast<int>(std::lround(corner_info.lattice_u))
+                            : static_cast<int>(std::lround(corner_info.lattice_v));
+  for (const auto& group_delta : model.group_delta_px) {
+    if (group_delta.first == group_key) {
+      *delta_px = group_delta.second;
+      return true;
+    }
+  }
+  if (model.group_delta_px.size() < 2) {
+    return false;
+  }
+
+  double min_delta = model.group_delta_px.front().second;
+  double max_delta = model.group_delta_px.front().second;
+  int positive_count = 0;
+  int negative_count = 0;
+  for (const auto& group_delta : model.group_delta_px) {
+    min_delta = std::min(min_delta, group_delta.second);
+    max_delta = std::max(max_delta, group_delta.second);
+    positive_count += group_delta.second > 0.0 ? 1 : 0;
+    negative_count += group_delta.second < 0.0 ? 1 : 0;
+  }
+  const bool consistent_direction =
+      positive_count == static_cast<int>(model.group_delta_px.size()) ||
+      negative_count == static_cast<int>(model.group_delta_px.size());
+  if (!consistent_direction || (max_delta - min_delta) > 4.0) {
+    return false;
+  }
+
+  bool found = false;
+  double best_delta = 0.0;
+  int best_distance = std::numeric_limits<int>::max();
+  for (const auto& group_delta : model.group_delta_px) {
+    const int distance = std::abs(group_delta.first - group_key);
+    if (distance < best_distance) {
+      best_distance = distance;
+      best_delta = group_delta.second;
+      found = true;
+    }
+  }
+  if (found) {
+    *delta_px = best_delta;
+    return true;
+  }
+  return false;
+}
+
+bool ApplyInternalStructureCorrection(
+    const InternalStructureCorrectionModel& model,
+    const CanonicalCorner& corner_info,
+    const SphereLatticeFrame& frame,
+    const cv::Point2f& seed_image,
+    cv::Point2f* corrected_image,
+    double* delta_px) {
+  if (corrected_image == nullptr || delta_px == nullptr) {
+    throw std::runtime_error("ApplyInternalStructureCorrection requires outputs.");
+  }
+  double delta = 0.0;
+  if (!LookupInternalStructureDelta(model, corner_info, &delta)) {
+    return false;
+  }
+  const cv::Point2f& axis =
+      model.group_by_column ? frame.module_u_axis : frame.module_v_axis;
+  cv::Point2f unit_axis{};
+  if (!NormalizeImageAxis(axis, &unit_axis)) {
+    return false;
+  }
+  *corrected_image = seed_image + static_cast<float>(delta) * unit_axis;
+  *delta_px = delta;
+  return true;
+}
+
 double ComputeAdaptiveBorderSeedSearchRadius(const SphereLatticeFrame& frame,
                                              const Eigen::Vector3d& border_seed_ray) {
   const double base_radius = std::max(kSphereLatticeSearchRadiusMin, frame.search_radius);
@@ -3299,6 +3556,82 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
   }
   StoreBoardBoundaryDebugCurves(boundary_model, camera, result);
 
+  InternalStructureCorrectionModel structure_correction;
+  if (options.enable_internal_structure_correction_after_ss &&
+      !use_ray_domain_refine && enable_seed_search) {
+    std::vector<InternalStructureCorrectionSample> structure_samples;
+    for (const int point_id : model.VisiblePointIds()) {
+      if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) !=
+          outer_point_ids.end()) {
+        continue;
+      }
+      const CanonicalCorner& corner_info = model.corner(point_id);
+      SphereLatticeFrame frame;
+      const bool has_frame =
+          BuildSphereLatticeFrame(camera, target_to_camera_rotation,
+                                  target_to_camera_translation, model,
+                                  corner_info, &frame);
+      if (!has_frame) {
+        continue;
+      }
+
+      SphereLatticeFrame search_frame = frame;
+      bool has_search_anchor = has_frame;
+      if (use_border_conditioned_seed) {
+        has_search_anchor = false;
+        BorderConditionedSeed border_seed;
+        if (has_boundary_model &&
+            BuildBorderConditionedSeed(boundary_model, camera, model, corner_info,
+                                       &border_seed) &&
+            IsInsideImage(border_seed.image_point, gray.size())) {
+          const double adaptive_search_radius =
+              ComputeAdaptiveBorderSeedSearchRadius(frame, border_seed.ray);
+          has_search_anchor = BuildSeedAnchoredSphereLatticeFrame(
+              frame, border_seed.ray, border_seed.image_point,
+              adaptive_search_radius, &search_frame);
+        }
+      }
+      if (!has_search_anchor) {
+        continue;
+      }
+
+      SphereSeedCandidate anchor_candidate =
+          EvaluateSphereSeedCandidate(gray, camera, corner_info, search_frame,
+                                      options, 0.0, 0.0);
+      SphereSeedCandidate seed_candidate =
+          SearchSphereLatticeSeed(gray, camera, corner_info, search_frame,
+                                  options);
+      cv::Point2f seed_image = search_frame.predicted_image;
+      bool has_seed = false;
+      if (anchor_candidate.valid) {
+        seed_image = anchor_candidate.image_point;
+        has_seed = true;
+      }
+      if (seed_candidate.valid) {
+        seed_image = seed_candidate.image_point;
+        has_seed = true;
+      }
+      if (!has_seed ||
+          !IsInsideImageWithBorder(seed_image, gray.size(),
+                                   options.min_border_distance)) {
+        continue;
+      }
+
+      InternalStructureCorrectionSample sample;
+      sample.point_id = point_id;
+      sample.row = static_cast<int>(std::lround(corner_info.lattice_v));
+      sample.col = static_cast<int>(std::lround(corner_info.lattice_u));
+      sample.seed_image = seed_image;
+      sample.module_u_axis = frame.module_u_axis;
+      sample.module_v_axis = frame.module_v_axis;
+      sample.local_module_scale = frame.local_module_scale;
+      sample.corner_info = &corner_info;
+      structure_samples.push_back(sample);
+    }
+    structure_correction = EstimateInternalStructureCorrection(
+        gray, gray_integral, structure_samples, options);
+  }
+
   for (const int point_id : model.VisiblePointIds()) {
     if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) != outer_point_ids.end()) {
       continue;
@@ -3412,6 +3745,19 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
       }
     }
 
+    if (!has_seed && has_frame &&
+        IsInsideImageWithBorder(frame.predicted_image, gray.size(),
+                                options.min_border_distance) &&
+        std::isfinite(frame.predicted_ray.x()) &&
+        std::isfinite(frame.predicted_ray.y()) &&
+        std::isfinite(frame.predicted_ray.z()) &&
+        frame.predicted_ray.squaredNorm() > 1e-12) {
+      sphere_seed_image = frame.predicted_image;
+      sphere_seed_ray = frame.predicted_ray.normalized();
+      has_seed = true;
+      debug.forced_prediction_seed = true;
+    }
+
     debug.sphere_seed_image = sphere_seed_image;
     debug.sphere_seed_ray = cv::Vec3d(sphere_seed_ray.x(), sphere_seed_ray.y(), sphere_seed_ray.z());
     if (use_ray_domain_refine) {
@@ -3431,6 +3777,14 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
       debug.sphere_raw_quality = quality_candidate.raw_quality;
       debug.sphere_seed_quality = quality_candidate.final_quality;
     }
+    if (debug.forced_prediction_seed) {
+      debug.sphere_template_quality = 1.0;
+      debug.sphere_gradient_quality = 1.0;
+      debug.sphere_prior_quality = 1.0;
+      debug.sphere_peak_quality = 1.0;
+      debug.sphere_raw_quality = 1.0;
+      debug.sphere_seed_quality = 1.0;
+    }
     debug.border_seed_to_sphere_seed_displacement =
         debug.border_seed_valid
             ? std::hypot(sphere_seed_image.x - debug.border_seed_image.x,
@@ -3442,8 +3796,41 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     const int image_evidence_search_radius =
         ComputeAdaptiveImageEvidenceSearchRadius(frame.local_module_scale, options);
 
-    cv::Point2f refined_image = sphere_seed_image;
-    Eigen::Vector3d refined_ray = sphere_seed_ray;
+    cv::Point2f subpix_seed_image = sphere_seed_image;
+    Eigen::Vector3d subpix_seed_ray = sphere_seed_ray;
+    cv::Point2f structure_candidate_image{};
+    Eigen::Vector3d structure_candidate_ray = Eigen::Vector3d::Zero();
+    double structure_candidate_delta_px = 0.0;
+    bool has_structure_candidate = false;
+    if (!use_ray_domain_refine && has_frame && has_seed &&
+        structure_correction.valid) {
+      cv::Point2f corrected_image{};
+      double correction_delta_px = 0.0;
+      if (ApplyInternalStructureCorrection(structure_correction, corner_info,
+                                           frame, sphere_seed_image,
+                                           &corrected_image,
+                                           &correction_delta_px) &&
+          IsInsideImageWithBorder(corrected_image, gray.size(),
+                                  options.min_border_distance)) {
+        Eigen::Vector3d corrected_ray = Eigen::Vector3d::Zero();
+        if (UnprojectImagePointToRay(camera, corrected_image, &corrected_ray)) {
+          structure_candidate_image = corrected_image;
+          structure_candidate_ray = corrected_ray;
+          structure_candidate_delta_px = correction_delta_px;
+          has_structure_candidate = true;
+          debug.structure_corrected_image = corrected_image;
+          debug.structure_correction_group_by_column =
+              structure_correction.group_by_column;
+          debug.structure_correction_delta_px = correction_delta_px;
+          debug.sphere_seed_to_structure_corrected_displacement =
+              std::hypot(corrected_image.x - sphere_seed_image.x,
+                         corrected_image.y - sphere_seed_image.y);
+        }
+      }
+    }
+
+    cv::Point2f refined_image = subpix_seed_image;
+    Eigen::Vector3d refined_ray = subpix_seed_ray;
     const int subpix_window_radius =
         ComputeAdaptiveInternalSubpixRadius(frame.local_module_scale, options);
     const double subpix_displacement_limit =
@@ -3451,7 +3838,7 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     double q_refine = 0.0;
     if (use_ray_domain_refine) {
       if (has_frame && has_seed &&
-          IsInsideImageWithBorder(sphere_seed_image, gray.size(), options.min_border_distance) &&
+          IsInsideImageWithBorder(subpix_seed_image, gray.size(), options.min_border_distance) &&
           options.do_subpix_refinement) {
         const auto subpix_start = std::chrono::steady_clock::now();
         std::vector<cv::Point2f> corners{refined_image};
@@ -3464,6 +3851,89 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
           runtime_breakdown->subpix_seconds += ElapsedSeconds(subpix_start);
         }
       }
+      if (has_frame && has_seed && has_structure_candidate &&
+          IsInsideImageWithBorder(structure_candidate_image, gray.size(),
+                                  options.min_border_distance)) {
+        InternalStructureCorrectionSample evidence_sample;
+        evidence_sample.point_id = point_id;
+        evidence_sample.row = static_cast<int>(std::lround(corner_info.lattice_v));
+        evidence_sample.col = static_cast<int>(std::lround(corner_info.lattice_u));
+        evidence_sample.module_u_axis = frame.module_u_axis;
+        evidence_sample.module_v_axis = frame.module_v_axis;
+        evidence_sample.local_module_scale = frame.local_module_scale;
+        evidence_sample.corner_info = &corner_info;
+
+        evidence_sample.seed_image = subpix_seed_image;
+        const double seed_candidate_evidence = InternalStructureRawEvidence(
+            gray, gray_integral, evidence_sample, subpix_seed_image,
+            options.min_template_contrast);
+        const double seed_path_evidence = InternalStructureRawEvidence(
+            gray, gray_integral, evidence_sample, refined_image,
+            options.min_template_contrast);
+        const double seed_path_displacement =
+            std::hypot(refined_image.x - subpix_seed_image.x,
+                       refined_image.y - subpix_seed_image.y);
+
+        cv::Point2f structure_refined_image = structure_candidate_image;
+        if (options.do_subpix_refinement) {
+          const auto subpix_start = std::chrono::steady_clock::now();
+          std::vector<cv::Point2f> structure_corners{structure_refined_image};
+          cv::cornerSubPix(
+              gray, structure_corners,
+              cv::Size(subpix_window_radius, subpix_window_radius),
+              cv::Size(-1, -1),
+              cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER,
+                               30, 0.1));
+          structure_refined_image = structure_corners.front();
+          if (runtime_breakdown != nullptr) {
+            runtime_breakdown->subpix_seconds += ElapsedSeconds(subpix_start);
+          }
+        }
+
+        evidence_sample.seed_image = structure_candidate_image;
+        const double structure_candidate_evidence = InternalStructureRawEvidence(
+            gray, gray_integral, evidence_sample, structure_candidate_image,
+            options.min_template_contrast);
+        const double structure_path_evidence = InternalStructureRawEvidence(
+            gray, gray_integral, evidence_sample, structure_refined_image,
+            options.min_template_contrast);
+        const double structure_path_displacement =
+            std::hypot(structure_refined_image.x - structure_candidate_image.x,
+                       structure_refined_image.y - structure_candidate_image.y);
+        constexpr double kStructurePathSelectionMargin = 0.005;
+        constexpr double kStructurePathDisplacementPenalty = 0.05;
+        const double displacement_scale =
+            std::max(1e-9, subpix_displacement_limit);
+        const double seed_path_score =
+            seed_path_evidence -
+            kStructurePathDisplacementPenalty *
+                std::min(3.0, seed_path_displacement / displacement_scale);
+        const double structure_path_score =
+            structure_path_evidence -
+            kStructurePathDisplacementPenalty *
+                std::min(3.0,
+                         structure_path_displacement / displacement_scale);
+        const bool seed_path_large_jump =
+            seed_path_displacement > 0.75 * displacement_scale;
+        const bool structure_path_more_stable =
+            structure_path_displacement + 2.0 < seed_path_displacement;
+        const bool structure_path_not_catastrophic =
+            structure_path_evidence + 0.05 >= 0.5 * seed_path_evidence;
+        const bool structure_seed_promising =
+            structure_candidate_evidence + 0.12 >= seed_candidate_evidence;
+        if (structure_seed_promising ||
+            structure_path_score >
+                seed_path_score + kStructurePathSelectionMargin ||
+            (seed_path_large_jump && structure_path_more_stable &&
+             structure_path_not_catastrophic)) {
+          subpix_seed_image = structure_candidate_image;
+          subpix_seed_ray = structure_candidate_ray;
+          refined_image = structure_refined_image;
+          debug.structure_correction_valid = true;
+          debug.structure_corrected_image = structure_candidate_image;
+          debug.structure_correction_delta_px = structure_candidate_delta_px;
+        }
+      }
       if (IsInsideImage(refined_image, gray.size())) {
         Eigen::Vector3d refined_ray_candidate = Eigen::Vector3d::Zero();
         if (UnprojectImagePointToRay(camera, refined_image, &refined_ray_candidate)) {
@@ -3472,12 +3942,12 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
       }
       q_refine =
           (has_frame && has_seed &&
-           IsInsideImageWithBorder(sphere_seed_image, gray.size(), options.min_border_distance))
+           IsInsideImageWithBorder(subpix_seed_image, gray.size(), options.min_border_distance))
               ? (options.do_subpix_refinement
-                     ? ClampUnit(1.0 - (std::hypot(refined_image.x - sphere_seed_image.x,
-                                                   refined_image.y - sphere_seed_image.y) *
-                                        std::hypot(refined_image.x - sphere_seed_image.x,
-                                                   refined_image.y - sphere_seed_image.y)) /
+                     ? ClampUnit(1.0 - (std::hypot(refined_image.x - subpix_seed_image.x,
+                                                   refined_image.y - subpix_seed_image.y) *
+                                        std::hypot(refined_image.x - subpix_seed_image.x,
+                                                   refined_image.y - subpix_seed_image.y)) /
                                            std::max(1e-9, subpix_displacement_limit *
                                                              subpix_displacement_limit))
                      : 1.0)
@@ -3490,7 +3960,7 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
       debug.ray_refine_converged = ray_refine_result.converged;
     } else {
       if (has_frame && has_seed &&
-          IsInsideImageWithBorder(sphere_seed_image, gray.size(), options.min_border_distance) &&
+          IsInsideImageWithBorder(subpix_seed_image, gray.size(), options.min_border_distance) &&
           options.do_subpix_refinement) {
         const auto subpix_start = std::chrono::steady_clock::now();
         std::vector<cv::Point2f> corners{refined_image};
@@ -3511,12 +3981,12 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
       }
       q_refine =
           (has_frame && has_seed &&
-           IsInsideImageWithBorder(sphere_seed_image, gray.size(), options.min_border_distance))
+           IsInsideImageWithBorder(subpix_seed_image, gray.size(), options.min_border_distance))
               ? (options.do_subpix_refinement
-                     ? ClampUnit(1.0 - (std::hypot(refined_image.x - sphere_seed_image.x,
-                                                   refined_image.y - sphere_seed_image.y) *
-                                        std::hypot(refined_image.x - sphere_seed_image.x,
-                                                   refined_image.y - sphere_seed_image.y)) /
+                     ? ClampUnit(1.0 - (std::hypot(refined_image.x - subpix_seed_image.x,
+                                                   refined_image.y - subpix_seed_image.y) *
+                                        std::hypot(refined_image.x - subpix_seed_image.x,
+                                                   refined_image.y - subpix_seed_image.y)) /
                                            std::max(1e-9, subpix_displacement_limit *
                                                              subpix_displacement_limit))
                      : 1.0)
@@ -3529,8 +3999,9 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     debug.subpix_displacement_limit = subpix_displacement_limit;
     debug.image_evidence_search_radius = image_evidence_search_radius;
     debug.seed_to_refined_displacement =
-        std::hypot(refined_image.x - sphere_seed_image.x, refined_image.y - sphere_seed_image.y);
-    debug.seed_to_refined_angular = AngleBetweenRays(sphere_seed_ray, refined_ray);
+        std::hypot(refined_image.x - subpix_seed_image.x,
+                   refined_image.y - subpix_seed_image.y);
+    debug.seed_to_refined_angular = AngleBetweenRays(subpix_seed_ray, refined_ray);
     debug.predicted_to_refined_displacement =
         std::hypot(refined_image.x - frame.predicted_image.x,
                    refined_image.y - frame.predicted_image.y);
@@ -3557,8 +4028,10 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     debug.image_centering_quality = image_score.centering_quality;
     debug.image_final_quality = image_score.final_quality;
 
+    const double seed_quality_for_final =
+        debug.forced_prediction_seed ? 1.0 : debug.sphere_seed_quality;
     const double final_quality =
-        std::min({debug.sphere_seed_quality, q_refine, image_score.final_quality});
+        std::min({seed_quality_for_final, q_refine, image_score.final_quality});
     debug.final_quality = final_quality;
 
     const bool valid =
@@ -3585,6 +4058,65 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     }
 
     result->internal_corner_debug.push_back(debug);
+  }
+}
+
+void SuppressDuplicateRefinedInternalCorners(ApriltagInternalDetectionResult* result) {
+  if (result == nullptr || result->internal_corner_debug.size() < 2) {
+    return;
+  }
+  constexpr double kDuplicateRefinedCornerDistancePx = 2.0;
+  constexpr double kDuplicateRefinedCornerDistance2 =
+      kDuplicateRefinedCornerDistancePx * kDuplicateRefinedCornerDistancePx;
+
+  std::vector<bool> suppress(result->internal_corner_debug.size(), false);
+  for (std::size_t i = 0; i < result->internal_corner_debug.size(); ++i) {
+    const InternalCornerDebugInfo& a = result->internal_corner_debug[i];
+    if (!a.valid || a.point_id < 0) {
+      continue;
+    }
+    for (std::size_t j = i + 1; j < result->internal_corner_debug.size(); ++j) {
+      const InternalCornerDebugInfo& b = result->internal_corner_debug[j];
+      if (!b.valid || b.point_id < 0 || a.point_id == b.point_id) {
+        continue;
+      }
+      const double dx = static_cast<double>(a.refined_image.x - b.refined_image.x);
+      const double dy = static_cast<double>(a.refined_image.y - b.refined_image.y);
+      if (dx * dx + dy * dy <= kDuplicateRefinedCornerDistance2) {
+        suppress[i] = true;
+        suppress[j] = true;
+      }
+    }
+  }
+
+  for (std::size_t i = 0; i < suppress.size(); ++i) {
+    if (!suppress[i]) {
+      continue;
+    }
+    InternalCornerDebugInfo& debug = result->internal_corner_debug[i];
+    if (debug.point_id < 0 ||
+        static_cast<std::size_t>(debug.point_id) >= result->corners.size()) {
+      continue;
+    }
+    CornerMeasurement& measurement =
+        result->corners[static_cast<std::size_t>(debug.point_id)];
+    if (!measurement.valid) {
+      continue;
+    }
+    measurement.valid = false;
+    measurement.quality = 0.0;
+    debug.valid = false;
+    debug.image_evidence_valid = false;
+    debug.final_quality = 0.0;
+    if (result->valid_corner_count > 0) {
+      --result->valid_corner_count;
+    }
+    if (result->valid_internal_corner_count > 0) {
+      --result->valid_internal_corner_count;
+    }
+    if (result->runtime_breakdown.valid_internal_corner_count > 0) {
+      --result->runtime_breakdown.valid_internal_corner_count;
+    }
   }
 }
 
@@ -4143,6 +4675,14 @@ ApriltagInternalDetector::ApriltagInternalDetector(
   config_.tag_id = requested_board_ids_.front();
   default_board_index_ = 0;
 
+  options_.ignore_image_evidence_min_quality =
+      config_.ignore_image_evidence_min_quality;
+  options_.force_internal_seed_from_prediction =
+      config_.force_internal_seed_from_prediction;
+  options_.bypass_internal_seed_filters = config_.bypass_internal_seed_filters;
+  options_.enable_internal_structure_correction_after_ss =
+      config_.enable_internal_structure_correction_after_ss;
+
   options_.min_border_distance = config_.outer_detector_config.min_border_distance;
   options_.outer_detector_config = config_.outer_detector_config;
   options_.outer_detector_config.tag_ids = requested_board_ids_;
@@ -4408,6 +4948,8 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
     }
   }
 
+  SuppressDuplicateRefinedInternalCorners(&result);
+
   result.success =
       result.valid_internal_corner_count > 0 &&
       result.valid_corner_count >= board_config.min_visible_points;
@@ -4582,6 +5124,7 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
       const cv::Scalar predicted_color(0, 165, 255);
   const cv::Scalar border_seed_color(255, 180, 0);
   const cv::Scalar seed_color(255, 80, 255);
+  const cv::Scalar structure_color(255, 255, 0);
   const cv::Scalar refined_color(0, 220, 80);
       const cv::Scalar arrow2_color(120, 190, 120);
       const cv::Scalar border_arrow_color(160, 160, 160);
@@ -4644,6 +5187,18 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
           cv::drawMarker(*output_image, debug.sphere_seed_image, seed_color,
                          cv::MARKER_DIAMOND, 6, 1, cv::LINE_AA);
         }
+        if (debug.structure_correction_valid &&
+            IsInsideImage(debug.structure_corrected_image, detections.image_size)) {
+          cv::line(*output_image, debug.sphere_seed_image,
+                   debug.structure_corrected_image, structure_color, 1,
+                   cv::LINE_AA);
+          cv::drawMarker(*output_image, debug.structure_corrected_image,
+                         cv::Scalar(255, 255, 255), cv::MARKER_CROSS, 8, 3,
+                         cv::LINE_AA);
+          cv::drawMarker(*output_image, debug.structure_corrected_image,
+                         structure_color, cv::MARKER_CROSS, 6, 1,
+                         cv::LINE_AA);
+        }
         if (has_border_seed_stage &&
             IsInsideImage(debug.border_seed_image, detections.image_size) &&
             IsInsideImage(debug.sphere_seed_image, detections.image_size)) {
@@ -4654,9 +5209,12 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
           cv::line(*output_image, debug.predicted_image, debug.sphere_seed_image,
                    border_arrow_color, 1);
         }
-        if (IsInsideImage(debug.sphere_seed_image, detections.image_size) &&
+        const cv::Point2f refine_start =
+            debug.structure_correction_valid ? debug.structure_corrected_image
+                                             : debug.sphere_seed_image;
+        if (IsInsideImage(refine_start, detections.image_size) &&
             IsInsideImage(debug.refined_image, detections.image_size)) {
-          cv::line(*output_image, debug.sphere_seed_image, debug.refined_image,
+          cv::line(*output_image, refine_start, debug.refined_image,
                    arrow2_color, 1);
         }
         if (IsInsideImage(debug.refined_image, detections.image_size)) {
@@ -4672,14 +5230,29 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
           cv::drawMarker(*output_image, debug.sphere_seed_image, seed_color,
                          cv::MARKER_DIAMOND, 6, 1, cv::LINE_AA);
         }
+        if (debug.structure_correction_valid &&
+            IsInsideImage(debug.structure_corrected_image, detections.image_size)) {
+          cv::line(*output_image, debug.sphere_seed_image,
+                   debug.structure_corrected_image, structure_color, 1,
+                   cv::LINE_AA);
+          cv::drawMarker(*output_image, debug.structure_corrected_image,
+                         cv::Scalar(255, 255, 255), cv::MARKER_CROSS, 8, 3,
+                         cv::LINE_AA);
+          cv::drawMarker(*output_image, debug.structure_corrected_image,
+                         structure_color, cv::MARKER_CROSS, 6, 1,
+                         cv::LINE_AA);
+        }
         if (IsInsideImage(debug.predicted_image, detections.image_size) &&
             IsInsideImage(debug.sphere_seed_image, detections.image_size)) {
           cv::line(*output_image, debug.predicted_image, debug.sphere_seed_image,
                    cv::Scalar(180, 180, 180), 1);
         }
-        if (IsInsideImage(debug.sphere_seed_image, detections.image_size) &&
+        const cv::Point2f refine_start =
+            debug.structure_correction_valid ? debug.structure_corrected_image
+                                             : debug.sphere_seed_image;
+        if (IsInsideImage(refine_start, detections.image_size) &&
             IsInsideImage(debug.refined_image, detections.image_size)) {
-          cv::line(*output_image, debug.sphere_seed_image, debug.refined_image,
+          cv::line(*output_image, refine_start, debug.refined_image,
                    arrow2_color, 1);
         }
         if (IsInsideImage(debug.refined_image, detections.image_size)) {
@@ -4797,8 +5370,8 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
       const std::string legend =
           (detections.projection_mode == InternalProjectionMode::SphereBorderLattice ||
            detections.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed)
-              ? "internal legend: P orange cross, BC blue triangle, SS magenta diamond, R green square"
-              : "internal legend: P orange cross, SS magenta diamond, R green square";
+              ? "internal legend: P orange cross, BC blue triangle, SS magenta diamond, SC cyan cross, R green square"
+              : "internal legend: P orange cross, SS magenta diamond, SC cyan cross, R green square";
       cv::putText(*output_image, legend, cv::Point(20, 112), cv::FONT_HERSHEY_SIMPLEX, 0.48,
                   cv::Scalar(255, 255, 255), 3, cv::LINE_AA);
       cv::putText(*output_image, legend, cv::Point(20, 112), cv::FONT_HERSHEY_SIMPLEX, 0.48,
@@ -4912,8 +5485,8 @@ void ApriltagInternalDetector::DrawDetections(
     const std::string legend =
         (config_.internal_projection_mode == InternalProjectionMode::SphereBorderLattice ||
          config_.internal_projection_mode == InternalProjectionMode::PureSphericalBoundarySeed)
-            ? "internal legend: P orange cross, BC blue triangle, SS magenta diamond, R green square"
-            : "internal legend: P orange cross, SS magenta diamond, R green square";
+            ? "internal legend: P orange cross, BC blue triangle, SS magenta diamond, SC cyan cross, R green square"
+            : "internal legend: P orange cross, SS magenta diamond, SC cyan cross, R green square";
     cv::putText(*output_image, legend, cv::Point(20, 114), cv::FONT_HERSHEY_SIMPLEX, 0.48,
                 cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
   }

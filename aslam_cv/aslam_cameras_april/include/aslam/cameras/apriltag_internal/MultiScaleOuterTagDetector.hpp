@@ -67,7 +67,6 @@ struct MultiScaleOuterTagDetectorConfig {
   // Legacy detector-local id-bracket rescue is unsafe for the multi-board
   // calibration rig because board ids do not encode spatial order.
   bool enable_anonymous_tag_like_geometry_rescue = false;
-  bool enable_interpolated_missing_board_geometry_rescue = false;
   double anonymous_tag_like_rescue_max_center_error_scale = 0.90;
   double anonymous_tag_like_rescue_min_area_ratio = 0.30;
   double anonymous_tag_like_rescue_max_area_ratio = 3.50;

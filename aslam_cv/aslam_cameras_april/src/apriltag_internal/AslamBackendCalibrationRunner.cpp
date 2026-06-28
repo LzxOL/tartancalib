@@ -3018,7 +3018,7 @@ AslamBackendCalibrationResult AslamBackendCalibrationRunner::Run(
     AppendUniqueWarning(stream.str(), &result.warnings);
   }
 
-  const JointMeasurementBuildResult measurement_result =
+  JointMeasurementBuildResult measurement_result =
       BuildMeasurementResult(result.effective_problem_input.measurement_dataset,
                              result.effective_problem_input.reference_board_id);
   if (!measurement_result.success) {
@@ -3036,6 +3036,13 @@ AslamBackendCalibrationResult AslamBackendCalibrationRunner::Run(
         consistency_weight_summary,
         &result.effective_problem_input.measurement_dataset,
         options_);
+    measurement_result =
+        BuildMeasurementResult(result.effective_problem_input.measurement_dataset,
+                               result.effective_problem_input.reference_board_id);
+    if (!measurement_result.success) {
+      result.failure_reason = measurement_result.failure_reason;
+      return result;
+    }
   }
   result.consistency_observation_count =
       consistency_weight_summary.observation_count;

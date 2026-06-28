@@ -6213,6 +6213,65 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << "\n";
   summary << "batch_acceptance_rejected_score_count: "
           << result.batch_acceptance_rejected_score_count << "\n";
+  summary << "persistent_incremental_backend_estimator_attempted: "
+          << (result.persistent_incremental_backend_estimator_attempted ? 1 : 0)
+          << "\n";
+  summary << "persistent_incremental_backend_estimator_used: "
+          << (result.persistent_incremental_backend_estimator_used ? 1 : 0)
+          << "\n";
+  summary << "persistent_incremental_backend_estimator_compatible: "
+          << (result.persistent_incremental_backend_estimator_compatible ? 1 : 0)
+          << "\n";
+  summary << "persistent_incremental_backend_estimator_fallback_reason: "
+          << result.persistent_incremental_backend_estimator_fallback_reason
+          << "\n";
+  summary << "persistent_incremental_backend_estimator_failure_reason: "
+          << result.persistent_incremental_backend_estimator_failure_reason
+          << "\n";
+  summary << "persistent_incremental_seed_batch_count: "
+          << result.persistent_incremental_seed_batch_count << "\n";
+  summary << "persistent_incremental_seed_frame_count: "
+          << result.persistent_incremental_seed_frame_count << "\n";
+  summary << "persistent_incremental_seed_board_observation_count: "
+          << result.persistent_incremental_seed_board_observation_count << "\n";
+  summary << "persistent_incremental_seed_point_count: "
+          << result.persistent_incremental_seed_point_count << "\n";
+  summary << "persistent_incremental_candidate_batch_count: "
+          << result.persistent_incremental_candidate_batch_count << "\n";
+  summary << "persistent_incremental_attempted_batch_count: "
+          << result.persistent_incremental_attempted_batch_count << "\n";
+  summary << "persistent_incremental_accepted_batch_count: "
+          << result.persistent_incremental_accepted_batch_count << "\n";
+  summary << "persistent_incremental_rejected_batch_count: "
+          << result.persistent_incremental_rejected_batch_count << "\n";
+  summary << "persistent_incremental_total_elapsed_time_seconds: "
+          << result.persistent_incremental_total_elapsed_time_seconds << "\n";
+  summary << "persistent_incremental_objective_decrease_gate_enabled: "
+          << (result.persistent_incremental_backend_estimator_used ? 1 : 0)
+          << "\n";
+  summary << "persistent_intrinsics_anchor_prior_enabled: "
+          << (result.persistent_intrinsics_anchor_prior_enabled ? 1 : 0)
+          << "\n";
+  summary << "persistent_intrinsics_anchor_weight_xi_alpha: "
+          << result.persistent_intrinsics_anchor_weight_xi_alpha << "\n";
+  summary << "persistent_intrinsics_anchor_weight_focal: "
+          << result.persistent_intrinsics_anchor_weight_focal << "\n";
+  summary << "persistent_intrinsics_anchor_weight_principal: "
+          << result.persistent_intrinsics_anchor_weight_principal << "\n";
+  const bool auto_anchor_weight =
+      result.persistent_intrinsics_anchor_prior_enabled &&
+      result.persistent_intrinsics_anchor_weight_xi_alpha <= 0.0 &&
+      result.persistent_intrinsics_anchor_weight_focal <= 0.0 &&
+      result.persistent_intrinsics_anchor_weight_principal <= 0.0;
+  summary << "persistent_intrinsics_anchor_weight_mode: "
+          << (auto_anchor_weight ? "auto_from_trust_region" : "explicit")
+          << "\n";
+  summary << "persistent_max_focal_relative_step: "
+          << result.persistent_max_focal_relative_step << "\n";
+  summary << "persistent_max_principal_step_px: "
+          << result.persistent_max_principal_step_px << "\n";
+  summary << "persistent_max_xi_alpha_step: "
+          << result.persistent_max_xi_alpha_step << "\n";
   summary << "kalibr_style_acceptance_note: legacy_rmse_pass is residual "
           << "health only; accepted_by_batch_acceptance requires the "
           << "intrinsics information-gain proxy and score gate.\n";
@@ -6341,6 +6400,30 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
       << "frame_completion_bonus,new_board_bonus,cap_penalty,"
       << "information_gain_proxy,residual_overage_penalty,"
       << "batch_acceptance_score,accepted_by_batch_acceptance,"
+      << "persistent_incremental_attempted,"
+      << "persistent_incremental_batch_accepted,"
+      << "persistent_incremental_force,"
+      << "persistent_incremental_information_gain,"
+      << "persistent_incremental_rank_theta_before,"
+      << "persistent_incremental_rank_theta_after,"
+      << "persistent_incremental_iterations,"
+      << "persistent_incremental_objective_start,"
+      << "persistent_incremental_objective_final,"
+      << "persistent_incremental_objective_decreased,"
+      << "persistent_incremental_elapsed_time_seconds,"
+      << "persistent_incremental_commit_state,"
+      << "persistent_incremental_camera_xi_before,"
+      << "persistent_incremental_camera_alpha_before,"
+      << "persistent_incremental_camera_fu_before,"
+      << "persistent_incremental_camera_fv_before,"
+      << "persistent_incremental_camera_cu_before,"
+      << "persistent_incremental_camera_cv_before,"
+      << "persistent_incremental_camera_xi_after,"
+      << "persistent_incremental_camera_alpha_after,"
+      << "persistent_incremental_camera_fu_after,"
+      << "persistent_incremental_camera_fv_after,"
+      << "persistent_incremental_camera_cu_after,"
+      << "persistent_incremental_camera_cv_after,"
       << "point_count,outer_point_count,internal_point_count\n";
   for (const ati::TrialBackendFrameBoardObservationDecision& decision :
        result.decisions) {
@@ -6423,6 +6506,31 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
         << decision.residual_overage_penalty << ","
         << decision.batch_acceptance_score << ","
         << (decision.accepted_by_batch_acceptance ? 1 : 0) << ","
+        << (decision.persistent_incremental_attempted ? 1 : 0) << ","
+        << (decision.persistent_incremental_batch_accepted ? 1 : 0) << ","
+        << (decision.persistent_incremental_force ? 1 : 0) << ","
+        << decision.persistent_incremental_information_gain << ","
+        << decision.persistent_incremental_rank_theta_before << ","
+        << decision.persistent_incremental_rank_theta_after << ","
+        << decision.persistent_incremental_iterations << ","
+        << decision.persistent_incremental_objective_start << ","
+        << decision.persistent_incremental_objective_final << ","
+        << (decision.persistent_incremental_objective_decreased ? 1 : 0)
+        << ","
+        << decision.persistent_incremental_elapsed_time_seconds << ","
+        << CsvEscape(decision.persistent_incremental_commit_state) << ","
+        << decision.persistent_incremental_camera_xi_before << ","
+        << decision.persistent_incremental_camera_alpha_before << ","
+        << decision.persistent_incremental_camera_fu_before << ","
+        << decision.persistent_incremental_camera_fv_before << ","
+        << decision.persistent_incremental_camera_cu_before << ","
+        << decision.persistent_incremental_camera_cv_before << ","
+        << decision.persistent_incremental_camera_xi_after << ","
+        << decision.persistent_incremental_camera_alpha_after << ","
+        << decision.persistent_incremental_camera_fu_after << ","
+        << decision.persistent_incremental_camera_fv_after << ","
+        << decision.persistent_incremental_camera_cu_after << ","
+        << decision.persistent_incremental_camera_cv_after << ","
         << decision.point_count << ","
         << decision.outer_point_count << ","
         << decision.internal_point_count << "\n";

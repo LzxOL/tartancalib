@@ -25,11 +25,13 @@
 #define ASLAM_CALIBRATION_CORE_LINEAR_SOLVER_H
 
 #include <cstddef>
+#include <cstdint>
 
 #include <vector>
 #include <string>
 
 #include <cholmod.h>
+#include <SuiteSparseQR.hpp>
 
 #include <Eigen/Core>
 
@@ -37,8 +39,6 @@
 #include <aslam/backend/LinearSystemSolver.hpp>
 
 #include "aslam/calibration/core/LinearSolverOptions.h"
-
-template <typename Entry> struct SuiteSparseQR_factorization;
 
 namespace sm {
 
@@ -164,7 +164,7 @@ namespace aslam {
       /// Sets the marginalization start index
       void setMargStartIndex(std::ptrdiff_t index);
       /// Returns the current Jacobian transpose
-      const aslam::backend::CompressedColumnMatrix<std::ptrdiff_t>&
+      const aslam::backend::CompressedColumnMatrix<int64_t>&
         getJacobianTranspose() const;
       /// Returns the current tolerance used by SPQR
       double getQRTolerance() const;
@@ -232,7 +232,7 @@ namespace aslam {
       /// Caching current estimated numerical rank deficiency for SVD
       std::ptrdiff_t _svdRankDeficiency;
       /// Jacobian builder
-      aslam::backend::CompressedColumnJacobianTransposeBuilder<std::ptrdiff_t>
+      aslam::backend::CompressedColumnJacobianTransposeBuilder<int64_t>
         _jacobianBuilder;
       /// Marginalization start index
       std::ptrdiff_t _margStartIndex;

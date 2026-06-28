@@ -71,6 +71,7 @@ struct ApriltagInternalConfig {
   bool ignore_image_evidence_min_quality = false;
   bool force_internal_seed_from_prediction = false;
   bool bypass_internal_seed_filters = false;
+  bool enable_internal_structure_correction_after_ss = true;
   InternalProjectionMode internal_projection_mode = InternalProjectionMode::SphereLattice;
   bool sphere_lattice_use_initial_camera = false;
   bool outer_spherical_use_initial_camera = false;

@@ -8338,6 +8338,28 @@ StereoExtrinsicCalibrationResult StereoExtrinsicCalibrationRunner::Run(
       result.global_sparse_ba_summary.iterations = 0;
       result.global_sparse_ba_summary.objective_start = 0.0;
       result.global_sparse_ba_summary.objective_final = 0.0;
+      result.global_sparse_ba_summary.spherical_weight =
+          options_.spherical_weight;
+      result.global_sparse_ba_summary.spherical_polar_weighting =
+          options_.spherical_polar_weighting;
+      result.global_sparse_ba_summary.spherical_min_polar_deg =
+          options_.spherical_min_polar_deg;
+      result.global_sparse_ba_summary.spherical_max_weight =
+          options_.spherical_max_weight;
+      result.global_sparse_ba_summary.spherical_uncertainty_mode =
+          options_.spherical_uncertainty_mode;
+      result.global_sparse_ba_summary.spherical_pixel_sigma_px =
+          options_.spherical_pixel_sigma_px;
+      result.global_sparse_ba_summary.spherical_model_sigma =
+          options_.spherical_model_sigma;
+      result.global_sparse_ba_summary.spherical_covariance_damping =
+          options_.spherical_covariance_damping;
+      result.global_sparse_ba_summary.spherical_min_sigma_rad =
+          options_.spherical_min_sigma_rad;
+      result.global_sparse_ba_summary.spherical_max_whitening_weight =
+          options_.spherical_max_whitening_weight;
+      result.global_sparse_ba_summary.spherical_use_normalize_jacobian =
+          options_.spherical_use_normalize_jacobian;
       const Eigen::Isometry3d initial_T_cam1_cam0 =
           ToIsometry3d(result.pre_global_sparse_ba_scene.T_cam1_cam0);
       const Eigen::Isometry3d final_T_cam1_cam0 =
@@ -13913,6 +13935,8 @@ void WriteStereoGlobalSparseBaSummary(const std::string& path,
          << "\n";
   output << "solver_mode: " << ToString(result.global_sparse_ba_summary.solver_mode)
          << "\n";
+  output << "stage6_ba_mode: "
+         << result.problem_input.solver_options.ba_mode_label << "\n";
   output << "residual_mode: "
          << ToString(result.global_sparse_ba_summary.residual_mode) << "\n";
   output << "selection_ba_residual_mode: "

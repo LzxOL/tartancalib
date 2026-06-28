@@ -1,6 +1,8 @@
 #include <aslam/cameras/apriltag_internal/Stage5Benchmark.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -25,6 +27,7 @@
 #include <aslam/cameras/apriltag_internal/MultiScaleOuterTagDetector.hpp>
 #include <aslam/cameras/apriltag_internal/PolarAngleResidualDiagnostics.hpp>
 #include <aslam/cameras/apriltag_internal/AslamBackendCalibrationRunner.hpp>
+#include <aslam/cameras/apriltag_internal/Stage5IncrementalBackendEstimator.hpp>
 
 namespace aslam {
 namespace cameras {
@@ -37,6 +40,245 @@ constexpr double kKalibrCornerMinReprojErrorPixels = 0.2;
 constexpr double kWideFovPoseRescueTriggerRmse = 50.0;
 constexpr double kWideFovPoseRescueMaxRayAngleRadians =
     85.0 * 3.14159265358979323846 / 180.0;
+constexpr double kRadiansToDegrees = 180.0 / 3.14159265358979323846;
+
+std::string SanitizeMetricKey(const std::string& input) {
+  std::string sanitized;
+  sanitized.reserve(input.size());
+  bool last_was_underscore = false;
+  for (char ch : input) {
+    const unsigned char uch = static_cast<unsigned char>(ch);
+    if (std::isalnum(uch)) {
+      sanitized.push_back(static_cast<char>(std::tolower(uch)));
+      last_was_underscore = false;
+    } else if (!last_was_underscore) {
+      sanitized.push_back('_');
+      last_was_underscore = true;
+    }
+  }
+  while (!sanitized.empty() && sanitized.back() == '_') {
+    sanitized.pop_back();
+  }
+  return sanitized.empty() ? "reference" : sanitized;
+}
+
+std::string RangeBucketLabel(double low, double high, const std::string& suffix) {
+  std::ostringstream label;
+  label << low << "_" << high << suffix;
+  std::string result = label.str();
+  std::replace(result.begin(), result.end(), '.', 'p');
+  return result;
+}
+
+std::string ValueBucketLabel(double value,
+                             const std::vector<double>& edges,
+                             const std::string& suffix) {
+  if (edges.size() < 2) {
+    return "all";
+  }
+  for (std::size_t i = 0; i + 1 < edges.size(); ++i) {
+    if (value >= edges[i] && value < edges[i + 1]) {
+      return RangeBucketLabel(edges[i], edges[i + 1], suffix);
+    }
+  }
+  std::ostringstream label;
+  label << edges.back() << "_plus" << suffix;
+  std::string result = label.str();
+  std::replace(result.begin(), result.end(), '.', 'p');
+  return result;
+}
+
+double PolarAngleDegrees(const Eigen::Vector3d& ray) {
+  const Eigen::Vector3d unit = ray.normalized();
+  const double z = std::max(-1.0, std::min(1.0, unit.z()));
+  return std::acos(z) * kRadiansToDegrees;
+}
+
+double AngularDifferenceDegrees(const Eigen::Vector3d& a,
+                                const Eigen::Vector3d& b) {
+  const double dot =
+      std::max(-1.0, std::min(1.0, a.normalized().dot(b.normalized())));
+  return std::acos(dot) * kRadiansToDegrees;
+}
+
+struct CameraRayCurveReference {
+  std::string label;
+  OuterBootstrapCameraIntrinsics intrinsics;
+};
+
+struct CameraRayCurveBucketAccumulator {
+  std::string reference_label;
+  std::string reference_family;
+  std::string bucket_type;
+  std::string bucket_label;
+  int sample_count = 0;
+  double angular_sum = 0.0;
+  double angular_square_sum = 0.0;
+  double max_angular = 0.0;
+  double our_polar_sum = 0.0;
+  double reference_polar_sum = 0.0;
+
+  void Add(const CameraRayCurveSample& sample) {
+    ++sample_count;
+    angular_sum += sample.angular_diff_deg;
+    angular_square_sum += sample.angular_diff_deg * sample.angular_diff_deg;
+    max_angular = std::max(max_angular, sample.angular_diff_deg);
+    our_polar_sum += sample.our_polar_deg;
+    reference_polar_sum += sample.reference_polar_deg;
+  }
+
+  CameraRayCurveBucketSummary Summary() const {
+    CameraRayCurveBucketSummary summary;
+    summary.reference_label = reference_label;
+    summary.reference_family = reference_family;
+    summary.bucket_type = bucket_type;
+    summary.bucket_label = bucket_label;
+    summary.sample_count = sample_count;
+    if (sample_count > 0) {
+      summary.mean_angular_diff_deg =
+          angular_sum / static_cast<double>(sample_count);
+      summary.rms_angular_diff_deg =
+          std::sqrt(angular_square_sum / static_cast<double>(sample_count));
+      summary.max_angular_diff_deg = max_angular;
+      summary.mean_our_polar_deg =
+          our_polar_sum / static_cast<double>(sample_count);
+      summary.mean_reference_polar_deg =
+          reference_polar_sum / static_cast<double>(sample_count);
+    }
+    return summary;
+  }
+};
+
+void AddRayCurveBucketSample(
+    const CameraRayCurveSample& sample,
+    const std::string& bucket_type,
+    const std::string& bucket_label,
+    std::map<std::string, CameraRayCurveBucketAccumulator>* accumulators) {
+  if (accumulators == nullptr) {
+    return;
+  }
+  const std::string key = sample.reference_label + "|" + bucket_type + "|" +
+                          bucket_label;
+  CameraRayCurveBucketAccumulator& accumulator = (*accumulators)[key];
+  accumulator.reference_label = sample.reference_label;
+  accumulator.reference_family = sample.reference_family;
+  accumulator.bucket_type = bucket_type;
+  accumulator.bucket_label = bucket_label;
+  accumulator.Add(sample);
+}
+
+CameraRayCurveDiagnostics ComputeCameraRayCurveDiagnostics(
+    const OuterBootstrapCameraIntrinsics& our_intrinsics,
+    const std::vector<CameraRayCurveReference>& references) {
+  CameraRayCurveDiagnostics diagnostics;
+  diagnostics.grid_width = 41;
+  diagnostics.grid_height = 41;
+  diagnostics.comparison_count = static_cast<int>(references.size());
+  if (!our_intrinsics.IsValid()) {
+    diagnostics.failure_reason = "ours camera intrinsics are invalid";
+    return diagnostics;
+  }
+  if (references.empty()) {
+    diagnostics.failure_reason = "no reference camera intrinsics available";
+    return diagnostics;
+  }
+
+  DoubleSphereCameraModel our_camera;
+  try {
+    our_camera = DoubleSphereCameraModel::FromConfig(
+        MakeIntermediateCameraConfig(our_intrinsics));
+  } catch (const std::exception& e) {
+    diagnostics.failure_reason =
+        std::string("failed to construct ours camera model: ") + e.what();
+    return diagnostics;
+  }
+
+  const cv::Size resolution = our_intrinsics.resolution;
+  const Eigen::Vector2d image_center(
+      0.5 * static_cast<double>(std::max(1, resolution.width - 1)),
+      0.5 * static_cast<double>(std::max(1, resolution.height - 1)));
+  const double max_radius =
+      std::max(1e-9, std::sqrt(image_center.x() * image_center.x() +
+                               image_center.y() * image_center.y()));
+  const std::vector<double> radial_edges = {0.0, 0.2, 0.4, 0.6, 0.8, 1.01};
+  const std::vector<double> polar_edges = {0.0, 30.0, 50.0, 70.0, 90.0};
+  std::map<std::string, CameraRayCurveBucketAccumulator> bucket_accumulators;
+
+  for (const CameraRayCurveReference& reference : references) {
+    if (!reference.intrinsics.IsValid()) {
+      diagnostics.warnings.push_back("skipped invalid reference camera: " +
+                                     reference.label);
+      continue;
+    }
+    DoubleSphereCameraModel reference_camera;
+    try {
+      reference_camera = DoubleSphereCameraModel::FromConfig(
+          MakeIntermediateCameraConfig(reference.intrinsics));
+    } catch (const std::exception& e) {
+      diagnostics.warnings.push_back("skipped reference camera " +
+                                     reference.label + ": " + e.what());
+      continue;
+    }
+
+    for (int y_index = 0; y_index < diagnostics.grid_height; ++y_index) {
+      const double y = diagnostics.grid_height <= 1
+                           ? image_center.y()
+                           : static_cast<double>(y_index) *
+                                 static_cast<double>(resolution.height - 1) /
+                                 static_cast<double>(diagnostics.grid_height - 1);
+      for (int x_index = 0; x_index < diagnostics.grid_width; ++x_index) {
+        const double x = diagnostics.grid_width <= 1
+                             ? image_center.x()
+                             : static_cast<double>(x_index) *
+                                   static_cast<double>(resolution.width - 1) /
+                                   static_cast<double>(diagnostics.grid_width - 1);
+        Eigen::Vector3d our_ray = Eigen::Vector3d::Zero();
+        Eigen::Vector3d reference_ray = Eigen::Vector3d::Zero();
+        const Eigen::Vector2d pixel(x, y);
+        if (!our_camera.keypointToEuclidean(pixel, &our_ray) ||
+            !reference_camera.keypointToEuclidean(pixel, &reference_ray) ||
+            our_ray.norm() <= 1e-12 || reference_ray.norm() <= 1e-12 ||
+            !our_ray.allFinite() || !reference_ray.allFinite()) {
+          ++diagnostics.invalid_unprojection_count;
+          continue;
+        }
+        CameraRayCurveSample sample;
+        sample.reference_label = SanitizeMetricKey(reference.label);
+        sample.reference_family = reference.intrinsics.NormalizedFamilyString();
+        sample.image_x = x;
+        sample.image_y = y;
+        sample.radial_fraction = (pixel - image_center).norm() / max_radius;
+        sample.our_polar_deg = PolarAngleDegrees(our_ray);
+        sample.reference_polar_deg = PolarAngleDegrees(reference_ray);
+        sample.angular_diff_deg =
+            AngularDifferenceDegrees(our_ray, reference_ray);
+        diagnostics.samples.push_back(sample);
+
+        AddRayCurveBucketSample(
+            sample, "radial",
+            ValueBucketLabel(sample.radial_fraction, radial_edges, "r"),
+            &bucket_accumulators);
+        AddRayCurveBucketSample(
+            sample, "ours_polar",
+            ValueBucketLabel(sample.our_polar_deg, polar_edges, "deg"),
+            &bucket_accumulators);
+        AddRayCurveBucketSample(
+            sample, "all", "all", &bucket_accumulators);
+      }
+    }
+  }
+
+  diagnostics.sample_count = static_cast<int>(diagnostics.samples.size());
+  diagnostics.bucket_summaries.reserve(bucket_accumulators.size());
+  for (const auto& kv : bucket_accumulators) {
+    diagnostics.bucket_summaries.push_back(kv.second.Summary());
+  }
+  diagnostics.success = diagnostics.sample_count > 0;
+  if (!diagnostics.success && diagnostics.failure_reason.empty()) {
+    diagnostics.failure_reason = "all ray-curve samples were invalid";
+  }
+  return diagnostics;
+}
 
 struct TrialBoardRmseAccumulator {
   std::string frame_label;
@@ -1352,13 +1594,69 @@ TrialBackendMetrics ExtractTrialBackendMetrics(
   return metrics;
 }
 
+TrialBackendOptimizationDiagnostics SummarizeTrialBackendOptimization(
+    const std::string& label,
+    const AslamBackendCalibrationResult& backend_result) {
+  TrialBackendOptimizationDiagnostics summary;
+  summary.label = label;
+  summary.success = backend_result.success;
+  summary.design_variable_count = backend_result.design_variable_count;
+  summary.error_term_count = backend_result.error_term_count;
+  summary.initial_overall_rmse = backend_result.initial_residual.overall_rmse;
+  summary.optimized_overall_rmse = backend_result.optimized_residual.overall_rmse;
+  summary.initial_outer_rmse = backend_result.initial_residual.outer_only_rmse;
+  summary.optimized_outer_rmse = backend_result.optimized_residual.outer_only_rmse;
+  summary.initial_internal_rmse = backend_result.initial_residual.internal_only_rmse;
+  summary.optimized_internal_rmse =
+      backend_result.optimized_residual.internal_only_rmse;
+  summary.camera_xi_before = backend_result.anchor_camera.xi;
+  summary.camera_alpha_before = backend_result.anchor_camera.alpha;
+  summary.camera_fu_before = backend_result.anchor_camera.fu;
+  summary.camera_fv_before = backend_result.anchor_camera.fv;
+  summary.camera_cu_before = backend_result.anchor_camera.cu;
+  summary.camera_cv_before = backend_result.anchor_camera.cv;
+  summary.camera_xi_after = backend_result.optimized_scene_state.camera.xi;
+  summary.camera_alpha_after = backend_result.optimized_scene_state.camera.alpha;
+  summary.camera_fu_after = backend_result.optimized_scene_state.camera.fu;
+  summary.camera_fv_after = backend_result.optimized_scene_state.camera.fv;
+  summary.camera_cu_after = backend_result.optimized_scene_state.camera.cu;
+  summary.camera_cv_after = backend_result.optimized_scene_state.camera.cv;
+  summary.stage_count = static_cast<int>(backend_result.stages.size());
+  summary.failure_reason = backend_result.failure_reason;
+  for (const AslamBackendOptimizationStageSummary& stage :
+       backend_result.stages) {
+    summary.total_iterations += stage.iterations;
+    summary.total_failed_iterations += stage.failed_iterations;
+    summary.any_intrinsics_stage =
+        summary.any_intrinsics_stage || stage.optimize_intrinsics;
+    summary.any_linear_solver_failure =
+        summary.any_linear_solver_failure || stage.linear_solver_failure;
+    summary.objective_start_sum += stage.objective_start;
+    summary.objective_final_sum += stage.objective_final;
+    summary.last_delta_x = stage.delta_x_final;
+    summary.last_delta_j = stage.delta_j_final;
+    summary.last_lm_lambda = stage.lm_lambda_final;
+  }
+  return summary;
+}
+
 AslamBackendCalibrationResult RunShortTrialBackend(
     const CalibrationStateBundle& bundle,
     const BackendProblemOptions& backend_options,
     const TrialBackendFrameBoardSelectionOptions& options,
     const std::string& label_suffix) {
+  BackendProblemOptions trial_backend_options = backend_options;
+  trial_backend_options.optimize_frame_poses = true;
+  trial_backend_options.optimize_board_poses = true;
+  trial_backend_options.optimize_intrinsics =
+      options.optimize_intrinsics_in_trial;
+  trial_backend_options.delayed_intrinsics_release =
+      options.optimize_intrinsics_in_trial &&
+      options.delayed_intrinsics_release_in_trial;
+  trial_backend_options.intrinsics_release_iteration =
+      std::max(0, options.intrinsics_release_iteration);
   CalibrationBackendProblemInput trial_input =
-      BuildBackendProblemInput(bundle, backend_options);
+      BuildBackendProblemInput(bundle, trial_backend_options);
   trial_input.dataset_label += label_suffix;
 
   AslamBackendCalibrationOptions runner_options;
@@ -1375,9 +1673,64 @@ AslamBackendCalibrationResult RunShortTrialBackend(
       kInvalidProjectionPenaltyPixels;
   runner_options.export_cost_parity_diagnostics = false;
   runner_options.run_jacobian_consistency_check = false;
+  runner_options.skip_optimization = false;
 
   const AslamBackendCalibrationRunner runner(runner_options);
   return runner.Run(trial_input);
+}
+
+AslamBackendCalibrationOptions MakeTrialBackendRunnerOptions(
+    const TrialBackendFrameBoardSelectionOptions& options) {
+  AslamBackendCalibrationOptions runner_options;
+  runner_options.max_iterations = std::max(1, options.max_iterations);
+  runner_options.convergence_delta_j = 1e-3;
+  runner_options.convergence_delta_x = 1e-4;
+  runner_options.levenberg_marquardt_lambda_init = 1e-3;
+  runner_options.linear_solver = "cholmod";
+  runner_options.verbose = false;
+  runner_options.use_huber_loss = true;
+  runner_options.outer_huber_delta_pixels = 10.0;
+  runner_options.internal_huber_delta_pixels = 6.0;
+  runner_options.invalid_projection_penalty_pixels =
+      kInvalidProjectionPenaltyPixels;
+  runner_options.export_cost_parity_diagnostics = false;
+  runner_options.run_jacobian_consistency_check = false;
+  runner_options.skip_optimization = false;
+  return runner_options;
+}
+
+void CopyPersistentIncrementalSummary(
+    const Stage5IncrementalBackendEstimatorResult& incremental_result,
+    TrialBackendFrameBoardSelectionResult* result) {
+  if (result == nullptr) {
+    return;
+  }
+  result->persistent_incremental_backend_estimator_attempted =
+      incremental_result.attempted;
+  result->persistent_incremental_backend_estimator_compatible =
+      incremental_result.compatible;
+  result->persistent_incremental_backend_estimator_fallback_reason =
+      incremental_result.fallback_reason;
+  result->persistent_incremental_backend_estimator_failure_reason =
+      incremental_result.failure_reason;
+  result->persistent_incremental_seed_batch_count =
+      incremental_result.seed_batch_count;
+  result->persistent_incremental_seed_frame_count =
+      incremental_result.seed_frame_count;
+  result->persistent_incremental_seed_board_observation_count =
+      incremental_result.seed_board_observation_count;
+  result->persistent_incremental_seed_point_count =
+      incremental_result.seed_point_count;
+  result->persistent_incremental_candidate_batch_count =
+      incremental_result.candidate_batch_count;
+  result->persistent_incremental_attempted_batch_count =
+      incremental_result.attempted_batch_count;
+  result->persistent_incremental_accepted_batch_count =
+      incremental_result.accepted_batch_count;
+  result->persistent_incremental_rejected_batch_count =
+      incremental_result.rejected_batch_count;
+  result->persistent_incremental_total_elapsed_time_seconds =
+      incremental_result.total_elapsed_time_seconds;
 }
 
 double ComputeFrameBoardCoverageGain(
@@ -1920,6 +2273,9 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
       backend_options,
       options,
       "_trial_backend_frame_board_pool");
+  result.trial_optimization_diagnostics.push_back(
+      SummarizeTrialBackendOptimization(
+          "frame_board_pool", result.trial_backend_result));
   if (!result.trial_backend_result.success) {
     result.failure_reason =
         "trial backend failed: " +
@@ -2168,6 +2524,9 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
       backend_options,
       options,
       "_trial_backend_incremental_seed");
+  result.trial_optimization_diagnostics.push_back(
+      SummarizeTrialBackendOptimization(
+          "incremental_seed", current_backend));
   if (!current_backend.success) {
     result.failure_reason =
         "incremental seed backend failed: " +
@@ -2196,6 +2555,24 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
   result.acceptance_rank_gain_threshold =
       options.acceptance_rank_gain_threshold;
   result.carry_accepted_trial_state = options.carry_accepted_trial_state;
+  result.optimize_intrinsics_in_trial = options.optimize_intrinsics_in_trial;
+  result.delayed_intrinsics_release_in_trial =
+      options.delayed_intrinsics_release_in_trial;
+  result.intrinsics_release_iteration = options.intrinsics_release_iteration;
+  result.persistent_intrinsics_anchor_prior_enabled =
+      options.persistent_intrinsics_anchor_prior_enabled;
+  result.persistent_intrinsics_anchor_weight_xi_alpha =
+      options.persistent_intrinsics_anchor_weight_xi_alpha;
+  result.persistent_intrinsics_anchor_weight_focal =
+      options.persistent_intrinsics_anchor_weight_focal;
+  result.persistent_intrinsics_anchor_weight_principal =
+      options.persistent_intrinsics_anchor_weight_principal;
+  result.persistent_max_focal_relative_step =
+      options.persistent_max_focal_relative_step;
+  result.persistent_max_principal_step_px =
+      options.persistent_max_principal_step_px;
+  result.persistent_max_xi_alpha_step =
+      options.persistent_max_xi_alpha_step;
   std::map<int, int> accepted_candidate_count_by_board;
   std::map<int, int> accepted_candidate_count_by_frame;
   std::map<int, int> accepted_frame_cohesion_count_by_frame;
@@ -2541,6 +2918,255 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
     result.frame_batch_candidate_count =
         static_cast<int>(candidate_indices_by_frame.size());
 
+    BackendProblemOptions persistent_backend_options = backend_options;
+    persistent_backend_options.optimize_frame_poses = true;
+    persistent_backend_options.optimize_board_poses = true;
+    persistent_backend_options.optimize_intrinsics =
+        options.optimize_intrinsics_in_trial;
+    persistent_backend_options.delayed_intrinsics_release =
+        options.optimize_intrinsics_in_trial &&
+        options.delayed_intrinsics_release_in_trial;
+    persistent_backend_options.intrinsics_release_iteration =
+        std::max(0, options.intrinsics_release_iteration);
+    result.persistent_intrinsics_anchor_prior_enabled =
+        options.persistent_intrinsics_anchor_prior_enabled;
+    result.persistent_intrinsics_anchor_weight_xi_alpha =
+        options.persistent_intrinsics_anchor_weight_xi_alpha;
+    result.persistent_intrinsics_anchor_weight_focal =
+        options.persistent_intrinsics_anchor_weight_focal;
+    result.persistent_intrinsics_anchor_weight_principal =
+        options.persistent_intrinsics_anchor_weight_principal;
+    result.persistent_max_focal_relative_step =
+        options.persistent_max_focal_relative_step;
+    result.persistent_max_principal_step_px =
+        options.persistent_max_principal_step_px;
+    result.persistent_max_xi_alpha_step =
+        options.persistent_max_xi_alpha_step;
+    const AslamBackendCalibrationOptions persistent_runner_options =
+        MakeTrialBackendRunnerOptions(options);
+
+    std::vector<Stage5IncrementalBackendBatchInput> persistent_batches;
+    std::map<int, Stage5IncrementalBackendBatchInput> persistent_batch_by_frame;
+    bool persistent_safety_ceiling_hit = false;
+    int persistent_candidate_observation_attempt_count = 0;
+    for (int frame_index : frame_order) {
+      if (static_cast<int>(persistent_batches.size()) >=
+          traversal_budget.traversal_limit) {
+        persistent_safety_ceiling_hit = true;
+        break;
+      }
+      const std::vector<std::size_t>& indices =
+          candidate_indices_by_frame[frame_index];
+      Stage5IncrementalBackendBatchInput batch_input;
+      batch_input.frame_index = frame_index;
+      batch_input.residual_health_threshold_px = result.threshold_px;
+      for (std::size_t index : indices) {
+        const TrialBackendFrameBoardObservationDecision& member =
+            candidate_decisions[index];
+        const FrameBoardKey key(member.frame_index, member.board_id);
+        if (accepted_keys.find(key) != accepted_keys.end()) {
+          continue;
+        }
+        if (batch_input.frame_label.empty()) {
+          batch_input.frame_label = member.frame_label;
+        }
+        batch_input.max_trial_rmse =
+            std::max(batch_input.max_trial_rmse, member.trial_rmse);
+        batch_input.frame_board_keys.insert(key);
+        batch_input.force =
+            batch_input.force || member.force_include_candidate;
+      }
+      if (batch_input.frame_board_keys.empty()) {
+        continue;
+      }
+      persistent_candidate_observation_attempt_count +=
+          static_cast<int>(batch_input.frame_board_keys.size());
+      persistent_batch_by_frame[frame_index] = batch_input;
+      persistent_batches.push_back(batch_input);
+    }
+
+    const Stage5IncrementalBackendEstimatorResult persistent_result =
+        RunStage5IncrementalBackendEstimator(
+            baseline_bundle, candidate_pool_bundle, persistent_backend_options,
+            options, persistent_runner_options, persistent_batches);
+    CopyPersistentIncrementalSummary(persistent_result, &result);
+
+    if (persistent_result.success) {
+      result.persistent_incremental_backend_estimator_used = true;
+      result.valid_candidate_traversed_count =
+          persistent_result.attempted_batch_count;
+      result.safety_ceiling_hit = persistent_safety_ceiling_hit;
+      if (result.safety_ceiling_hit) {
+        result.warnings.push_back(
+            "runtime_safety_ceiling_hit; persistent incremental result is runtime-capped");
+      }
+      result.frame_batch_attempted_count =
+          persistent_result.attempted_batch_count;
+      result.frame_batch_accepted_count =
+          persistent_result.accepted_batch_count;
+      result.frame_batch_rejected_count =
+          persistent_result.rejected_batch_count;
+      result.batch_acceptance_attempted_count =
+          persistent_result.attempted_batch_count;
+      result.batch_acceptance_accepted_count =
+          persistent_result.accepted_batch_count;
+      result.batch_acceptance_rejected_score_count =
+          persistent_result.rejected_batch_count;
+      result.attempted_candidate_count =
+          persistent_candidate_observation_attempt_count;
+      accepted_keys = persistent_result.accepted_keys;
+      result.curated_bundle = persistent_result.curated_bundle;
+      result.success = true;
+      result.rejected_board_observation_count =
+          static_cast<int>(candidate_pool_keys.size() > accepted_keys.size()
+                               ? candidate_pool_keys.size() -
+                                     accepted_keys.size()
+                               : 0);
+      result.kept_frame_count =
+          result.curated_bundle.measurement_dataset.accepted_frame_count;
+      result.kept_board_observation_count =
+          result.curated_bundle.measurement_dataset
+              .accepted_board_observation_count;
+      result.kept_outer_point_count =
+          result.curated_bundle.measurement_dataset.accepted_outer_point_count;
+      result.kept_internal_point_count =
+          result.curated_bundle.measurement_dataset
+              .accepted_internal_point_count;
+      result.kept_total_point_count =
+          result.curated_bundle.measurement_dataset.accepted_total_point_count;
+      result.warnings.insert(result.warnings.end(),
+                             persistent_result.warnings.begin(),
+                             persistent_result.warnings.end());
+      result.warnings.push_back(
+          "Used persistent incremental Stage5 backend estimator for frame-batch selection.");
+
+      std::map<int, Stage5IncrementalBackendBatchResult>
+          persistent_batch_result_by_frame;
+      for (const Stage5IncrementalBackendBatchResult& batch_result :
+           persistent_result.batch_results) {
+        persistent_batch_result_by_frame[batch_result.frame_index] =
+            batch_result;
+      }
+
+      for (TrialBackendFrameBoardObservationDecision candidate :
+           candidate_decisions) {
+        const FrameBoardKey key(candidate.frame_index, candidate.board_id);
+        const auto batch_it =
+            persistent_batch_result_by_frame.find(candidate.frame_index);
+        const bool in_attempted_batch =
+            batch_it != persistent_batch_result_by_frame.end() &&
+            persistent_batch_by_frame[candidate.frame_index]
+                    .frame_board_keys.count(key) > 0;
+        candidate.frame_batch_candidate = true;
+        candidate.persistent_incremental_attempted = in_attempted_batch;
+        if (!in_attempted_batch) {
+          candidate.kept = false;
+          candidate.reason = result.safety_ceiling_hit
+                                 ? "runtime_safety_ceiling"
+                                 : "not_attempted_persistent_incremental";
+          decision_by_key[key] = candidate;
+          continue;
+        }
+        const Stage5IncrementalBackendBatchResult& batch_result =
+            batch_it->second;
+        candidate.attempted_incremental = true;
+        candidate.frame_batch_attempted = batch_result.attempted;
+        candidate.frame_batch_accepted = batch_result.batch_accepted;
+        candidate.persistent_incremental_batch_accepted =
+            batch_result.batch_accepted;
+        candidate.persistent_incremental_force = batch_result.force;
+        candidate.persistent_incremental_information_gain =
+            batch_result.information_gain;
+        candidate.persistent_incremental_rank_theta_before =
+            batch_result.rank_theta_before;
+        candidate.persistent_incremental_rank_theta_after =
+            batch_result.rank_theta_after;
+        candidate.persistent_incremental_iterations =
+            batch_result.num_iterations;
+        candidate.persistent_incremental_objective_start =
+            batch_result.objective_start;
+        candidate.persistent_incremental_objective_final =
+            batch_result.objective_final;
+        candidate.persistent_incremental_objective_decreased =
+            batch_result.objective_decreased;
+        candidate.persistent_incremental_elapsed_time_seconds =
+            batch_result.elapsed_time_seconds;
+        candidate.persistent_incremental_commit_state =
+            batch_result.committed_or_rollback;
+        candidate.persistent_incremental_camera_xi_before =
+            batch_result.camera_xi_before;
+        candidate.persistent_incremental_camera_alpha_before =
+            batch_result.camera_alpha_before;
+        candidate.persistent_incremental_camera_fu_before =
+            batch_result.camera_fu_before;
+        candidate.persistent_incremental_camera_fv_before =
+            batch_result.camera_fv_before;
+        candidate.persistent_incremental_camera_cu_before =
+            batch_result.camera_cu_before;
+        candidate.persistent_incremental_camera_cv_before =
+            batch_result.camera_cv_before;
+        candidate.persistent_incremental_camera_xi_after =
+            batch_result.camera_xi_after;
+        candidate.persistent_incremental_camera_alpha_after =
+            batch_result.camera_alpha_after;
+        candidate.persistent_incremental_camera_fu_after =
+            batch_result.camera_fu_after;
+        candidate.persistent_incremental_camera_fv_after =
+            batch_result.camera_fv_after;
+        candidate.persistent_incremental_camera_cu_after =
+            batch_result.camera_cu_after;
+        candidate.persistent_incremental_camera_cv_after =
+            batch_result.camera_cv_after;
+        candidate.information_gain_proxy = batch_result.information_gain;
+        candidate.intrinsics_jacobian_info_term =
+            batch_result.information_gain;
+        candidate.intrinsics_jacobian_rank_gain =
+            batch_result.rank_theta_after >= 0 &&
+                    batch_result.rank_theta_before >= 0
+                ? static_cast<double>(batch_result.rank_theta_after -
+                                      batch_result.rank_theta_before)
+                : 0.0;
+        candidate.global_rmse_after = batch_result.rmse_after;
+        candidate.outer_rmse_delta = batch_result.outer_rmse_after;
+        candidate.internal_rmse_delta = batch_result.internal_rmse_after;
+        candidate.hard_validity_pass = batch_result.objective_finite;
+        candidate.legacy_rmse_pass = batch_result.objective_decreased;
+        candidate.accepted_by_batch_acceptance =
+            batch_result.batch_accepted && !batch_result.force;
+        candidate.kept = accepted_keys.find(key) != accepted_keys.end();
+        if (candidate.kept) {
+          candidate.reason = batch_result.accept_reason.empty()
+                                 ? "accepted_persistent_incremental_batch"
+                                 : batch_result.accept_reason;
+          ++result.accepted_candidate_count;
+          if (candidate.intrinsics_diversity_anchor) {
+            ++result.intrinsics_diversity_anchor_accepted_count;
+          }
+        } else {
+          candidate.reason = batch_result.reject_reason.empty()
+                                 ? "rejected_persistent_incremental_batch"
+                                 : batch_result.reject_reason;
+          if (candidate.intrinsics_diversity_anchor) {
+            ++result.intrinsics_diversity_anchor_rejected_count;
+          }
+        }
+        decision_by_key[key] = candidate;
+      }
+      result.decisions.reserve(decision_by_key.size());
+      for (const auto& entry : decision_by_key) {
+        result.decisions.push_back(entry.second);
+      }
+      return result;
+    }
+
+    if (persistent_result.attempted) {
+      result.warnings.push_back(
+          "Persistent incremental Stage5 backend estimator fallback: " +
+          (persistent_result.failure_reason.empty()
+               ? persistent_result.fallback_reason
+               : persistent_result.failure_reason));
+    }
+
     for (int frame_index : frame_order) {
       if (options.budget_mode ==
               TrialBackendFrameBoardSelectionOptions::BudgetMode::KalibrStyle &&
@@ -2639,6 +3265,9 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
           backend_options,
           options,
           "_trial_backend_frame_batch_candidate");
+      result.trial_optimization_diagnostics.push_back(
+          SummarizeTrialBackendOptimization(
+              "frame_batch_candidate", tentative_backend));
       if (!tentative_backend.success) {
         ++result.frame_batch_rejected_count;
         for (const TrialBackendFrameBoardObservationDecision& member :
@@ -2956,6 +3585,9 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
         backend_options,
         options,
         "_trial_backend_incremental_candidate");
+    result.trial_optimization_diagnostics.push_back(
+        SummarizeTrialBackendOptimization(
+            "incremental_candidate", tentative_backend));
     if (!tentative_backend.success) {
       candidate.kept = false;
       candidate.reason =
@@ -3175,6 +3807,9 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             backend_options,
             options,
             "_trial_backend_frame_cohesion_post_pass_candidate");
+        result.trial_optimization_diagnostics.push_back(
+            SummarizeTrialBackendOptimization(
+                "frame_cohesion_post_pass_candidate", tentative_backend));
         if (!tentative_backend.success) {
           candidate.kept = false;
           candidate.reason =
@@ -5376,6 +6011,52 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
   report.kalibr_holdout_evaluation =
       EvaluateCameraModel(report.holdout_dataset, kalibr_intrinsics, "kalibr");
 
+  report.additional_camera_references = input.additional_camera_references;
+  std::vector<CameraRayCurveReference> ray_curve_references;
+  ray_curve_references.push_back(CameraRayCurveReference{"kalibr", kalibr_intrinsics});
+  for (std::size_t reference_index = 0;
+       reference_index < input.additional_camera_references.size();
+       ++reference_index) {
+    const KalibrBenchmarkReference& reference =
+        input.additional_camera_references[reference_index];
+    OuterBootstrapCameraIntrinsics reference_intrinsics;
+    std::string reference_error;
+    if (!LoadKalibrCamchainIntrinsics(reference.camchain_yaml,
+                                      &reference_intrinsics,
+                                      &reference_error)) {
+      report.failure_reason = reference_error;
+      return report;
+    }
+    std::string method_label = reference.source_label.empty()
+                                   ? ("reference_" +
+                                      std::to_string(reference_index + 1))
+                                   : reference.source_label;
+    method_label = SanitizeMetricKey(method_label);
+    ray_curve_references.push_back(
+        CameraRayCurveReference{method_label, reference_intrinsics});
+    report.additional_training_evaluations.push_back(
+        EvaluateCameraModel(report.training_dataset,
+                            reference_intrinsics,
+                            method_label));
+    report.additional_holdout_evaluations.push_back(
+        EvaluateCameraModel(report.holdout_dataset,
+                            reference_intrinsics,
+                            method_label));
+  }
+  report.camera_ray_curve_diagnostics = ComputeCameraRayCurveDiagnostics(
+      report.baseline_result.final_stage5_bundle.scene_state.camera,
+      ray_curve_references);
+  if (!report.camera_ray_curve_diagnostics.success &&
+      !report.camera_ray_curve_diagnostics.failure_reason.empty()) {
+    report.warnings.push_back(
+        "Camera ray-curve diagnostics failed: " +
+        report.camera_ray_curve_diagnostics.failure_reason);
+  }
+  report.warnings.insert(
+      report.warnings.end(),
+      report.camera_ray_curve_diagnostics.warnings.begin(),
+      report.camera_ray_curve_diagnostics.warnings.end());
+
   if (input.multi_board_consistency_diagnostics_options.enabled) {
     report.multi_board_consistency_diagnostics = EvaluateMultiBoardConsistency(
         report.training_dataset,
@@ -5762,6 +6443,20 @@ void WriteStage5BenchmarkProtocolSummary(const std::string& path,
   output << "kalibr_training_split_signature: "
          << report.kalibr_reference.training_split_signature << "\n";
   output << "kalibr_source_label: " << report.kalibr_reference.source_label << "\n";
+  output << "additional_reference_camera_count: "
+         << report.additional_camera_references.size() << "\n";
+  for (std::size_t index = 0;
+       index < report.additional_camera_references.size();
+       ++index) {
+    const KalibrBenchmarkReference& reference =
+        report.additional_camera_references[index];
+    const std::string prefix =
+        "additional_reference_" + std::to_string(index) + "_";
+    output << prefix << "source_label: " << reference.source_label << "\n";
+    output << prefix << "camchain_yaml: " << reference.camchain_yaml << "\n";
+    output << prefix << "training_split_signature: "
+           << reference.training_split_signature << "\n";
+  }
   output << "internal_joint_refine_mode: "
          << ToString(report.internal_joint_refine_result.options.mode)
          << "\n";
@@ -5876,6 +6571,33 @@ void WriteStage5BenchmarkTrainingSummary(const std::string& path,
   output << "kalibr_point_count_excluding_board"
          << report.kalibr_training_evaluation.excluded_board_id_for_rmse << ": "
          << report.kalibr_training_evaluation.point_count_excluding_board << "\n";
+  output << "additional_reference_camera_count: "
+         << report.additional_training_evaluations.size() << "\n";
+  for (std::size_t index = 0;
+       index < report.additional_training_evaluations.size();
+       ++index) {
+    const CameraModelRefitEvaluationResult& evaluation =
+        report.additional_training_evaluations[index];
+    const std::string prefix =
+        "reference_" + SanitizeMetricKey(evaluation.method_label) + "_";
+    output << prefix << "overall_rmse: " << evaluation.overall_rmse << "\n";
+    output << prefix << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
+    output << prefix << "internal_only_rmse: "
+           << evaluation.internal_only_rmse << "\n";
+    output << prefix << "overall_rmse_excluding_board"
+           << evaluation.excluded_board_id_for_rmse << ": "
+           << evaluation.overall_rmse_excluding_board << "\n";
+    output << prefix << "internal_only_rmse_excluding_board"
+           << evaluation.excluded_board_id_for_rmse << ": "
+           << evaluation.internal_only_rmse_excluding_board << "\n";
+    WriteKalibrStyleResidualStatistics(output,
+                                       prefix.substr(0, prefix.size() - 1),
+                                       evaluation);
+    output << prefix << "point_count: " << evaluation.point_count << "\n";
+    output << prefix << "point_count_excluding_board"
+           << evaluation.excluded_board_id_for_rmse << ": "
+           << evaluation.point_count_excluding_board << "\n";
+  }
 }
 
 void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
@@ -5935,34 +6657,127 @@ void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
   output << "kalibr_point_count_excluding_board"
          << report.kalibr_holdout_evaluation.excluded_board_id_for_rmse << ": "
          << report.kalibr_holdout_evaluation.point_count_excluding_board << "\n";
+  output << "additional_reference_camera_count: "
+         << report.additional_holdout_evaluations.size() << "\n";
+  output << "camera_ray_curve_success: "
+         << (report.camera_ray_curve_diagnostics.success ? 1 : 0) << "\n";
+  output << "camera_ray_curve_comparison_count: "
+         << report.camera_ray_curve_diagnostics.comparison_count << "\n";
+  output << "camera_ray_curve_sample_count: "
+         << report.camera_ray_curve_diagnostics.sample_count << "\n";
+  output << "camera_ray_curve_invalid_unprojection_count: "
+         << report.camera_ray_curve_diagnostics.invalid_unprojection_count
+         << "\n";
+  if (!report.camera_ray_curve_diagnostics.failure_reason.empty()) {
+    output << "camera_ray_curve_failure_reason: "
+           << report.camera_ray_curve_diagnostics.failure_reason << "\n";
+  }
+  for (std::size_t index = 0;
+       index < report.additional_holdout_evaluations.size();
+       ++index) {
+    const CameraModelRefitEvaluationResult& evaluation =
+        report.additional_holdout_evaluations[index];
+    const std::string prefix =
+        "reference_" + SanitizeMetricKey(evaluation.method_label) + "_";
+    output << prefix << "overall_rmse: " << evaluation.overall_rmse << "\n";
+    output << prefix << "pose_only_refit_rmse: "
+           << evaluation.pose_only_refit_rmse << "\n";
+    output << prefix << "pose_only_refit_success_rate: "
+           << evaluation.pose_only_refit_success_rate << "\n";
+    output << prefix << "pose_only_refit_attempt_count: "
+           << evaluation.pose_only_refit_attempt_count << "\n";
+    output << prefix << "pose_only_refit_success_count: "
+           << evaluation.pose_only_refit_success_count << "\n";
+    output << prefix << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
+    output << prefix << "internal_only_rmse: "
+           << evaluation.internal_only_rmse << "\n";
+    output << prefix << "overall_rmse_excluding_board"
+           << evaluation.excluded_board_id_for_rmse << ": "
+           << evaluation.overall_rmse_excluding_board << "\n";
+    output << prefix << "internal_only_rmse_excluding_board"
+           << evaluation.excluded_board_id_for_rmse << ": "
+           << evaluation.internal_only_rmse_excluding_board << "\n";
+    WriteKalibrStyleResidualStatistics(output, prefix.substr(0, prefix.size() - 1),
+                                       evaluation);
+    output << prefix << "point_count: " << evaluation.point_count << "\n";
+    output << prefix << "point_count_excluding_board"
+           << evaluation.excluded_board_id_for_rmse << ": "
+           << evaluation.point_count_excluding_board << "\n";
+  }
 }
 
 void WriteStage5BenchmarkHoldoutPointsCsv(const std::string& path,
                                           const Stage5BenchmarkReport& report) {
-  WriteCameraModelRefitPointsCsv(
-      path,
-      std::vector<CameraModelRefitEvaluationResult>{
-          report.our_holdout_evaluation,
-          report.kalibr_holdout_evaluation});
+  std::vector<CameraModelRefitEvaluationResult> evaluations{
+      report.our_holdout_evaluation,
+      report.kalibr_holdout_evaluation};
+  evaluations.insert(evaluations.end(),
+                     report.additional_holdout_evaluations.begin(),
+                     report.additional_holdout_evaluations.end());
+  WriteCameraModelRefitPointsCsv(path, evaluations);
 }
 
 void WriteStage5BenchmarkHoldoutBoardObservationsCsv(
     const std::string& path,
     const Stage5BenchmarkReport& report) {
-  WriteCameraModelRefitBoardObservationsCsv(
-      path,
-      std::vector<CameraModelRefitEvaluationResult>{
-          report.our_holdout_evaluation,
-          report.kalibr_holdout_evaluation});
+  std::vector<CameraModelRefitEvaluationResult> evaluations{
+      report.our_holdout_evaluation,
+      report.kalibr_holdout_evaluation};
+  evaluations.insert(evaluations.end(),
+                     report.additional_holdout_evaluations.begin(),
+                     report.additional_holdout_evaluations.end());
+  WriteCameraModelRefitBoardObservationsCsv(path, evaluations);
 }
 
 void WriteStage5BenchmarkHoldoutFramesCsv(const std::string& path,
                                           const Stage5BenchmarkReport& report) {
-  WriteCameraModelRefitFramesCsv(
-      path,
-      std::vector<CameraModelRefitEvaluationResult>{
-          report.our_holdout_evaluation,
-          report.kalibr_holdout_evaluation});
+  std::vector<CameraModelRefitEvaluationResult> evaluations{
+      report.our_holdout_evaluation,
+      report.kalibr_holdout_evaluation};
+  evaluations.insert(evaluations.end(),
+                     report.additional_holdout_evaluations.begin(),
+                     report.additional_holdout_evaluations.end());
+  WriteCameraModelRefitFramesCsv(path, evaluations);
+}
+
+void WriteCameraRayCurveSamplesCsv(
+    const std::string& path,
+    const CameraRayCurveDiagnostics& diagnostics) {
+  std::ofstream output(path.c_str());
+  output << "reference_label,reference_family,image_x,image_y,radial_fraction,"
+         << "our_polar_deg,reference_polar_deg,angular_diff_deg\n";
+  for (const CameraRayCurveSample& sample : diagnostics.samples) {
+    output << sample.reference_label << ","
+           << sample.reference_family << ","
+           << sample.image_x << ","
+           << sample.image_y << ","
+           << sample.radial_fraction << ","
+           << sample.our_polar_deg << ","
+           << sample.reference_polar_deg << ","
+           << sample.angular_diff_deg << "\n";
+  }
+}
+
+void WriteCameraRayCurveSummaryCsv(
+    const std::string& path,
+    const CameraRayCurveDiagnostics& diagnostics) {
+  std::ofstream output(path.c_str());
+  output << "reference_label,reference_family,bucket_type,bucket_label,"
+         << "sample_count,mean_angular_diff_deg,rms_angular_diff_deg,"
+         << "max_angular_diff_deg,mean_our_polar_deg,mean_reference_polar_deg\n";
+  for (const CameraRayCurveBucketSummary& summary :
+       diagnostics.bucket_summaries) {
+    output << summary.reference_label << ","
+           << summary.reference_family << ","
+           << summary.bucket_type << ","
+           << summary.bucket_label << ","
+           << summary.sample_count << ","
+           << summary.mean_angular_diff_deg << ","
+           << summary.rms_angular_diff_deg << ","
+           << summary.max_angular_diff_deg << ","
+           << summary.mean_our_polar_deg << ","
+           << summary.mean_reference_polar_deg << "\n";
+  }
 }
 
 void WriteCameraModelRefitPointsCsv(

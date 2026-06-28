@@ -26,7 +26,6 @@
 
 #include <cholmod.h>
 #include <SuiteSparseQR.hpp>
-#include <spqr.hpp>
 
 #include "aslam/calibration/exceptions/OutOfBoundException.h"
 #include "aslam/calibration/exceptions/InvalidOperationException.h"
@@ -60,7 +59,7 @@ namespace aslam {
         throw NullPointerException("cholmod", __FILE__, __LINE__,
           __PRETTY_FUNCTION__);
       const std::ptrdiff_t numIndices = colEndIdx - colStartIdx + 1;
-      std::ptrdiff_t* colIndices = new std::ptrdiff_t[numIndices];
+      int64_t* colIndices = new int64_t[numIndices];
       for (std::ptrdiff_t j = colStartIdx; j <= colEndIdx; ++j)
         colIndices[j - colStartIdx] = j;
       cholmod_sparse* A_sub = cholmod_l_submatrix(A, NULL, -1, colIndices,
@@ -92,7 +91,7 @@ namespace aslam {
         throw NullPointerException("cholmod", __FILE__, __LINE__,
           __PRETTY_FUNCTION__);
       const std::ptrdiff_t numIndices = rowEndIdx - rowStartIdx + 1;
-      std::ptrdiff_t* rowIndices = new std::ptrdiff_t[numIndices];
+      int64_t* rowIndices = new int64_t[numIndices];
       for (std::ptrdiff_t i = rowStartIdx; i <= rowEndIdx; ++i)
        rowIndices[i - rowStartIdx] = i;
       cholmod_sparse* A_sub = cholmod_l_submatrix(A, rowIndices, numIndices,
@@ -115,8 +114,8 @@ namespace aslam {
       if (j < 0)
         throw OutOfBoundException<std::ptrdiff_t>(j, 0,
           "index must be positive", __FILE__, __LINE__, __PRETTY_FUNCTION__);
-      const std::ptrdiff_t* col_ptr =
-        reinterpret_cast<const std::ptrdiff_t*>(A->p);
+      const int64_t* col_ptr =
+        reinterpret_cast<const int64_t*>(A->p);
       const double* values = reinterpret_cast<const double*>(A->x);
       const std::ptrdiff_t p = col_ptr[j];
       const std::ptrdiff_t numElements = col_ptr[j + 1] - p;
@@ -158,10 +157,10 @@ namespace aslam {
         throw NullPointerException("in", __FILE__, __LINE__,
           __PRETTY_FUNCTION__);
       out.setZero(in->nrow, in->ncol);
-      const std::ptrdiff_t* row_ind =
-        reinterpret_cast<const std::ptrdiff_t*>(in->i);
-      const std::ptrdiff_t* col_ptr =
-        reinterpret_cast<const std::ptrdiff_t*>(in->p);
+      const int64_t* row_ind =
+        reinterpret_cast<const int64_t*>(in->i);
+      const int64_t* col_ptr =
+        reinterpret_cast<const int64_t*>(in->p);
       const double* values = reinterpret_cast<const double*>(in->x);
       for (std::ptrdiff_t c = 0; c < static_cast<std::ptrdiff_t>(in->ncol); ++c)
         for (std::ptrdiff_t v = col_ptr[c]; v < col_ptr[c + 1]; ++v) {
@@ -224,8 +223,8 @@ namespace aslam {
       if (out == NULL)
         throw InvalidOperationException("cholmod_l_allocate_sparse failed",
           __FILE__, __LINE__, __PRETTY_FUNCTION__);
-      std::ptrdiff_t* row_ind = reinterpret_cast<std::ptrdiff_t*>(out->i);
-      std::ptrdiff_t* col_ptr = reinterpret_cast<std::ptrdiff_t*>(out->p);
+      int64_t* row_ind = reinterpret_cast<int64_t*>(out->i);
+      int64_t* col_ptr = reinterpret_cast<int64_t*>(out->p);
       double* values = reinterpret_cast<double*>(out->x);
       std::ptrdiff_t rowIt = 0;
       std::ptrdiff_t colIt = 1;
@@ -268,8 +267,12 @@ namespace aslam {
       if (cholmod == NULL)
         throw NullPointerException("cholmod", __FILE__, __LINE__,
           __PRETTY_FUNCTION__);
+      double maxColNorm = 0.0;
+      for (std::ptrdiff_t j = 0; j < static_cast<std::ptrdiff_t>(A->ncol);
+          ++j)
+        maxColNorm = std::max(maxColNorm, colNorm(A, j));
       return 20.0 * static_cast<double>(A->nrow + A->ncol) * eps *
-        spqr_maxcolnorm<double>(A, cholmod);
+        maxColNorm;
     }
 
     double svGap(const Eigen::VectorXd& sv, std::ptrdiff_t rank) {

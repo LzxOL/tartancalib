@@ -27,6 +27,8 @@ set(TARTANCALIB_ASLAM_CV_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/aslam_cv")
 set(TARTANCALIB_SM_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/Schweizer-Messer")
+set(TARTANCALIB_INCREMENTAL_CALIBRATION_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/aslam_incremental_calibration/incremental_calibration")
 
 include_directories(
   "${CMAKE_CURRENT_SOURCE_DIR}/compat"
@@ -47,6 +49,7 @@ include_directories(
   "${TARTANCALIB_SM_DIR}/sm_property_tree/include"
   "${TARTANCALIB_SM_DIR}/sm_random/include"
   "${TARTANCALIB_SM_DIR}/sm_timing/include"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/include"
   ${Boost_INCLUDE_DIRS}
   ${SUITESPARSE_INCLUDE_DIRS}
 )
@@ -154,11 +157,24 @@ target_link_libraries(tartancalib_sparse_block_matrix PUBLIC
 
 add_library(tartancalib_aslam_backend STATIC
   "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/MEstimatorPolicies.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/Matrix.cpp"
   "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/JacobianContainer.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/JacobianBuilder.cpp"
   "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/DesignVariable.cpp"
   "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/ErrorTerm.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/LinearSystemSolver.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/SparseCholeskyLinearSolverOptions.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/SparseCholeskyLinearSystemSolver.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/BlockCholeskyLinearSolverOptions.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/BlockCholeskyLinearSystemSolver.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/SparseBlockMatrixWrapper.cpp"
   "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/OptimizationProblemBase.cpp"
   "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/Optimizer.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/Optimizer2.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/TrustRegionPolicy.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/GaussNewtonTrustRegionPolicy.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/LevenbergMarquardtTrustRegionPolicy.cpp"
+  "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/DogLegTrustRegionPolicy.cpp"
   "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/sparse_matrix_functions.cpp"
   "${TARTANCALIB_ASLAM_OPTIMIZER_DIR}/aslam_backend/src/OptimizationProblem.cpp"
 )
@@ -168,6 +184,45 @@ target_link_libraries(tartancalib_aslam_backend PUBLIC
   tartancalib_sm_logging
   tartancalib_sm_property_tree
   tartancalib_sm_timing
+  Eigen3::Eigen
+  Boost::thread
+  Threads::Threads
+  TBB::tbb
+  ${SUITESPARSE_LIBRARIES}
+)
+
+add_library(tartancalib_incremental_calibration STATIC
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/base/Serializable.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/base/Timestamp.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/base/Condition.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/base/Mutex.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/base/Thread.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/base/Threads.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/base/Timer.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/exceptions/Exception.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/exceptions/InvalidOperationException.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/exceptions/NullPointerException.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/exceptions/SystemException.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/statistics/NormalDistribution1v.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/statistics/ChiSquareDistribution.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/statistics/EstimatorMLNormal1v.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/functions/IncompleteGammaPFunction.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/functions/IncompleteGammaQFunction.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/functions/LogFactorialFunction.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/functions/LogGammaFunction.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/core/IncrementalEstimator.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/core/OptimizationProblem.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/core/IncrementalOptimizationProblem.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/core/LinearSolver.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/core/LinearSolverOptions.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/algorithms/marginalize.cpp"
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/src/algorithms/linalg.cpp"
+)
+target_include_directories(tartancalib_incremental_calibration PUBLIC
+  "${TARTANCALIB_INCREMENTAL_CALIBRATION_DIR}/include"
+)
+target_link_libraries(tartancalib_incremental_calibration PUBLIC
+  tartancalib_aslam_backend
   Eigen3::Eigen
   Boost::thread
   Threads::Threads
@@ -272,6 +327,7 @@ add_library(tartancalib_apriltag_internal_core STATIC
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/OuterDetectionCache.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/OuterOnlyCameraInitializer.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/PolarAngleResidualDiagnostics.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/Stage5IncrementalBackendEstimator.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/Stage6IncrementalBatchEstimator.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/StereoResidualEvaluator.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/StereoExtrinsicCalibrationRunner.cpp"
@@ -289,6 +345,7 @@ target_link_libraries(tartancalib_apriltag_internal_core PUBLIC
   tartancalib_aslam_backend
   tartancalib_aslam_backend_expressions
   tartancalib_aslam_cameras
+  tartancalib_incremental_calibration
   Eigen3::Eigen
   ${OpenCV_LIBS}
   Boost::filesystem

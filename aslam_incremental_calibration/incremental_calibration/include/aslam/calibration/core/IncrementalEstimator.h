@@ -174,6 +174,8 @@ namespace aslam {
       void removeBatch(size_t idx);
       /// Removes a measurement batch from the estimator
       void removeBatch(const BatchSP& batch);
+      /// Rejects a just-added batch and restores the saved pre-batch state
+      void rejectBatch(const BatchSP& batch);
       /// Re-runs the optimizer
       ReturnValue reoptimize();
       /** @}
@@ -203,7 +205,7 @@ namespace aslam {
       /// Returns the last information gain
       double getInformationGain() const;
       /// Returns the current Jacobian transpose if available
-      const aslam::backend::CompressedColumnMatrix<std::ptrdiff_t>&
+      const aslam::backend::CompressedColumnMatrix<int64_t>&
         getJacobianTranspose() const;
       /// Returns the current estimated numerical rank of J_psi
       std::ptrdiff_t getRankPsi() const;
@@ -248,6 +250,8 @@ namespace aslam {
       void orderMarginalizedDesignVariables();
       /// Restores the linear solver
       void restoreLinearSolver();
+      /// Synchronizes cached marginal information after restoring a state
+      void synchronizeMarginalInformation();
       /** @}
         */
 

@@ -771,9 +771,6 @@ MultiScaleOuterTagDetectorConfig ParseConfig(const std::string& yaml_path) {
     } else if (key == "enableAnonymousTagLikeGeometryRescue" ||
                key == "enable_anonymous_tag_like_geometry_rescue") {
       config.enable_anonymous_tag_like_geometry_rescue = ParseBool(key, value);
-    } else if (key == "enableInterpolatedMissingBoardGeometryRescue" ||
-               key == "enable_interpolated_missing_board_geometry_rescue") {
-      config.enable_interpolated_missing_board_geometry_rescue = ParseBool(key, value);
     } else if (key == "anonymousTagLikeRescueMaxCenterErrorScale" ||
                key == "anonymous_tag_like_rescue_max_center_error_scale") {
       config.anonymous_tag_like_rescue_max_center_error_scale = ParseDouble(key, value);
@@ -3159,166 +3156,6 @@ ScaleCandidate BuildSyntheticCandidateFromOriginalCorners(
   return candidate;
 }
 
-void TryInterpolatedMissingBoardGeometryRescue(
-    const cv::Mat& gray_original,
-    const MultiScaleOuterTagDetectorConfig& config,
-    const DoubleSphereCameraModel* sphere_camera,
-    std::vector<PerTagOuterAggregationState>* states) {
-  if (!config.enable_interpolated_missing_board_geometry_rescue ||
-      states == nullptr || states->size() < 3) {
-    return;
-  }
-
-  std::vector<ResolvedBoardGeometry> resolved_boards;
-  resolved_boards.reserve(states->size());
-  for (const PerTagOuterAggregationState& state : *states) {
-    if (state.coarse_candidates.empty()) {
-      continue;
-    }
-    ResolvedBoardGeometry geometry;
-    if (BuildResolvedBoardGeometry(state, &geometry)) {
-      resolved_boards.push_back(geometry);
-    }
-  }
-  if (resolved_boards.size() < 2) {
-    return;
-  }
-  std::sort(resolved_boards.begin(), resolved_boards.end(),
-            [](const ResolvedBoardGeometry& lhs, const ResolvedBoardGeometry& rhs) {
-              return lhs.board_id < rhs.board_id;
-            });
-
-  auto find_state_by_board = [&](int board_id) -> const PerTagOuterAggregationState* {
-    for (const PerTagOuterAggregationState& state : *states) {
-      if (state.result.board_id == board_id) {
-        return &state;
-      }
-    }
-    return nullptr;
-  };
-
-  for (PerTagOuterAggregationState& state : *states) {
-    if (!state.saw_any_detection || state.saw_matching_tag_id ||
-        !state.coarse_candidates.empty()) {
-      continue;
-    }
-
-    const int target_board_id = state.result.board_id;
-    const ResolvedBoardGeometry* lower = nullptr;
-    const ResolvedBoardGeometry* upper = nullptr;
-    for (const ResolvedBoardGeometry& resolved : resolved_boards) {
-      if (resolved.board_id < target_board_id) {
-        if (lower == nullptr || resolved.board_id > lower->board_id) {
-          lower = &resolved;
-        }
-      } else if (resolved.board_id > target_board_id) {
-        if (upper == nullptr || resolved.board_id < upper->board_id) {
-          upper = &resolved;
-        }
-      }
-    }
-    if (lower == nullptr || upper == nullptr || lower->board_id == upper->board_id) {
-      continue;
-    }
-
-    const PerTagOuterAggregationState* lower_state = find_state_by_board(lower->board_id);
-    const PerTagOuterAggregationState* upper_state = find_state_by_board(upper->board_id);
-    const ScaleCandidate* lower_candidate =
-        lower_state == nullptr ? nullptr : BestCoarseCandidate(*lower_state);
-    const ScaleCandidate* upper_candidate =
-        upper_state == nullptr ? nullptr : BestCoarseCandidate(*upper_state);
-    if (lower_candidate == nullptr || upper_candidate == nullptr) {
-      continue;
-    }
-
-    const double id_alpha =
-        static_cast<double>(target_board_id - lower->board_id) /
-        static_cast<double>(upper->board_id - lower->board_id);
-    if (id_alpha <= 0.0 || id_alpha >= 1.0) {
-      continue;
-    }
-    std::array<cv::Point2f, 4> predicted_corners{};
-    for (int corner_index = 0; corner_index < 4; ++corner_index) {
-      predicted_corners[static_cast<std::size_t>(corner_index)] =
-          lower_candidate->original_corners[static_cast<std::size_t>(corner_index)] +
-          (upper_candidate->original_corners[static_cast<std::size_t>(corner_index)] -
-           lower_candidate->original_corners[static_cast<std::size_t>(corner_index)]) *
-              static_cast<float>(id_alpha);
-    }
-    if (!PassesBorderCheck(predicted_corners, gray_original.size(),
-                           config.min_border_distance) ||
-        ComputeQuadArea(predicted_corners) < kMinQuadAreaPixels) {
-      continue;
-    }
-
-    std::ostringstream seed_label;
-    seed_label << "interpolated_missing_board_geometry_seed target_id=" << target_board_id
-               << " bracket=" << lower->board_id << "," << upper->board_id;
-    ScaleCandidate seed_candidate = BuildSyntheticCandidateFromOriginalCorners(
-        target_board_id, gray_original.size(), predicted_corners, 3, seed_label.str());
-
-    const RefinedCandidate refined_candidate =
-        RefineCoarseCandidate(gray_original, seed_candidate, predicted_corners,
-                              config, sphere_camera);
-    int image_evidence_corner_count = 0;
-    double max_displacement = 0.0;
-    for (int corner_index = 0; corner_index < 4; ++corner_index) {
-      const OuterCornerVerificationDebugInfo& debug =
-          refined_candidate.verification_debug[static_cast<std::size_t>(corner_index)];
-      if (debug.line_seed_accepted || debug.spherical_refinement_applied ||
-          debug.image_line_valid) {
-        ++image_evidence_corner_count;
-      }
-      max_displacement = std::max(
-          max_displacement,
-          Norm(refined_candidate.refined_original[static_cast<std::size_t>(corner_index)] -
-               predicted_corners[static_cast<std::size_t>(corner_index)]));
-    }
-    const double expected_edge = std::max(
-        kMinQuadEdgePixels, (1.0 - id_alpha) * lower->mean_edge + id_alpha * upper->mean_edge);
-    const bool refined_inside =
-        PassesBorderCheck(refined_candidate.refined_original, gray_original.size(),
-                          config.min_border_distance);
-    const double refined_area = ComputeQuadArea(refined_candidate.refined_original);
-    const double max_allowed_displacement = std::max(18.0, 0.35 * expected_edge);
-    if (image_evidence_corner_count < 3 ||
-        max_displacement > max_allowed_displacement ||
-        !refined_inside ||
-        refined_area < kMinQuadAreaPixels) {
-      state.attempted_local_patch_rescue = true;
-      std::ostringstream reject_summary;
-      reject_summary << "interpolated_missing_board_geometry_rejected target_id="
-                     << target_board_id
-                     << " bracket=" << lower->board_id << "," << upper->board_id
-                     << " evidence_corners=" << image_evidence_corner_count
-                     << " max_refine_displacement_px=" << std::fixed << std::setprecision(2)
-                     << max_displacement
-                     << " max_allowed_px=" << max_allowed_displacement
-                     << " refined_inside=" << (refined_inside ? 1 : 0)
-                     << " refined_area=" << refined_area;
-      state.local_patch_rescue_summaries.push_back(reject_summary.str());
-      continue;
-    }
-
-    std::ostringstream rescue_summary;
-    rescue_summary << "interpolated_missing_board_geometry_rescue target_id=" << target_board_id
-                   << " bracket=" << lower->board_id << "," << upper->board_id
-                   << " evidence_corners=" << image_evidence_corner_count
-                   << " max_refine_displacement_px=" << std::fixed << std::setprecision(2)
-                   << max_displacement
-                   << " quality=" << refined_candidate.quality;
-    ScaleCandidate accepted_candidate = BuildSyntheticCandidateFromOriginalCorners(
-        target_board_id, gray_original.size(), refined_candidate.refined_original,
-        3, rescue_summary.str());
-    state.saw_matching_tag_id = true;
-    state.attempted_local_patch_rescue = true;
-    state.coarse_candidates.push_back(accepted_candidate);
-    state.result.successful_scale_longest_sides.push_back(
-        accepted_candidate.target_longest_side);
-    state.local_patch_rescue_summaries.push_back(rescue_summary.str());
-  }
-}
-
 void TryLocalSpherePatchRescue(
     const cv::Mat& gray_original,
     const MultiScaleOuterTagDetectorConfig& config,
@@ -3747,8 +3584,6 @@ std::vector<OuterTagDetectionResult> MultiScaleOuterTagDetector::DetectMultiple(
                             requested_index_by_id, detector_.get(), &states);
   TryAnonymousTagLikeGeometryRescue(gray_original.size(), config_,
                                     anonymous_tag_like_candidates, &states);
-  TryInterpolatedMissingBoardGeometryRescue(gray_original, config_, sphere_camera_.get(),
-                                            &states);
 
   std::vector<OuterTagDetectionResult> results;
   results.reserve(states.size());

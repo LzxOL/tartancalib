@@ -27,31 +27,9 @@
 
 #include <Eigen/Core>
 
-namespace Eigen {
-
-  /** The NumTraits<size_t> structure defines support for size_t type in Eigen.
-      \brief Eigen support for size_t
-    */
-  template<> struct NumTraits<size_t> {
-    /// Real definition
-    typedef size_t Real;
-    /// Floating point definition
-    typedef double FloatingPoint;
-    /// Enum for Eigen
-    enum {
-      /// Is complex
-      IsComplex = 0,
-      /// Has floating point
-      HasFloatingPoint = 0,
-      /// Read cost
-      ReadCost = 1,
-      /// Add cost
-      AddCost = 1,
-      /// Multiplicative cost
-      MulCost = 1,
-    };
-  };
-
-}
+// Modern Eigen already provides NumTraits for the unsigned integer type that
+// size_t aliases on supported platforms. The original Kalibr compatibility
+// specialization can be instantiated too late with newer Eigen/Clang, so this
+// header is intentionally a no-op in this standalone build.
 
 #endif // ASLAM_CALIBRATION_UTILS_SIZETSUPPORT_H

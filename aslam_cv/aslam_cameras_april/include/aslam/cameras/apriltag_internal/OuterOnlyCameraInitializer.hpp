@@ -1,10 +1,12 @@
 #ifndef ASLAM_CAMERAS_APRILTAG_INTERNAL_OUTER_ONLY_CAMERA_INITIALIZER_HPP
 #define ASLAM_CAMERAS_APRILTAG_INTERNAL_OUTER_ONLY_CAMERA_INITIALIZER_HPP
 
+#include <array>
 #include <limits>
 #include <string>
 #include <vector>
 
+#include <Eigen/Core>
 #include <opencv2/core.hpp>
 
 #include <aslam/cameras/apriltag_internal/MultiBoardOuterBootstrap.hpp>
@@ -12,6 +14,16 @@
 namespace aslam {
 namespace cameras {
 namespace apriltag_internal {
+
+enum class AutoCameraInitializationRefineMode {
+  None,
+  CoordinateSearch,
+  KalibrOuterLm,
+};
+
+const char* ToString(AutoCameraInitializationRefineMode mode);
+AutoCameraInitializationRefineMode ParseAutoCameraInitializationRefineMode(
+    const std::string& value);
 
 struct AutoCameraInitializationCandidate {
   int rank = -1;
@@ -25,6 +37,14 @@ struct AutoCameraInitializationCandidate {
   int successful_board_count = 0;
   double success_rate = 0.0;
   double mean_observation_rmse = std::numeric_limits<double>::infinity();
+  int leave_one_board_out_attempt_count = 0;
+  int leave_one_board_out_success_count = 0;
+  double leave_one_board_out_rmse = std::numeric_limits<double>::infinity();
+  int relative_layout_pair_family_count = 0;
+  int relative_layout_pair_sample_count = 0;
+  double relative_layout_translation_rmse = std::numeric_limits<double>::infinity();
+  double relative_layout_rotation_rmse_deg = std::numeric_limits<double>::infinity();
+  double relative_layout_consistency_score = std::numeric_limits<double>::infinity();
   bool valid = false;
   std::string failure_reason;
 };
@@ -40,6 +60,16 @@ struct AutoCameraInitializationResidual {
   std::string failure_reason;
 };
 
+struct AutoCameraInitializationBootstrapObservation {
+  int frame_index = -1;
+  std::string frame_label;
+  int board_id = -1;
+  std::array<Eigen::Vector2d, 4> outer_corners{};
+  bool used_in_lm = false;
+  bool pose_init_success = false;
+  double pose_fit_outer_rmse = std::numeric_limits<double>::quiet_NaN();
+};
+
 struct AutoCameraInitializationResult {
   bool success = false;
   CameraInitializationMode requested_mode =
@@ -48,8 +78,56 @@ struct AutoCameraInitializationResult {
   bool auto_attempted = false;
   bool fallback_used = false;
   bool used_manual_intermediate_camera = false;
+  bool used_explicit_initial_camera = false;
   bool used_manual_generic_seed = false;
   bool selected_candidate_refined = false;
+  AutoCameraInitializationRefineMode refine_mode =
+      AutoCameraInitializationRefineMode::KalibrOuterLm;
+  int lm_frame_count = 0;
+  int lm_view_count = 0;
+  int lm_residual_count = 0;
+  int lm_invalid_projection_count = 0;
+  int lm_nonfinite_count = 0;
+  int lm_iteration_count = 0;
+  double lm_initial_rmse = std::numeric_limits<double>::infinity();
+  double lm_final_rmse = std::numeric_limits<double>::infinity();
+  std::string stage5_init_seed_method;
+  std::string stage5_init_seed_source;
+  double stage5_init_omni_gamma = std::numeric_limits<double>::quiet_NaN();
+  std::string stage5_init_omni_gamma_source;
+  std::string stage5_init_ds_mapping;
+  int stage5_init_ds_mapping_verified_against_kalibr_source = 0;
+  int stage5_init_ds_grid_enumeration_enabled = 0;
+  int stage5_init_uses_yaml_intrinsics = 0;
+  int stage5_init_uses_kalibr_camchain_intrinsics = 0;
+  int stage5_init_outer_only = 1;
+  int stage5_init_uses_layout_to_update_intrinsics = 0;
+  int stage5_init_layout_loo_diagnostics_only = 1;
+  int stage5_init_multiboard_frame_objective_enabled = 0;
+  int stage5_init_fixed_layout_frame_constraint_used = 0;
+  int stage5_init_optimizes_layout_variables = 0;
+  std::string stage5_init_lm_selection_objective;
+  std::string stage5_init_selection_prefilter;
+  std::string stage5_init_selection_scorer;
+  int stage5_init_selection_uses_information_metric = 0;
+  int stage5_init_selection_is_exact_kalibr_information_theoretic = 0;
+  int stage5_init_calibrate_intrinsics_enabled = 0;
+  std::string stage5_init_calibrate_intrinsics_released_params;
+  std::string stage5_init_calibrate_intrinsics_optimizer;
+  double stage5_init_runtime_seconds = 0.0;
+  int stage5_init_selected_pose_success_count = 0;
+  int stage5_init_selected_pose_total_count = 0;
+  double full_outer_pose_success_rate = 0.0;
+  double full_outer_rmse = std::numeric_limits<double>::infinity();
+  double full_outer_median_error = std::numeric_limits<double>::infinity();
+  double full_outer_p95_error = std::numeric_limits<double>::infinity();
+  double full_outer_robust_inlier_rmse = std::numeric_limits<double>::infinity();
+  double full_outer_robust_outlier_threshold =
+      std::numeric_limits<double>::infinity();
+  int full_outer_robust_outlier_count = 0;
+  int full_outer_projection_failure_count = 0;
+  int full_outer_nonfinite_count = 0;
+  int bootstrap_internal_points_used = 0;
   std::string selected_source_label;
   OuterBootstrapCameraIntrinsics selected_camera;
   cv::Size image_size;
@@ -63,12 +141,19 @@ struct AutoCameraInitializationResult {
   double initialization_rmse = std::numeric_limits<double>::infinity();
   std::vector<AutoCameraInitializationCandidate> candidates;
   std::vector<AutoCameraInitializationResidual> selected_residuals;
+  std::vector<AutoCameraInitializationBootstrapObservation>
+      lm_bootstrap_observations;
   std::vector<std::string> warnings;
   std::string failure_reason;
 };
 
 struct AutoCameraInitializationOptions {
   CameraInitializationMode mode = CameraInitializationMode::AutoWithManualFallback;
+  AutoCameraInitializationRefineMode refine_mode =
+      AutoCameraInitializationRefineMode::KalibrOuterLm;
+  bool use_explicit_initial_camera = false;
+  OuterBootstrapCameraIntrinsics explicit_initial_camera;
+  std::string explicit_initial_camera_source_label = "explicit_initial_camera";
   int max_candidate_observations = 80;
   int top_candidate_count = 10;
   bool refine_best_candidate = true;
@@ -102,6 +187,9 @@ void WriteAutoCameraInitializationCandidatesCsv(
     const std::string& path,
     const AutoCameraInitializationResult& result);
 void WriteAutoCameraInitializationOuterResidualsCsv(
+    const std::string& path,
+    const AutoCameraInitializationResult& result);
+void WriteAutoCameraInitializationBootstrapViewsCsv(
     const std::string& path,
     const AutoCameraInitializationResult& result);
 

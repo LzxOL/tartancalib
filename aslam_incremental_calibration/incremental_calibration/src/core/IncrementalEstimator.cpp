@@ -157,7 +157,7 @@ namespace aslam {
       return _informationGain;
     }
 
-    const aslam::backend::CompressedColumnMatrix<std::ptrdiff_t>&
+    const aslam::backend::CompressedColumnMatrix<int64_t>&
         IncrementalEstimator::getJacobianTranspose() const {
       return _optimizer->getSolver<LinearSolver>()->getJacobianTranspose();
     }
@@ -360,7 +360,19 @@ namespace aslam {
       linearSolver->setMargStartIndex(static_cast<std::ptrdiff_t>(JCols - dim));
 
       // optimize
-      aslam::backend::SolutionReturnValue srv = _optimizer->optimize();
+      aslam::backend::SolutionReturnValue srv;
+      try {
+        srv = _optimizer->optimize();
+      }
+      catch (...) {
+        if (!force) {
+          _problem->restoreDesignVariables();
+          _problem->remove(problem);
+          if (_problem->getNumOptimizationProblems() > 0)
+            restoreLinearSolver();
+        }
+        throw;
+      }
 
       // return value
       ReturnValue ret;
@@ -483,6 +495,18 @@ namespace aslam {
         removeBatch(std::distance(_problem->getOptimizationProblemBegin(), it));
     }
 
+    void IncrementalEstimator::rejectBatch(const BatchSP& batch) {
+      auto it = _problem->getOptimizationProblem(batch);
+      if (it != _problem->getOptimizationProblemEnd()) {
+        _problem->restoreDesignVariables();
+        _problem->remove(it);
+        if (_problem->getNumOptimizationProblems() > 0) {
+          restoreLinearSolver();
+          synchronizeMarginalInformation();
+        }
+      }
+    }
+
     size_t IncrementalEstimator::getNumBatches() const {
       return _problem->getNumOptimizationProblems();
     }
@@ -534,6 +558,43 @@ namespace aslam {
 
       // build the system
       linearSolver->buildSystem(_optimizer->options().nThreads, true);
+    }
+
+    void IncrementalEstimator::synchronizeMarginalInformation() {
+      auto linearSolver = _optimizer->getSolver<LinearSolver>();
+      linearSolver->analyzeMarginal();
+
+      if (linearSolver->getOptions().columnScaling) {
+        _singularValuesScaled = linearSolver->getSingularValues();
+        _nobsBasisScaled = linearSolver->getNullSpace();
+        _obsBasisScaled = linearSolver->getRowSpace();
+        _sigma2ThetaScaled = linearSolver->getCovariance();
+        _sigma2ThetaObsScaled = linearSolver->getRowSpaceCovariance();
+      }
+      else {
+        _singularValuesScaled.resize(0);
+        _nobsBasisScaled.resize(0, 0);
+        _obsBasisScaled.resize(0, 0);
+        _sigma2ThetaScaled.resize(0, 0);
+        _sigma2ThetaObsScaled.resize(0, 0);
+      }
+
+      _informationGain = 0.0;
+      _svLog2Sum = linearSolver->getSingularValuesLog2Sum();
+      _nobsBasis = linearSolver->getNullSpace();
+      _obsBasis = linearSolver->getRowSpace();
+      _sigma2Theta = linearSolver->getCovariance();
+      _sigma2ThetaObs = linearSolver->getRowSpaceCovariance();
+      _singularValues = linearSolver->getSingularValues();
+      _svdTolerance = linearSolver->getSVDTolerance();
+      _qrTolerance = linearSolver->getQRTolerance();
+      _rankTheta = linearSolver->getSVDRank();
+      _rankThetaDeficiency = linearSolver->getSVDRankDeficiency();
+      _rankPsi = linearSolver->getQRRank();
+      _rankPsiDeficiency = linearSolver->getQRRankDeficiency();
+      _peakMemoryUsage = linearSolver->getPeakMemoryUsage();
+      _memoryUsage = linearSolver->getMemoryUsage();
+      _numFlops = linearSolver->getNumFlops();
     }
 
   }
