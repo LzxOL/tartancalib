@@ -24,9 +24,11 @@
 #include <opencv2/imgproc.hpp>
 
 #include <boost/filesystem.hpp>
+#include <boost/make_shared.hpp>
 #include <boost/shared_ptr.hpp>
 
 #include <aslam/backend/CameraDesignVariable.hpp>
+#include <aslam/backend/DesignVariable.hpp>
 #include <aslam/backend/ErrorTerm.hpp>
 #include <aslam/backend/ErrorTermTransformation.hpp>
 #include <aslam/backend/HomogeneousExpression.hpp>
@@ -37,6 +39,9 @@
 #include <aslam/backend/OptimizationProblem.hpp>
 #include <aslam/backend/Optimizer.hpp>
 #include <aslam/backend/TransformationExpression.hpp>
+#include <aslam/calibration/core/IncrementalEstimator.h>
+#include <aslam/calibration/core/LinearSolverOptions.h>
+#include <aslam/calibration/core/OptimizationProblem.h>
 #include <aslam/cameras/apriltag_internal/DoubleSphereCameraModel.hpp>
 #include <aslam/cameras/apriltag_internal/AngularResidualGeometry.hpp>
 #include <aslam/cameras/apriltag_internal/JointReprojectionCostCore.hpp>
@@ -52,6 +57,7 @@ namespace apriltag_internal {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using PairBoardKey = std::pair<int, int>;
 using DsGeometry = aslam::cameras::DoubleSphereCameraGeometry;
 using DsProjection =
     aslam::cameras::DoubleSphereProjection<aslam::cameras::NoDistortion>;
@@ -63,6 +69,11 @@ using PinholeEquiGeometry =
 using PinholeEquiProjection =
     aslam::cameras::PinholeProjection<aslam::cameras::EquidistantDistortion>;
 namespace fs = boost::filesystem;
+using CalibrationBatch = aslam::calibration::OptimizationProblem;
+
+constexpr std::size_t kStage6StereoExtrinsicInformationGroupId = 0;
+constexpr std::size_t kStage6BoardLayoutGroupId = 1;
+constexpr std::size_t kStage6PairPoseGroupId = 2;
 
 struct StereoCandidateTraversalBudget {
   StereoCandidateBudgetMode mode = StereoCandidateBudgetMode::Fixed;
@@ -371,6 +382,80 @@ struct StereoPoseVariableState {
   aslam::backend::TransformationExpression expression;
 };
 
+using StereoPoseVariableMap =
+    std::map<int, StereoPoseVariableState, std::less<int>,
+             Eigen::aligned_allocator<
+                 std::pair<const int, StereoPoseVariableState> > >;
+using StereoPoseMatrixMap =
+    std::map<int, Eigen::Matrix4d, std::less<int>,
+             Eigen::aligned_allocator<
+                 std::pair<const int, Eigen::Matrix4d> > >;
+
+StereoPoseVariableState& GetOrCreateStereoPoseVariable(
+    StereoPoseVariableMap* variables,
+    int id) {
+  auto it = variables->find(id);
+  if (it != variables->end()) {
+    return it->second;
+  }
+  return variables
+      ->emplace(std::piecewise_construct, std::forward_as_tuple(id),
+                std::forward_as_tuple())
+      .first->second;
+}
+
+void InitializeStereoPoseVariable(StereoPoseVariableState* variable,
+                                  const Eigen::Matrix4d& transform_matrix,
+                                  bool active) {
+  if (variable == nullptr) {
+    return;
+  }
+  variable->transform = sm::kinematics::Transformation(transform_matrix);
+  variable->expression = aslam::backend::transformationToExpression(
+      variable->transform, variable->rotation_dv, variable->translation_dv);
+  variable->rotation_dv->setActive(active);
+  variable->translation_dv->setActive(active);
+}
+
+void AddStereoPoseVariableDvs(
+    const StereoPoseVariableState& variable,
+    std::size_t group_id,
+    const boost::shared_ptr<CalibrationBatch>& batch) {
+  batch->addDesignVariable(variable.rotation_dv, group_id);
+  batch->addDesignVariable(variable.translation_dv, group_id);
+}
+
+void SetStereoPoseVariableFromMatrix(StereoPoseVariableState* variable,
+                                     const Eigen::Matrix4d& matrix) {
+  if (variable == nullptr) {
+    return;
+  }
+  variable->transform.set(matrix);
+  variable->rotation_dv->set(variable->transform.q());
+  variable->translation_dv->set(variable->transform.t());
+}
+
+bool IsStereoPoseVariableFinite(const StereoPoseVariableState& variable) {
+  const Eigen::Vector4d& q = variable.transform.q();
+  const Eigen::Vector3d& t = variable.transform.t();
+  return q.allFinite() && t.allFinite() &&
+         std::abs(q.norm() - 1.0) < 1e-3;
+}
+
+int CountStereoObservationPointsForKeys(
+    const StereoMeasurementDataset& dataset,
+    const std::set<PairBoardKey>& keys) {
+  int count = 0;
+  for (const StereoObservation& observation : dataset.observations) {
+    if (observation.used_in_solver &&
+        keys.count(PairBoardKey(observation.pair_index,
+                                observation.board_id)) > 0) {
+      ++count;
+    }
+  }
+  return count;
+}
+
 struct StereoViewSelectionScore {
   int shared_board_count = 0;
   int shared_outer_point_count = 0;
@@ -378,7 +463,6 @@ struct StereoViewSelectionScore {
   int single_camera_only_board_count = 0;
 };
 
-using PairBoardKey = std::pair<int, int>;
 using CoObsLocalPoseKey = std::tuple<int, int, int>;
 
 bool PairBoardSelected(const StereoPairSelectionSummary& selection_summary,
@@ -1442,6 +1526,413 @@ StereoCameraFixedCalibration UpdateStereoCalibrationFromGeometry(
   return calibration;
 }
 
+struct Stage6PersistentResidualStats {
+  int point_count = 0;
+  int cam0_point_count = 0;
+  int cam1_point_count = 0;
+  int invalid_projection_count = 0;
+  double squared_error = 0.0;
+  double cam0_squared_error = 0.0;
+  double cam1_squared_error = 0.0;
+
+  double Rmse() const {
+    return point_count > 0
+               ? std::sqrt(squared_error / static_cast<double>(point_count))
+               : std::numeric_limits<double>::infinity();
+  }
+  double Cam0Rmse() const {
+    return cam0_point_count > 0
+               ? std::sqrt(cam0_squared_error /
+                           static_cast<double>(cam0_point_count))
+               : std::numeric_limits<double>::infinity();
+  }
+  double Cam1Rmse() const {
+    return cam1_point_count > 0
+               ? std::sqrt(cam1_squared_error /
+                           static_cast<double>(cam1_point_count))
+               : std::numeric_limits<double>::infinity();
+  }
+};
+
+void FillPersistentResidualDiagnostics(
+    const Stage6PersistentResidualStats& before,
+    const Stage6PersistentResidualStats& after,
+    StereoPairTrialSelectionDecision* decision) {
+  if (decision == nullptr) {
+    return;
+  }
+  decision->initial_total_rmse = before.Rmse();
+  decision->trial_total_rmse = after.Rmse();
+  decision->total_rmse_delta =
+      decision->trial_total_rmse - decision->initial_total_rmse;
+  decision->cam0_rmse_delta = after.Cam0Rmse() - before.Cam0Rmse();
+  decision->cam1_rmse_delta = after.Cam1Rmse() - before.Cam1Rmse();
+}
+
+void FillPersistentResidualDiagnostics(
+    const Stage6PersistentResidualStats& before,
+    const Stage6PersistentResidualStats& after,
+    StereoPairBoardTrialSelectionDecision* decision) {
+  if (decision == nullptr) {
+    return;
+  }
+  decision->initial_total_rmse = before.Rmse();
+  decision->trial_total_rmse = after.Rmse();
+  decision->total_rmse_delta =
+      decision->trial_total_rmse - decision->initial_total_rmse;
+  decision->cam0_rmse_delta = after.Cam0Rmse() - before.Cam0Rmse();
+  decision->cam1_rmse_delta = after.Cam1Rmse() - before.Cam1Rmse();
+}
+
+template <typename GeometryT0, typename GeometryT1>
+class Stage6PersistentStereoProblemBuilder {
+ public:
+  Stage6PersistentStereoProblemBuilder(
+      const StereoMeasurementDataset& dataset,
+      const StereoExtrinsicSolverOptions& options,
+      const StereoSceneState& seed_scene)
+      : dataset_(dataset),
+        options_(options),
+        cam0_geometry_(MakeTypedStereoGeometry<GeometryT0>(seed_scene.cam0)),
+        cam1_geometry_(MakeTypedStereoGeometry<GeometryT1>(seed_scene.cam1)),
+        cam0_dv_(cam0_geometry_),
+        cam1_dv_(cam1_geometry_),
+        gauge_fixed_board_id_(seed_scene.gauge_fixed_board_id),
+        baseline_seed_(seed_scene.T_cam1_cam0) {
+    cam0_dv_.setActive(false, false, false);
+    cam1_dv_.setActive(false, false, false);
+    seed_scene_pair_poses_.insert(seed_scene.T_cam0_world_by_pair.begin(),
+                                  seed_scene.T_cam0_world_by_pair.end());
+    InitializeStereoPoseVariable(&baseline_variable_, seed_scene.T_cam1_cam0,
+                                 true);
+    BuildBoardVariables(seed_scene);
+  }
+
+  struct StateSnapshot {
+    Eigen::Matrix4d baseline = Eigen::Matrix4d::Identity();
+    StereoPoseMatrixMap pair_poses;
+    StereoPoseMatrixMap board_poses;
+  };
+
+  boost::shared_ptr<CalibrationBatch> BuildBatch(
+      const std::set<PairBoardKey>& keys,
+      bool force_add_pair_variables,
+      const StateSnapshot* anchor_state) {
+    boost::shared_ptr<CalibrationBatch> batch =
+        boost::make_shared<CalibrationBatch>();
+    AddCameraVariables(batch);
+    AddBaselineVariable(batch);
+    MaybeAddBaselineAnchorPrior(anchor_state, batch);
+    AddBoardVariables(batch);
+    AddPairVariables(keys, force_add_pair_variables, batch);
+    AddResiduals(keys, batch);
+    return batch;
+  }
+
+  StateSnapshot CaptureState() const {
+    StateSnapshot snapshot;
+    snapshot.baseline = baseline_variable_.transform.T();
+    for (const auto& entry : pair_variables_) {
+      snapshot.pair_poses[entry.first] = entry.second.transform.T();
+    }
+    for (const auto& entry : board_variables_) {
+      snapshot.board_poses[entry.first] = entry.second.transform.T();
+    }
+    return snapshot;
+  }
+
+  void RestoreState(const StateSnapshot& snapshot) {
+    SetStereoPoseVariableFromMatrix(&baseline_variable_, snapshot.baseline);
+    for (auto it = pair_variables_.begin(); it != pair_variables_.end();) {
+      if (snapshot.pair_poses.count(it->first) == 0) {
+        it = pair_variables_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (const auto& entry : snapshot.pair_poses) {
+      auto variable_it = pair_variables_.find(entry.first);
+      if (variable_it != pair_variables_.end()) {
+        SetStereoPoseVariableFromMatrix(&variable_it->second, entry.second);
+      }
+    }
+    for (const auto& entry : snapshot.board_poses) {
+      auto variable_it = board_variables_.find(entry.first);
+      if (variable_it != board_variables_.end()) {
+        SetStereoPoseVariableFromMatrix(&variable_it->second, entry.second);
+      }
+    }
+  }
+
+  bool CurrentStateFinite(std::string* reason) const {
+    if (!IsStereoPoseVariableFinite(baseline_variable_)) {
+      if (reason != nullptr) {
+        *reason = "nonfinite_stereo_baseline";
+      }
+      return false;
+    }
+    for (const auto& entry : pair_variables_) {
+      if (!IsStereoPoseVariableFinite(entry.second)) {
+        if (reason != nullptr) {
+          *reason = "nonfinite_pair_pose_" + std::to_string(entry.first);
+        }
+        return false;
+      }
+    }
+    for (const auto& entry : board_variables_) {
+      if (!IsStereoPoseVariableFinite(entry.second)) {
+        if (reason != nullptr) {
+          *reason = "nonfinite_board_pose_" + std::to_string(entry.first);
+        }
+        return false;
+      }
+    }
+    if (reason != nullptr) {
+      reason->clear();
+    }
+    return true;
+  }
+
+  StereoSceneState BuildSceneState(const StereoSceneState& scene_template) const {
+    StereoSceneState scene = scene_template;
+    scene.T_cam1_cam0 = baseline_variable_.transform.T();
+    for (const auto& entry : pair_variables_) {
+      scene.T_cam0_world_by_pair[entry.first] = entry.second.transform.T();
+    }
+    for (const auto& entry : board_variables_) {
+      scene.T_world_board_by_id[entry.first] = entry.second.transform.T();
+    }
+    scene.success = true;
+    scene.failure_reason.clear();
+    return scene;
+  }
+
+  Stage6PersistentResidualStats EvaluateAccepted(
+      const std::set<PairBoardKey>& accepted_keys) const {
+    Stage6PersistentResidualStats stats;
+    const Eigen::Matrix4d T_cam1_cam0 = baseline_variable_.transform.T();
+    for (const StereoObservation& observation : dataset_.observations) {
+      if (!observation.used_in_solver ||
+          accepted_keys.count(PairBoardKey(observation.pair_index,
+                                           observation.board_id)) == 0) {
+        continue;
+      }
+      const StereoPoseVariableState* pair_variable =
+          FindPairVariable(observation.pair_index);
+      if (pair_variable == nullptr) {
+        ++stats.invalid_projection_count;
+        continue;
+      }
+      Eigen::Matrix4d T_world_board = Eigen::Matrix4d::Identity();
+      if (observation.board_id != gauge_fixed_board_id_) {
+        const StereoPoseVariableState* board_variable =
+            FindBoardVariable(observation.board_id);
+        if (board_variable == nullptr) {
+          ++stats.invalid_projection_count;
+          continue;
+        }
+        T_world_board = board_variable->transform.T();
+      }
+      const Eigen::Vector4d point_board(observation.target_point_board.x(),
+                                        observation.target_point_board.y(),
+                                        observation.target_point_board.z(),
+                                        1.0);
+      Eigen::Vector4d point_camera =
+          pair_variable->transform.T() * T_world_board * point_board;
+      if (observation.camera_index == 1) {
+        point_camera = T_cam1_cam0 * point_camera;
+      }
+      Eigen::Vector2d predicted = Eigen::Vector2d::Zero();
+      const bool ok =
+          observation.camera_index == 0
+              ? cam0_geometry_->homogeneousToKeypoint(point_camera, predicted)
+              : cam1_geometry_->homogeneousToKeypoint(point_camera, predicted);
+      if (!ok || !predicted.allFinite()) {
+        ++stats.invalid_projection_count;
+        continue;
+      }
+      const double squared_error =
+          (predicted - observation.observed_image_xy).squaredNorm();
+      ++stats.point_count;
+      stats.squared_error += squared_error;
+      if (observation.camera_index == 0) {
+        ++stats.cam0_point_count;
+        stats.cam0_squared_error += squared_error;
+      } else {
+        ++stats.cam1_point_count;
+        stats.cam1_squared_error += squared_error;
+      }
+    }
+    return stats;
+  }
+
+ private:
+  void AddCameraVariables(const boost::shared_ptr<CalibrationBatch>& batch) {
+    cam0_dv_.setActive(false, false, false);
+    cam1_dv_.setActive(false, false, false);
+    batch->addDesignVariable(cam0_dv_.projectionDesignVariable(),
+                             kStage6PairPoseGroupId);
+    batch->addDesignVariable(cam0_dv_.distortionDesignVariable(),
+                             kStage6PairPoseGroupId);
+    batch->addDesignVariable(cam0_dv_.shutterDesignVariable(),
+                             kStage6PairPoseGroupId);
+    batch->addDesignVariable(cam1_dv_.projectionDesignVariable(),
+                             kStage6PairPoseGroupId);
+    batch->addDesignVariable(cam1_dv_.distortionDesignVariable(),
+                             kStage6PairPoseGroupId);
+    batch->addDesignVariable(cam1_dv_.shutterDesignVariable(),
+                             kStage6PairPoseGroupId);
+  }
+
+  void AddBaselineVariable(const boost::shared_ptr<CalibrationBatch>& batch) {
+    baseline_variable_.rotation_dv->setActive(true);
+    baseline_variable_.translation_dv->setActive(true);
+    AddStereoPoseVariableDvs(baseline_variable_,
+                             kStage6StereoExtrinsicInformationGroupId, batch);
+  }
+
+  void MaybeAddBaselineAnchorPrior(
+      const StateSnapshot* anchor_state,
+      const boost::shared_ptr<CalibrationBatch>& batch) {
+    const double translation_weight = std::max(
+        0.0, options_.persistent_incremental_baseline_prior_translation_weight);
+    const double rotation_weight = std::max(
+        0.0, options_.persistent_incremental_baseline_prior_rotation_weight);
+    if (translation_weight <= 0.0 && rotation_weight <= 0.0) {
+      return;
+    }
+    Eigen::Matrix4d anchor = baseline_seed_;
+    if (anchor_state != nullptr) {
+      anchor = anchor_state->baseline;
+    }
+    batch->addErrorTerm(boost::shared_ptr<aslam::backend::ErrorTerm>(
+        new aslam::backend::ErrorTermTransformation(
+            baseline_variable_.expression, sm::kinematics::Transformation(anchor),
+            rotation_weight, translation_weight)));
+  }
+
+  void BuildBoardVariables(const StereoSceneState& seed_scene) {
+    for (const auto& entry : seed_scene.T_world_board_by_id) {
+      if (entry.first == gauge_fixed_board_id_) {
+        continue;
+      }
+      StereoPoseVariableState& variable =
+          GetOrCreateStereoPoseVariable(&board_variables_, entry.first);
+      InitializeStereoPoseVariable(&variable, entry.second, true);
+    }
+  }
+
+  void AddBoardVariables(const boost::shared_ptr<CalibrationBatch>& batch) {
+    for (auto& entry : board_variables_) {
+      entry.second.rotation_dv->setActive(true);
+      entry.second.translation_dv->setActive(true);
+      AddStereoPoseVariableDvs(entry.second, kStage6BoardLayoutGroupId, batch);
+    }
+  }
+
+  void AddPairVariables(const std::set<PairBoardKey>& keys,
+                        bool force_add_pair_variables,
+                        const boost::shared_ptr<CalibrationBatch>& batch) {
+    std::set<int> pairs;
+    for (const PairBoardKey& key : keys) {
+      pairs.insert(key.first);
+    }
+    for (int pair_index : pairs) {
+      auto pair_it = pair_variables_.find(pair_index);
+      if (pair_it == pair_variables_.end()) {
+        const auto pose_it = seed_scene_pair_poses_.find(pair_index);
+        if (pose_it == seed_scene_pair_poses_.end()) {
+          throw std::runtime_error(
+              "Stage6 persistent estimator missing initialized pair pose.");
+        }
+        StereoPoseVariableState& variable =
+            GetOrCreateStereoPoseVariable(&pair_variables_, pair_index);
+        InitializeStereoPoseVariable(&variable, pose_it->second, true);
+        pair_it = pair_variables_.find(pair_index);
+      } else if (!force_add_pair_variables) {
+        continue;
+      }
+      pair_it->second.rotation_dv->setActive(true);
+      pair_it->second.translation_dv->setActive(true);
+      AddStereoPoseVariableDvs(pair_it->second, kStage6PairPoseGroupId, batch);
+    }
+  }
+
+  void AddResiduals(const std::set<PairBoardKey>& keys,
+                    const boost::shared_ptr<CalibrationBatch>& batch) {
+    const aslam::backend::TransformationExpression identity_transform(
+        Eigen::Matrix4d::Identity());
+    for (const StereoObservation& observation : dataset_.observations) {
+      if (!observation.used_in_solver ||
+          keys.count(PairBoardKey(observation.pair_index,
+                                  observation.board_id)) == 0) {
+        continue;
+      }
+      const StereoPoseVariableState* pair_variable =
+          FindPairVariable(observation.pair_index);
+      if (pair_variable == nullptr) {
+        continue;
+      }
+      aslam::backend::TransformationExpression board_expression =
+          identity_transform;
+      if (observation.board_id != gauge_fixed_board_id_) {
+        const StereoPoseVariableState* board_variable =
+            FindBoardVariable(observation.board_id);
+        if (board_variable == nullptr) {
+          continue;
+        }
+        board_expression = board_variable->expression;
+      }
+      const aslam::backend::HomogeneousExpression point_board(
+          observation.target_point_board);
+      aslam::backend::HomogeneousExpression point_camera =
+          pair_variable->expression * (board_expression * point_board);
+      if (observation.camera_index == 1) {
+        point_camera = baseline_variable_.expression * point_camera;
+      }
+      const double weight = std::max(0.0, observation.weight) *
+                            options_.ba_shared_observation_weight_scale;
+      if (weight <= 0.0) {
+        continue;
+      }
+      if (observation.camera_index == 0) {
+        batch->addErrorTerm(boost::shared_ptr<aslam::backend::ErrorTerm>(
+            new StereoCameraReprojectionError<GeometryT0>(
+                observation.observed_image_xy, weight, point_camera, cam0_dv_,
+                options_.persistent_incremental_invalid_projection_penalty_px)));
+      } else {
+        batch->addErrorTerm(boost::shared_ptr<aslam::backend::ErrorTerm>(
+            new StereoCameraReprojectionError<GeometryT1>(
+                observation.observed_image_xy, weight, point_camera, cam1_dv_,
+                options_.persistent_incremental_invalid_projection_penalty_px)));
+      }
+    }
+  }
+
+  const StereoPoseVariableState* FindPairVariable(int pair_index) const {
+    const auto it = pair_variables_.find(pair_index);
+    return it == pair_variables_.end() ? nullptr : &it->second;
+  }
+
+  const StereoPoseVariableState* FindBoardVariable(int board_id) const {
+    const auto it = board_variables_.find(board_id);
+    return it == board_variables_.end() ? nullptr : &it->second;
+  }
+
+  const StereoMeasurementDataset& dataset_;
+  const StereoExtrinsicSolverOptions& options_;
+  boost::shared_ptr<GeometryT0> cam0_geometry_;
+  boost::shared_ptr<GeometryT1> cam1_geometry_;
+  CameraDv<GeometryT0> cam0_dv_;
+  CameraDv<GeometryT1> cam1_dv_;
+  int gauge_fixed_board_id_ = 1;
+  Eigen::Matrix4d baseline_seed_ = Eigen::Matrix4d::Identity();
+  StereoPoseVariableState baseline_variable_;
+  StereoPoseVariableMap pair_variables_;
+  StereoPoseVariableMap board_variables_;
+  StereoPoseMatrixMap seed_scene_pair_poses_;
+};
+
 double EvaluateTotalProblemObjective(aslam::backend::OptimizationProblem* problem) {
   if (problem == nullptr) {
     throw std::runtime_error("EvaluateTotalProblemObjective requires a valid problem.");
@@ -2408,7 +2899,8 @@ StereoPairBoardConsistencySummary BuildPairBoardConsistencySummary(
       } else if (split == "holdout") {
         // Holdout pairs are not design variables in the optimized scene. Use the
         // same stereo-outer refit pose as the holdout evaluator so the audit is
-        // comparable to holdout RMSE instead of reporting infinity.
+        // comparable to extrinsic-only holdout RMSE instead of reporting
+        // infinity.
         RuntimeCounters runtime_counters;
         StereoRefitDiagnostics refit_diagnostics;
         Eigen::Matrix4d refit_pose = Eigen::Matrix4d::Identity();
@@ -7432,6 +7924,759 @@ void AccumulatePairBatchDiagnostics(
   }
 }
 
+void CopyPersistentReturnValueToPairDecision(
+    const aslam::calibration::IncrementalEstimator::ReturnValue& ret,
+    int rank_before,
+    int normalization_count,
+    const std::string& batch_type,
+    bool solution_valid,
+    const std::string& committed_or_rollback,
+    StereoPairTrialSelectionDecision* decision) {
+  if (decision == nullptr) {
+    return;
+  }
+  decision->incremental_estimator_enabled = true;
+  decision->persistent_incremental_estimator_used = true;
+  decision->candidate_batch_type = batch_type;
+  decision->batchAccepted = ret.batchAccepted && solution_valid;
+  decision->solution_valid = solution_valid;
+  decision->optimization_success = ret.numIterations > 0 ||
+                                   (std::isfinite(ret.JStart) &&
+                                    std::isfinite(ret.JFinal));
+  decision->num_iterations = static_cast<int>(ret.numIterations);
+  decision->objective_before = ret.JStart;
+  decision->objective_after = ret.JFinal;
+  decision->marginal_information_gain_proxy = ret.informationGain;
+  decision->normalized_information_gain =
+      normalization_count > 0
+          ? ret.informationGain / static_cast<double>(normalization_count)
+          : ret.informationGain;
+  decision->information_gain_normalization_count =
+      std::max(1, normalization_count);
+  decision->rank_before = rank_before;
+  decision->rank_after = static_cast<int>(ret.rankTheta);
+  decision->rank_psi_after = static_cast<int>(ret.rankPsi);
+  decision->rank_psi_deficiency_after =
+      static_cast<int>(ret.rankPsiDeficiency);
+  decision->rank_theta_deficiency_after =
+      static_cast<int>(ret.rankThetaDeficiency);
+  decision->rank_proxy_increases =
+      rank_before >= 0 && static_cast<int>(ret.rankTheta) > rank_before;
+  decision->svd_tolerance = ret.svdTolerance;
+  decision->qr_tolerance = ret.qrTolerance;
+  decision->elapsed_time_seconds = ret.elapsedTime;
+  decision->committed_or_rollback = committed_or_rollback;
+}
+
+void CopyPersistentReturnValueToBoardDecision(
+    const aslam::calibration::IncrementalEstimator::ReturnValue& ret,
+    int rank_before,
+    int normalization_count,
+    const std::string& batch_type,
+    bool solution_valid,
+    const std::string& committed_or_rollback,
+    StereoPairBoardTrialSelectionDecision* decision) {
+  if (decision == nullptr) {
+    return;
+  }
+  decision->incremental_estimator_enabled = true;
+  decision->persistent_incremental_estimator_used = true;
+  decision->candidate_batch_type = batch_type;
+  decision->batchAccepted = ret.batchAccepted && solution_valid;
+  decision->solution_valid = solution_valid;
+  decision->optimization_success = ret.numIterations > 0 ||
+                                   (std::isfinite(ret.JStart) &&
+                                    std::isfinite(ret.JFinal));
+  decision->num_iterations = static_cast<int>(ret.numIterations);
+  decision->objective_before = ret.JStart;
+  decision->objective_after = ret.JFinal;
+  decision->marginal_information_gain_proxy = ret.informationGain;
+  decision->normalized_information_gain =
+      normalization_count > 0
+          ? ret.informationGain / static_cast<double>(normalization_count)
+          : ret.informationGain;
+  decision->information_gain_normalization_count =
+      std::max(1, normalization_count);
+  decision->rank_before = rank_before;
+  decision->rank_after = static_cast<int>(ret.rankTheta);
+  decision->rank_psi_after = static_cast<int>(ret.rankPsi);
+  decision->rank_psi_deficiency_after =
+      static_cast<int>(ret.rankPsiDeficiency);
+  decision->rank_theta_deficiency_after =
+      static_cast<int>(ret.rankThetaDeficiency);
+  decision->rank_proxy_increases =
+      rank_before >= 0 && static_cast<int>(ret.rankTheta) > rank_before;
+  decision->svd_tolerance = ret.svdTolerance;
+  decision->qr_tolerance = ret.qrTolerance;
+  decision->elapsed_time_seconds = ret.elapsedTime;
+  decision->committed_or_rollback = committed_or_rollback;
+}
+
+template <typename GeometryT0, typename GeometryT1>
+StereoPairBoardTrialSelectionSummary
+RunPersistentIncrementalPairCohesiveSelectionTyped(
+    const StereoMeasurementDataset& dataset,
+    const StereoExtrinsicSolverOptions& options,
+    const StereoPairSelectionSummary& base_selection,
+    StereoPairTrialSelectionSummary* pair_summary,
+    StereoPairSelectionSummary* final_selection,
+    StereoSceneState* scene_state) {
+  const Clock::time_point start_time = Clock::now();
+  StereoPairBoardTrialSelectionSummary board_summary;
+  board_summary.enabled = true;
+  board_summary.success = false;
+  board_summary.pairboard_selection_mode = options.pairboard_selection_mode;
+  board_summary.incremental_estimator_enabled = true;
+  board_summary.persistent_incremental_estimator_used = true;
+  board_summary.marginal_information_gain_proxy_enabled = false;
+  board_summary.rmse_delta_diagnostics_only = true;
+  board_summary.incremental_mi_tol = options.incremental_mi_tol;
+  board_summary.incremental_rank_threshold = options.incremental_rank_threshold;
+  board_summary.incremental_info_block = ToString(options.incremental_info_block);
+  board_summary.persistent_incremental_information_group =
+      "stereo_extrinsic";
+  if (pair_summary != nullptr) {
+    *pair_summary = StereoPairTrialSelectionSummary();
+    pair_summary->enabled = true;
+    pair_summary->requested_seed_count =
+        options.persistent_incremental_seed_pair_count;
+    pair_summary->warnings.push_back(
+        "persistent_incremental_pair_cohesive_selection");
+  }
+  if (final_selection == nullptr || scene_state == nullptr) {
+    board_summary.failure_reason = "missing_output_pointer";
+    return board_summary;
+  }
+  if (options.rig_param_mode != StereoRigParamMode::Cam0Reference) {
+    board_summary.failure_reason =
+        "persistent_incremental_first_version_requires_cam0_reference";
+    return board_summary;
+  }
+  if (options.final_ba_residual_mode != StereoFinalBaResidualMode::Pixel ||
+      options.selection_ba_residual_mode != StereoFinalBaResidualMode::Pixel) {
+    board_summary.failure_reason =
+        "persistent_incremental_first_version_supports_pixel_residual_only";
+    return board_summary;
+  }
+
+  std::vector<const StereoPairSelectionRow*> ranked_rows;
+  for (const StereoPairSelectionRow& row : base_selection.rows) {
+    if (!row.eligible || row.shared_board_count <= 0) {
+      continue;
+    }
+    if (dataset.pair_shared_board_ids.count(row.pair_index) == 0) {
+      continue;
+    }
+    ranked_rows.push_back(&row);
+  }
+  std::sort(ranked_rows.begin(), ranked_rows.end(),
+            [](const StereoPairSelectionRow* lhs,
+               const StereoPairSelectionRow* rhs) {
+              return IsSelectionRowBetter(*lhs, *rhs);
+            });
+  board_summary.candidate_count = static_cast<int>(ranked_rows.size());
+  board_summary.valid_candidate_count = board_summary.candidate_count;
+  board_summary.budget_mode = options.pair_selection_budget_mode;
+  board_summary.runtime_safety_ceiling =
+      options.pair_selection_runtime_safety_ceiling;
+  board_summary.max_candidate_additions_effective =
+      options.pair_selection_budget_mode == StereoCandidateBudgetMode::KalibrStyle
+          ? "adaptive_incremental_all_until_safety_ceiling"
+          : std::to_string(options.pair_selection_max_candidate_additions);
+  if (pair_summary != nullptr) {
+    pair_summary->candidate_count = board_summary.candidate_count;
+    pair_summary->valid_candidate_count = board_summary.valid_candidate_count;
+    pair_summary->budget_mode = board_summary.budget_mode;
+    pair_summary->runtime_safety_ceiling = board_summary.runtime_safety_ceiling;
+    pair_summary->max_candidate_additions_effective =
+        board_summary.max_candidate_additions_effective;
+  }
+  if (ranked_rows.empty()) {
+    board_summary.failure_reason =
+        "no_valid_persistent_incremental_pair_candidates";
+    return board_summary;
+  }
+
+  aslam::calibration::IncrementalEstimator::Options inc_options;
+  inc_options.infoGainDelta = options.incremental_mi_tol;
+  inc_options.checkValidity = false;
+  inc_options.verbose = false;
+  aslam::calibration::LinearSolverOptions solver_options;
+  solver_options.columnScaling = true;
+  aslam::backend::Optimizer2Options optimizer_options;
+  optimizer_options.maxIterations =
+      std::max(1, options.persistent_incremental_max_iterations);
+  optimizer_options.convergenceDeltaJ =
+      options.persistent_incremental_convergence_delta_j;
+  optimizer_options.convergenceDeltaX =
+      options.persistent_incremental_convergence_delta_x;
+  optimizer_options.verbose = false;
+  optimizer_options.nThreads = 4;
+
+  Stage6PersistentStereoProblemBuilder<GeometryT0, GeometryT1> builder(
+      dataset, options, *scene_state);
+  aslam::calibration::IncrementalEstimator estimator(
+      kStage6StereoExtrinsicInformationGroupId, inc_options, solver_options,
+      optimizer_options);
+
+  const StereoCandidateTraversalBudget pair_budget =
+      ComputeStereoCandidateTraversalBudget(
+          options.pair_selection_budget_mode,
+          static_cast<int>(ranked_rows.size()),
+          options.pair_selection_max_candidate_additions,
+          options.pair_selection_adaptive_budget_ratio,
+          options.pair_selection_adaptive_budget_min,
+          options.pair_selection_adaptive_budget_max,
+          options.pair_selection_runtime_safety_ceiling);
+  board_summary.budget_mode = pair_budget.mode;
+  board_summary.runtime_safety_ceiling = pair_budget.runtime_safety_ceiling;
+  board_summary.max_candidate_additions_effective =
+      pair_budget.max_candidate_additions_effective;
+  if (pair_summary != nullptr) {
+    pair_summary->budget_mode = pair_budget.mode;
+    pair_summary->runtime_safety_ceiling = pair_budget.runtime_safety_ceiling;
+    pair_summary->max_candidate_additions_effective =
+        pair_budget.max_candidate_additions_effective;
+  }
+
+  std::set<PairBoardKey> selected_pair_boards;
+  std::set<PairBoardKey> seed_pair_boards;
+  std::set<int> covered_boards;
+  int current_rank = -1;
+  const int seed_target =
+      std::min<int>(std::max(1, options.persistent_incremental_seed_pair_count),
+                    static_cast<int>(ranked_rows.size()));
+  auto build_pair_cohesive_candidate =
+      [&](const StereoPairSelectionRow& row,
+          const std::set<PairBoardKey>& already_selected,
+          std::vector<StereoPairBoardTrialSelectionDecision>* board_decisions,
+          std::set<PairBoardKey>* batch_keys) {
+        if (board_decisions == nullptr || batch_keys == nullptr) {
+          return;
+        }
+        const auto shared_it =
+            dataset.pair_shared_board_ids.find(row.pair_index);
+        if (shared_it == dataset.pair_shared_board_ids.end()) {
+          return;
+        }
+        for (int board_id : shared_it->second) {
+          StereoPairBoardTrialSelectionDecision board_decision =
+              MakePairBoardDecision(dataset, *scene_state, options,
+                                    row.pair_index, board_id);
+          board_decision.pair_cohesion_candidate = true;
+          board_decision.selected_pair_board_count_before =
+              static_cast<int>(already_selected.size());
+          board_decision.selected_pair_count_before = static_cast<int>(
+              PairIndicesFromPairBoards(already_selected).size());
+          board_decision.selected_board_count_before = static_cast<int>(
+              BoardIdsFromPairBoards(already_selected).size());
+          board_decision.coverage_gain =
+              ComputePairBoardCoverageGain(already_selected, row.pair_index,
+                                           board_id);
+          board_decisions->push_back(board_decision);
+          batch_keys->insert(PairBoardKey(row.pair_index, board_id));
+        }
+      };
+
+  int traversed = seed_target;
+
+  std::vector<const StereoPairSelectionRow*> seed_rows;
+  std::set<int> seed_pair_indices;
+  std::vector<StereoPairTrialSelectionDecision> seed_pair_decisions;
+  std::vector<StereoPairBoardTrialSelectionDecision> seed_board_decisions;
+  for (int i = 0; i < seed_target; ++i) {
+    const StereoPairSelectionRow* row = ranked_rows[i];
+    if (row == nullptr) {
+      continue;
+    }
+    seed_rows.push_back(row);
+    seed_pair_indices.insert(row->pair_index);
+    std::vector<StereoPairBoardTrialSelectionDecision> row_board_decisions;
+    std::set<PairBoardKey> row_keys;
+    build_pair_cohesive_candidate(*row, seed_pair_boards,
+                                  &row_board_decisions, &row_keys);
+    if (row_keys.empty()) {
+      continue;
+    }
+    StereoPairTrialSelectionDecision pair_decision =
+        MakeTrialDecisionFromRow(dataset, *row, covered_boards);
+    pair_decision.attempted = true;
+    pair_decision.incremental_estimator_enabled = true;
+    pair_decision.persistent_incremental_estimator_used = true;
+    pair_decision.candidate_batch_type =
+        "persistent_pair_cohesive_seed_batch";
+    pair_decision.force = true;
+    pair_decision.seed = true;
+    AccumulatePairBatchDiagnostics(&pair_decision, row_board_decisions);
+    seed_pair_decisions.push_back(pair_decision);
+    seed_board_decisions.insert(seed_board_decisions.end(),
+                                row_board_decisions.begin(),
+                                row_board_decisions.end());
+    seed_pair_boards.insert(row_keys.begin(), row_keys.end());
+  }
+  board_summary.valid_candidate_traversed_count = traversed;
+  if (pair_summary != nullptr) {
+    pair_summary->valid_candidate_traversed_count = traversed;
+  }
+  if (seed_pair_boards.empty()) {
+    board_summary.failure_reason = "empty_persistent_incremental_seed_batch";
+    return board_summary;
+  }
+
+  typename Stage6PersistentStereoProblemBuilder<GeometryT0, GeometryT1>::
+      StateSnapshot seed_state = builder.CaptureState();
+  boost::shared_ptr<CalibrationBatch> seed_batch =
+      builder.BuildBatch(seed_pair_boards, true, &seed_state);
+  aslam::calibration::IncrementalEstimator::ReturnValue seed_ret{};
+  bool seed_add_exception = false;
+  std::string seed_invalid_reason;
+  try {
+    seed_ret = estimator.addBatch(seed_batch, true);
+  } catch (const std::exception& exception) {
+    seed_add_exception = true;
+    seed_invalid_reason =
+        std::string("incremental_seed_batch_exception: ") + exception.what();
+  }
+  bool seed_state_valid = false;
+  if (!seed_add_exception) {
+    seed_state_valid = builder.CurrentStateFinite(&seed_invalid_reason);
+  }
+  const bool seed_objective_finite =
+      !seed_add_exception && std::isfinite(seed_ret.JStart) &&
+      std::isfinite(seed_ret.JFinal);
+  const bool seed_objective_decreased =
+      seed_objective_finite && seed_ret.JFinal <= seed_ret.JStart;
+  const bool seed_accepted = !seed_add_exception && seed_ret.batchAccepted &&
+                             seed_state_valid && seed_objective_decreased;
+  ++board_summary.batch_acceptance_attempted_count;
+  board_summary.attempted_count += static_cast<int>(seed_rows.size());
+  if (pair_summary != nullptr) {
+    pair_summary->attempted_count += static_cast<int>(seed_rows.size());
+  }
+  const int seed_normalization_count =
+      std::max(1, static_cast<int>(seed_pair_boards.size()));
+  if (!seed_accepted) {
+    ++board_summary.batch_acceptance_rejected_score_count;
+    board_summary.rejected_count += static_cast<int>(seed_rows.size());
+    if (pair_summary != nullptr) {
+      pair_summary->rejected_count += static_cast<int>(seed_rows.size());
+    }
+    if (!seed_add_exception && seed_ret.batchAccepted) {
+      estimator.rejectBatch(seed_batch);
+    }
+    builder.RestoreState(seed_state);
+    if (seed_invalid_reason.empty()) {
+      seed_invalid_reason =
+          seed_ret.batchAccepted ? "persistent_seed_validity_gate"
+                                 : "persistent_seed_estimator_rejected_batch";
+    }
+    for (StereoPairTrialSelectionDecision pair_decision :
+         seed_pair_decisions) {
+      pair_decision.accepted = false;
+      pair_decision.batchAccepted = false;
+      pair_decision.reject_reason = seed_invalid_reason;
+      CopyPersistentReturnValueToPairDecision(
+          seed_ret, current_rank, seed_normalization_count,
+          "persistent_pair_cohesive_seed_batch", false, "rollback",
+          &pair_decision);
+      if (pair_summary != nullptr) {
+        pair_summary->decisions.push_back(pair_decision);
+      }
+    }
+    for (StereoPairBoardTrialSelectionDecision board_decision :
+         seed_board_decisions) {
+      board_decision.attempted = true;
+      board_decision.accepted = false;
+      board_decision.batchAccepted = false;
+      board_decision.force = true;
+      board_decision.seed = true;
+      board_decision.reject_reason = seed_invalid_reason;
+      CopyPersistentReturnValueToBoardDecision(
+          seed_ret, current_rank, seed_normalization_count,
+          "persistent_pair_cohesive_seed_batch", false, "rollback",
+          &board_decision);
+      board_summary.decisions.push_back(board_decision);
+    }
+    board_summary.failure_reason = seed_invalid_reason;
+    return board_summary;
+  }
+
+  ++board_summary.batch_acceptance_accepted_count;
+  board_summary.accepted_count += static_cast<int>(seed_rows.size());
+  board_summary.seed_count = static_cast<int>(seed_rows.size());
+  board_summary.persistent_incremental_seed_batch_count = 1;
+  board_summary.persistent_incremental_seed_pair_count =
+      static_cast<int>(seed_pair_indices.size());
+  board_summary.persistent_incremental_seed_pair_board_count =
+      static_cast<int>(seed_pair_boards.size());
+  board_summary.persistent_incremental_seed_point_count =
+      CountStereoObservationPointsForKeys(dataset, seed_pair_boards);
+  board_summary.persistent_incremental_seed_rank_theta =
+      static_cast<int>(seed_ret.rankTheta);
+  board_summary.persistent_incremental_seed_information_gain =
+      seed_ret.informationGain;
+  if (pair_summary != nullptr) {
+    pair_summary->accepted_count += static_cast<int>(seed_rows.size());
+    pair_summary->seed_count = static_cast<int>(seed_rows.size());
+  }
+  selected_pair_boards.insert(seed_pair_boards.begin(), seed_pair_boards.end());
+  covered_boards = BoardIdsFromPairBoards(selected_pair_boards);
+  current_rank = static_cast<int>(seed_ret.rankTheta);
+  Stage6PersistentResidualStats seed_stats =
+      builder.EvaluateAccepted(selected_pair_boards);
+  board_summary.initial_seed_rmse = seed_stats.Rmse();
+  board_summary.final_selected_rmse = seed_stats.Rmse();
+  if (pair_summary != nullptr) {
+    pair_summary->initial_seed_rmse = seed_stats.Rmse();
+    pair_summary->final_selected_rmse = seed_stats.Rmse();
+  }
+  for (StereoPairTrialSelectionDecision pair_decision : seed_pair_decisions) {
+    pair_decision.accepted = true;
+    pair_decision.batchAccepted = true;
+    pair_decision.accept_reason = "forced_seed_batch";
+    pair_decision.trial_total_rmse = seed_stats.Rmse();
+    pair_decision.initial_total_rmse = seed_stats.Rmse();
+    pair_decision.total_rmse_delta = 0.0;
+    pair_decision.cam0_rmse_delta = 0.0;
+    pair_decision.cam1_rmse_delta = 0.0;
+    CopyPersistentReturnValueToPairDecision(
+        seed_ret, -1, seed_normalization_count,
+        "persistent_pair_cohesive_seed_batch", true, "committed",
+        &pair_decision);
+    if (pair_summary != nullptr) {
+      pair_summary->decisions.push_back(pair_decision);
+    }
+  }
+  for (StereoPairBoardTrialSelectionDecision board_decision :
+       seed_board_decisions) {
+    board_decision.attempted = true;
+    board_decision.accepted = true;
+    board_decision.batchAccepted = true;
+    board_decision.force = true;
+    board_decision.seed = true;
+    board_decision.accept_reason = "forced_seed_batch";
+    board_decision.trial_total_rmse = seed_stats.Rmse();
+    board_decision.initial_total_rmse = seed_stats.Rmse();
+    board_decision.total_rmse_delta = 0.0;
+    board_decision.cam0_rmse_delta = 0.0;
+    board_decision.cam1_rmse_delta = 0.0;
+    CopyPersistentReturnValueToBoardDecision(
+        seed_ret, -1, seed_normalization_count,
+        "persistent_pair_cohesive_seed_batch", true, "committed",
+        &board_decision);
+    board_summary.decisions.push_back(board_decision);
+  }
+
+  for (const StereoPairSelectionRow* row : ranked_rows) {
+    if (row == nullptr) {
+      continue;
+    }
+    if (seed_pair_indices.count(row->pair_index) > 0) {
+      continue;
+    }
+    if (pair_budget.traversal_limit != std::numeric_limits<int>::max() &&
+        traversed >= pair_budget.traversal_limit) {
+      board_summary.safety_ceiling_hit =
+          pair_budget.runtime_safety_ceiling > 0 &&
+          traversed >= pair_budget.runtime_safety_ceiling;
+      break;
+    }
+    ++traversed;
+    board_summary.valid_candidate_traversed_count = traversed;
+    if (pair_summary != nullptr) {
+      pair_summary->valid_candidate_traversed_count = traversed;
+    }
+
+    std::vector<StereoPairBoardTrialSelectionDecision> board_decisions;
+    std::set<PairBoardKey> batch_keys;
+    build_pair_cohesive_candidate(*row, selected_pair_boards,
+                                  &board_decisions, &batch_keys);
+    if (batch_keys.empty()) {
+      continue;
+    }
+    StereoPairTrialSelectionDecision pair_decision =
+        MakeTrialDecisionFromRow(dataset, *row, covered_boards);
+    pair_decision.attempted = true;
+    pair_decision.incremental_estimator_enabled = true;
+    pair_decision.persistent_incremental_estimator_used = true;
+    pair_decision.candidate_batch_type = "persistent_pair_cohesive";
+    AccumulatePairBatchDiagnostics(&pair_decision, board_decisions);
+
+    const bool force = false;
+    const int normalization_count =
+        std::max(1, static_cast<int>(batch_keys.size()));
+    typename Stage6PersistentStereoProblemBuilder<GeometryT0, GeometryT1>::
+        StateSnapshot state = builder.CaptureState();
+    boost::shared_ptr<CalibrationBatch> batch =
+        builder.BuildBatch(batch_keys, true, &state);
+    aslam::calibration::IncrementalEstimator::ReturnValue ret{};
+    bool add_exception = false;
+    std::string state_invalid_reason;
+    try {
+      ret = estimator.addBatch(batch, force);
+    } catch (const std::exception& exception) {
+      add_exception = true;
+      state_invalid_reason =
+          std::string("incremental_add_batch_exception: ") + exception.what();
+    }
+    bool state_valid = false;
+    if (!add_exception) {
+      state_valid = builder.CurrentStateFinite(&state_invalid_reason);
+    }
+    const bool objective_finite =
+        !add_exception && std::isfinite(ret.JStart) && std::isfinite(ret.JFinal);
+    const bool objective_decreased =
+        objective_finite && (ret.JFinal <= ret.JStart || force);
+    const bool incremental_kept = !add_exception && ret.batchAccepted;
+    bool accepted = incremental_kept && state_valid && objective_decreased;
+    const Stage6PersistentResidualStats before_stats =
+        builder.EvaluateAccepted(selected_pair_boards);
+    std::set<PairBoardKey> trial_pair_boards = selected_pair_boards;
+    trial_pair_boards.insert(batch_keys.begin(), batch_keys.end());
+    const Stage6PersistentResidualStats trial_stats =
+        builder.EvaluateAccepted(trial_pair_boards);
+    FillPersistentResidualDiagnostics(before_stats, trial_stats,
+                                      &pair_decision);
+    bool residual_health_guard_pass = true;
+    std::string residual_health_reject_reason;
+    const double catastrophic_total_delta =
+        std::max(1.0, 10.0 * options.pair_selection_max_rmse_delta);
+    const double catastrophic_camera_delta =
+        std::max(1.0, 10.0 * options.pair_selection_max_camera_rmse_delta);
+    if (accepted) {
+      if (!std::isfinite(pair_decision.trial_total_rmse) ||
+          !std::isfinite(pair_decision.initial_total_rmse)) {
+        residual_health_guard_pass = false;
+        residual_health_reject_reason =
+            "persistent_catastrophic_residual_guard nonfinite_committed_rmse";
+      } else if (pair_decision.total_rmse_delta >
+                 catastrophic_total_delta) {
+        residual_health_guard_pass = false;
+        std::ostringstream reason;
+        reason << "persistent_catastrophic_residual_guard total_delta="
+               << pair_decision.total_rmse_delta << " max="
+               << catastrophic_total_delta;
+        residual_health_reject_reason = reason.str();
+      } else if (pair_decision.cam0_rmse_delta >
+                 catastrophic_camera_delta) {
+        residual_health_guard_pass = false;
+        std::ostringstream reason;
+        reason << "persistent_catastrophic_residual_guard cam0_delta="
+               << pair_decision.cam0_rmse_delta << " max="
+               << catastrophic_camera_delta;
+        residual_health_reject_reason = reason.str();
+      } else if (pair_decision.cam1_rmse_delta >
+                 catastrophic_camera_delta) {
+        residual_health_guard_pass = false;
+        std::ostringstream reason;
+        reason << "persistent_catastrophic_residual_guard cam1_delta="
+               << pair_decision.cam1_rmse_delta << " max="
+               << catastrophic_camera_delta;
+        residual_health_reject_reason = reason.str();
+      }
+    }
+    if (!residual_health_guard_pass) {
+      accepted = false;
+    }
+    const std::string committed_or_rollback =
+        accepted ? "committed" : "rollback";
+
+    CopyPersistentReturnValueToPairDecision(
+        ret, current_rank, normalization_count, "persistent_pair_cohesive",
+        state_valid && objective_decreased, committed_or_rollback,
+        &pair_decision);
+    pair_decision.force = force;
+    pair_decision.accepted = accepted;
+    pair_decision.batchAccepted = accepted;
+    pair_decision.info_gain_threshold = options.incremental_mi_tol;
+    if (accepted) {
+      pair_decision.accept_reason =
+          force ? "forced_seed"
+                : (ret.informationGain > options.incremental_mi_tol
+                       ? "incremental_information_gain"
+                       : "incremental_rank_gain");
+    } else {
+      if (add_exception) {
+        pair_decision.reject_reason = state_invalid_reason;
+      } else if (!incremental_kept) {
+        pair_decision.reject_reason = "incremental_estimator_rejected_batch";
+      } else if (!state_valid) {
+        pair_decision.reject_reason = state_invalid_reason;
+      } else if (!objective_decreased) {
+        std::ostringstream reason;
+        reason << "incremental_objective_increase_gate JStart=" << ret.JStart
+               << " JFinal=" << ret.JFinal;
+        pair_decision.reject_reason = reason.str();
+      } else if (!residual_health_guard_pass) {
+        pair_decision.reject_reason = residual_health_reject_reason;
+      } else {
+        pair_decision.reject_reason = "persistent_incremental_validity_gate";
+      }
+    }
+
+    ++board_summary.batch_acceptance_attempted_count;
+    ++board_summary.attempted_count;
+    if (pair_summary != nullptr) {
+      ++pair_summary->attempted_count;
+    }
+    if (accepted) {
+      ++board_summary.batch_acceptance_accepted_count;
+      ++board_summary.accepted_count;
+      if (pair_summary != nullptr) {
+        ++pair_summary->accepted_count;
+      }
+      selected_pair_boards.insert(batch_keys.begin(), batch_keys.end());
+      covered_boards = BoardIdsFromPairBoards(selected_pair_boards);
+      current_rank = static_cast<int>(ret.rankTheta);
+      board_summary.final_selected_rmse = trial_stats.Rmse();
+      if (pair_summary != nullptr) {
+        pair_summary->final_selected_rmse = trial_stats.Rmse();
+      }
+      for (StereoPairBoardTrialSelectionDecision board_decision :
+           board_decisions) {
+        board_decision.attempted = true;
+        board_decision.accepted = true;
+        board_decision.batchAccepted = true;
+        board_decision.force = force;
+        board_decision.seed = force;
+        board_decision.accept_reason = pair_decision.accept_reason;
+        CopyPersistentReturnValueToBoardDecision(
+            ret, pair_decision.rank_before, normalization_count,
+            "persistent_pair_cohesive", true, "committed",
+            &board_decision);
+        FillPersistentResidualDiagnostics(before_stats, trial_stats,
+                                          &board_decision);
+        board_summary.decisions.push_back(board_decision);
+      }
+    } else {
+      ++board_summary.batch_acceptance_rejected_score_count;
+      if (!residual_health_guard_pass) {
+        ++board_summary
+              .persistent_incremental_residual_health_guard_rejected_count;
+      }
+      ++board_summary.rejected_count;
+      if (pair_summary != nullptr) {
+        ++pair_summary->rejected_count;
+      }
+      if (!add_exception && incremental_kept) {
+        estimator.rejectBatch(batch);
+      }
+      builder.RestoreState(state);
+      for (StereoPairBoardTrialSelectionDecision board_decision :
+           board_decisions) {
+        board_decision.attempted = true;
+        board_decision.accepted = false;
+        board_decision.batchAccepted = false;
+        board_decision.force = force;
+        board_decision.seed = force;
+        board_decision.reject_reason = pair_decision.reject_reason;
+        CopyPersistentReturnValueToBoardDecision(
+            ret, pair_decision.rank_before, normalization_count,
+            "persistent_pair_cohesive", false, "rollback",
+            &board_decision);
+        FillPersistentResidualDiagnostics(before_stats, trial_stats,
+                                          &board_decision);
+        board_summary.decisions.push_back(board_decision);
+      }
+    }
+    if (pair_summary != nullptr) {
+      pair_summary->decisions.push_back(pair_decision);
+    }
+  }
+
+  board_summary.final_selected_pair_board_count =
+      static_cast<int>(selected_pair_boards.size());
+  board_summary.selected_pair_board_keys = selected_pair_boards;
+  board_summary.success = !selected_pair_boards.empty();
+  board_summary.persistent_incremental_elapsed_time_seconds =
+      ElapsedSeconds(start_time);
+  board_summary.pair_cohesion_under_target_pair_count_before_rescue =
+      CountPairsBelowPairCohesionTarget(
+          selected_pair_boards, dataset,
+          options.pair_cohesion_min_boards_per_pair);
+  board_summary.pair_cohesion_under_target_pair_count_after_rescue =
+      board_summary.pair_cohesion_under_target_pair_count_before_rescue;
+  board_summary.single_board_pair_count_before_rescue =
+      CountPairsBelowSelectedBoardMinimum(
+          selected_pair_boards, options.pair_cohesion_min_boards_per_pair);
+  board_summary.single_board_pair_count_after_rescue =
+      board_summary.single_board_pair_count_before_rescue;
+  board_summary.single_board_pair_count_after_policy =
+      board_summary.single_board_pair_count_after_rescue;
+  if (!board_summary.success) {
+    board_summary.failure_reason =
+        "persistent_incremental_selection_rejected_all_batches";
+    return board_summary;
+  }
+  *scene_state = builder.BuildSceneState(*scene_state);
+  *final_selection =
+      BuildSelectionSummaryFromSelectedPairBoards(
+          base_selection, dataset, selected_pair_boards);
+  if (pair_summary != nullptr) {
+    pair_summary->success = true;
+    pair_summary->final_selected_pair_count =
+        static_cast<int>(PairIndicesFromPairBoards(selected_pair_boards).size());
+    pair_summary->selected_pair_indices =
+        PairIndicesFromPairBoards(selected_pair_boards);
+  }
+  return board_summary;
+}
+
+StereoPairBoardTrialSelectionSummary
+RunPersistentIncrementalPairCohesiveSelection(
+    const StereoMeasurementDataset& dataset,
+    const StereoExtrinsicSolverOptions& options,
+    const StereoPairSelectionSummary& base_selection,
+    StereoPairTrialSelectionSummary* pair_summary,
+    StereoPairSelectionSummary* final_selection,
+    StereoSceneState* scene_state) {
+  if (scene_state == nullptr) {
+    StereoPairBoardTrialSelectionSummary summary;
+    summary.failure_reason = "missing_scene_state";
+    return summary;
+  }
+  const std::string cam0_family = scene_state->cam0.camera_model_family;
+  const std::string cam1_family = scene_state->cam1.camera_model_family;
+  if (cam0_family == "ds-none" && cam1_family == "ds-none") {
+    return RunPersistentIncrementalPairCohesiveSelectionTyped
+        <DsGeometry, DsGeometry>(
+            dataset, options, base_selection, pair_summary, final_selection,
+            scene_state);
+  }
+  if (cam0_family == "ds-none" && cam1_family == "eucm-none") {
+    return RunPersistentIncrementalPairCohesiveSelectionTyped
+        <DsGeometry, EucmGeometry>(
+            dataset, options, base_selection, pair_summary, final_selection,
+            scene_state);
+  }
+  if (cam0_family == "eucm-none" && cam1_family == "ds-none") {
+    return RunPersistentIncrementalPairCohesiveSelectionTyped
+        <EucmGeometry, DsGeometry>(
+            dataset, options, base_selection, pair_summary, final_selection,
+            scene_state);
+  }
+  if (cam0_family == "eucm-none" && cam1_family == "eucm-none") {
+    return RunPersistentIncrementalPairCohesiveSelectionTyped
+        <EucmGeometry, EucmGeometry>(
+            dataset, options, base_selection, pair_summary, final_selection,
+            scene_state);
+  }
+  if (cam0_family == "pinhole-equi" && cam1_family == "pinhole-equi") {
+    return RunPersistentIncrementalPairCohesiveSelectionTyped
+        <PinholeEquiGeometry, PinholeEquiGeometry>(
+            dataset, options, base_selection, pair_summary, final_selection,
+            scene_state);
+  }
+  StereoPairBoardTrialSelectionSummary summary;
+  summary.enabled = true;
+  summary.incremental_estimator_enabled = true;
+  summary.persistent_incremental_estimator_used = true;
+  summary.failure_reason =
+      "unsupported_persistent_incremental_camera_families: " + cam0_family +
+      "/" + cam1_family;
+  return summary;
+}
+
 Stage6IncrementalBatchEstimatorOptions MakeStage6IncrementalEstimatorOptions(
     const StereoExtrinsicSolverOptions& options,
     bool pair_level) {
@@ -8230,6 +9475,34 @@ StereoExtrinsicCalibrationResult StereoExtrinsicCalibrationRunner::Run(
                           result.initialization, options_);
   }
   if (!options_.board_masking_use_local_board_pose_ba &&
+      options_.enable_persistent_incremental_stereo_ba) {
+    StereoPairSelectionSummary final_selection = result.pair_selection_summary;
+    result.pair_board_trial_selection_summary =
+        RunPersistentIncrementalPairCohesiveSelection(
+            input.measurement_dataset, options_, result.pair_selection_summary,
+            &result.pair_trial_selection_summary, &final_selection,
+            &result.optimized_scene);
+    if (result.pair_board_trial_selection_summary.success) {
+      result.pair_selection_summary = final_selection;
+      result.pair_selection_summary.selected_pair_board_keys =
+          result.pair_board_trial_selection_summary.selected_pair_board_keys;
+    } else {
+      result.warnings.push_back(
+          "persistent_incremental_pair_cohesive_selection_failed: " +
+          result.pair_board_trial_selection_summary.failure_reason);
+      if (!options_.allow_legacy_selection_fallback_after_persistent_failure) {
+        result.failure_reason =
+            "persistent_incremental_pair_cohesive_selection_failed: " +
+            result.pair_board_trial_selection_summary.failure_reason;
+        result.runtime_summary.total_runtime_seconds = ElapsedSeconds(total_start);
+        return result;
+      }
+    }
+  }
+  if (!options_.board_masking_use_local_board_pose_ba &&
+      !result.pair_board_trial_selection_summary.success &&
+      (!options_.enable_persistent_incremental_stereo_ba ||
+       options_.allow_legacy_selection_fallback_after_persistent_failure) &&
       options_.enable_committing_pair_batch_selection) {
     StereoPairSelectionSummary final_selection = result.pair_selection_summary;
     result.pair_board_trial_selection_summary =
@@ -8247,6 +9520,9 @@ StereoExtrinsicCalibrationResult StereoExtrinsicCalibrationRunner::Run(
           result.pair_board_trial_selection_summary.failure_reason);
     }
   } else if (!options_.board_masking_use_local_board_pose_ba &&
+             !result.pair_board_trial_selection_summary.success &&
+             (!options_.enable_persistent_incremental_stereo_ba ||
+              options_.allow_legacy_selection_fallback_after_persistent_failure) &&
              options_.enable_kalibr_style_pair_selection) {
     StereoPairSelectionSummary final_selection = result.pair_selection_summary;
     result.pair_trial_selection_summary = RunKalibrStylePairTrialSelection(
@@ -8261,6 +9537,8 @@ StereoExtrinsicCalibrationResult StereoExtrinsicCalibrationRunner::Run(
     }
   }
   if (!options_.board_masking_use_local_board_pose_ba &&
+      !result.pair_board_trial_selection_summary.success &&
+      !options_.enable_persistent_incremental_stereo_ba &&
       !options_.enable_committing_pair_batch_selection &&
       options_.enable_pair_board_trial_selection) {
     StereoPairSelectionSummary final_selection = result.pair_selection_summary;
@@ -8331,8 +9609,10 @@ StereoExtrinsicCalibrationResult StereoExtrinsicCalibrationRunner::Run(
         initial_selected_summary.cam1_rmse;
     if (options_.skip_final_global_ba) {
       result.global_sparse_ba_summary.success = true;
-      result.global_sparse_ba_summary.failure_reason =
-          options_.enable_committing_pair_batch_selection
+    result.global_sparse_ba_summary.failure_reason =
+          options_.enable_persistent_incremental_stereo_ba
+              ? "skip_final_global_ba_after_persistent_incremental_stereo_ba"
+              : options_.enable_committing_pair_batch_selection
               ? "skip_final_global_ba_after_incremental_batch_acceptance"
               : "skip_final_global_ba_after_trial_selection";
       result.global_sparse_ba_summary.iterations = 0;
@@ -8462,10 +9742,11 @@ StereoExtrinsicCalibrationResult StereoExtrinsicCalibrationRunner::Run(
           "holdout_extrinsic_only");
   result.runtime_summary.holdout_evaluation_runtime_seconds =
       ElapsedSeconds(holdout_start);
-  std::cout << "[Stage6] runner: holdout evaluation done. total_rmse="
-            << result.holdout_residual_summary.total_stereo_rmse
+  std::cout << "[Stage6] runner: holdout extrinsic-only evaluation done. total_rmse="
+            << result.holdout_extrinsic_only_residual_summary.total_stereo_rmse
             << ", used_pairs="
-            << result.holdout_residual_summary.used_pair_count << std::endl;
+            << result.holdout_extrinsic_only_residual_summary.used_pair_count
+            << std::endl;
   result.pair_board_consistency_summary =
       BuildPairBoardConsistencySummary(input.measurement_dataset,
                                        result.optimized_scene, options_);
@@ -8656,11 +9937,10 @@ void WriteStereoReprojectionSummary(const std::string& path,
     output << prefix << "_std_residual_y: " << summary.std_residual_y << "\n";
   };
   write_split(result.training_residual_summary, "training");
-  write_split(result.holdout_residual_summary, "holdout");
   write_split(result.holdout_extrinsic_only_residual_summary,
               "holdout_extrinsic_only");
-  output << "holdout_refit_mode: stereo_outer_symmetric\n";
   output << "holdout_extrinsic_only_mode: local_stereo_board_pose_refit\n";
+  output << "holdout_extrinsic_only_diagnostic: local_per_pair_board_pose_refit_tests_stereo_extrinsic_with_layout_removed\n";
   output << "solver_mode: " << ToString(result.problem_input.solver_options.solver_mode)
          << "\n";
   output << "selected_pair_count: "
@@ -8676,17 +9956,6 @@ void WriteStereoPerCameraResidualsCsv(const std::string& path,
   for (const StereoCameraResidualSummary& summary :
        result.training_residual_summary.camera_summaries) {
     output << "training," << summary.camera_index << "," << summary.point_count
-           << "," << summary.rmse
-           << "," << summary.shared_point_count
-           << "," << summary.shared_rmse
-           << "," << summary.cam0_only_point_count
-           << "," << summary.cam0_only_rmse
-           << "," << summary.cam1_only_point_count
-           << "," << summary.cam1_only_rmse << "\n";
-  }
-  for (const StereoCameraResidualSummary& summary :
-       result.holdout_residual_summary.camera_summaries) {
-    output << "holdout," << summary.camera_index << "," << summary.point_count
            << "," << summary.rmse
            << "," << summary.shared_point_count
            << "," << summary.shared_rmse
@@ -8750,34 +10019,6 @@ void WriteStereoPerFrameResidualsCsv(const std::string& path,
            << summary.std_residual_y << "," << summary.failure_reason << "\n";
   }
   for (const StereoPairResidualSummary& summary :
-       result.holdout_residual_summary.pair_summaries) {
-    output << "holdout," << summary.pair_index << "," << summary.left_frame_label << ","
-           << summary.right_frame_label << "," << (summary.is_training ? 1 : 0) << ","
-           << (summary.used_in_metrics ? 1 : 0) << ","
-           << StereoPairPoseRefitModeToString(
-                  result.problem_input.solver_options.pair_pose_refit_mode) << ","
-           << (summary.pose_refit_success ? 1 : 0) << ","
-           << (summary.used_symmetric_refit ? 1 : 0) << ","
-           << (summary.refit_fell_back_to_seed ? 1 : 0) << ","
-           << summary.shared_board_count << ","
-           << summary.cam0_only_board_count << ","
-           << summary.cam1_only_board_count << ","
-           << summary.pose_source << ","
-           << summary.point_count << ","
-           << summary.outer_point_count << "," << summary.internal_point_count << ","
-           << summary.cam0_point_count << "," << summary.cam1_point_count << ","
-           << summary.shared_point_count << "," << summary.shared_outer_point_count << ","
-           << summary.shared_internal_point_count << ","
-           << summary.overall_rmse << "," << summary.cam0_rmse << ","
-           << summary.cam1_rmse << "," << summary.outer_rmse << ","
-           << summary.internal_rmse << "," << summary.shared_cam0_rmse << ","
-           << summary.shared_cam1_rmse << "," << summary.shared_outer_rmse << ","
-           << summary.shared_internal_rmse << "," << summary.cam0_only_rmse << ","
-           << summary.cam1_only_rmse << "," << summary.mean_residual_x << ","
-           << summary.mean_residual_y << "," << summary.std_residual_x << ","
-           << summary.std_residual_y << "," << summary.failure_reason << "\n";
-  }
-  for (const StereoPairResidualSummary& summary :
        result.holdout_extrinsic_only_residual_summary.pair_summaries) {
     output << "holdout_extrinsic_only," << summary.pair_index << ","
            << summary.left_frame_label << ","
@@ -8812,6 +10053,263 @@ void WriteStereoPerFrameResidualsCsv(const std::string& path,
            << summary.cam1_only_rmse << "," << summary.mean_residual_x << ","
            << summary.mean_residual_y << "," << summary.std_residual_x << ","
            << summary.std_residual_y << "," << summary.failure_reason << "\n";
+  }
+}
+
+void WriteStereoHoldoutLayoutTransferGapCsv(
+    const std::string& path,
+    const StereoExtrinsicCalibrationResult& result) {
+  std::ofstream output(path.c_str());
+  output << "pair_index,left_frame_label,right_frame_label,shared_board_count,"
+         << "normal_pose_source,normal_used_in_metrics,"
+         << "extrinsic_only_pose_source,extrinsic_only_used_in_metrics,"
+         << "normal_rmse,extrinsic_only_rmse,layout_transfer_gap_rmse,"
+         << "normal_outer_rmse,extrinsic_only_outer_rmse,"
+         << "layout_transfer_gap_outer_rmse,"
+         << "normal_internal_rmse,extrinsic_only_internal_rmse,"
+         << "layout_transfer_gap_internal_rmse,"
+         << "normal_point_count,extrinsic_only_point_count,"
+         << "normal_failure_reason,extrinsic_only_failure_reason\n";
+  std::map<int, const StereoPairResidualSummary*> extrinsic_by_pair;
+  for (const StereoPairResidualSummary& summary :
+       result.holdout_extrinsic_only_residual_summary.pair_summaries) {
+    extrinsic_by_pair[summary.pair_index] = &summary;
+  }
+  for (const StereoPairResidualSummary& normal :
+       result.holdout_residual_summary.pair_summaries) {
+    const auto extrinsic_it = extrinsic_by_pair.find(normal.pair_index);
+    const StereoPairResidualSummary* extrinsic =
+        extrinsic_it == extrinsic_by_pair.end() ? nullptr : extrinsic_it->second;
+    const auto gap = [extrinsic](const StereoPairResidualSummary& lhs,
+                                 double StereoPairResidualSummary::*member) {
+      if (extrinsic == nullptr) {
+        return 0.0;
+      }
+      const double lhs_value = lhs.*member;
+      const double rhs_value = extrinsic->*member;
+      if (!std::isfinite(lhs_value) || !std::isfinite(rhs_value)) {
+        return 0.0;
+      }
+      return lhs_value - rhs_value;
+    };
+    output << normal.pair_index << "," << normal.left_frame_label << ","
+           << normal.right_frame_label << "," << normal.shared_board_count
+           << "," << normal.pose_source << ","
+           << (normal.used_in_metrics ? 1 : 0) << ",";
+    if (extrinsic != nullptr) {
+      output << extrinsic->pose_source << ","
+             << (extrinsic->used_in_metrics ? 1 : 0) << ","
+             << normal.overall_rmse << "," << extrinsic->overall_rmse << ","
+             << gap(normal, &StereoPairResidualSummary::overall_rmse) << ","
+             << normal.outer_rmse << "," << extrinsic->outer_rmse << ","
+             << gap(normal, &StereoPairResidualSummary::outer_rmse) << ","
+             << normal.internal_rmse << "," << extrinsic->internal_rmse << ","
+             << gap(normal, &StereoPairResidualSummary::internal_rmse) << ","
+             << normal.point_count << "," << extrinsic->point_count << ","
+             << normal.failure_reason << ","
+             << extrinsic->failure_reason << "\n";
+    } else {
+      output << "missing,0," << normal.overall_rmse << ",0,0,"
+             << normal.outer_rmse << ",0,0," << normal.internal_rmse
+             << ",0,0," << normal.point_count << ",0,"
+             << normal.failure_reason << ",missing_extrinsic_only_pair\n";
+    }
+  }
+}
+
+void WriteStereoHoldoutLocalLayoutDriftCsv(
+    const std::string& path,
+    const StereoExtrinsicCalibrationResult& result) {
+  std::ofstream output(path.c_str());
+  output << std::setprecision(12);
+  output << "pair_index,left_frame_label,right_frame_label,board_id,"
+         << "shared_board_count,normal_pair_pose_success,"
+         << "local_board_pose_success,global_board_pose_available,"
+         << "normal_pose_source,local_pose_source,"
+         << "translation_drift_m,rotation_drift_deg,"
+         << "global_outer_rmse_px,local_outer_rmse_px,"
+         << "global_outer_point_count,local_outer_point_count,"
+         << "failure_reason\n";
+
+  const StereoMeasurementDataset& dataset =
+      result.problem_input.measurement_dataset;
+  const StereoSceneState& scene_state = result.optimized_scene;
+  std::map<int, const StereoPairResidualSummary*> holdout_summary_by_pair;
+  for (const StereoPairResidualSummary& summary :
+       result.holdout_residual_summary.pair_summaries) {
+    holdout_summary_by_pair[summary.pair_index] = &summary;
+  }
+  const DoubleSphereCameraModel cam0 =
+      DoubleSphereCameraModel::FromConfig(MakeCameraConfig(scene_state.cam0));
+  const DoubleSphereCameraModel cam1 =
+      DoubleSphereCameraModel::FromConfig(MakeCameraConfig(scene_state.cam1));
+  const Eigen::Isometry3d T_cam1_cam0 =
+      ToIsometry3d(scene_state.T_cam1_cam0);
+  const auto evaluate_global_outer_rmse_with_pose =
+      [&dataset, &scene_state, &cam0, &cam1, &T_cam1_cam0](
+          int pair_index, int board_id,
+          const Eigen::Isometry3d& T_cam0_world,
+          int* point_count) -> double {
+    if (point_count != nullptr) {
+      *point_count = 0;
+    }
+    const auto board_pose_it = scene_state.T_world_board_by_id.find(board_id);
+    if (board_pose_it == scene_state.T_world_board_by_id.end() ||
+        !cam0.IsValid() || !cam1.IsValid()) {
+      return std::numeric_limits<double>::infinity();
+    }
+    const Eigen::Isometry3d T_world_board =
+        ToIsometry3d(board_pose_it->second);
+    double squared_error_sum = 0.0;
+    int count = 0;
+    for (const StereoObservation& observation : dataset.observations) {
+      if (observation.pair_index != pair_index ||
+          observation.board_id != board_id ||
+          observation.point_type != JointPointType::Outer ||
+          !observation.used_in_solver) {
+        continue;
+      }
+      const Eigen::Vector3d point_cam0 =
+          T_cam0_world * (T_world_board * observation.target_point_board);
+      Eigen::Vector2d predicted = Eigen::Vector2d::Zero();
+      const bool ok =
+          observation.camera_index == 0
+              ? cam0.vsEuclideanToKeypoint(point_cam0, &predicted)
+              : cam1.vsEuclideanToKeypoint(T_cam1_cam0 * point_cam0,
+                                           &predicted);
+      if (!ok) {
+        continue;
+      }
+      const Eigen::Vector2d residual =
+          predicted - observation.observed_image_xy;
+      if (!residual.allFinite()) {
+        continue;
+      }
+      squared_error_sum += residual.squaredNorm();
+      ++count;
+    }
+    if (point_count != nullptr) {
+      *point_count = count;
+    }
+    return count > 0 ? std::sqrt(squared_error_sum /
+                                 static_cast<double>(count))
+                     : std::numeric_limits<double>::infinity();
+  };
+
+  for (int pair_index : dataset.holdout_pair_indices) {
+    const StereoFramePair* pair = FindPair(dataset, pair_index);
+    const std::string left_frame_label =
+        pair == nullptr ? std::string() : pair->left_frame_label;
+    const std::string right_frame_label =
+        pair == nullptr ? std::string() : pair->right_frame_label;
+    const auto shared_it = dataset.pair_shared_board_ids.find(pair_index);
+    if (shared_it == dataset.pair_shared_board_ids.end()) {
+      continue;
+    }
+    const auto summary_it = holdout_summary_by_pair.find(pair_index);
+    const StereoPairResidualSummary* pair_summary =
+        summary_it == holdout_summary_by_pair.end() ? nullptr
+                                                    : summary_it->second;
+
+    Eigen::Matrix4d T_cam0_world_matrix = Eigen::Matrix4d::Identity();
+    StereoRefitDiagnostics diagnostics;
+    RuntimeCounters runtime_counters;
+    std::string normal_failure_reason;
+    bool normal_pair_pose_success = RefitPairPoseFromStereoOuterObservations(
+        dataset, scene_state, pair_index, result.problem_input.solver_options,
+        &runtime_counters, &diagnostics, &T_cam0_world_matrix);
+    if (!normal_pair_pose_success) {
+      normal_failure_reason = "pair_refit_failed";
+      const auto pair_pose_it = scene_state.T_cam0_world_by_pair.find(pair_index);
+      if (pair_pose_it != scene_state.T_cam0_world_by_pair.end()) {
+        T_cam0_world_matrix = pair_pose_it->second;
+        normal_failure_reason = "pair_refit_failed_using_optimized_scene_seed:" +
+                                normal_failure_reason;
+      }
+    }
+
+    const Eigen::Isometry3d T_cam0_world =
+        ToIsometry3d(T_cam0_world_matrix);
+    for (int board_id : shared_it->second) {
+      const auto board_pose_it = scene_state.T_world_board_by_id.find(board_id);
+      const bool have_global_board_pose =
+          board_pose_it != scene_state.T_world_board_by_id.end();
+
+      Eigen::Matrix4d T_cam0_board_local_matrix = Eigen::Matrix4d::Identity();
+      const bool local_board_pose_success = RefitStereoBoardPoseForVisualization(
+          dataset, scene_state, pair_index, board_id,
+          result.problem_input.solver_options.symmetric_refit_max_iterations,
+          result.problem_input.solver_options.symmetric_refit_step,
+          &T_cam0_board_local_matrix);
+
+      double translation_drift_m =
+          std::numeric_limits<double>::quiet_NaN();
+      double rotation_drift_deg =
+          std::numeric_limits<double>::quiet_NaN();
+      double global_outer_rmse_px =
+          std::numeric_limits<double>::quiet_NaN();
+      double local_outer_rmse_px =
+          std::numeric_limits<double>::quiet_NaN();
+      int global_outer_point_count = 0;
+      int local_outer_point_count = 0;
+      std::string failure_reason;
+
+      if (!normal_pair_pose_success) {
+        failure_reason += "normal_pair_pose_refit_failed;";
+      }
+      if (!have_global_board_pose) {
+        failure_reason += "missing_global_board_pose;";
+      }
+      if (!local_board_pose_success) {
+        failure_reason += "local_board_pose_refit_failed;";
+      }
+
+      if (have_global_board_pose) {
+        global_outer_rmse_px = evaluate_global_outer_rmse_with_pose(
+            pair_index, board_id, T_cam0_world, &global_outer_point_count);
+      }
+      if (local_board_pose_success) {
+        const Eigen::Isometry3d T_cam0_board_local =
+            ToIsometry3d(T_cam0_board_local_matrix);
+        const std::vector<StereoBoardPoseObservation> local_observations =
+            CollectStereoBoardPoseObservations(dataset, pair_index, board_id);
+        local_outer_rmse_px = EvaluateStereoBoardPoseRmse(
+            local_observations, scene_state, T_cam0_board_local);
+        local_outer_point_count = static_cast<int>(local_observations.size());
+      }
+      if (have_global_board_pose && local_board_pose_success) {
+        const Eigen::Isometry3d T_cam0_board_global =
+            T_cam0_world * ToIsometry3d(board_pose_it->second);
+        const Eigen::Isometry3d T_cam0_board_local =
+            ToIsometry3d(T_cam0_board_local_matrix);
+        translation_drift_m =
+            (T_cam0_board_local.translation() -
+             T_cam0_board_global.translation()).norm();
+        rotation_drift_deg =
+            RotationDistanceRadians(T_cam0_board_global,
+                                    T_cam0_board_local) *
+            180.0 / M_PI;
+      }
+
+      output << pair_index << "," << left_frame_label << ","
+             << right_frame_label << "," << board_id << ","
+             << (pair_summary == nullptr ? 0 : pair_summary->shared_board_count)
+             << "," << (normal_pair_pose_success ? 1 : 0) << ","
+             << (local_board_pose_success ? 1 : 0) << ","
+             << (have_global_board_pose ? 1 : 0) << ","
+             << (pair_summary == nullptr ? std::string() : pair_summary->pose_source)
+             << ",local_stereo_board_pose_refit,"
+             << translation_drift_m << "," << rotation_drift_deg << ","
+             << global_outer_rmse_px << "," << local_outer_rmse_px << ","
+             << global_outer_point_count << "," << local_outer_point_count
+             << ",";
+      if (failure_reason.empty()) {
+        output << normal_failure_reason;
+      } else {
+        output << failure_reason << normal_failure_reason;
+      }
+      output << "\n";
+    }
   }
 }
 
@@ -9737,19 +11235,6 @@ void WriteStereoPerBoardResidualsCsv(const std::string& path,
            << summary.shared_internal_rmse << "\n";
   }
   for (const StereoBoardResidualSummary& summary :
-       result.holdout_residual_summary.board_summaries) {
-    output << "holdout," << summary.board_id << "," << summary.point_count << ","
-           << summary.cam0_point_count << "," << summary.cam1_point_count << ","
-           << summary.shared_pair_count << "," << summary.shared_point_count << ","
-           << summary.shared_cam0_point_count << ","
-           << summary.shared_cam1_point_count << ","
-           << summary.shared_outer_point_count << ","
-           << summary.shared_internal_point_count << ","
-           << summary.rmse << "," << summary.shared_cam0_rmse << ","
-           << summary.shared_cam1_rmse << "," << summary.shared_outer_rmse << ","
-           << summary.shared_internal_rmse << "\n";
-  }
-  for (const StereoBoardResidualSummary& summary :
        result.holdout_extrinsic_only_residual_summary.board_summaries) {
     output << "holdout_extrinsic_only," << summary.board_id << ","
            << summary.point_count << ","
@@ -9914,6 +11399,28 @@ void WriteStereoInitializationSummary(const std::string& path,
   output << "gauge_connected_board_count: "
          << result.initialization.gauge_connected_board_count << "\n";
   output << "medoid_score: " << result.initialization.medoid_score << "\n";
+  output << "pair_only_stereo_ba_init_enabled: "
+         << (result.problem_input.solver_options.enable_pair_only_stereo_ba_init ? 1 : 0)
+         << "\n";
+  output << "pair_only_stereo_ba_init_success: "
+         << (result.pair_init_summary.success ? 1 : 0) << "\n";
+  output << "pair_only_raw_candidate_count: "
+         << result.pair_init_summary.raw_candidate_count << "\n";
+  output << "pair_only_consistency_filtered_candidate_count: "
+         << result.pair_init_summary.consistency_filtered_candidate_count << "\n";
+  output << "pair_only_consistency_rejected_candidate_count: "
+         << result.pair_init_summary.consistency_rejected_candidate_count << "\n";
+  output << "pair_only_before_shared_rmse: "
+         << result.pair_init_summary.before_shared_rmse << "\n";
+  output << "pair_only_after_shared_rmse: "
+         << result.pair_init_summary.after_shared_rmse << "\n";
+  output << "pair_only_used_refined_baseline: "
+         << (result.pair_init_summary.used_refined_baseline ? 1 : 0) << "\n";
+  output << "pair_only_baseline_rotation_delta_deg: "
+         << result.pair_init_summary.baseline_rotation_delta_deg << "\n";
+  output << "pair_only_baseline_translation_delta_m: "
+         << result.pair_init_summary.baseline_translation_delta_m << "\n";
+  output << "stage6_initialization_role: seed_only_no_selection\n";
   for (int pair_index : result.initialization.reachable_training_pair_indices) {
     output << "reachable_training_pair: " << pair_index << "\n";
   }
@@ -10345,9 +11852,12 @@ void WriteStereoPairTrialSelectionSummary(
          << (result.pair_trial_selection_summary.enabled ? 1 : 0) << "\n";
   output << "selection_method: "
          << (result.problem_input.solver_options
-                     .enable_committing_pair_batch_selection
-                 ? "kalibr_style_incremental_batch_acceptance_pair_level"
-                 : "kalibr_style_pair_trial_selection")
+                     .enable_persistent_incremental_stereo_ba
+                 ? "persistent_incremental_pair_cohesive_selection"
+                 : (result.problem_input.solver_options
+                            .enable_committing_pair_batch_selection
+                        ? "kalibr_style_incremental_batch_acceptance_pair_level"
+                        : "kalibr_style_pair_trial_selection"))
          << "\n";
   output << "incremental_estimator_enabled: "
          << (result.problem_input.solver_options
@@ -10363,7 +11873,9 @@ void WriteStereoPairTrialSelectionSummary(
          << "\n";
   output << "rmse_delta_diagnostics_only: "
          << (result.problem_input.solver_options
-                     .enable_committing_pair_batch_selection
+                     .enable_committing_pair_batch_selection ||
+             result.problem_input.solver_options
+                     .enable_persistent_incremental_stereo_ba
                  ? 1
                  : 0)
          << "\n";
@@ -10500,10 +12012,16 @@ void WriteStereoPairTrialSelectionDecisionsCsv(
          << "trial_total_rmse,total_rmse_delta,"
          << "cam0_rmse_delta,cam1_rmse_delta,baseline_rotation_delta_deg,"
          << "baseline_translation_delta_m,incremental_estimator_enabled,"
+         << "persistent_incremental_estimator_used,"
          << "candidate_batch_type,accept_reason,solution_valid,"
          << "optimization_success,num_iterations,objective_before,"
          << "objective_after,marginal_information_gain_proxy,rank_before,"
-         << "rank_after,rank_proxy_increases,info_gain_threshold,"
+         << "normalized_information_gain,"
+         << "information_gain_normalization_count,rank_after,"
+         << "rank_psi_after,rank_psi_deficiency_after,"
+         << "rank_theta_deficiency_after,rank_proxy_increases,"
+         << "svd_tolerance,qr_tolerance,elapsed_time_seconds,"
+         << "info_gain_threshold,"
          << "committed_or_rollback,trial_coobs_stereo_factor_count,"
          << "trial_coobs_layout_factor_count,"
          << "trial_coobs_stereo_initial_rot_mean_deg,"
@@ -10536,14 +12054,21 @@ void WriteStereoPairTrialSelectionDecisionsCsv(
            << row.baseline_rotation_delta_deg << ","
            << row.baseline_translation_delta_m << ","
            << (row.incremental_estimator_enabled ? 1 : 0) << ","
+           << (row.persistent_incremental_estimator_used ? 1 : 0) << ","
            << row.candidate_batch_type << "," << row.accept_reason << ","
            << (row.solution_valid ? 1 : 0) << ","
            << (row.optimization_success ? 1 : 0) << ","
            << row.num_iterations << "," << row.objective_before << ","
            << row.objective_after << ","
            << row.marginal_information_gain_proxy << ","
-           << row.rank_before << "," << row.rank_after << ","
+           << row.rank_before << "," << row.normalized_information_gain << ","
+           << row.information_gain_normalization_count << ","
+           << row.rank_after << "," << row.rank_psi_after << ","
+           << row.rank_psi_deficiency_after << ","
+           << row.rank_theta_deficiency_after << ","
            << (row.rank_proxy_increases ? 1 : 0) << ","
+           << row.svd_tolerance << "," << row.qr_tolerance << ","
+           << row.elapsed_time_seconds << ","
            << row.info_gain_threshold << "," << row.committed_or_rollback
            << "," << row.trial_coobs_stereo_factor_count << ","
            << row.trial_coobs_layout_factor_count << ","
@@ -10567,6 +12092,76 @@ void WriteStereoPairTrialSelectionDecisionsCsv(
   }
 }
 
+void WriteStage6PersistentIncrementalBatchDecisionsCsv(
+    const std::string& path,
+    const StereoExtrinsicCalibrationResult& result) {
+  std::ofstream output(path.c_str());
+  output << "batch_index,pair_index,left_frame_label,right_frame_label,"
+         << "batch_type,seed,force,attempted,accepted,batchAccepted,"
+         << "committed_or_rollback,shared_board_count,"
+         << "selected_pair_board_count,selected_board_ids,"
+         << "shared_outer_point_count,shared_internal_point_count,"
+         << "candidate_score,coverage_gain,initial_total_rmse,"
+         << "trial_total_rmse,total_rmse_delta,cam0_rmse_delta,"
+         << "cam1_rmse_delta,baseline_rotation_delta_deg,"
+         << "baseline_translation_delta_m,solution_valid,"
+         << "optimization_success,num_iterations,JStart,JFinal,"
+         << "information_gain,normalized_information_gain,"
+         << "information_gain_normalization_count,rank_before,rankTheta,"
+         << "rankPsi,rankPsiDeficiency,rankThetaDeficiency,"
+         << "rank_increases,svd_tolerance,qr_tolerance,"
+         << "elapsed_time_seconds,info_gain_threshold,accept_reason,"
+         << "reject_reason\n";
+
+  std::map<int, std::vector<int> > selected_boards_by_pair;
+  for (const PairBoardKey& key :
+       result.pair_board_trial_selection_summary.selected_pair_board_keys) {
+    selected_boards_by_pair[key.first].push_back(key.second);
+  }
+  for (auto& entry : selected_boards_by_pair) {
+    std::sort(entry.second.begin(), entry.second.end());
+  }
+
+  int batch_index = 0;
+  for (const StereoPairTrialSelectionDecision& row :
+       result.pair_trial_selection_summary.decisions) {
+    const auto boards_it = selected_boards_by_pair.find(row.pair_index);
+    const std::vector<int> empty_boards;
+    const std::vector<int>& boards =
+        boards_it == selected_boards_by_pair.end() ? empty_boards
+                                                   : boards_it->second;
+    output << batch_index++ << "," << row.pair_index << ","
+           << row.left_frame_label << "," << row.right_frame_label << ","
+           << row.candidate_batch_type << "," << (row.seed ? 1 : 0) << ","
+           << (row.force ? 1 : 0) << "," << (row.attempted ? 1 : 0) << ","
+           << (row.accepted ? 1 : 0) << "," << (row.batchAccepted ? 1 : 0)
+           << "," << row.committed_or_rollback << ","
+           << row.shared_board_count << "," << boards.size() << ","
+           << JoinInts(boards, ';') << "," << row.shared_outer_point_count
+           << "," << row.shared_internal_point_count << ","
+           << row.candidate_score << "," << row.coverage_gain << ","
+           << row.initial_total_rmse << "," << row.trial_total_rmse << ","
+           << row.total_rmse_delta << "," << row.cam0_rmse_delta << ","
+           << row.cam1_rmse_delta << ","
+           << row.baseline_rotation_delta_deg << ","
+           << row.baseline_translation_delta_m << ","
+           << (row.solution_valid ? 1 : 0) << ","
+           << (row.optimization_success ? 1 : 0) << ","
+           << row.num_iterations << "," << row.objective_before << ","
+           << row.objective_after << ","
+           << row.marginal_information_gain_proxy << ","
+           << row.normalized_information_gain << ","
+           << row.information_gain_normalization_count << ","
+           << row.rank_before << "," << row.rank_after << ","
+           << row.rank_psi_after << "," << row.rank_psi_deficiency_after
+           << "," << row.rank_theta_deficiency_after << ","
+           << (row.rank_proxy_increases ? 1 : 0) << ","
+           << row.svd_tolerance << "," << row.qr_tolerance << ","
+           << row.elapsed_time_seconds << "," << row.info_gain_threshold
+           << "," << row.accept_reason << "," << row.reject_reason << "\n";
+  }
+}
+
 void WriteStereoPairTrialSelectedPairsCsv(
     const std::string& path,
     const StereoExtrinsicCalibrationResult& result) {
@@ -10585,13 +12180,22 @@ void WriteStereoPairBoardTrialSelectionSummary(
          << (result.pair_board_trial_selection_summary.enabled ? 1 : 0) << "\n";
   output << "selection_method: "
          << (result.problem_input.solver_options
-                     .enable_committing_pair_batch_selection
-                 ? "kalibr_style_ba_coupled_batch_selection"
-                 : "kalibr_style_pair_board_trial_selection")
+                     .enable_persistent_incremental_stereo_ba
+                 ? "persistent_incremental_pair_cohesive_selection"
+                 : (result.problem_input.solver_options
+                            .enable_committing_pair_batch_selection
+                        ? "kalibr_style_ba_coupled_batch_selection"
+                        : "kalibr_style_pair_board_trial_selection"))
          << "\n";
   output << "incremental_batch_acceptance_enabled: "
          << (result.problem_input.solver_options
                      .enable_committing_pair_batch_selection
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "persistent_incremental_batch_acceptance_enabled: "
+         << (result.problem_input.solver_options
+                     .enable_persistent_incremental_stereo_ba
                  ? 1
                  : 0)
          << "\n";
@@ -10600,6 +12204,101 @@ void WriteStereoPairBoardTrialSelectionSummary(
                      .incremental_estimator_enabled
                  ? 1
                  : 0)
+         << "\n";
+  output << "persistent_incremental_estimator_used: "
+         << (result.pair_board_trial_selection_summary
+                     .persistent_incremental_estimator_used
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "persistent_incremental_default_main_path: "
+         << (result.problem_input.solver_options
+                     .enable_persistent_incremental_stereo_ba
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "persistent_incremental_fail_closed: "
+         << (result.problem_input.solver_options
+                         .enable_persistent_incremental_stereo_ba &&
+                     !result.problem_input.solver_options
+                          .allow_legacy_selection_fallback_after_persistent_failure
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "legacy_selection_fallback_after_persistent_failure_allowed: "
+         << (result.problem_input.solver_options
+                     .allow_legacy_selection_fallback_after_persistent_failure
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "persistent_incremental_uses_real_incremental_estimator: "
+         << (result.pair_board_trial_selection_summary
+                     .persistent_incremental_estimator_used
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "persistent_incremental_batch_unit: pair_cohesive\n";
+  output << "pair_board_selection_role: "
+         << (result.problem_input.solver_options
+                     .enable_persistent_incremental_stereo_ba
+                 ? "ablation_fallback_diagnostic"
+                 : "main_or_legacy_path")
+         << "\n";
+  output << "legacy_rmse_score_gates_role: "
+         << (result.problem_input.solver_options
+                     .enable_persistent_incremental_stereo_ba
+                 ? "diagnostics_plus_catastrophic_residual_safety_guard"
+                 : "legacy_acceptance_path")
+         << "\n";
+  output << "selection_acceptance_primary_signal: "
+         << (result.problem_input.solver_options
+                     .enable_persistent_incremental_stereo_ba
+                 ? "incremental_estimator_information_rank_objective_validity"
+                 : "legacy_score_rmse_gates")
+         << "\n";
+  output << "coobs_layout_factor_role: "
+         << (result.problem_input.solver_options.selection_coobs_factor_ba_enable
+                 ? "explicit_ablation_enabled"
+                 : "diagnostic_disabled")
+         << "\n";
+  output << "persistent_incremental_information_group: "
+         << result.pair_board_trial_selection_summary
+                .persistent_incremental_information_group
+         << "\n";
+  output << "persistent_incremental_requested_seed_pair_count: "
+         << result.problem_input.solver_options
+                .persistent_incremental_seed_pair_count
+         << "\n";
+  output << "legacy_pair_selection_seed_count: "
+         << result.problem_input.solver_options.pair_selection_seed_count
+         << "\n";
+  output << "persistent_incremental_seed_batch_count: "
+         << result.pair_board_trial_selection_summary
+                .persistent_incremental_seed_batch_count
+         << "\n";
+  output << "persistent_incremental_seed_pair_count: "
+         << result.pair_board_trial_selection_summary
+                .persistent_incremental_seed_pair_count
+         << "\n";
+  output << "persistent_incremental_seed_pair_board_count: "
+         << result.pair_board_trial_selection_summary
+                .persistent_incremental_seed_pair_board_count
+         << "\n";
+  output << "persistent_incremental_seed_point_count: "
+         << result.pair_board_trial_selection_summary
+                .persistent_incremental_seed_point_count
+         << "\n";
+  output << "persistent_incremental_seed_rank_theta: "
+         << result.pair_board_trial_selection_summary
+                .persistent_incremental_seed_rank_theta
+         << "\n";
+  output << "persistent_incremental_seed_information_gain: "
+         << result.pair_board_trial_selection_summary
+                .persistent_incremental_seed_information_gain
+         << "\n";
+  output << "persistent_incremental_elapsed_time_seconds: "
+         << result.pair_board_trial_selection_summary
+                .persistent_incremental_elapsed_time_seconds
          << "\n";
   output << "marginal_information_gain_proxy_enabled: "
          << (result.pair_board_trial_selection_summary
@@ -10613,6 +12312,29 @@ void WriteStereoPairBoardTrialSelectionSummary(
                  ? 1
                  : 0)
          << "\n";
+  const double catastrophic_total_delta = std::max(
+      1.0,
+      10.0 * result.problem_input.solver_options.pair_selection_max_rmse_delta);
+  const double catastrophic_camera_delta =
+      std::max(1.0, 10.0 * result.problem_input.solver_options
+                            .pair_selection_max_camera_rmse_delta);
+  output << "persistent_residual_delta_diagnostics_enabled: "
+         << (result.problem_input.solver_options
+                     .enable_persistent_incremental_stereo_ba
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "persistent_catastrophic_residual_guard_enabled: "
+         << (result.problem_input.solver_options
+                     .enable_persistent_incremental_stereo_ba
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "persistent_catastrophic_residual_guard_total_delta_px: "
+         << catastrophic_total_delta << "\n";
+  output << "persistent_catastrophic_residual_guard_camera_delta_px: "
+         << catastrophic_camera_delta
+         << "\n";
   output << "incremental_mi_tol: "
          << result.pair_board_trial_selection_summary.incremental_mi_tol
          << "\n";
@@ -10624,8 +12346,14 @@ void WriteStereoPairBoardTrialSelectionSummary(
          << result.pair_board_trial_selection_summary.incremental_info_block
          << "\n";
   output << "batch_acceptance_policy: "
-         << ToString(
-                result.problem_input.solver_options.batch_acceptance_policy)
+         << (result.problem_input.solver_options
+                     .enable_persistent_incremental_stereo_ba
+                 ? "persistent_incremental_estimator"
+                 : ToString(result.problem_input.solver_options
+                                .batch_acceptance_policy))
+         << "\n";
+  output << "legacy_batch_acceptance_policy: "
+         << ToString(result.problem_input.solver_options.batch_acceptance_policy)
          << "\n";
   output << "selection_ba_residual_mode: "
          << ToString(result.problem_input.solver_options
@@ -10768,6 +12496,10 @@ void WriteStereoPairBoardTrialSelectionSummary(
          << result.pair_board_trial_selection_summary
                 .batch_acceptance_rejected_score_count
          << "\n";
+  output << "persistent_incremental_residual_health_guard_rejected_count: "
+         << result.pair_board_trial_selection_summary
+                .persistent_incremental_residual_health_guard_rejected_count
+         << "\n";
   const StereoExtrinsicSolverOptions& options =
       result.problem_input.solver_options;
   output << "pair_cohesion_enabled: "
@@ -10866,11 +12598,17 @@ void WriteStereoPairBoardTrialSelectionDecisionsCsv(
          << "score_term,coverage_term,pair_completion_bonus,new_board_bonus,"
          << "cap_penalty,information_gain_proxy,residual_overage_penalty,"
          << "batch_acceptance_score,accepted_by_batch_acceptance,"
-         << "incremental_estimator_enabled,candidate_batch_type,"
+         << "incremental_estimator_enabled,"
+         << "persistent_incremental_estimator_used,candidate_batch_type,"
          << "accept_reason,solution_valid,optimization_success,"
          << "num_iterations,objective_before,objective_after,"
-         << "marginal_information_gain_proxy,rank_before,rank_after,"
-         << "rank_proxy_increases,info_gain_threshold,"
+         << "marginal_information_gain_proxy,rank_before,"
+         << "normalized_information_gain,"
+         << "information_gain_normalization_count,rank_after,"
+         << "rank_psi_after,rank_psi_deficiency_after,"
+         << "rank_theta_deficiency_after,rank_proxy_increases,"
+         << "svd_tolerance,qr_tolerance,elapsed_time_seconds,"
+         << "info_gain_threshold,"
          << "committed_or_rollback,trial_coobs_stereo_factor_count,"
          << "trial_coobs_layout_factor_count,"
          << "trial_coobs_stereo_initial_rot_mean_deg,"
@@ -10920,14 +12658,21 @@ void WriteStereoPairBoardTrialSelectionDecisionsCsv(
            << row.batch_acceptance_score << ","
            << (row.accepted_by_batch_acceptance ? 1 : 0) << ","
            << (row.incremental_estimator_enabled ? 1 : 0) << ","
+           << (row.persistent_incremental_estimator_used ? 1 : 0) << ","
            << row.candidate_batch_type << "," << row.accept_reason << ","
            << (row.solution_valid ? 1 : 0) << ","
            << (row.optimization_success ? 1 : 0) << ","
            << row.num_iterations << "," << row.objective_before << ","
            << row.objective_after << ","
            << row.marginal_information_gain_proxy << ","
-           << row.rank_before << "," << row.rank_after << ","
+           << row.rank_before << "," << row.normalized_information_gain << ","
+           << row.information_gain_normalization_count << ","
+           << row.rank_after << "," << row.rank_psi_after << ","
+           << row.rank_psi_deficiency_after << ","
+           << row.rank_theta_deficiency_after << ","
            << (row.rank_proxy_increases ? 1 : 0) << ","
+           << row.svd_tolerance << "," << row.qr_tolerance << ","
+           << row.elapsed_time_seconds << ","
            << row.info_gain_threshold << "," << row.committed_or_rollback
            << "," << row.trial_coobs_stereo_factor_count << ","
            << row.trial_coobs_layout_factor_count << ","
@@ -12487,8 +14232,12 @@ void WriteCoObsFactorBaExperiment(
   summary_csv
       << "variant_name,lambda_stereo,lambda_layout,"
       << "num_pixel_residuals,num_stereo_factors,num_layout_factors,"
-      << "training_rmse,holdout_rmse,holdout_cam0_rmse,holdout_cam1_rmse,"
-      << "holdout_cam_gap,holdout_board4_rmse,holdout_board5_rmse,"
+      << "training_rmse,extrinsic_only_holdout_rmse,"
+      << "extrinsic_only_holdout_cam0_rmse,"
+      << "extrinsic_only_holdout_cam1_rmse,"
+      << "extrinsic_only_holdout_cam_gap,"
+      << "extrinsic_only_holdout_board4_rmse,"
+      << "extrinsic_only_holdout_board5_rmse,"
       << "C_pose_median_rot,C_layout_median_rot,C_stereo_median_rot,"
       << "T_1_0_rot_drift_deg,T_1_0_trans_drift,"
       << "board4_layout_rot_drift_deg,board5_layout_rot_drift_deg,"
@@ -13925,12 +15674,34 @@ void WriteStereoGlobalSparseBaSummary(const std::string& path,
                  ? 1
                  : 0)
          << "\n";
+  output << "persistent_incremental_batch_acceptance_enabled: "
+         << (result.problem_input.solver_options
+                     .enable_persistent_incremental_stereo_ba
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "persistent_incremental_stereo_ba_enabled: "
+         << (result.problem_input.solver_options
+                     .enable_persistent_incremental_stereo_ba
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "final_state_uses_persistent_committed_scene: "
+         << (result.problem_input.solver_options.skip_final_global_ba &&
+                     result.problem_input.solver_options
+                         .enable_persistent_incremental_stereo_ba
+                 ? 1
+                 : 0)
+         << "\n";
   output << "final_state_label: "
          << (result.problem_input.solver_options.skip_final_global_ba
                  ? (result.problem_input.solver_options
-                            .enable_committing_pair_batch_selection
-                        ? "after_incremental_batch_acceptance"
-                        : "after_trial_selection")
+                            .enable_persistent_incremental_stereo_ba
+                        ? "after_persistent_incremental_committed_scene"
+                        : (result.problem_input.solver_options
+                                   .enable_committing_pair_batch_selection
+                               ? "after_incremental_batch_acceptance"
+                               : "after_trial_selection"))
                  : "after_final_global_ba")
          << "\n";
   output << "solver_mode: " << ToString(result.global_sparse_ba_summary.solver_mode)

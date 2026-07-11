@@ -59,6 +59,8 @@ enum class ResidualModel {
   NormalizedSphereAngular,
   HybridEdgeAngular,
   PolarContinuousHybrid,
+  Chordal,
+  PixelChordalHybrid,
 };
 
 const char* ToString(ResidualModel model);
@@ -67,6 +69,14 @@ ResidualModel ParseResidualModel(const std::string& value);
 bool ComputeAngularObservationGeometry(
     const DoubleSphereCameraModel& camera,
     const Eigen::Vector2d& observed_image_xy,
+    AngularObservationGeometry* geometry);
+
+// Model-independent helpers used after the active camera geometry has
+// unprojected/projected the measurement. Keeping these operations separate
+// prevents non-DS camera families from being evaluated through a DS proxy.
+bool ComputeAngularObservationGeometryFromRay(
+    const Eigen::Vector2d& observed_image_xy,
+    const Eigen::Vector3d& observed_ray,
     AngularObservationGeometry* geometry);
 
 bool ComputeBearingTangentCovariance(
@@ -79,6 +89,11 @@ bool ComputeBearingTangentCovariance(
 bool ComputeAngularPredictionGeometry(
     const DoubleSphereCameraModel& camera,
     const Eigen::Vector3d& point_camera,
+    AngularPredictionGeometry* geometry);
+
+bool ComputeAngularPredictionGeometryFromPoint(
+    const Eigen::Vector3d& point_camera,
+    const Eigen::Vector2d& predicted_image_xy,
     AngularPredictionGeometry* geometry);
 
 Eigen::Vector2d ComputeAngularResidualTangent(

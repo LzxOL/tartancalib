@@ -64,6 +64,38 @@ std::vector<int> ParseIntList(const std::string& value) {
   return result;
 }
 
+bool TryParseScalarDouble(const std::string& line,
+                          const std::string& key,
+                          double* value) {
+  if (value == nullptr) {
+    return false;
+  }
+  const std::string prefix = key + ":";
+  if (line.find(prefix) != 0) {
+    return false;
+  }
+  const std::string token = Trim(line.substr(prefix.size()));
+  if (token.empty()) {
+    return false;
+  }
+  *value = std::stod(token);
+  return true;
+}
+
+bool TryParseScalarInt(const std::string& line,
+                       const std::string& key,
+                       int* value) {
+  if (value == nullptr) {
+    return false;
+  }
+  double parsed = 0.0;
+  if (!TryParseScalarDouble(line, key, &parsed)) {
+    return false;
+  }
+  *value = static_cast<int>(std::lround(parsed));
+  return true;
+}
+
 }  // namespace
 
 bool LoadKalibrCamchainIntrinsics(const std::string& yaml_path,
@@ -85,6 +117,20 @@ bool LoadKalibrCamchainIntrinsics(const std::string& yaml_path,
   }
 
   bool in_cam0 = false;
+  bool cam0_seen = false;
+  bool camodocal_mei = false;
+  std::string camodocal_section;
+  double camodocal_xi = std::numeric_limits<double>::quiet_NaN();
+  double camodocal_gamma1 = std::numeric_limits<double>::quiet_NaN();
+  double camodocal_gamma2 = std::numeric_limits<double>::quiet_NaN();
+  double camodocal_u0 = std::numeric_limits<double>::quiet_NaN();
+  double camodocal_v0 = std::numeric_limits<double>::quiet_NaN();
+  double camodocal_k1 = 0.0;
+  double camodocal_k2 = 0.0;
+  double camodocal_p1 = 0.0;
+  double camodocal_p2 = 0.0;
+  int camodocal_width = 0;
+  int camodocal_height = 0;
   std::string camera_model;
   std::string distortion_model;
   std::vector<double> intrinsics_values;
@@ -96,8 +142,43 @@ bool LoadKalibrCamchainIntrinsics(const std::string& yaml_path,
     if (trimmed.empty() || trimmed[0] == '#') {
       continue;
     }
+    if (trimmed.find("model_type:") == 0) {
+      const std::string model_type =
+          Trim(trimmed.substr(std::string("model_type:").size()));
+      camodocal_mei = model_type == "MEI" || model_type == "mei";
+    } else if (TryParseScalarInt(trimmed, "image_width", &camodocal_width)) {
+      continue;
+    } else if (TryParseScalarInt(trimmed, "image_height", &camodocal_height)) {
+      continue;
+    } else if (trimmed == "mirror_parameters:" ||
+               trimmed == "distortion_parameters:" ||
+               trimmed == "projection_parameters:") {
+      camodocal_section = trimmed.substr(0, trimmed.size() - 1);
+      continue;
+    } else if (camodocal_mei && !camodocal_section.empty()) {
+      if (camodocal_section == "mirror_parameters") {
+        if (TryParseScalarDouble(trimmed, "xi", &camodocal_xi)) {
+          continue;
+        }
+      } else if (camodocal_section == "distortion_parameters") {
+        if (TryParseScalarDouble(trimmed, "k1", &camodocal_k1) ||
+            TryParseScalarDouble(trimmed, "k2", &camodocal_k2) ||
+            TryParseScalarDouble(trimmed, "p1", &camodocal_p1) ||
+            TryParseScalarDouble(trimmed, "p2", &camodocal_p2)) {
+          continue;
+        }
+      } else if (camodocal_section == "projection_parameters") {
+        if (TryParseScalarDouble(trimmed, "gamma1", &camodocal_gamma1) ||
+            TryParseScalarDouble(trimmed, "gamma2", &camodocal_gamma2) ||
+            TryParseScalarDouble(trimmed, "u0", &camodocal_u0) ||
+            TryParseScalarDouble(trimmed, "v0", &camodocal_v0)) {
+          continue;
+        }
+      }
+    }
     if (trimmed == "cam0:") {
       in_cam0 = true;
+      cam0_seen = true;
       continue;
     }
     if (!in_cam0) {
@@ -119,6 +200,25 @@ bool LoadKalibrCamchainIntrinsics(const std::string& yaml_path,
   }
 
   if (camera_model.empty()) {
+    if (!cam0_seen && camodocal_mei &&
+        camodocal_width > 0 && camodocal_height > 0 &&
+        std::isfinite(camodocal_xi) &&
+        std::isfinite(camodocal_gamma1) &&
+        std::isfinite(camodocal_gamma2) &&
+        std::isfinite(camodocal_u0) &&
+        std::isfinite(camodocal_v0)) {
+      intrinsics->camera_model = "omni";
+      intrinsics->distortion_model = "radtan";
+      intrinsics->resolution = cv::Size(camodocal_width, camodocal_height);
+      intrinsics->SetIntrinsicsVector(
+          {camodocal_xi, camodocal_gamma1, camodocal_gamma2,
+           camodocal_u0, camodocal_v0});
+      intrinsics->SetDistortionVector(
+          {camodocal_k1, camodocal_k2, camodocal_p1, camodocal_p2});
+      if (intrinsics->IsValid()) {
+        return true;
+      }
+    }
     if (error_message != nullptr) {
       *error_message = "Kalibr camchain yaml does not contain a readable cam0 block.";
     }

@@ -37,11 +37,19 @@ def parse_stereo_extrinsic_yaml(path: Path) -> SummaryMap:
     return data
 
 
+def parse_csv_rows(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
 def to_float(value: str) -> Optional[float]:
     if value == "":
         return None
     try:
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
     except ValueError:
         return None
 
@@ -112,6 +120,127 @@ def parse_vector4(value: str) -> List[Optional[float]]:
     return values
 
 
+def polar_metric(
+    rows: List[Dict[str, str]],
+    split: str,
+    point_type: str,
+    bucket: str,
+    metric: str,
+    camera_index: str = "-1",
+    board_id: Optional[str] = None,
+) -> Optional[float]:
+    values: List[float] = []
+    weights: List[int] = []
+    for row in rows:
+        if row.get("split") != split:
+            continue
+        if row.get("point_type") != point_type:
+            continue
+        if row.get("polar_bucket") != bucket:
+            continue
+        if row.get("camera_index") != camera_index:
+            continue
+        if board_id is not None and row.get("board_id") != board_id:
+            continue
+        value = to_float(row.get(metric, ""))
+        count = to_int(row.get("point_count", ""))
+        if value is None or count is None or count <= 0:
+            continue
+        values.append(value)
+        weights.append(count)
+    if not values:
+        return None
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return None
+    return sum(value * weight for value, weight in zip(values, weights)) / total_weight
+
+
+def polar_point_count(
+    rows: List[Dict[str, str]],
+    split: str,
+    point_type: str,
+    bucket: str,
+    camera_index: str = "-1",
+) -> Optional[int]:
+    total = 0
+    found = False
+    for row in rows:
+        if row.get("split") != split:
+            continue
+        if row.get("point_type") != point_type:
+            continue
+        if row.get("polar_bucket") != bucket:
+            continue
+        if row.get("camera_index") != camera_index:
+            continue
+        count = to_int(row.get("point_count", ""))
+        if count is None:
+            continue
+        total += count
+        found = True
+    return total if found else None
+
+
+def layout_drift_stats(rows: List[Dict[str, str]]) -> Dict[str, Optional[float]]:
+    gaps: List[float] = []
+    global_rmse: List[float] = []
+    local_rmse: List[float] = []
+    translations: List[float] = []
+    rotations: List[float] = []
+    for row in rows:
+        global_value = to_float(row.get("global_outer_rmse_px", ""))
+        local_value = to_float(row.get("local_outer_rmse_px", ""))
+        translation = to_float(row.get("translation_drift_m", ""))
+        rotation = to_float(row.get("rotation_drift_deg", ""))
+        if global_value is not None and local_value is not None:
+            gaps.append(global_value - local_value)
+            global_rmse.append(global_value)
+            local_rmse.append(local_value)
+        if translation is not None:
+            translations.append(translation)
+        if rotation is not None:
+            rotations.append(rotation)
+
+    def mean(values: List[float]) -> Optional[float]:
+        return sum(values) / len(values) if values else None
+
+    def maximum(values: List[float]) -> Optional[float]:
+        return max(values) if values else None
+
+    return {
+        "layout_drift_row_count": float(len(rows)) if rows else None,
+        "layout_drift_mean_outer_gap_px": mean(gaps),
+        "layout_drift_max_outer_gap_px": maximum(gaps),
+        "layout_drift_mean_global_outer_rmse_px": mean(global_rmse),
+        "layout_drift_mean_local_outer_rmse_px": mean(local_rmse),
+        "layout_drift_mean_translation_m": mean(translations),
+        "layout_drift_max_translation_m": maximum(translations),
+        "layout_drift_mean_rotation_deg": mean(rotations),
+        "layout_drift_max_rotation_deg": maximum(rotations),
+    }
+
+
+def selected_board_distribution(rows: List[Dict[str, str]]) -> Dict[str, object]:
+    board_counts: Dict[int, int] = {}
+    pair_ids = set()
+    for row in rows:
+        pair_id = to_int(row.get("pair_index", ""))
+        board_id = to_int(row.get("board_id", ""))
+        if pair_id is not None:
+            pair_ids.add(pair_id)
+        if board_id is None:
+            continue
+        board_counts[board_id] = board_counts.get(board_id, 0) + 1
+    distribution = ",".join(
+        f"{board_id}:{board_counts[board_id]}" for board_id in sorted(board_counts)
+    )
+    return {
+        "persistent_selected_pair_count_from_csv": len(pair_ids),
+        "persistent_selected_board_distribution": distribution,
+    }
+
+
 def load_row(directory: Path) -> Dict[str, object]:
     extrinsic = parse_key_value_file(directory / "stereo_extrinsic_summary.txt")
     extrinsic_yaml = parse_stereo_extrinsic_yaml(directory / "stereo_extrinsic.yaml")
@@ -126,6 +255,29 @@ def load_row(directory: Path) -> Dict[str, object]:
     global_sparse_ba = parse_key_value_file(
         directory / "stereo_global_sparse_ba_summary.txt"
     )
+    persistent = parse_key_value_file(
+        directory / "stage6_persistent_incremental_selection_summary.txt"
+    )
+    reference_holdout = parse_key_value_file(
+        directory / "stereo_reference_holdout_summary.txt"
+    )
+    polar_rows = parse_csv_rows(directory / "stereo_holdout_board_polar_rmse.csv")
+    selected_board_rows = parse_csv_rows(
+        directory / "stage6_persistent_incremental_selected_boards.csv"
+    )
+    if not selected_board_rows:
+        selected_board_rows = parse_csv_rows(
+            directory / "stereo_pair_board_trial_selected_boards.csv"
+        )
+    drift = layout_drift_stats(
+        parse_csv_rows(directory / "stereo_holdout_local_layout_drift.csv")
+    )
+    selected_distribution = selected_board_distribution(selected_board_rows)
+    persistent_selected_pair_board_count = to_int(
+        persistent.get("final_selected_pair_board_count", "")
+    )
+    if persistent_selected_pair_board_count is None and selected_board_rows:
+        persistent_selected_pair_board_count = len(selected_board_rows)
     translation = parse_vector3(
         extrinsic.get("translation_xyz", extrinsic_yaml.get("translation_xyz", ""))
     )
@@ -200,6 +352,78 @@ def load_row(directory: Path) -> Dict[str, object]:
             and to_float(reprojection.get("training_shared_cam1_rmse", "")) is not None
             else None
         ),
+        "holdout_extrinsic_only_total_stereo_rmse": to_float(
+            reprojection.get("holdout_extrinsic_only_total_stereo_rmse", "")
+        ),
+        "holdout_extrinsic_only_outer_only_rmse": to_float(
+            reprojection.get("holdout_extrinsic_only_outer_only_rmse", "")
+        ),
+        "holdout_extrinsic_only_internal_only_rmse": to_float(
+            reprojection.get("holdout_extrinsic_only_internal_only_rmse", "")
+        ),
+        "holdout_extrinsic_only_used_pair_count": to_int(
+            reprojection.get("holdout_extrinsic_only_used_pair_count", "")
+        ),
+        "reference_extrinsic_only_holdout_total_stereo_rmse": to_float(
+            reference_holdout.get(
+                "reference_extrinsic_only_holdout_total_stereo_rmse", ""
+            )
+        ),
+        "ours_minus_reference_extrinsic_only_holdout_total_stereo_rmse": to_float(
+            reference_holdout.get(
+                "ours_minus_reference_extrinsic_only_holdout_total_stereo_rmse",
+                "",
+            )
+        ),
+        "persistent_incremental_estimator_used": to_int(
+            persistent.get("persistent_incremental_estimator_used", "")
+        ),
+        "persistent_incremental_default_main_path": to_int(
+            persistent.get("persistent_incremental_default_main_path", "")
+        ),
+        "persistent_incremental_seed_pair_count": to_int(
+            persistent.get("persistent_incremental_seed_pair_count", "")
+        ),
+        "persistent_incremental_seed_pair_board_count": to_int(
+            persistent.get("persistent_incremental_seed_pair_board_count", "")
+        ),
+        "persistent_incremental_seed_information_gain": to_float(
+            persistent.get("persistent_incremental_seed_information_gain", "")
+        ),
+        "persistent_attempted_count": to_int(persistent.get("attempted_count", "")),
+        "persistent_accepted_count": to_int(persistent.get("accepted_count", "")),
+        "persistent_rejected_count": to_int(persistent.get("rejected_count", "")),
+        "persistent_final_selected_pair_board_count": persistent_selected_pair_board_count,
+        **selected_distribution,
+        "persistent_rmse_delta_diagnostics_only": to_int(
+            persistent.get("rmse_delta_diagnostics_only", "")
+        ),
+        "persistent_catastrophic_rejected_count": to_int(
+            persistent.get("batch_acceptance_rejected_catastrophic_residual_count", "")
+        ),
+        "extrinsic_only_polar_0_30_rmse": polar_metric(
+            polar_rows, "holdout_extrinsic_only", "all", "polar_0_30",
+            "pixel_rmse_px"
+        ),
+        "extrinsic_only_polar_30_50_rmse": polar_metric(
+            polar_rows, "holdout_extrinsic_only", "all", "polar_30_50",
+            "pixel_rmse_px"
+        ),
+        "extrinsic_only_polar_50_70_rmse": polar_metric(
+            polar_rows, "holdout_extrinsic_only", "all", "polar_50_70",
+            "pixel_rmse_px"
+        ),
+        "extrinsic_only_polar_70_plus_rmse": polar_metric(
+            polar_rows, "holdout_extrinsic_only", "all", "polar_70_plus",
+            "pixel_rmse_px"
+        ),
+        "extrinsic_only_polar_50_70_point_count": polar_point_count(
+            polar_rows, "holdout_extrinsic_only", "all", "polar_50_70"
+        ),
+        "extrinsic_only_polar_70_plus_point_count": polar_point_count(
+            polar_rows, "holdout_extrinsic_only", "all", "polar_70_plus"
+        ),
+        **drift,
         "same_intrinsics_path": to_int(
             intrinsics_sanity.get("same_intrinsics_path", "")
         ),
@@ -369,6 +593,40 @@ CSV_COLUMNS: Sequence[str] = (
     "training_shared_cam0_rmse",
     "training_shared_cam1_rmse",
     "training_shared_cam1_over_cam0_rmse_ratio",
+    "holdout_extrinsic_only_total_stereo_rmse",
+    "holdout_extrinsic_only_outer_only_rmse",
+    "holdout_extrinsic_only_internal_only_rmse",
+    "holdout_extrinsic_only_used_pair_count",
+    "reference_extrinsic_only_holdout_total_stereo_rmse",
+    "ours_minus_reference_extrinsic_only_holdout_total_stereo_rmse",
+    "persistent_incremental_estimator_used",
+    "persistent_incremental_default_main_path",
+    "persistent_incremental_seed_pair_count",
+    "persistent_incremental_seed_pair_board_count",
+    "persistent_incremental_seed_information_gain",
+    "persistent_attempted_count",
+    "persistent_accepted_count",
+    "persistent_rejected_count",
+    "persistent_final_selected_pair_board_count",
+    "persistent_selected_pair_count_from_csv",
+    "persistent_selected_board_distribution",
+    "persistent_rmse_delta_diagnostics_only",
+    "persistent_catastrophic_rejected_count",
+    "extrinsic_only_polar_0_30_rmse",
+    "extrinsic_only_polar_30_50_rmse",
+    "extrinsic_only_polar_50_70_rmse",
+    "extrinsic_only_polar_70_plus_rmse",
+    "extrinsic_only_polar_50_70_point_count",
+    "extrinsic_only_polar_70_plus_point_count",
+    "layout_drift_row_count",
+    "layout_drift_mean_outer_gap_px",
+    "layout_drift_max_outer_gap_px",
+    "layout_drift_mean_global_outer_rmse_px",
+    "layout_drift_mean_local_outer_rmse_px",
+    "layout_drift_mean_translation_m",
+    "layout_drift_max_translation_m",
+    "layout_drift_mean_rotation_deg",
+    "layout_drift_max_rotation_deg",
     "same_intrinsics_path",
     "same_intrinsics_parameters",
     "same_resolution",
@@ -446,31 +704,44 @@ def write_markdown(path: Path, rows: List[Dict[str, object]]) -> None:
     lines.append(f"experiment_count: {len(rows)}")
     lines.append("")
     lines.append(
-        "| subset | pairs | graph_iter | no_progress | init_pairs | excluded | "
-        "unreachable | shared_pairs | single_cam_pairs | train_total | cam0 | cam1 | "
-        "cam1/cam0 | baseline | rot_deg |"
+        "| subset | pairs | selected | pair-board | accepted | rejected | "
+        "boards | train RMSE | ours extrinsic-only | reference | ours-ref | "
+        "polar 50-70 | polar 70+ | baseline | rot_deg |"
     )
     lines.append(
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|"
     )
     for row in rows:
         lines.append(
-            "| {subset} | {pairs} | {graph_iter} | {no_progress} | {init_pairs} | "
-            "{excluded} | {unreachable} | {shared_pairs} | {single_pairs} | "
-            "{train_total} | {cam0} | {cam1} | {ratio} | {baseline} | {rot} |".format(
+            "| {subset} | {pairs} | {selected} | {pair_board} | {accepted} | "
+            "{rejected} | {boards} | {train_total} | {extrinsic_only} | "
+            "{reference} | {delta} | {polar_50_70} | {polar_70_plus} | {baseline} | "
+            "{rot} |".format(
                 subset=row.get("subset_label", ""),
                 pairs=fmt_int(row.get("paired_frame_count")),
-                graph_iter=fmt_int(row.get("graph_propagation_iteration_count")),
-                no_progress=fmt_int(row.get("graph_propagation_stopped_by_no_progress")),
-                init_pairs=fmt_int(row.get("initialized_training_pair_count")),
-                excluded=fmt_int(row.get("excluded_training_pair_count")),
-                unreachable=fmt_int(row.get("unreachable_training_pair_count")),
-                shared_pairs=fmt_int(row.get("training_shared_board_pair_count")),
-                single_pairs=fmt_int(row.get("training_single_camera_only_pair_count")),
+                selected=fmt_int(row.get("selected_pair_count")),
+                pair_board=fmt_int(
+                    row.get("persistent_final_selected_pair_board_count")
+                ),
+                accepted=fmt_int(row.get("persistent_accepted_count")),
+                rejected=fmt_int(row.get("persistent_rejected_count")),
+                boards=row.get("persistent_selected_board_distribution", ""),
                 train_total=fmt_float(row.get("training_total_stereo_rmse")),
-                cam0=fmt_float(row.get("training_cam0_rmse")),
-                cam1=fmt_float(row.get("training_cam1_rmse")),
-                ratio=fmt_float(row.get("training_cam1_over_cam0_rmse_ratio")),
+                extrinsic_only=fmt_float(
+                    row.get("holdout_extrinsic_only_total_stereo_rmse")
+                ),
+                reference=fmt_float(
+                    row.get("reference_extrinsic_only_holdout_total_stereo_rmse")
+                ),
+                delta=fmt_float(
+                    row.get(
+                        "ours_minus_reference_extrinsic_only_holdout_total_stereo_rmse"
+                    )
+                ),
+                polar_50_70=fmt_float(row.get("extrinsic_only_polar_50_70_rmse")),
+                polar_70_plus=fmt_float(
+                    row.get("extrinsic_only_polar_70_plus_rmse")
+                ),
                 baseline=fmt_float(row.get("baseline_length")),
                 rot=fmt_float(row.get("rotation_angle_deg")),
             )

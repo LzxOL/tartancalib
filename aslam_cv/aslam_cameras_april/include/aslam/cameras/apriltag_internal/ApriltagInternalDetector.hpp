@@ -50,8 +50,8 @@ struct ApriltagInternalDetectionOptions {
   // the normal image-evidence seed validation path.
   bool bypass_internal_seed_filters = false;
   InternalPoseRescueMode internal_pose_rescue_mode =
-      InternalPoseRescueMode::Off;
-  double internal_pose_rescue_max_ray_angle_deg = 85.0;
+      InternalPoseRescueMode::Enabled;
+  double internal_pose_rescue_max_ray_angle_deg = 88.0;
   double internal_pose_rescue_accept_max_outer_rmse = 8.0;
   bool enable_geometry_prior_outer_seed = false;
   bool geometry_prior_rescue_diagnostic_only = true;
@@ -172,6 +172,7 @@ struct ApriltagInternalDetectionResult {
   int board_id = -1;
   cv::Size image_size;
   std::string failure_reason;
+  std::string internal_camera_source;
   InternalProjectionMode projection_mode = InternalProjectionMode::Homography;
   cv::Point2f tag_center;
   float observed_perimeter = 0.0f;

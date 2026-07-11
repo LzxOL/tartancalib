@@ -60,6 +60,19 @@ const char* ToString(AslamBackendCalibrationOptions::ConsistencyWeightMode mode)
   return "cauchy";
 }
 
+const char* ToString(
+    AslamBackendCalibrationOptions::BoardPoseParameterization mode) {
+  switch (mode) {
+    case AslamBackendCalibrationOptions::BoardPoseParameterization::
+        ReferenceChain:
+      return "reference_chain";
+    case AslamBackendCalibrationOptions::BoardPoseParameterization::
+        IndependentFrameBoardPose:
+      return "independent_frame_board_pose";
+  }
+  return "reference_chain";
+}
+
 const char* ToString(AslamBackendCalibrationOptions::AngularObservedRayMode mode) {
   switch (mode) {
     case AslamBackendCalibrationOptions::AngularObservedRayMode::DynamicCurrentCamera:
@@ -90,6 +103,29 @@ AslamBackendCalibrationOptions::PolarAngleWeightMode ParsePolarAngleWeightMode(
     return AslamBackendCalibrationOptions::PolarAngleWeightMode::AdaptiveSigma;
   }
   throw std::runtime_error("Unknown polar angle weight mode: " + value);
+}
+
+AslamBackendCalibrationOptions::BoardPoseParameterization
+ParseBoardPoseParameterization(const std::string& value) {
+  std::string lowered = value;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](unsigned char ch) {
+                   return static_cast<char>(std::tolower(ch));
+                 });
+  if (lowered == "reference_chain" || lowered == "reference-chain" ||
+      lowered == "chain" || lowered == "layout") {
+    return AslamBackendCalibrationOptions::BoardPoseParameterization::
+        ReferenceChain;
+  }
+  if (lowered == "independent_frame_board_pose" ||
+      lowered == "independent-frame-board-pose" ||
+      lowered == "independent_board_pose" ||
+      lowered == "independent-board-pose" ||
+      lowered == "local_board_pose" || lowered == "local-board-pose") {
+    return AslamBackendCalibrationOptions::BoardPoseParameterization::
+        IndependentFrameBoardPose;
+  }
+  throw std::runtime_error("Unknown board pose parameterization: " + value);
 }
 
 AslamBackendCalibrationOptions::ConsistencyWeightMode ParseConsistencyWeightMode(
@@ -134,6 +170,9 @@ using EucmProjection = aslam::cameras::ExtendedUnifiedProjection<aslam::cameras:
 using PinholeEquiGeometry = aslam::cameras::EquidistantDistortedPinholeCameraGeometry;
 using PinholeEquiProjection =
     aslam::cameras::PinholeProjection<aslam::cameras::EquidistantDistortion>;
+using MeiGeometry = aslam::cameras::DistortedOmniCameraGeometry;
+using MeiProjection =
+    aslam::cameras::OmniProjection<aslam::cameras::RadialTangentialDistortion>;
 
 struct ConsistencyWeightSummary {
   bool success = false;
@@ -178,6 +217,16 @@ bool ClampIntrinsicsInPlace(OuterBootstrapCameraIntrinsics* intrinsics) {
     intrinsics->distortion_coeffs.clear();
   } else if (family == "pinhole-equi") {
     intrinsics->xi = 0.0;
+    intrinsics->alpha = 0.0;
+    intrinsics->beta = 0.0;
+    if (intrinsics->distortion_coeffs.size() != 4) {
+      intrinsics->distortion_coeffs.resize(4, 0.0);
+    }
+    for (double& coefficient : intrinsics->distortion_coeffs) {
+      coefficient = std::max(-1.5, std::min(1.5, coefficient));
+    }
+  } else if (family == "omni-radtan") {
+    intrinsics->xi = std::max(-0.95, std::min(3.0, intrinsics->xi));
     intrinsics->alpha = 0.0;
     intrinsics->beta = 0.0;
     if (intrinsics->distortion_coeffs.size() != 4) {
@@ -823,6 +872,96 @@ OuterBootstrapCameraIntrinsics GeometryToIntrinsics<PinholeEquiGeometry>(
   return intrinsics;
 }
 
+template <>
+OuterBootstrapCameraIntrinsics GeometryToIntrinsics<MeiGeometry>(
+    const MeiGeometry& geometry) {
+  OuterBootstrapCameraIntrinsics intrinsics;
+  intrinsics.camera_model = "omni";
+  intrinsics.distortion_model = "radtan";
+  intrinsics.xi = geometry.projection().xi();
+  intrinsics.fu = geometry.projection().fu();
+  intrinsics.fv = geometry.projection().fv();
+  intrinsics.cu = geometry.projection().cu();
+  intrinsics.cv = geometry.projection().cv();
+  Eigen::MatrixXd distortion_parameters;
+  geometry.projection().distortion().getParameters(distortion_parameters);
+  intrinsics.distortion_coeffs.resize(
+      static_cast<std::size_t>(distortion_parameters.rows()), 0.0);
+  for (Eigen::Index index = 0; index < distortion_parameters.rows(); ++index) {
+    intrinsics.distortion_coeffs[static_cast<std::size_t>(index)] =
+        distortion_parameters(index, 0);
+  }
+  intrinsics.resolution =
+      cv::Size(geometry.projection().width(), geometry.projection().height());
+  return intrinsics;
+}
+
+template <typename GeometryT>
+bool ComputeObservationGeometryForCamera(
+    const GeometryT& camera,
+    const Eigen::Vector2d& observed_image_xy,
+    AngularObservationGeometry* geometry) {
+  Eigen::Vector3d observed_ray = Eigen::Vector3d::Zero();
+  if (!camera.keypointToEuclidean(observed_image_xy, observed_ray)) {
+    return false;
+  }
+  return ComputeAngularObservationGeometryFromRay(
+      observed_image_xy, observed_ray, geometry);
+}
+
+template <typename GeometryT>
+bool ComputePredictionGeometryForCamera(
+    const GeometryT& camera,
+    const Eigen::Vector4d& point_camera,
+    AngularPredictionGeometry* geometry) {
+  Eigen::Vector2d predicted_image_xy = Eigen::Vector2d::Zero();
+  if (!camera.homogeneousToKeypoint(point_camera, predicted_image_xy)) {
+    return false;
+  }
+  return ComputeAngularPredictionGeometryFromPoint(
+      point_camera.head<3>(), predicted_image_xy, geometry);
+}
+
+template <typename GeometryT>
+double EstimateAngularSigmaPerPixelForCamera(
+    const GeometryT& camera,
+    const Eigen::Vector2d& observed_image_xy,
+    const AngularObservationGeometry& observation_geometry,
+    double finite_difference_step_px = 1.0) {
+  if (!observation_geometry.success ||
+      !(finite_difference_step_px > 0.0) ||
+      !std::isfinite(finite_difference_step_px)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  double squared_sum = 0.0;
+  int count = 0;
+  const Eigen::Vector2d offsets[] = {
+      Eigen::Vector2d(finite_difference_step_px, 0.0),
+      Eigen::Vector2d(-finite_difference_step_px, 0.0),
+      Eigen::Vector2d(0.0, finite_difference_step_px),
+      Eigen::Vector2d(0.0, -finite_difference_step_px),
+  };
+  for (const Eigen::Vector2d& offset : offsets) {
+    AngularObservationGeometry shifted_geometry;
+    if (!ComputeObservationGeometryForCamera(
+            camera, observed_image_xy + offset, &shifted_geometry)) {
+      continue;
+    }
+    const Eigen::Vector3d ray_delta =
+        shifted_geometry.observed_ray - observation_geometry.observed_ray;
+    const double sigma =
+        (observation_geometry.tangent_basis.transpose() * ray_delta).norm() /
+        finite_difference_step_px;
+    if (sigma > 0.0 && std::isfinite(sigma)) {
+      squared_sum += sigma * sigma;
+      ++count;
+    }
+  }
+  return count > 0
+             ? std::sqrt(squared_sum / static_cast<double>(count))
+             : std::numeric_limits<double>::quiet_NaN();
+}
+
 template <typename GeometryT>
 boost::shared_ptr<GeometryT> MakeTypedGeometry(
     const OuterBootstrapCameraIntrinsics& intrinsics);
@@ -864,6 +1003,23 @@ boost::shared_ptr<PinholeEquiGeometry> MakeTypedGeometry<PinholeEquiGeometry>(
           projection, aslam::cameras::GlobalShutter(), aslam::cameras::NoMask()));
 }
 
+template <>
+boost::shared_ptr<MeiGeometry> MakeTypedGeometry<MeiGeometry>(
+    const OuterBootstrapCameraIntrinsics& intrinsics) {
+  const std::vector<double> distortion =
+      intrinsics.distortion_coeffs.size() == 4
+          ? intrinsics.distortion_coeffs
+          : std::vector<double>{0.0, 0.0, 0.0, 0.0};
+  MeiProjection projection(
+      intrinsics.xi, intrinsics.fu, intrinsics.fv, intrinsics.cu,
+      intrinsics.cv, intrinsics.resolution.width, intrinsics.resolution.height,
+      aslam::cameras::RadialTangentialDistortion(
+          distortion[0], distortion[1], distortion[2], distortion[3]));
+  return boost::shared_ptr<MeiGeometry>(
+      new MeiGeometry(
+          projection, aslam::cameras::GlobalShutter(), aslam::cameras::NoMask()));
+}
+
 struct PoseVariableState {
   sm::kinematics::Transformation transform;
   boost::shared_ptr<aslam::backend::MappedRotationQuaternion> rotation_dv;
@@ -894,6 +1050,269 @@ std::map<std::pair<int, int>, ObservationBudget> BuildObservationBudgets(
   return budgets;
 }
 
+bool ComposeCameraBoardPoseFromReferenceChain(
+    const JointReprojectionSceneState& scene_state,
+    int frame_index,
+    int board_id,
+    Eigen::Matrix4d* T_camera_board) {
+  if (T_camera_board == nullptr) {
+    return false;
+  }
+  const JointSceneFrameState* frame_state =
+      FindJointSceneFrameState(scene_state, frame_index);
+  if (frame_state == nullptr || !frame_state->initialized) {
+    return false;
+  }
+  Eigen::Matrix4d T_reference_board = Eigen::Matrix4d::Identity();
+  if (board_id != scene_state.reference_board_id) {
+    const JointSceneBoardState* board_state =
+        FindJointSceneBoardState(scene_state, board_id);
+    if (board_state == nullptr || !board_state->initialized) {
+      return false;
+    }
+    T_reference_board = board_state->T_reference_board;
+  }
+  *T_camera_board = frame_state->T_camera_reference * T_reference_board;
+  return true;
+}
+
+double RmseFromSquaredSum(double squared_sum, int count) {
+  return count > 0 ? std::sqrt(squared_sum / static_cast<double>(count)) : 0.0;
+}
+
+template <typename GeometryT>
+JointResidualEvaluationResult EvaluateIndependentFrameBoardPoseResiduals(
+    const JointMeasurementBuildResult& measurement_result,
+    const boost::shared_ptr<GeometryT>& camera_geometry,
+    const std::map<std::pair<int, int>, PoseVariableState>& local_pose_variables,
+    int reference_board_id,
+    int top_k) {
+  JointResidualEvaluationResult result;
+  result.reference_board_id = reference_board_id;
+  if (!measurement_result.success) {
+    result.failure_reason = "measurement_result.success is false";
+    return result;
+  }
+  if (camera_geometry == nullptr) {
+    result.failure_reason = "missing camera geometry";
+    return result;
+  }
+
+  std::map<std::pair<int, int>, std::pair<double, int> >
+      board_observation_accumulators;
+  std::map<std::pair<int, int>, std::pair<int, std::string> >
+      board_observation_labels;
+  std::map<int, std::tuple<double, int, int, int> > board_accumulators;
+  std::map<int, std::pair<double, int> > frame_accumulators;
+  std::map<int, std::pair<int, std::string> > frame_labels;
+  std::map<int, std::vector<int> > frame_visible_boards;
+
+  double total_squared_sum = 0.0;
+  double outer_squared_sum = 0.0;
+  double internal_squared_sum = 0.0;
+  int total_count = 0;
+  int outer_count = 0;
+  int internal_count = 0;
+
+  for (const JointPointObservation& observation :
+       measurement_result.solver_observations) {
+    if (!observation.used_in_solver) {
+      continue;
+    }
+    const std::pair<int, int> key(observation.frame_index,
+                                  observation.board_id);
+    const auto pose_it = local_pose_variables.find(key);
+    if (pose_it == local_pose_variables.end()) {
+      continue;
+    }
+    const Eigen::Vector4d point_board(observation.target_xyz_board.x(),
+                                      observation.target_xyz_board.y(),
+                                      observation.target_xyz_board.z(),
+                                      1.0);
+    const Eigen::Vector4d point_camera_h =
+        pose_it->second.expression.toTransformationMatrix() * point_board;
+    Eigen::Vector2d predicted = Eigen::Vector2d::Zero();
+    const bool valid_projection =
+        camera_geometry->homogeneousToKeypoint(point_camera_h, predicted) &&
+        predicted.allFinite();
+
+    JointResidualPointDiagnostics point;
+    point.frame_index = observation.frame_index;
+    point.frame_label = observation.frame_label;
+    point.board_id = observation.board_id;
+    point.point_id = observation.point_id;
+    point.point_type = observation.point_type;
+    point.observed_image_xy = observation.image_xy;
+    point.target_xyz_board = observation.target_xyz_board;
+    point.predicted_image_xy =
+        valid_projection ? predicted
+                         : Eigen::Vector2d(
+                               std::numeric_limits<double>::quiet_NaN(),
+                               std::numeric_limits<double>::quiet_NaN());
+    if (valid_projection) {
+      point.residual_xy = predicted - observation.image_xy;
+    } else {
+      point.residual_xy = Eigen::Vector2d::Constant(100.0);
+    }
+    point.residual_norm = point.residual_xy.norm();
+    point.quality = observation.quality;
+    point.used_in_solver = observation.used_in_solver;
+    point.frame_storage_index = observation.frame_storage_index;
+    point.source_board_observation_index =
+        observation.source_board_observation_index;
+    point.source_point_index = observation.source_point_index;
+    point.source_kind = observation.source_kind;
+    result.point_diagnostics.push_back(point);
+
+    const double squared = point.residual_xy.squaredNorm();
+    total_squared_sum += squared;
+    ++total_count;
+    if (observation.point_type == JointPointType::Outer) {
+      outer_squared_sum += squared;
+      ++outer_count;
+    } else {
+      internal_squared_sum += squared;
+      ++internal_count;
+    }
+    board_observation_accumulators[key].first += squared;
+    board_observation_accumulators[key].second += 1;
+    board_observation_labels[key] =
+        std::make_pair(observation.board_id, observation.frame_label);
+
+    std::tuple<double, int, int, int>& board_acc =
+        board_accumulators[observation.board_id];
+    std::get<0>(board_acc) += squared;
+    std::get<1>(board_acc) += 1;
+    if (observation.point_type == JointPointType::Outer) {
+      std::get<2>(board_acc) += 1;
+    } else {
+      std::get<3>(board_acc) += 1;
+    }
+    frame_accumulators[observation.frame_index].first += squared;
+    frame_accumulators[observation.frame_index].second += 1;
+    frame_labels[observation.frame_index] =
+        std::make_pair(observation.frame_index, observation.frame_label);
+    std::vector<int>& visible_boards =
+        frame_visible_boards[observation.frame_index];
+    if (std::find(visible_boards.begin(), visible_boards.end(),
+                  observation.board_id) == visible_boards.end()) {
+      visible_boards.push_back(observation.board_id);
+    }
+  }
+
+  if (total_count <= 0) {
+    result.failure_reason =
+        "No used observations with independent frame-board poses";
+    return result;
+  }
+  result.overall_rmse = RmseFromSquaredSum(total_squared_sum, total_count);
+  result.outer_only_rmse = RmseFromSquaredSum(outer_squared_sum, outer_count);
+  result.internal_only_rmse =
+      RmseFromSquaredSum(internal_squared_sum, internal_count);
+  result.overall_image_plane_rmse = result.overall_rmse;
+  result.outer_only_image_plane_rmse = result.outer_only_rmse;
+  result.internal_only_image_plane_rmse = result.internal_only_rmse;
+
+  for (const auto& entry : board_observation_accumulators) {
+    JointResidualBoardObservationDiagnostics diagnostics;
+    diagnostics.frame_index = entry.first.first;
+    diagnostics.board_id = entry.first.second;
+    diagnostics.frame_label = board_observation_labels[entry.first].second;
+    diagnostics.point_count = entry.second.second;
+    diagnostics.rmse =
+        RmseFromSquaredSum(entry.second.first, entry.second.second);
+    for (const JointResidualPointDiagnostics& point :
+         result.point_diagnostics) {
+      if (point.frame_index == diagnostics.frame_index &&
+          point.board_id == diagnostics.board_id) {
+        if (point.point_type == JointPointType::Outer) {
+          ++diagnostics.outer_point_count;
+        } else {
+          ++diagnostics.internal_point_count;
+        }
+      }
+    }
+    result.board_observation_diagnostics.push_back(diagnostics);
+  }
+  for (const auto& entry : board_accumulators) {
+    JointResidualBoardDiagnostics diagnostics;
+    diagnostics.board_id = entry.first;
+    diagnostics.point_count = std::get<1>(entry.second);
+    diagnostics.outer_point_count = std::get<2>(entry.second);
+    diagnostics.internal_point_count = std::get<3>(entry.second);
+    diagnostics.rmse =
+        RmseFromSquaredSum(std::get<0>(entry.second),
+                           std::get<1>(entry.second));
+    for (const JointResidualBoardObservationDiagnostics& observation :
+         result.board_observation_diagnostics) {
+      if (observation.board_id == diagnostics.board_id) {
+        ++diagnostics.observation_count;
+      }
+    }
+    result.board_diagnostics.push_back(diagnostics);
+  }
+  for (const auto& entry : frame_accumulators) {
+    JointResidualFrameDiagnostics diagnostics;
+    diagnostics.frame_index = entry.first;
+    diagnostics.frame_label = frame_labels[entry.first].second;
+    diagnostics.visible_board_ids = frame_visible_boards[entry.first];
+    diagnostics.point_count = entry.second.second;
+    diagnostics.rmse = RmseFromSquaredSum(entry.second.first,
+                                          entry.second.second);
+    for (const JointResidualPointDiagnostics& point :
+         result.point_diagnostics) {
+      if (point.frame_index == diagnostics.frame_index) {
+        if (point.point_type == JointPointType::Outer) {
+          ++diagnostics.outer_point_count;
+        } else {
+          ++diagnostics.internal_point_count;
+        }
+      }
+    }
+    result.frame_diagnostics.push_back(diagnostics);
+  }
+  result.worst_points = result.point_diagnostics;
+  std::sort(result.worst_points.begin(), result.worst_points.end(),
+            [](const JointResidualPointDiagnostics& lhs,
+               const JointResidualPointDiagnostics& rhs) {
+              return lhs.residual_norm > rhs.residual_norm;
+            });
+  if (top_k >= 0 && static_cast<int>(result.worst_points.size()) > top_k) {
+    result.worst_points.resize(static_cast<std::size_t>(top_k));
+  }
+  result.worst_board_observations = result.board_observation_diagnostics;
+  std::sort(result.worst_board_observations.begin(),
+            result.worst_board_observations.end(),
+            [](const JointResidualBoardObservationDiagnostics& lhs,
+               const JointResidualBoardObservationDiagnostics& rhs) {
+              return lhs.rmse > rhs.rmse;
+            });
+  if (top_k >= 0 &&
+      static_cast<int>(result.worst_board_observations.size()) > top_k) {
+    result.worst_board_observations.resize(static_cast<std::size_t>(top_k));
+  }
+  result.worst_boards = result.board_diagnostics;
+  std::sort(result.worst_boards.begin(), result.worst_boards.end(),
+            [](const JointResidualBoardDiagnostics& lhs,
+               const JointResidualBoardDiagnostics& rhs) {
+              return lhs.rmse > rhs.rmse;
+            });
+  if (top_k >= 0 && static_cast<int>(result.worst_boards.size()) > top_k) {
+    result.worst_boards.resize(static_cast<std::size_t>(top_k));
+  }
+  result.worst_frames = result.frame_diagnostics;
+  std::sort(result.worst_frames.begin(), result.worst_frames.end(),
+            [](const JointResidualFrameDiagnostics& lhs,
+               const JointResidualFrameDiagnostics& rhs) {
+              return lhs.rmse > rhs.rmse;
+            });
+  if (top_k >= 0 && static_cast<int>(result.worst_frames.size()) > top_k) {
+    result.worst_frames.resize(static_cast<std::size_t>(top_k));
+  }
+  result.success = true;
+  return result;
+}
+
 double ComputeBalanceWeight(const ObservationBudget& budget,
                             JointPointType point_type,
                             const AslamBackendCalibrationOptions& options) {
@@ -922,8 +1341,9 @@ double ComputeBalanceWeight(const ObservationBudget& budget,
   return type_budget / std::max(1, type_count);
 }
 
+template <typename GeometryT>
 double ComputePolarAngleWeightScale(
-    const DoubleSphereCameraModel& camera,
+    const GeometryT& camera,
     const JointPointObservation& observation,
     const AslamBackendCalibrationOptions& options) {
   if (observation.point_type != JointPointType::Internal) {
@@ -936,7 +1356,12 @@ double ComputePolarAngleWeightScale(
     return 1.0;
   }
 
-  const double polar_angle = ComputePolarAngleDeg(camera, observation.image_xy);
+  AngularObservationGeometry geometry;
+  const double polar_angle =
+      ComputeObservationGeometryForCamera(camera, observation.image_xy,
+                                          &geometry)
+          ? geometry.polar_angle_deg
+          : std::numeric_limits<double>::quiet_NaN();
   if (!std::isfinite(polar_angle)) {
     return 1.0;
   }
@@ -1618,12 +2043,9 @@ class CameraAngularReprojectionError : public aslam::backend::ErrorTermFs<2> {
       return;
     }
     const Eigen::Vector3d unit_ray = point_camera / point_norm;
-    Eigen::Matrix3d d_unit_d_point = Eigen::Matrix3d::Identity();
-    if (use_normalize_jacobian_) {
-      d_unit_d_point =
-          (Eigen::Matrix3d::Identity() - unit_ray * unit_ray.transpose()) /
-          point_norm;
-    }
+    const Eigen::Matrix3d d_unit_d_point =
+        (Eigen::Matrix3d::Identity() - unit_ray * unit_ray.transpose()) /
+        point_norm;
 
     const Eigen::Matrix<double, 2, 3> tangent_t =
         observation_geometry.tangent_basis.transpose();
@@ -1724,10 +2146,6 @@ class CameraAngularReprojectionError : public aslam::backend::ErrorTermFs<2> {
           "CameraAngularReprojectionError requires valid output pointers.");
     }
     const Eigen::Vector4d point_homogeneous = point_camera_.toHomogeneous();
-    const Eigen::Vector3d point_camera = point_homogeneous.head<3>();
-    const DoubleSphereCameraModel residual_camera = DoubleSphereCameraModel::FromConfig(
-        MakeIntermediateCameraConfig(
-            GeometryToIntrinsics<GeometryT>(*camera_dv_.camera())));
     bool observation_valid = false;
     if (observed_ray_mode_ ==
         AslamBackendCalibrationOptions::AngularObservedRayMode::
@@ -1735,13 +2153,12 @@ class CameraAngularReprojectionError : public aslam::backend::ErrorTermFs<2> {
       *observation_geometry = frozen_observation_geometry_;
       observation_valid = observation_geometry->success;
     } else {
-      observation_valid = ComputeAngularObservationGeometry(
-          residual_camera, observed_image_xy_, observation_geometry);
+      observation_valid = ComputeObservationGeometryForCamera(
+          *camera_dv_.camera(), observed_image_xy_, observation_geometry);
     }
-    *valid_projection =
-        observation_valid &&
-        ComputeAngularPredictionGeometry(
-            residual_camera, point_camera, predicted_geometry);
+    *valid_projection = observation_valid &&
+        ComputePredictionGeometryForCamera(
+            *camera_dv_.camera(), point_homogeneous, predicted_geometry);
     if (!(*valid_projection) || !observation_geometry->success) {
       return Eigen::Vector2d::Constant(invalid_projection_penalty_radians_);
     }
@@ -1759,6 +2176,471 @@ class CameraAngularReprojectionError : public aslam::backend::ErrorTermFs<2> {
   AslamBackendCalibrationOptions::AngularObservedRayMode observed_ray_mode_ =
       AslamBackendCalibrationOptions::AngularObservedRayMode::DynamicCurrentCamera;
   AngularObservationGeometry frozen_observation_geometry_;
+};
+
+template <typename GeometryT>
+class CameraChordalReprojectionError : public aslam::backend::ErrorTermFs<3> {
+ public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  using camera_dv_t = aslam::backend::CameraDesignVariable<GeometryT>;
+  using inverse_covariance_t = Eigen::Matrix3d;
+
+  CameraChordalReprojectionError(
+      const Eigen::Vector2d& observed_image_xy,
+      const inverse_covariance_t& inverse_covariance,
+      double huber_delta_chordal,
+      bool use_huber_loss,
+      const aslam::backend::HomogeneousExpression& point_camera,
+      const camera_dv_t& camera_dv,
+      double invalid_projection_penalty_chordal,
+      bool use_normalize_jacobian = true,
+      AslamBackendCalibrationOptions::AngularObservedRayMode observed_ray_mode =
+          AslamBackendCalibrationOptions::AngularObservedRayMode::
+              DynamicCurrentCamera,
+      const AngularObservationGeometry& frozen_observation_geometry =
+          AngularObservationGeometry())
+      : observed_image_xy_(observed_image_xy),
+        point_camera_(point_camera),
+        camera_dv_(camera_dv),
+        inverse_covariance_(inverse_covariance.cwiseMax(0.0)),
+        balance_weight_((inverse_covariance_(0, 0) +
+                         inverse_covariance_(1, 1) +
+                         inverse_covariance_(2, 2)) /
+                        3.0),
+        huber_delta_chordal_(huber_delta_chordal),
+        invalid_projection_penalty_chordal_(invalid_projection_penalty_chordal),
+        use_normalize_jacobian_(use_normalize_jacobian),
+        observed_ray_mode_(observed_ray_mode),
+        frozen_observation_geometry_(frozen_observation_geometry) {
+    parent_t::setInvR(inverse_covariance_);
+    aslam::backend::DesignVariable::set_t design_variables;
+    point_camera_.getDesignVariables(design_variables);
+    camera_dv_.getDesignVariables(design_variables);
+    parent_t::setDesignVariablesIterator(design_variables.begin(),
+                                         design_variables.end());
+
+    if (use_huber_loss && huber_delta_chordal_ > 0.0 &&
+        balance_weight_ > 0.0) {
+      parent_t::setMEstimatorPolicy(
+          boost::shared_ptr<aslam::backend::MEstimator>(
+              new aslam::backend::HuberMEstimator(
+                  std::sqrt(balance_weight_) * huber_delta_chordal_)));
+    }
+  }
+
+ protected:
+  double evaluateErrorImplementation() override {
+    AngularObservationGeometry observation_geometry;
+    AngularPredictionGeometry prediction_geometry;
+    bool valid_projection = false;
+    parent_t::setError(
+        ComputeResidual(&observation_geometry, &prediction_geometry,
+                        &valid_projection));
+    return parent_t::evaluateChiSquaredError();
+  }
+
+  void evaluateJacobiansImplementation(
+      aslam::backend::JacobianContainer& jacobians) const override {
+    const Eigen::Vector4d point_homogeneous = point_camera_.toHomogeneous();
+    AngularObservationGeometry observation_geometry;
+    AngularPredictionGeometry prediction_geometry;
+    bool valid_projection = false;
+    const Eigen::Matrix<double, 3, 1> residual =
+        ComputeResidual(&observation_geometry, &prediction_geometry,
+                        &valid_projection);
+    (void)residual;
+    if (!valid_projection || !observation_geometry.success ||
+        !prediction_geometry.valid_projection) {
+      return;
+    }
+
+    const Eigen::Vector3d point_camera = point_homogeneous.head<3>();
+    const double point_norm = point_camera.norm();
+    if (!(point_norm > 1e-12) || !std::isfinite(point_norm)) {
+      return;
+    }
+    const Eigen::Vector3d unit_ray = point_camera / point_norm;
+    const Eigen::Matrix3d d_unit_d_point =
+        (Eigen::Matrix3d::Identity() - unit_ray * unit_ray.transpose()) /
+        point_norm;
+    const Eigen::Matrix<double, 3, 4> d_residual_d_homogeneous =
+        (Eigen::Matrix<double, 3, 4>() <<
+             d_unit_d_point(0, 0), d_unit_d_point(0, 1),
+             d_unit_d_point(0, 2), 0.0,
+             d_unit_d_point(1, 0), d_unit_d_point(1, 1),
+             d_unit_d_point(1, 2), 0.0,
+             d_unit_d_point(2, 0), d_unit_d_point(2, 1),
+             d_unit_d_point(2, 2), 0.0)
+            .finished();
+    point_camera_.evaluateJacobians(jacobians, d_residual_d_homogeneous);
+
+    if (observed_ray_mode_ ==
+        AslamBackendCalibrationOptions::AngularObservedRayMode::
+            FrozenAnchorCamera) {
+      return;
+    }
+
+    auto add_finite_difference_camera_jacobian =
+        [&](const auto& design_variable_adapter) {
+          if (design_variable_adapter == nullptr ||
+              !design_variable_adapter->isActive()) {
+            return;
+          }
+          const Eigen::MatrixXd base_parameters =
+              design_variable_adapter->getParameters();
+          const int dimension = static_cast<int>(base_parameters.size());
+          if (dimension <= 0) {
+            return;
+          }
+          Eigen::MatrixXd camera_jacobian(3, dimension);
+          camera_jacobian.setZero();
+          for (int index = 0; index < dimension; ++index) {
+            const Eigen::Index row =
+                static_cast<Eigen::Index>(index % base_parameters.rows());
+            const Eigen::Index col =
+                static_cast<Eigen::Index>(index / base_parameters.rows());
+            const double base_value = base_parameters(row, col);
+            const double epsilon =
+                std::max(1e-7, 1e-6 * std::max(1.0, std::fabs(base_value)));
+
+            Eigen::MatrixXd positive = base_parameters;
+            positive(row, col) = base_value + epsilon;
+            design_variable_adapter->setParameters(positive);
+            AngularObservationGeometry positive_observation;
+            AngularPredictionGeometry positive_prediction;
+            bool positive_valid = false;
+            const Eigen::Matrix<double, 3, 1> positive_residual =
+                ComputeResidual(&positive_observation, &positive_prediction,
+                                &positive_valid);
+
+            Eigen::MatrixXd negative = base_parameters;
+            negative(row, col) = base_value - epsilon;
+            design_variable_adapter->setParameters(negative);
+            AngularObservationGeometry negative_observation;
+            AngularPredictionGeometry negative_prediction;
+            bool negative_valid = false;
+            const Eigen::Matrix<double, 3, 1> negative_residual =
+                ComputeResidual(&negative_observation, &negative_prediction,
+                                &negative_valid);
+
+            if (positive_valid && negative_valid &&
+                positive_residual.allFinite() &&
+                negative_residual.allFinite()) {
+              camera_jacobian.col(index) =
+                  (positive_residual - negative_residual) / (2.0 * epsilon);
+            }
+          }
+          design_variable_adapter->setParameters(base_parameters);
+          jacobians.add(design_variable_adapter.get(), camera_jacobian);
+        };
+
+    add_finite_difference_camera_jacobian(
+        const_cast<camera_dv_t&>(camera_dv_).projectionDesignVariable());
+    add_finite_difference_camera_jacobian(
+        const_cast<camera_dv_t&>(camera_dv_).distortionDesignVariable());
+  }
+
+ private:
+  using parent_t = aslam::backend::ErrorTermFs<3>;
+
+  Eigen::Matrix<double, 3, 1> ComputeResidual(
+      AngularObservationGeometry* observation_geometry,
+      AngularPredictionGeometry* prediction_geometry,
+      bool* valid_projection) const {
+    if (observation_geometry == nullptr || prediction_geometry == nullptr ||
+        valid_projection == nullptr) {
+      throw std::runtime_error(
+          "CameraChordalReprojectionError requires valid output pointers.");
+    }
+    const Eigen::Vector4d point_homogeneous = point_camera_.toHomogeneous();
+    bool observation_valid = false;
+    if (observed_ray_mode_ ==
+        AslamBackendCalibrationOptions::AngularObservedRayMode::
+            FrozenAnchorCamera) {
+      *observation_geometry = frozen_observation_geometry_;
+      observation_valid = observation_geometry->success;
+    } else {
+      observation_valid = ComputeObservationGeometryForCamera(
+          *camera_dv_.camera(), observed_image_xy_, observation_geometry);
+    }
+    *valid_projection = observation_valid &&
+        ComputePredictionGeometryForCamera(
+            *camera_dv_.camera(), point_homogeneous, prediction_geometry);
+    if (!(*valid_projection) || !observation_geometry->success ||
+        !prediction_geometry->valid_projection ||
+        !observation_geometry->observed_ray.allFinite() ||
+        !prediction_geometry->predicted_ray.allFinite()) {
+      return Eigen::Matrix<double, 3, 1>::Constant(
+          invalid_projection_penalty_chordal_);
+    }
+    return prediction_geometry->predicted_ray - observation_geometry->observed_ray;
+  }
+
+  Eigen::Vector2d observed_image_xy_ = Eigen::Vector2d::Zero();
+  aslam::backend::HomogeneousExpression point_camera_;
+  camera_dv_t camera_dv_;
+  inverse_covariance_t inverse_covariance_ = inverse_covariance_t::Identity();
+  double balance_weight_ = 1.0;
+  double huber_delta_chordal_ = 0.0;
+  double invalid_projection_penalty_chordal_ = 0.35;
+  bool use_normalize_jacobian_ = true;
+  AslamBackendCalibrationOptions::AngularObservedRayMode observed_ray_mode_ =
+      AslamBackendCalibrationOptions::AngularObservedRayMode::DynamicCurrentCamera;
+  AngularObservationGeometry frozen_observation_geometry_;
+};
+
+template <typename GeometryT>
+class CameraPolarContinuousHybridReprojectionError
+    : public aslam::backend::ErrorTermFs<2> {
+ public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  using camera_dv_t = aslam::backend::CameraDesignVariable<GeometryT>;
+  using inverse_covariance_t = Eigen::Matrix2d;
+
+  CameraPolarContinuousHybridReprojectionError(
+      const Eigen::Vector2d& observed_image_xy,
+      const inverse_covariance_t& inverse_covariance,
+      double huber_delta_pixels,
+      bool use_huber_loss,
+      const aslam::backend::HomogeneousExpression& point_camera,
+      const camera_dv_t& camera_dv,
+      double invalid_projection_penalty_pixels,
+      double invalid_projection_penalty_radians,
+      bool use_normalize_jacobian,
+      AslamBackendCalibrationOptions::AngularObservedRayMode observed_ray_mode,
+      const AngularObservationGeometry& frozen_observation_geometry,
+      double threshold_deg,
+      double temperature_deg)
+      : observed_image_xy_(observed_image_xy),
+        point_camera_(point_camera),
+        camera_dv_(camera_dv),
+        inverse_covariance_(inverse_covariance.cwiseMax(0.0)),
+        balance_weight_(
+            0.5 * (inverse_covariance_(0, 0) + inverse_covariance_(1, 1))),
+        invalid_projection_penalty_pixels_(invalid_projection_penalty_pixels),
+        invalid_projection_penalty_radians_(invalid_projection_penalty_radians),
+        use_normalize_jacobian_(use_normalize_jacobian),
+        observed_ray_mode_(observed_ray_mode),
+        frozen_observation_geometry_(frozen_observation_geometry),
+        threshold_deg_(threshold_deg),
+        temperature_deg_(temperature_deg) {
+    parent_t::setInvR(inverse_covariance_);
+    aslam::backend::DesignVariable::set_t design_variables;
+    point_camera_.getDesignVariables(design_variables);
+    camera_dv_.getDesignVariables(design_variables);
+    parent_t::setDesignVariablesIterator(design_variables.begin(),
+                                         design_variables.end());
+
+    if (use_huber_loss && huber_delta_pixels > 0.0 && balance_weight_ > 0.0) {
+      parent_t::setMEstimatorPolicy(
+          boost::shared_ptr<aslam::backend::MEstimator>(
+              new aslam::backend::HuberMEstimator(
+                  std::sqrt(balance_weight_) * huber_delta_pixels)));
+    }
+  }
+
+  ReprojectionDebugSample BuildDebugSample() const {
+    ReprojectionDebugSample sample;
+    sample.backend_inv_r_scale = balance_weight_;
+    HybridEvaluation evaluation;
+    const Eigen::Vector2d residual = ComputeResidual(&evaluation);
+    sample.valid_projection = evaluation.valid_projection;
+    sample.predicted_image_xy = evaluation.predicted_image_xy;
+    sample.residual_xy = residual;
+    sample.residual_norm = residual.norm();
+    sample.backend_raw_squared_error =
+        residual.transpose() * inverse_covariance_ * residual;
+    sample.backend_m_estimator_weight =
+        parent_t::getMEstimatorWeight(sample.backend_raw_squared_error);
+    sample.backend_weighted_squared_error =
+        sample.backend_m_estimator_weight * sample.backend_raw_squared_error;
+    return sample;
+  }
+
+ protected:
+  double evaluateErrorImplementation() override {
+    HybridEvaluation evaluation;
+    parent_t::setError(ComputeResidual(&evaluation));
+    return parent_t::evaluateChiSquaredError();
+  }
+
+  void evaluateJacobiansImplementation(
+      aslam::backend::JacobianContainer& jacobians) const override {
+    HybridEvaluation evaluation;
+    const Eigen::Vector2d residual = ComputeResidual(&evaluation);
+    (void)residual;
+    if (!evaluation.valid_projection ||
+        !evaluation.observation_geometry.success ||
+        !evaluation.prediction_geometry.valid_projection) {
+      return;
+    }
+
+    const Eigen::Vector4d point_homogeneous = point_camera_.toHomogeneous();
+    typename GeometryT::jacobian_homogeneous_t projection_jacobian;
+    Eigen::Vector2d predicted_image = Eigen::Vector2d::Zero();
+    const bool valid_image_jacobian =
+        camera_dv_.camera()->homogeneousToKeypoint(
+            point_homogeneous, predicted_image, projection_jacobian) &&
+        predicted_image.allFinite() && projection_jacobian.allFinite();
+    if (!valid_image_jacobian) {
+      return;
+    }
+
+    const Eigen::Vector3d point_camera = point_homogeneous.head<3>();
+    const double point_norm = point_camera.norm();
+    if (!(point_norm > 1e-12) || !std::isfinite(point_norm)) {
+      return;
+    }
+    const Eigen::Vector3d unit_ray = point_camera / point_norm;
+    Eigen::Matrix3d d_unit_d_point = Eigen::Matrix3d::Identity();
+    if (use_normalize_jacobian_) {
+      d_unit_d_point =
+          (Eigen::Matrix3d::Identity() - unit_ray * unit_ray.transpose()) /
+          point_norm;
+    }
+    const Eigen::Matrix<double, 2, 3> d_angular_d_point =
+        evaluation.observation_geometry.tangent_basis.transpose() *
+        d_unit_d_point;
+    const Eigen::Matrix<double, 2, 4> angular_jacobian =
+        (Eigen::Matrix<double, 2, 4>() <<
+             d_angular_d_point(0, 0), d_angular_d_point(0, 1),
+             d_angular_d_point(0, 2), 0.0,
+             d_angular_d_point(1, 0), d_angular_d_point(1, 1),
+             d_angular_d_point(1, 2), 0.0)
+            .finished();
+    const Eigen::Matrix<double, 2, 4> hybrid_jacobian =
+        (1.0 - evaluation.angular_weight) * projection_jacobian +
+        evaluation.angular_weight * angular_jacobian;
+    point_camera_.evaluateJacobians(jacobians, hybrid_jacobian);
+
+    auto add_finite_difference_camera_jacobian =
+        [&](const auto& design_variable_adapter) {
+          if (design_variable_adapter == nullptr ||
+              !design_variable_adapter->isActive()) {
+            return;
+          }
+          const Eigen::MatrixXd base_parameters =
+              design_variable_adapter->getParameters();
+          const int dimension = static_cast<int>(base_parameters.size());
+          if (dimension <= 0) {
+            return;
+          }
+          Eigen::MatrixXd camera_jacobian(2, dimension);
+          camera_jacobian.setZero();
+          for (int index = 0; index < dimension; ++index) {
+            const Eigen::Index row =
+                static_cast<Eigen::Index>(index % base_parameters.rows());
+            const Eigen::Index col =
+                static_cast<Eigen::Index>(index / base_parameters.rows());
+            const double base_value = base_parameters(row, col);
+            const double epsilon =
+                std::max(1e-7, 1e-6 * std::max(1.0, std::fabs(base_value)));
+
+            Eigen::MatrixXd positive = base_parameters;
+            positive(row, col) = base_value + epsilon;
+            design_variable_adapter->setParameters(positive);
+            HybridEvaluation positive_eval;
+            const Eigen::Vector2d positive_residual =
+                ComputeResidual(&positive_eval);
+
+            Eigen::MatrixXd negative = base_parameters;
+            negative(row, col) = base_value - epsilon;
+            design_variable_adapter->setParameters(negative);
+            HybridEvaluation negative_eval;
+            const Eigen::Vector2d negative_residual =
+                ComputeResidual(&negative_eval);
+
+            if (positive_eval.valid_projection &&
+                negative_eval.valid_projection &&
+                positive_residual.allFinite() &&
+                negative_residual.allFinite()) {
+              camera_jacobian.col(index) =
+                  (positive_residual - negative_residual) / (2.0 * epsilon);
+            }
+          }
+          design_variable_adapter->setParameters(base_parameters);
+          jacobians.add(design_variable_adapter.get(), camera_jacobian);
+        };
+
+    add_finite_difference_camera_jacobian(
+        const_cast<camera_dv_t&>(camera_dv_).projectionDesignVariable());
+    add_finite_difference_camera_jacobian(
+        const_cast<camera_dv_t&>(camera_dv_).distortionDesignVariable());
+  }
+
+ private:
+  using parent_t = aslam::backend::ErrorTermFs<2>;
+
+  struct HybridEvaluation {
+    bool valid_projection = false;
+    double angular_weight = 0.0;
+    Eigen::Vector2d predicted_image_xy = Eigen::Vector2d::Zero();
+    AngularObservationGeometry observation_geometry;
+    AngularPredictionGeometry prediction_geometry;
+  };
+
+  Eigen::Vector2d ComputeResidual(HybridEvaluation* evaluation) const {
+    if (evaluation == nullptr) {
+      throw std::runtime_error(
+          "CameraPolarContinuousHybridReprojectionError requires output.");
+    }
+    const Eigen::Vector4d point_homogeneous = point_camera_.toHomogeneous();
+    bool observation_valid = false;
+    if (observed_ray_mode_ ==
+        AslamBackendCalibrationOptions::AngularObservedRayMode::
+            FrozenAnchorCamera) {
+      evaluation->observation_geometry = frozen_observation_geometry_;
+      observation_valid = evaluation->observation_geometry.success;
+    } else {
+      observation_valid = ComputeObservationGeometryForCamera(
+          *camera_dv_.camera(), observed_image_xy_,
+          &evaluation->observation_geometry);
+    }
+    const bool image_valid =
+        camera_dv_.camera()->homogeneousToKeypoint(
+            point_homogeneous, evaluation->predicted_image_xy) &&
+        evaluation->predicted_image_xy.allFinite();
+    const bool angular_valid = observation_valid &&
+        ComputePredictionGeometryForCamera(
+            *camera_dv_.camera(), point_homogeneous,
+            &evaluation->prediction_geometry);
+    evaluation->valid_projection =
+        image_valid && angular_valid &&
+        evaluation->observation_geometry.success;
+    if (!evaluation->valid_projection) {
+      return Eigen::Vector2d::Constant(
+          0.5 * (invalid_projection_penalty_pixels_ +
+                 invalid_projection_penalty_radians_));
+    }
+    evaluation->angular_weight = ComputePolarContinuousAngularWeight(
+        evaluation->observation_geometry.polar_angle_deg,
+        threshold_deg_,
+        temperature_deg_);
+    const Eigen::Vector2d pixel_residual =
+        evaluation->predicted_image_xy - observed_image_xy_;
+    const Eigen::Vector2d angular_residual =
+        ComputeAngularResidualTangent(evaluation->observation_geometry,
+                                      evaluation->prediction_geometry);
+    return (1.0 - evaluation->angular_weight) * pixel_residual +
+           evaluation->angular_weight * angular_residual;
+  }
+
+  Eigen::Vector2d observed_image_xy_ = Eigen::Vector2d::Zero();
+  aslam::backend::HomogeneousExpression point_camera_;
+  camera_dv_t camera_dv_;
+  inverse_covariance_t inverse_covariance_ = inverse_covariance_t::Identity();
+  double balance_weight_ = 1.0;
+  double invalid_projection_penalty_pixels_ = 100.0;
+  double invalid_projection_penalty_radians_ = 0.35;
+  bool use_normalize_jacobian_ = true;
+  AslamBackendCalibrationOptions::AngularObservedRayMode observed_ray_mode_ =
+      AslamBackendCalibrationOptions::AngularObservedRayMode::
+          DynamicCurrentCamera;
+  AngularObservationGeometry frozen_observation_geometry_;
+  double threshold_deg_ = 50.0;
+  double temperature_deg_ = 10.0;
 };
 
 template <typename GeometryT>
@@ -2436,10 +3318,15 @@ bool ExecuteBackendOptimization(
     throw std::runtime_error("ExecuteBackendOptimization requires a valid result pointer.");
   }
 
-  boost::shared_ptr<GeometryT> camera_geometry =
-      MakeTypedGeometry<GeometryT>(result->initial_scene_state.camera);
-  CameraDv<GeometryT> camera_dv(camera_geometry);
-  camera_dv.setActive(false, false, false);
+	  boost::shared_ptr<GeometryT> camera_geometry =
+	      MakeTypedGeometry<GeometryT>(result->initial_scene_state.camera);
+	  const boost::shared_ptr<GeometryT> anchor_camera_geometry =
+	      MakeTypedGeometry<GeometryT>(result->anchor_camera);
+	  CameraDv<GeometryT> camera_dv(camera_geometry);
+	  camera_dv.setActive(false, false, false);
+	  const double chordal_reference_focal_px = std::sqrt(
+	      std::max(1.0, std::abs(result->initial_scene_state.camera.fu)) *
+	      std::max(1.0, std::abs(result->initial_scene_state.camera.fv)));
 
   boost::shared_ptr<aslam::backend::OptimizationProblem> problem(
       new aslam::backend::OptimizationProblem);
@@ -2447,8 +3334,13 @@ bool ExecuteBackendOptimization(
   problem->addDesignVariable(camera_dv.distortionDesignVariable());
   problem->addDesignVariable(camera_dv.shutterDesignVariable());
 
+  const bool independent_frame_board_pose =
+      result->options.board_pose_parameterization ==
+      AslamBackendCalibrationOptions::BoardPoseParameterization::
+          IndependentFrameBoardPose;
   std::map<int, PoseVariableState> frame_variables;
   std::map<int, PoseVariableState> board_variables;
+  std::map<std::pair<int, int>, PoseVariableState> local_pose_variables;
   std::map<aslam::backend::DesignVariable*, std::string> design_variable_labels;
   design_variable_labels[camera_dv.projectionDesignVariable().get()] =
       "camera_intrinsics";
@@ -2457,60 +3349,105 @@ bool ExecuteBackendOptimization(
   design_variable_labels[camera_dv.shutterDesignVariable().get()] =
       "camera_shutter";
 
-  for (const JointSceneFrameState& frame_state : result->initial_scene_state.frames) {
-    if (!frame_state.initialized) {
-      continue;
-    }
-    PoseVariableState& variable = frame_variables[frame_state.frame_index];
-    variable.transform = sm::kinematics::Transformation(frame_state.T_camera_reference);
-    variable.expression = aslam::backend::transformationToExpression(
-        variable.transform, variable.rotation_dv, variable.translation_dv);
-    const bool active =
-        result->effective_problem_input.optimization_masks.optimize_frame_poses;
-    variable.rotation_dv->setActive(active);
-    variable.translation_dv->setActive(active);
-    problem->addDesignVariable(variable.rotation_dv);
-    problem->addDesignVariable(variable.translation_dv);
-    design_variable_labels[variable.rotation_dv.get()] =
-        "frame_rotation_frame_" + std::to_string(frame_state.frame_index);
-    design_variable_labels[variable.translation_dv.get()] =
-        "frame_translation_frame_" + std::to_string(frame_state.frame_index);
-  }
-
-  for (const JointSceneBoardState& board_state : result->initial_scene_state.boards) {
-    if (!board_state.initialized ||
-        board_state.board_id == result->effective_problem_input.reference_board_id) {
-      continue;
-    }
-    PoseVariableState& variable = board_variables[board_state.board_id];
-    variable.transform = sm::kinematics::Transformation(board_state.T_reference_board);
-    variable.expression = aslam::backend::transformationToExpression(
-        variable.transform, variable.rotation_dv, variable.translation_dv);
-    const bool active =
-        result->effective_problem_input.optimization_masks.optimize_board_poses;
-    variable.rotation_dv->setActive(active);
-    variable.translation_dv->setActive(active);
-    problem->addDesignVariable(variable.rotation_dv);
-    problem->addDesignVariable(variable.translation_dv);
-    design_variable_labels[variable.rotation_dv.get()] =
-        "board_rotation_board_" + std::to_string(board_state.board_id);
-    design_variable_labels[variable.translation_dv.get()] =
-        "board_translation_board_" + std::to_string(board_state.board_id);
-  }
-
   const std::map<std::pair<int, int>, ObservationBudget> observation_budgets =
       BuildObservationBudgets(measurement_result);
+  if (independent_frame_board_pose) {
+    const bool active =
+        result->effective_problem_input.optimization_masks.optimize_frame_poses;
+    for (const auto& entry : observation_budgets) {
+      Eigen::Matrix4d T_camera_board = Eigen::Matrix4d::Identity();
+      if (!ComposeCameraBoardPoseFromReferenceChain(
+              result->initial_scene_state, entry.first.first,
+              entry.first.second, &T_camera_board)) {
+        continue;
+      }
+      PoseVariableState& variable = local_pose_variables[entry.first];
+      variable.transform = sm::kinematics::Transformation(T_camera_board);
+      variable.expression = aslam::backend::transformationToExpression(
+          variable.transform, variable.rotation_dv, variable.translation_dv);
+      variable.rotation_dv->setActive(active);
+      variable.translation_dv->setActive(active);
+      problem->addDesignVariable(variable.rotation_dv);
+      problem->addDesignVariable(variable.translation_dv);
+      const std::string key_label =
+          "frame_" + std::to_string(entry.first.first) + "_board_" +
+          std::to_string(entry.first.second);
+      design_variable_labels[variable.rotation_dv.get()] =
+          "local_board_rotation_" + key_label;
+      design_variable_labels[variable.translation_dv.get()] =
+          "local_board_translation_" + key_label;
+    }
+    result->initial_residual =
+        EvaluateIndependentFrameBoardPoseResiduals(
+            measurement_result, camera_geometry, local_pose_variables,
+            result->effective_problem_input.reference_board_id, 10);
+    if (!result->initial_residual.success) {
+      result->failure_reason = result->initial_residual.failure_reason;
+      return false;
+    }
+  } else {
+    for (const JointSceneFrameState& frame_state :
+         result->initial_scene_state.frames) {
+      if (!frame_state.initialized) {
+        continue;
+      }
+      PoseVariableState& variable = frame_variables[frame_state.frame_index];
+      variable.transform =
+          sm::kinematics::Transformation(frame_state.T_camera_reference);
+      variable.expression = aslam::backend::transformationToExpression(
+          variable.transform, variable.rotation_dv, variable.translation_dv);
+      const bool active =
+          result->effective_problem_input.optimization_masks.optimize_frame_poses;
+      variable.rotation_dv->setActive(active);
+      variable.translation_dv->setActive(active);
+      problem->addDesignVariable(variable.rotation_dv);
+      problem->addDesignVariable(variable.translation_dv);
+      design_variable_labels[variable.rotation_dv.get()] =
+          "frame_rotation_frame_" + std::to_string(frame_state.frame_index);
+      design_variable_labels[variable.translation_dv.get()] =
+          "frame_translation_frame_" + std::to_string(frame_state.frame_index);
+    }
+
+    for (const JointSceneBoardState& board_state :
+         result->initial_scene_state.boards) {
+      if (!board_state.initialized ||
+          board_state.board_id ==
+              result->effective_problem_input.reference_board_id) {
+        continue;
+      }
+      PoseVariableState& variable = board_variables[board_state.board_id];
+      variable.transform =
+          sm::kinematics::Transformation(board_state.T_reference_board);
+      variable.expression = aslam::backend::transformationToExpression(
+          variable.transform, variable.rotation_dv, variable.translation_dv);
+      const bool active =
+          result->effective_problem_input.optimization_masks.optimize_board_poses;
+      variable.rotation_dv->setActive(active);
+      variable.translation_dv->setActive(active);
+      problem->addDesignVariable(variable.rotation_dv);
+      problem->addDesignVariable(variable.translation_dv);
+      design_variable_labels[variable.rotation_dv.get()] =
+          "board_rotation_board_" + std::to_string(board_state.board_id);
+      design_variable_labels[variable.translation_dv.get()] =
+          "board_translation_board_" + std::to_string(board_state.board_id);
+    }
+  }
   const aslam::backend::TransformationExpression identity_transform(
       Eigen::Matrix4d::Identity());
   int skipped_point_count = 0;
   std::vector<boost::shared_ptr<CameraReprojectionError<GeometryT> > > reprojection_errors;
   std::vector<boost::shared_ptr<CameraAngularReprojectionError<GeometryT> > >
       angular_reprojection_errors;
+  std::vector<
+      boost::shared_ptr<CameraPolarContinuousHybridReprojectionError<GeometryT> > >
+      hybrid_reprojection_errors;
   std::vector<aslam::backend::ErrorTerm*> influence_error_terms;
   std::vector<BackendErrorTermInfluenceMetadata> influence_metadata;
   reprojection_errors.reserve(
       static_cast<std::size_t>(measurement_result.used_total_point_count));
   angular_reprojection_errors.reserve(
+      static_cast<std::size_t>(measurement_result.used_total_point_count));
+  hybrid_reprojection_errors.reserve(
       static_cast<std::size_t>(measurement_result.used_total_point_count));
   influence_error_terms.reserve(
       static_cast<std::size_t>(measurement_result.used_total_point_count));
@@ -2520,58 +3457,63 @@ bool ExecuteBackendOptimization(
     if (!observation.used_in_solver) {
       continue;
     }
-    const auto frame_it = frame_variables.find(observation.frame_index);
-    if (frame_it == frame_variables.end()) {
-      ++skipped_point_count;
-      continue;
-    }
-
-    aslam::backend::TransformationExpression board_expression = identity_transform;
-    if (observation.board_id != result->effective_problem_input.reference_board_id) {
-      const auto board_it = board_variables.find(observation.board_id);
-      if (board_it == board_variables.end()) {
+    const Eigen::Vector4d zero_h = Eigen::Vector4d::Zero();
+    aslam::backend::HomogeneousExpression point_camera(zero_h);
+    const aslam::backend::HomogeneousExpression point_board(
+        observation.target_xyz_board);
+    if (independent_frame_board_pose) {
+      const auto pose_it = local_pose_variables.find(
+          std::make_pair(observation.frame_index, observation.board_id));
+      if (pose_it == local_pose_variables.end()) {
         ++skipped_point_count;
         continue;
       }
-      board_expression = board_it->second.expression;
-    }
+      point_camera = pose_it->second.expression * point_board;
+    } else {
+      const auto frame_it = frame_variables.find(observation.frame_index);
+      if (frame_it == frame_variables.end()) {
+        ++skipped_point_count;
+        continue;
+      }
 
-    const aslam::backend::HomogeneousExpression point_board(
-        observation.target_xyz_board);
-    const aslam::backend::HomogeneousExpression point_reference =
-        board_expression * point_board;
-    const aslam::backend::HomogeneousExpression point_camera =
-        frame_it->second.expression * point_reference;
+      aslam::backend::TransformationExpression board_expression =
+          identity_transform;
+      if (observation.board_id !=
+          result->effective_problem_input.reference_board_id) {
+        const auto board_it = board_variables.find(observation.board_id);
+        if (board_it == board_variables.end()) {
+          ++skipped_point_count;
+          continue;
+        }
+        board_expression = board_it->second.expression;
+      }
+
+      const aslam::backend::HomogeneousExpression point_reference =
+          board_expression * point_board;
+      point_camera = frame_it->second.expression * point_reference;
+    }
 
     const ObservationBudget& budget =
         observation_budgets.find(std::make_pair(observation.frame_index, observation.board_id))
             ->second;
-    const DoubleSphereCameraModel weight_camera =
-        DoubleSphereCameraModel::FromConfig(
-            MakeIntermediateCameraConfig(result->effective_problem_input.scene_state.camera));
     const double polar_angle_weight =
-        ComputePolarAngleWeightScale(weight_camera, observation, result->options);
+        ComputePolarAngleWeightScale(*camera_geometry, observation,
+                                     result->options);
     const double balance_weight =
         ComputeBalanceWeight(budget, observation.point_type, result->options) *
         std::max(0.0, observation.final_observation_weight) *
         polar_angle_weight;
     const Eigen::Matrix2d inverse_covariance = ComputeBackendInverseCovariance(
         balance_weight, observation.point_type, result->options);
-    const DoubleSphereCameraModel dynamic_residual_camera =
-        DoubleSphereCameraModel::FromConfig(
-            MakeIntermediateCameraConfig(result->effective_problem_input.scene_state.camera));
-    const DoubleSphereCameraModel anchor_residual_camera =
-        DoubleSphereCameraModel::FromConfig(
-            MakeIntermediateCameraConfig(result->anchor_camera));
-    const DoubleSphereCameraModel& observation_ray_camera =
+    const GeometryT& observation_ray_camera =
         result->options.angular_observed_ray_mode ==
                 AslamBackendCalibrationOptions::AngularObservedRayMode::
                     FrozenAnchorCamera
-            ? anchor_residual_camera
-            : dynamic_residual_camera;
+            ? *anchor_camera_geometry
+            : *camera_geometry;
     AngularObservationGeometry angular_observation_geometry;
     const bool have_angular_observation_geometry =
-        ComputeAngularObservationGeometry(
+        ComputeObservationGeometryForCamera(
             observation_ray_camera, observation.image_xy,
             &angular_observation_geometry);
     const double observed_polar_angle_deg =
@@ -2586,26 +3528,52 @@ bool ExecuteBackendOptimization(
               ? result->options.outer_residual_model
               : result->options.internal_residual_model;
     }
-    const bool use_continuous_hybrid =
-        requested_point_residual_model == ResidualModel::PolarContinuousHybrid;
-    const bool use_normalized_angular =
-        requested_point_residual_model == ResidualModel::NormalizedSphereAngular;
-    const double continuous_angular_weight = use_continuous_hybrid
-        ? ComputePolarContinuousAngularWeight(
+	    const bool bearing_space_mode =
+	        requested_point_residual_model == ResidualModel::SphereAngular ||
+	        requested_point_residual_model ==
+	            ResidualModel::NormalizedSphereAngular ||
+	        requested_point_residual_model == ResidualModel::HybridEdgeAngular ||
+	        requested_point_residual_model ==
+	            ResidualModel::PolarContinuousHybrid ||
+	        requested_point_residual_model == ResidualModel::Chordal ||
+	        requested_point_residual_model ==
+	            ResidualModel::PixelChordalHybrid;
+	    if (bearing_space_mode && !have_angular_observation_geometry) {
+	      ++skipped_point_count;
+	      continue;
+	    }
+	    const bool use_continuous_hybrid =
+	        requested_point_residual_model == ResidualModel::PolarContinuousHybrid;
+	    const bool use_normalized_angular =
+	        requested_point_residual_model == ResidualModel::NormalizedSphereAngular;
+	    const bool use_pixel_chordal_hybrid =
+	        requested_point_residual_model == ResidualModel::PixelChordalHybrid;
+	    const double continuous_angular_weight = use_continuous_hybrid
+	        ? ComputePolarContinuousAngularWeight(
               observed_polar_angle_deg,
               result->options.polar_continuous_hybrid_threshold_deg,
               result->options.polar_continuous_hybrid_temperature_deg)
         : 0.0;
-    const bool use_angular_residual =
-        !use_continuous_hybrid &&
-        ShouldUseAngularResidual(
-            requested_point_residual_model,
-            observed_polar_angle_deg,
-            result->options.hybrid_angular_threshold_deg);
-    const bool add_pixel_residual =
-        !use_angular_residual || use_continuous_hybrid;
-    const bool add_angular_primary =
-        use_angular_residual || continuous_angular_weight > 0.0;
+	    const bool use_angular_residual =
+	        !use_continuous_hybrid &&
+	        ShouldUseAngularResidual(
+	            requested_point_residual_model,
+	            observed_polar_angle_deg,
+	            result->options.hybrid_angular_threshold_deg);
+	    const bool use_chordal_residual =
+	        (requested_point_residual_model == ResidualModel::Chordal ||
+	         requested_point_residual_model == ResidualModel::PixelChordalHybrid) &&
+	        have_angular_observation_geometry;
+	    const bool add_pixel_residual =
+	        use_pixel_chordal_hybrid
+	            ? result->options.pixel_residual_weight > 0.0
+	            : (!use_angular_residual && !use_chordal_residual) ||
+	                  use_continuous_hybrid;
+	    const bool add_angular_primary =
+	        use_angular_residual || continuous_angular_weight > 0.0;
+	    const bool add_chordal_primary =
+	        use_chordal_residual &&
+	        result->options.chordal_residual_weight > 0.0;
     const bool add_angular_auxiliary =
         result->options.angular_auxiliary_enabled &&
         result->options.angular_auxiliary_weight > 0.0 &&
@@ -2613,12 +3581,19 @@ bool ExecuteBackendOptimization(
           result->options.angular_auxiliary_apply_to_outer) ||
          (observation.point_type == JointPointType::Internal &&
           result->options.angular_auxiliary_apply_to_internal));
-    const double pixel_weight_scale = use_continuous_hybrid
-        ? std::max(0.0, 1.0 - continuous_angular_weight)
-        : 1.0;
-    const double angular_primary_weight_scale = use_continuous_hybrid
-        ? continuous_angular_weight
-        : 1.0;
+	    const double pixel_weight_scale = use_pixel_chordal_hybrid
+	        ? std::max(0.0, result->options.pixel_residual_weight)
+	        : (use_continuous_hybrid
+	               ? std::max(0.0, 1.0 - continuous_angular_weight)
+	               : 1.0);
+	    const double angular_primary_weight_scale = use_continuous_hybrid
+	        ? continuous_angular_weight *
+	              chordal_reference_focal_px * chordal_reference_focal_px
+	        : 1.0;
+	    const double chordal_weight_scale =
+	        add_chordal_primary
+	            ? std::max(0.0, result->options.chordal_residual_weight)
+	            : 0.0;
     double angular_sigma_per_pixel_rad = std::numeric_limits<double>::quiet_NaN();
     double normalized_angular_weight_scale = 1.0;
     const bool need_normalized_angular_scale =
@@ -2628,9 +3603,9 @@ bool ExecuteBackendOptimization(
         have_angular_observation_geometry;
     if (need_normalized_angular_scale) {
       angular_sigma_per_pixel_rad =
-          EstimateAngularSigmaPerPixel(observation_ray_camera,
-                                       observation.image_xy,
-                                       angular_observation_geometry);
+          EstimateAngularSigmaPerPixelForCamera(
+              observation_ray_camera, observation.image_xy,
+              angular_observation_geometry);
       const double safe_sigma = std::max(
           result->options.normalized_angular_min_sigma_rad,
           angular_sigma_per_pixel_rad);
@@ -2653,16 +3628,21 @@ bool ExecuteBackendOptimization(
         observed_polar_angle_deg;
     residual_type_assignment.residual_model_requested =
         ToString(requested_point_residual_model);
-    if (use_angular_residual && have_angular_observation_geometry) {
-      residual_type_assignment.residual_model_effective =
-          use_normalized_angular ? "normalized_sphere_angular"
-                                 : "sphere_angular";
-    } else if (use_continuous_hybrid) {
-      residual_type_assignment.residual_model_effective =
-          "polar_continuous_hybrid";
-    } else {
-      residual_type_assignment.residual_model_effective = "image_plane";
-    }
+	    if (use_angular_residual && have_angular_observation_geometry) {
+	      residual_type_assignment.residual_model_effective =
+	          use_normalized_angular ? "normalized_sphere_angular"
+	                                 : "sphere_angular";
+	    } else if (use_continuous_hybrid) {
+	      residual_type_assignment.residual_model_effective =
+	          "polar_continuous_hybrid";
+	    } else if (requested_point_residual_model == ResidualModel::Chordal) {
+	      residual_type_assignment.residual_model_effective = "chordal";
+	    } else if (use_pixel_chordal_hybrid) {
+	      residual_type_assignment.residual_model_effective =
+	          "pixel_chordal_hybrid";
+	    } else {
+	      residual_type_assignment.residual_model_effective = "image_plane";
+	    }
     residual_type_assignment.angular_observation_geometry_success =
         have_angular_observation_geometry;
     residual_type_assignment.image_plane_weight_scale =
@@ -2701,7 +3681,7 @@ bool ExecuteBackendOptimization(
           influence_metadata.push_back(meta);
         };
 
-    auto add_angular_error = [&](double weight_scale, bool auxiliary) {
+	    auto add_angular_error = [&](double weight_scale, bool auxiliary) {
       if (!have_angular_observation_geometry || !(weight_scale > 0.0)) {
         return;
       }
@@ -2741,7 +3721,41 @@ bool ExecuteBackendOptimization(
                 .internal_angular_auxiliary_residual_count;
         }
       }
-    };
+	    };
+
+	    auto add_chordal_error = [&]() {
+	      if (!have_angular_observation_geometry || !(chordal_weight_scale > 0.0)) {
+	        return;
+	      }
+	      const double huber_delta_chordal =
+	          observation.point_type == JointPointType::Outer
+	              ? result->options.outer_huber_delta_radians
+	              : result->options.internal_huber_delta_radians;
+	      const Eigen::Matrix3d chordal_inverse_covariance =
+	          balance_weight * chordal_weight_scale *
+	          chordal_reference_focal_px * chordal_reference_focal_px *
+	          Eigen::Matrix3d::Identity();
+	      boost::shared_ptr<CameraChordalReprojectionError<GeometryT> > error(
+	          new CameraChordalReprojectionError<GeometryT>(
+	              observation.image_xy,
+	              chordal_inverse_covariance,
+	              huber_delta_chordal,
+	              result->options.use_huber_loss,
+	              point_camera,
+	              camera_dv,
+	              result->options.invalid_projection_penalty_radians,
+	              result->options.angular_use_normalize_jacobian,
+	              result->options.angular_observed_ray_mode,
+	              angular_observation_geometry));
+	      problem->addErrorTerm(error);
+	      append_influence_metadata(error.get(), "chordal");
+	      ++result->residual_block_construction.chordal_residual_count;
+	      if (observation.point_type == JointPointType::Outer) {
+	        ++result->residual_block_construction.outer_chordal_residual_count;
+	      } else {
+	        ++result->residual_block_construction.internal_chordal_residual_count;
+	      }
+	    };
 
     if (add_pixel_residual && pixel_weight_scale > 0.0) {
       const double huber_delta = observation.point_type == JointPointType::Outer
@@ -2766,12 +3780,15 @@ bool ExecuteBackendOptimization(
         ++result->residual_block_construction.internal_image_plane_residual_count;
       }
     }
-    if (add_angular_primary) {
-      add_angular_error(
-          angular_primary_weight_scale *
-              (use_normalized_angular ? normalized_angular_weight_scale : 1.0),
-          false);
-    }
+	    if (add_angular_primary) {
+	      add_angular_error(
+	          angular_primary_weight_scale *
+	              (use_normalized_angular ? normalized_angular_weight_scale : 1.0),
+	          false);
+	    }
+	    if (add_chordal_primary) {
+	      add_chordal_error();
+	    }
     if (add_angular_auxiliary) {
       const double auxiliary_normalized_scale =
           result->options.angular_auxiliary_normalized
@@ -2822,7 +3839,8 @@ bool ExecuteBackendOptimization(
   result->board_pose_prior_rotation_sigma_deg =
       result->options.board_pose_prior_rotation_sigma_deg;
   if (result->options.board_pose_prior_enabled &&
-      result->effective_problem_input.optimization_masks.optimize_board_poses) {
+      result->effective_problem_input.optimization_masks.optimize_board_poses &&
+      !independent_frame_board_pose) {
     for (const auto& board_entry : board_variables) {
       const PoseVariableState& variable = board_entry.second;
       boost::shared_ptr<BoardPoseAnchorError> prior(
@@ -2845,14 +3863,31 @@ bool ExecuteBackendOptimization(
     return false;
   }
 
-  if (result->options.export_cost_parity_diagnostics) {
-    result->initial_cost_parity = EvaluateCostParityDiagnostics(
-        "initial",
-        problem,
-        measurement_result,
-        result->initial_scene_state,
-        reprojection_errors,
-        frontend_cost_options);
+  if (result->options.export_cost_parity_diagnostics &&
+      !independent_frame_board_pose) {
+    if (!hybrid_reprojection_errors.empty()) {
+      result->initial_cost_parity = EvaluateCostParityDiagnostics(
+          "initial",
+          problem,
+          measurement_result,
+          result->initial_scene_state,
+          hybrid_reprojection_errors,
+          frontend_cost_options);
+    } else {
+      result->initial_cost_parity = EvaluateCostParityDiagnostics(
+          "initial",
+          problem,
+          measurement_result,
+          result->initial_scene_state,
+          reprojection_errors,
+          frontend_cost_options);
+    }
+  } else if (result->options.export_cost_parity_diagnostics &&
+             independent_frame_board_pose) {
+    AppendUniqueWarning(
+        "Cost parity diagnostics are skipped for independent_frame_board_pose "
+        "because the parity evaluator is reference-chain scene based.",
+        &result->warnings);
   }
   if (result->options.export_variable_block_influence_diagnostics) {
     result->initial_variable_block_influence =
@@ -2863,13 +3898,21 @@ bool ExecuteBackendOptimization(
             influence_metadata,
             design_variable_labels);
   }
-  if (result->options.run_jacobian_consistency_check) {
+  if (result->options.run_jacobian_consistency_check &&
+      !independent_frame_board_pose) {
     result->jacobian_diagnostics = RunJacobianDiagnostics<GeometryT>(
         problem,
         &camera_dv,
         frame_variables,
         board_variables,
         result->options.jacobian_finite_difference_epsilon);
+  } else if (result->options.run_jacobian_consistency_check &&
+             independent_frame_board_pose) {
+    AppendUniqueWarning(
+        "Jacobian consistency diagnostics are skipped for "
+        "independent_frame_board_pose because the diagnostic helper currently "
+        "expects reference-chain frame/board variable blocks.",
+        &result->warnings);
   }
 
   if (result->options.skip_optimization) {
@@ -2918,26 +3961,37 @@ bool ExecuteBackendOptimization(
     }
   }
 
-  for (JointSceneFrameState& frame_state : result->optimized_scene_state.frames) {
-    const auto frame_it = frame_variables.find(frame_state.frame_index);
-    if (frame_it == frame_variables.end()) {
-      continue;
+  if (independent_frame_board_pose) {
+    result->optimized_residual =
+        EvaluateIndependentFrameBoardPoseResiduals(
+            measurement_result, camera_geometry, local_pose_variables,
+            result->effective_problem_input.reference_board_id, 10);
+  } else {
+    for (JointSceneFrameState& frame_state :
+         result->optimized_scene_state.frames) {
+      const auto frame_it = frame_variables.find(frame_state.frame_index);
+      if (frame_it == frame_variables.end()) {
+        continue;
+      }
+      frame_state.T_camera_reference = frame_it->second.transform.T();
     }
-    frame_state.T_camera_reference = frame_it->second.transform.T();
+    for (JointSceneBoardState& board_state :
+         result->optimized_scene_state.boards) {
+      if (board_state.board_id ==
+          result->effective_problem_input.reference_board_id) {
+        board_state.T_reference_board = Eigen::Matrix4d::Identity();
+        continue;
+      }
+      const auto board_it = board_variables.find(board_state.board_id);
+      if (board_it == board_variables.end()) {
+        continue;
+      }
+      board_state.T_reference_board = board_it->second.transform.T();
+    }
+    result->optimized_residual =
+        residual_evaluator.Evaluate(measurement_result,
+                                    result->optimized_scene_state);
   }
-  for (JointSceneBoardState& board_state : result->optimized_scene_state.boards) {
-    if (board_state.board_id == result->effective_problem_input.reference_board_id) {
-      board_state.T_reference_board = Eigen::Matrix4d::Identity();
-      continue;
-    }
-    const auto board_it = board_variables.find(board_state.board_id);
-    if (board_it == board_variables.end()) {
-      continue;
-    }
-    board_state.T_reference_board = board_it->second.transform.T();
-  }
-  result->optimized_residual =
-      residual_evaluator.Evaluate(measurement_result, result->optimized_scene_state);
   if (!result->optimized_residual.success) {
     result->failure_reason = result->optimized_residual.failure_reason;
     result->warnings.insert(result->warnings.end(),
@@ -2946,14 +4000,25 @@ bool ExecuteBackendOptimization(
     return false;
   }
 
-  if (result->options.export_cost_parity_diagnostics) {
-    result->optimized_cost_parity = EvaluateCostParityDiagnostics(
-        "optimized",
-        problem,
-        measurement_result,
-        result->optimized_scene_state,
-        reprojection_errors,
-        frontend_cost_options);
+  if (result->options.export_cost_parity_diagnostics &&
+      !independent_frame_board_pose) {
+    if (!hybrid_reprojection_errors.empty()) {
+      result->optimized_cost_parity = EvaluateCostParityDiagnostics(
+          "optimized",
+          problem,
+          measurement_result,
+          result->optimized_scene_state,
+          hybrid_reprojection_errors,
+          frontend_cost_options);
+    } else {
+      result->optimized_cost_parity = EvaluateCostParityDiagnostics(
+          "optimized",
+          problem,
+          measurement_result,
+          result->optimized_scene_state,
+          reprojection_errors,
+          frontend_cost_options);
+    }
   }
   if (result->options.export_variable_block_influence_diagnostics) {
     result->optimized_variable_block_influence =
@@ -2980,6 +4045,8 @@ AslamBackendCalibrationResult AslamBackendCalibrationRunner::Run(
   result.dataset_label = input.dataset_label;
   result.baseline_protocol_label = input.baseline_protocol_label;
   result.training_split_signature = input.training_split_signature;
+  result.board_pose_parameterization =
+      ToString(options_.board_pose_parameterization);
   result.problem_input = input;
   result.effective_problem_input = BuildEffectiveProblemInput(input, options_);
   result.options = options_;
@@ -3091,6 +4158,9 @@ AslamBackendCalibrationResult AslamBackendCalibrationRunner::Run(
   } else if (family == "pinhole-equi") {
     backend_success = ExecuteBackendOptimization<PinholeEquiGeometry>(
         &result, measurement_result, residual_evaluator, frontend_cost_options);
+  } else if (family == "omni-radtan") {
+    backend_success = ExecuteBackendOptimization<MeiGeometry>(
+        &result, measurement_result, residual_evaluator, frontend_cost_options);
   } else {
     result.failure_reason = "Unsupported backend camera family: " + family;
     return result;
@@ -3115,6 +4185,22 @@ void WriteAslamBackendCalibrationSummary(
   output << "dataset_label: " << result.dataset_label << "\n";
   output << "baseline_protocol_label: " << result.baseline_protocol_label << "\n";
   output << "training_split_signature: " << result.training_split_signature << "\n";
+  output << "board_pose_parameterization: "
+         << result.board_pose_parameterization << "\n";
+  output << "uses_reference_chain_board_layout: "
+         << (result.options.board_pose_parameterization ==
+                     AslamBackendCalibrationOptions::
+                         BoardPoseParameterization::ReferenceChain
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "uses_independent_frame_board_poses: "
+         << (result.options.board_pose_parameterization ==
+                     AslamBackendCalibrationOptions::
+                         BoardPoseParameterization::IndependentFrameBoardPose
+                 ? 1
+                 : 0)
+         << "\n";
   output << "effective_frame_count: "
          << result.effective_problem_input.measurement_dataset.accepted_frame_count << "\n";
   output << "effective_board_observation_count: "
@@ -3250,6 +4336,10 @@ void WriteAslamBackendCalibrationSummary(
          << result.options.normalized_angular_min_sigma_rad << "\n";
   output << "backend_normalized_angular_max_weight_scale: "
          << result.options.normalized_angular_max_weight_scale << "\n";
+  output << "backend_pixel_residual_weight: "
+         << result.options.pixel_residual_weight << "\n";
+  output << "backend_chordal_residual_weight: "
+         << result.options.chordal_residual_weight << "\n";
   output << "backend_angular_use_normalize_jacobian: "
          << (result.options.angular_use_normalize_jacobian ? 1 : 0)
          << "\n";
@@ -3273,12 +4363,16 @@ void WriteAslamBackendCalibrationSummary(
          << result.residual_block_construction.image_plane_residual_count << "\n";
   output << "constructed_angular_residual_count: "
          << result.residual_block_construction.angular_residual_count << "\n";
+  output << "constructed_chordal_residual_count: "
+         << result.residual_block_construction.chordal_residual_count << "\n";
   output << "constructed_angular_auxiliary_residual_count: "
          << result.residual_block_construction.angular_auxiliary_residual_count << "\n";
   output << "constructed_outer_image_plane_residual_count: "
          << result.residual_block_construction.outer_image_plane_residual_count << "\n";
   output << "constructed_outer_angular_residual_count: "
          << result.residual_block_construction.outer_angular_residual_count << "\n";
+  output << "constructed_outer_chordal_residual_count: "
+         << result.residual_block_construction.outer_chordal_residual_count << "\n";
   output << "constructed_outer_angular_auxiliary_residual_count: "
          << result.residual_block_construction
                 .outer_angular_auxiliary_residual_count << "\n";
@@ -3286,6 +4380,8 @@ void WriteAslamBackendCalibrationSummary(
          << result.residual_block_construction.internal_image_plane_residual_count << "\n";
   output << "constructed_internal_angular_residual_count: "
          << result.residual_block_construction.internal_angular_residual_count << "\n";
+  output << "constructed_internal_chordal_residual_count: "
+         << result.residual_block_construction.internal_chordal_residual_count << "\n";
   output << "constructed_internal_angular_auxiliary_residual_count: "
          << result.residual_block_construction
                 .internal_angular_auxiliary_residual_count << "\n";
@@ -3325,8 +4421,8 @@ void WriteAslamBackendCalibrationSummary(
          << (result.options.skip_optimization ? 1 : 0) << "\n";
   output << "backend_final_state_label: "
          << (result.options.skip_optimization
-                 ? "after_trial_backend_selection"
-                 : "after_final_backend_ba")
+                 ? "after_incremental_selection_ba"
+                 : "unexpected_backend_optimization")
          << "\n";
   if (result.initial_cost_parity.success) {
     output << "initial_frontend_total_cost: "

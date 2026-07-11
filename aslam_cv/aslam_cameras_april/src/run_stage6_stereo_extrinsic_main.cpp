@@ -153,11 +153,20 @@ struct CmdArgs {
   bool stage6_pair_init_use_huber_loss = true;
   bool stage6_enable_kalibr_style_pair_selection = true;
   bool stage6_enable_committing_pair_batch_selection = false;
+  bool stage6_enable_persistent_incremental_stereo_ba = true;
+  bool stage6_allow_legacy_selection_fallback_after_persistent_failure = false;
   bool stage6_enable_stage6_incremental_estimator = false;
   bool stage6_enable_incremental_pair_diversity_rescue = false;
   int stage6_incremental_pair_diversity_rescue_min_boards = 1;
   double stage6_incremental_mi_tol = 0.2;
   double stage6_incremental_rank_threshold = 1e-6;
+  int stage6_persistent_incremental_max_iterations = 8;
+  double stage6_persistent_incremental_convergence_delta_j = 1e-3;
+  double stage6_persistent_incremental_convergence_delta_x = 1e-4;
+  double stage6_persistent_incremental_baseline_prior_translation_weight = 1e-6;
+  double stage6_persistent_incremental_baseline_prior_rotation_weight = 1e-6;
+  double stage6_persistent_incremental_invalid_projection_penalty_px = 100.0;
+  int stage6_persistent_incremental_seed_pair_count = 1;
   std::string stage6_incremental_info_block = "stereo_extrinsic";
   std::string stage6_batch_acceptance_policy = "residual_score";
   int stage6_pair_selection_seed_count = 10;
@@ -385,6 +394,15 @@ void PrintUsage(const char* program) {
       << " [--stage6-enable-kalibr-style-pair-selection]"
       << " [--stage6-disable-kalibr-style-pair-selection]"
       << " [--stage6-enable-committing-pair-batch-selection]"
+      << " [--stage6-enable-persistent-incremental-stereo-ba]"
+      << " [--stage6-disable-persistent-incremental-stereo-ba]"
+      << " [--stage6-persistent-incremental-max-iterations N]"
+      << " [--stage6-persistent-incremental-convergence-delta-j X]"
+      << " [--stage6-persistent-incremental-convergence-delta-x X]"
+      << " [--stage6-persistent-incremental-baseline-prior-translation-weight X]"
+      << " [--stage6-persistent-incremental-baseline-prior-rotation-weight X]"
+      << " [--stage6-persistent-incremental-invalid-projection-penalty-px X]"
+      << " [--stage6-persistent-incremental-seed-pair-count N]"
       << " [--stage6-enable-stage6-incremental-estimator]"
       << " [--stage6-disable-stage6-incremental-estimator]"
       << " [--stage6-incremental-mi-tol X]"
@@ -852,6 +870,15 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.stage6_enable_kalibr_style_pair_selection = false;
     } else if (token == "--stage6-enable-committing-pair-batch-selection") {
       args.stage6_enable_committing_pair_batch_selection = true;
+    } else if (token ==
+               "--stage6-enable-persistent-incremental-stereo-ba") {
+      args.stage6_enable_persistent_incremental_stereo_ba = true;
+    } else if (token ==
+               "--stage6-disable-persistent-incremental-stereo-ba") {
+      args.stage6_enable_persistent_incremental_stereo_ba = false;
+    } else if (token ==
+               "--stage6-allow-legacy-selection-fallback") {
+      args.stage6_allow_legacy_selection_fallback_after_persistent_failure = true;
     } else if (token == "--stage6-enable-stage6-incremental-estimator") {
       args.stage6_enable_stage6_incremental_estimator = true;
     } else if (token == "--stage6-disable-stage6-incremental-estimator") {
@@ -869,6 +896,41 @@ CmdArgs ParseArgs(int argc, char** argv) {
     } else if (token == "--stage6-incremental-rank-threshold" &&
                i + 1 < argc) {
       args.stage6_incremental_rank_threshold = std::stod(argv[++i]);
+    } else if (token == "--stage6-persistent-incremental-max-iterations" &&
+               i + 1 < argc) {
+      args.stage6_persistent_incremental_max_iterations = std::stoi(argv[++i]);
+    } else if (token ==
+                   "--stage6-persistent-incremental-convergence-delta-j" &&
+               i + 1 < argc) {
+      args.stage6_persistent_incremental_convergence_delta_j =
+          std::stod(argv[++i]);
+    } else if (token ==
+                   "--stage6-persistent-incremental-convergence-delta-x" &&
+               i + 1 < argc) {
+      args.stage6_persistent_incremental_convergence_delta_x =
+          std::stod(argv[++i]);
+    } else if (
+        token ==
+            "--stage6-persistent-incremental-baseline-prior-translation-weight" &&
+        i + 1 < argc) {
+      args.stage6_persistent_incremental_baseline_prior_translation_weight =
+          std::stod(argv[++i]);
+    } else if (
+        token ==
+            "--stage6-persistent-incremental-baseline-prior-rotation-weight" &&
+        i + 1 < argc) {
+      args.stage6_persistent_incremental_baseline_prior_rotation_weight =
+          std::stod(argv[++i]);
+    } else if (
+        token ==
+            "--stage6-persistent-incremental-invalid-projection-penalty-px" &&
+        i + 1 < argc) {
+      args.stage6_persistent_incremental_invalid_projection_penalty_px =
+          std::stod(argv[++i]);
+    } else if (token == "--stage6-persistent-incremental-seed-pair-count" &&
+               i + 1 < argc) {
+      args.stage6_persistent_incremental_seed_pair_count =
+          std::stoi(argv[++i]);
     } else if (token == "--stage6-incremental-info-block" &&
                i + 1 < argc) {
       args.stage6_incremental_info_block = argv[++i];
@@ -1301,51 +1363,19 @@ void WriteStereoReferenceComparison(const std::string& path,
 void WriteStereoReferenceHoldoutSummary(
     const std::string& path,
     const StereoReferenceComparison& comparison,
-    const ati::StereoResidualSummary& ours,
-    const ati::StereoResidualSummary& reference,
     const ati::StereoResidualSummary& ours_extrinsic_only,
     const ati::StereoResidualSummary& reference_extrinsic_only) {
   std::ofstream output(path.c_str());
-  output << "success: " << (comparison.success && reference.success ? 1 : 0)
+  output << "success: "
+         << (comparison.success && reference_extrinsic_only.success ? 1 : 0)
          << "\n";
   output << "failure_reason: "
-         << (comparison.success ? reference.failure_reason
+         << (comparison.success ? reference_extrinsic_only.failure_reason
                                 : comparison.failure_reason)
          << "\n";
   output << "reference_camchain_path: " << comparison.reference_camchain_path
          << "\n";
-  output << "ours_holdout_total_stereo_rmse: "
-         << ours.total_stereo_rmse << "\n";
-  output << "reference_holdout_total_stereo_rmse: "
-         << reference.total_stereo_rmse << "\n";
-  output << "ours_minus_reference_holdout_total_stereo_rmse: "
-         << (ours.total_stereo_rmse - reference.total_stereo_rmse) << "\n";
-  output << "ours_holdout_cam0_rmse: " << ours.cam0_rmse << "\n";
-  output << "reference_holdout_cam0_rmse: " << reference.cam0_rmse << "\n";
-  output << "ours_holdout_cam1_rmse: " << ours.cam1_rmse << "\n";
-  output << "reference_holdout_cam1_rmse: " << reference.cam1_rmse << "\n";
-  output << "ours_holdout_outer_only_rmse: " << ours.outer_only_rmse << "\n";
-  output << "reference_holdout_outer_only_rmse: "
-         << reference.outer_only_rmse << "\n";
-  output << "ours_holdout_internal_only_rmse: "
-         << ours.internal_only_rmse << "\n";
-  output << "reference_holdout_internal_only_rmse: "
-         << reference.internal_only_rmse << "\n";
-  output << "ours_holdout_shared_total_rmse: "
-         << ours.shared_total_rmse << "\n";
-  output << "reference_holdout_shared_total_rmse: "
-         << reference.shared_total_rmse << "\n";
-  output << "ours_holdout_cam0_only_total_rmse: "
-         << ours.cam0_only_total_rmse << "\n";
-  output << "reference_holdout_cam0_only_total_rmse: "
-         << reference.cam0_only_total_rmse << "\n";
-  output << "ours_holdout_cam1_only_total_rmse: "
-         << ours.cam1_only_total_rmse << "\n";
-  output << "reference_holdout_cam1_only_total_rmse: "
-         << reference.cam1_only_total_rmse << "\n";
-  output << "holdout_used_pair_count: " << ours.used_pair_count << "\n";
-  output << "reference_holdout_used_pair_count: "
-         << reference.used_pair_count << "\n";
+  output << "comparison_metric: extrinsic_only_holdout\n";
   output << "ours_extrinsic_only_holdout_total_stereo_rmse: "
          << ours_extrinsic_only.total_stereo_rmse << "\n";
   output << "reference_extrinsic_only_holdout_total_stereo_rmse: "
@@ -2497,9 +2527,15 @@ int main(int argc, char** argv) {
         args.stage6_enable_kalibr_style_pair_selection;
     problem_input.solver_options.enable_committing_pair_batch_selection =
         args.stage6_enable_committing_pair_batch_selection;
+    problem_input.solver_options.enable_persistent_incremental_stereo_ba =
+        args.stage6_enable_persistent_incremental_stereo_ba;
+    problem_input.solver_options
+        .allow_legacy_selection_fallback_after_persistent_failure =
+        args.stage6_allow_legacy_selection_fallback_after_persistent_failure;
     problem_input.solver_options.enable_stage6_incremental_estimator =
         args.stage6_enable_stage6_incremental_estimator ||
-        args.stage6_enable_committing_pair_batch_selection;
+        args.stage6_enable_committing_pair_batch_selection ||
+        args.stage6_enable_persistent_incremental_stereo_ba;
     problem_input.solver_options.enable_incremental_pair_diversity_rescue =
         args.stage6_enable_incremental_pair_diversity_rescue;
     problem_input.solver_options.incremental_pair_diversity_rescue_min_boards =
@@ -2508,6 +2544,23 @@ int main(int argc, char** argv) {
         args.stage6_incremental_mi_tol;
     problem_input.solver_options.incremental_rank_threshold =
         args.stage6_incremental_rank_threshold;
+    problem_input.solver_options.persistent_incremental_max_iterations =
+        args.stage6_persistent_incremental_max_iterations;
+    problem_input.solver_options.persistent_incremental_convergence_delta_j =
+        args.stage6_persistent_incremental_convergence_delta_j;
+    problem_input.solver_options.persistent_incremental_convergence_delta_x =
+        args.stage6_persistent_incremental_convergence_delta_x;
+    problem_input.solver_options
+        .persistent_incremental_baseline_prior_translation_weight =
+        args.stage6_persistent_incremental_baseline_prior_translation_weight;
+    problem_input.solver_options
+        .persistent_incremental_baseline_prior_rotation_weight =
+        args.stage6_persistent_incremental_baseline_prior_rotation_weight;
+    problem_input.solver_options
+        .persistent_incremental_invalid_projection_penalty_px =
+        args.stage6_persistent_incremental_invalid_projection_penalty_px;
+    problem_input.solver_options.persistent_incremental_seed_pair_count =
+        args.stage6_persistent_incremental_seed_pair_count;
     problem_input.solver_options.incremental_info_block =
         ParseStage6IncrementalInfoBlock(args.stage6_incremental_info_block);
     problem_input.solver_options.batch_acceptance_policy =
@@ -2644,11 +2697,13 @@ int main(int argc, char** argv) {
         result.runtime_summary.training_optimization_runtime_seconds -
         result.runtime_summary.holdout_evaluation_runtime_seconds;
 
-    ati::WriteStereoExtrinsicYaml(
-        (output_dir / "stereo_extrinsic.yaml").string(), result);
-    ati::WriteStereoExtrinsicSummary(
-        (output_dir / "stereo_extrinsic_summary.txt").string(), result);
-    if (!args.stereo_reference_camchain_path.empty()) {
+    if (result.success) {
+      ati::WriteStereoExtrinsicYaml(
+          (output_dir / "stereo_extrinsic.yaml").string(), result);
+      ati::WriteStereoExtrinsicSummary(
+          (output_dir / "stereo_extrinsic_summary.txt").string(), result);
+    }
+    if (result.success && !args.stereo_reference_camchain_path.empty()) {
       const StereoReferenceComparison reference_comparison =
           CompareAgainstStereoReference(args.stereo_reference_camchain_path,
                                         result.optimized_scene.T_cam1_cam0);
@@ -2659,13 +2714,6 @@ int main(int argc, char** argv) {
         ati::StereoSceneState reference_scene = result.optimized_scene;
         reference_scene.T_cam1_cam0 =
             reference_comparison.reference_T_cam1_cam0;
-        ati::StereoResidualEvaluator reference_holdout_evaluator(
-            ati::StereoResidualEvaluationOptions{
-                true,
-                problem_input.solver_options.pair_pose_refit_mode,
-                problem_input.solver_options.symmetric_refit_max_iterations,
-                problem_input.solver_options.symmetric_refit_step,
-                false});
         ati::StereoResidualEvaluator reference_extrinsic_only_holdout_evaluator(
             ati::StereoResidualEvaluationOptions{
                 false,
@@ -2673,13 +2721,6 @@ int main(int argc, char** argv) {
                 problem_input.solver_options.symmetric_refit_max_iterations,
                 problem_input.solver_options.symmetric_refit_step,
                 true});
-        const ati::StereoResidualSummary reference_holdout_summary =
-            reference_holdout_evaluator.Evaluate(
-                problem_input.measurement_dataset, reference_scene,
-                std::set<int>(
-                    problem_input.measurement_dataset.holdout_pair_indices.begin(),
-                    problem_input.measurement_dataset.holdout_pair_indices.end()),
-                "reference_holdout");
         const ati::StereoResidualSummary
             reference_extrinsic_only_holdout_summary =
                 reference_extrinsic_only_holdout_evaluator.Evaluate(
@@ -2690,8 +2731,7 @@ int main(int argc, char** argv) {
                     "reference_holdout_extrinsic_only");
         WriteStereoReferenceHoldoutSummary(
             (output_dir / "stereo_reference_holdout_summary.txt").string(),
-            reference_comparison, result.holdout_residual_summary,
-            reference_holdout_summary,
+            reference_comparison,
             result.holdout_extrinsic_only_residual_summary,
             reference_extrinsic_only_holdout_summary);
         WriteStereoResidualPerBoardCsv(
@@ -2712,25 +2752,33 @@ int main(int argc, char** argv) {
         }
       }
     }
-    ati::WriteStereoReprojectionSummary(
-        (output_dir / "stereo_reprojection_summary.txt").string(), result);
-    ati::WriteStereoPerCameraResidualsCsv(
-        (output_dir / "stereo_per_camera_residuals.csv").string(), result);
-    ati::WriteStereoPerFrameResidualsCsv(
-        (output_dir / "stereo_per_frame_residuals.csv").string(), result);
-    ati::WriteStereoBaFrameFactorTraceCsv(
-        (output_dir / "stereo_ba_frame_factor_trace.csv").string(), result);
-    ati::WriteStereoJacobianBlockDiagnosticsCsv(
-        (output_dir / "stereo_jacobian_block_diagnostics.csv").string(),
-        result);
-    ati::WriteStereoPerBoardResidualsCsv(
-        (output_dir / "stereo_per_board_residuals.csv").string(), result);
-    ati::WriteStereoHoldoutBoardPolarRmseCsv(
-        (output_dir / "stereo_holdout_board_polar_rmse.csv").string(),
-        result);
-    ati::WriteStereoIntrinsicsSanitySummary(
-        (output_dir / "stereo_intrinsics_sanity_summary.txt").string(), result);
-    if (problem_input.solver_options.coobs_enable) {
+    if (result.success) {
+      ati::WriteStereoReprojectionSummary(
+          (output_dir / "stereo_reprojection_summary.txt").string(), result);
+      ati::WriteStereoPerCameraResidualsCsv(
+          (output_dir / "stereo_per_camera_residuals.csv").string(), result);
+      ati::WriteStereoPerFrameResidualsCsv(
+          (output_dir / "stereo_per_frame_residuals.csv").string(), result);
+      ati::WriteStereoHoldoutLayoutTransferGapCsv(
+          (output_dir / "stereo_holdout_layout_transfer_gap.csv").string(),
+          result);
+      ati::WriteStereoHoldoutLocalLayoutDriftCsv(
+          (output_dir / "stereo_holdout_local_layout_drift.csv").string(),
+          result);
+      ati::WriteStereoBaFrameFactorTraceCsv(
+          (output_dir / "stereo_ba_frame_factor_trace.csv").string(), result);
+      ati::WriteStereoJacobianBlockDiagnosticsCsv(
+          (output_dir / "stereo_jacobian_block_diagnostics.csv").string(),
+          result);
+      ati::WriteStereoPerBoardResidualsCsv(
+          (output_dir / "stereo_per_board_residuals.csv").string(), result);
+      ati::WriteStereoHoldoutBoardPolarRmseCsv(
+          (output_dir / "stereo_holdout_board_polar_rmse.csv").string(),
+          result);
+      ati::WriteStereoIntrinsicsSanitySummary(
+          (output_dir / "stereo_intrinsics_sanity_summary.txt").string(), result);
+    }
+    if (result.success && problem_input.solver_options.coobs_enable) {
       ati::MultiBoardCoObservationOptions coobs_options;
       coobs_options.enabled = true;
       coobs_options.output_dir =
@@ -2760,7 +2808,7 @@ int main(int argc, char** argv) {
       const ati::MultiBoardCoObservationConsistency coobs(coobs_options);
       coobs.Evaluate(result);
     }
-    if (problem_input.solver_options.coobs_factor_ba_enable) {
+    if (result.success && problem_input.solver_options.coobs_factor_ba_enable) {
       const fs::path coobs_factor_dir =
           output_dir /
           problem_input.solver_options.coobs_factor_ba_output_dir_suffix;
@@ -2770,7 +2818,7 @@ int main(int argc, char** argv) {
         problem_input.solver_options.export_angular_fixedk_diagnostic ||
         problem_input.solver_options.final_ba_residual_mode !=
             ati::StereoFinalBaResidualMode::Pixel;
-    if (write_angular_fixedk_diagnostic) {
+    if (result.success && write_angular_fixedk_diagnostic) {
       const fs::path angular_dir =
           output_dir / "stage6_angular_fixedK_diagnostic";
       fs::create_directories(angular_dir);
@@ -2785,6 +2833,10 @@ int main(int argc, char** argv) {
         (output_dir / "stereo_pairing_summary.txt").string(), problem_input);
     ati::WriteStereoInitializationSummary(
         (output_dir / "stereo_initialization_summary.txt").string(), result);
+    if (problem_input.solver_options.enable_persistent_incremental_stereo_ba) {
+      ati::WriteStereoInitializationSummary(
+          (output_dir / "stage6_init_summary.txt").string(), result);
+    }
     ati::WriteStereoGraphSummary(
         (output_dir / "stereo_graph_summary.txt").string(), result);
     ati::WriteStereoPairSelectionSummary(
@@ -2801,7 +2853,8 @@ int main(int argc, char** argv) {
           result);
     }
     if (problem_input.solver_options.enable_kalibr_style_pair_selection ||
-        problem_input.solver_options.enable_committing_pair_batch_selection) {
+        problem_input.solver_options.enable_committing_pair_batch_selection ||
+        problem_input.solver_options.enable_persistent_incremental_stereo_ba) {
       ati::WriteStereoPairTrialSelectionSummary(
           (output_dir / "stereo_pair_trial_selection_summary.txt").string(),
           result);
@@ -2812,7 +2865,8 @@ int main(int argc, char** argv) {
           (output_dir / "stereo_pair_trial_selected_pairs.csv").string(), result);
     }
     if (problem_input.solver_options.enable_pair_board_trial_selection ||
-        problem_input.solver_options.enable_committing_pair_batch_selection) {
+        problem_input.solver_options.enable_committing_pair_batch_selection ||
+        problem_input.solver_options.enable_persistent_incremental_stereo_ba) {
       ati::WriteStereoPairBoardTrialSelectionSummary(
           (output_dir / "stereo_pair_board_trial_selection_summary.txt").string(),
           result);
@@ -2822,14 +2876,34 @@ int main(int argc, char** argv) {
       ati::WriteStereoPairBoardTrialSelectedBoardsCsv(
           (output_dir / "stereo_pair_board_trial_selected_boards.csv").string(),
           result);
+      if (problem_input.solver_options.enable_persistent_incremental_stereo_ba) {
+        ati::WriteStereoPairBoardTrialSelectionSummary(
+            (output_dir / "stage6_persistent_incremental_selection_summary.txt")
+                .string(),
+            result);
+        ati::WriteStage6PersistentIncrementalBatchDecisionsCsv(
+            (output_dir / "stage6_persistent_incremental_batch_decisions.csv")
+                .string(),
+            result);
+        ati::WriteStereoPairBoardTrialSelectionDecisionsCsv(
+            (output_dir /
+             "stage6_persistent_incremental_pair_board_decisions.csv")
+                .string(),
+            result);
+        ati::WriteStereoPairBoardTrialSelectedBoardsCsv(
+            (output_dir / "stage6_persistent_incremental_selected_boards.csv")
+                .string(),
+            result);
+      }
     }
     ati::WriteStereoGlobalSparseBaSummary(
         (output_dir / "stereo_global_sparse_ba_summary.txt").string(), result);
     ati::WriteStereoGlobalSparseBaInitialVsFinal(
         (output_dir / "stereo_global_sparse_ba_initial_vs_final.txt").string(),
         result);
-    if (problem_input.solver_options.export_pair_board_consistency_audit ||
-        problem_input.solver_options.enable_pair_board_consistency_gate) {
+    if (result.success &&
+        (problem_input.solver_options.export_pair_board_consistency_audit ||
+         problem_input.solver_options.enable_pair_board_consistency_gate)) {
       ati::WriteStereoPairBoardConsistencySummary(
           (output_dir / "stereo_pair_board_consistency_summary.txt").string(),
           result);
@@ -2839,8 +2913,9 @@ int main(int argc, char** argv) {
       ati::WriteStereoPairBoardConsistencyCsv(
           (output_dir / "stereo_pair_board_consistency.csv").string(), result);
     }
-    if (problem_input.solver_options.enable_shared_board_quality_gate ||
-        problem_input.solver_options.enable_shared_board_quality_hard_gate) {
+    if (result.success &&
+        (problem_input.solver_options.enable_shared_board_quality_gate ||
+         problem_input.solver_options.enable_shared_board_quality_hard_gate)) {
       ati::WriteStereoSharedBoardQualityAuditCsv(
           (output_dir / "stereo_shared_board_quality_audit.csv").string(),
           result);
@@ -2856,7 +2931,8 @@ int main(int argc, char** argv) {
       ati::WriteStereoRobustLossSummary(
           (output_dir / "stereo_robust_loss_summary.txt").string(), result);
     }
-    if (problem_input.solver_options.export_extrinsic_uncertainty_diagnostics) {
+    if (result.success &&
+        problem_input.solver_options.export_extrinsic_uncertainty_diagnostics) {
       ati::WriteStereoExtrinsicUncertaintySummary(
           (output_dir / "stereo_extrinsic_uncertainty_summary.txt").string(),
           result);
@@ -2866,7 +2942,8 @@ int main(int argc, char** argv) {
       ati::WriteStereoExtrinsicJackknifeCsv(
           (output_dir / "stereo_extrinsic_jackknife.csv").string(), result);
     }
-    if (problem_input.solver_options.export_stereo_reprojection_visualizations) {
+    if (result.success &&
+        problem_input.solver_options.export_stereo_reprojection_visualizations) {
       ati::WriteStereoReprojectionVisualizations(
           (output_dir / "stereo_reprojection_visualizations" /
            "overview_side_by_side")
@@ -2881,6 +2958,10 @@ int main(int argc, char** argv) {
           result.optimized_scene,
           "ours_holdout_extrinsic_only_top_bad_pair_boards",
           problem_input.solver_options.stereo_visualization_top_k);
+    }
+    if (result.success &&
+        (problem_input.solver_options.export_stereo_reprojection_visualizations ||
+         problem_input.solver_options.enable_persistent_incremental_stereo_ba)) {
       ati::WriteStereoBackendInputVisualizations(
           (output_dir / "stereo_backend_input_visualizations").string(),
           result,

@@ -35,6 +35,9 @@ std::string NormalizeCameraModelToken(const std::string& value) {
   if (lowered == "pinhole") {
     return "pinhole";
   }
+  if (lowered == "mei" || lowered == "omni" || lowered == "omnidirectional") {
+    return "omni";
+  }
   return lowered;
 }
 
@@ -48,6 +51,10 @@ std::string NormalizeDistortionModelToken(const std::string& value) {
   }
   if (lowered == "equi" || lowered == "equidistant") {
     return "equi";
+  }
+  if (lowered == "radtan" || lowered == "radial-tangential" ||
+      lowered == "radial_tangential") {
+    return "radtan";
   }
   return lowered;
 }
@@ -66,10 +73,23 @@ std::string NormalizeFamilyString(const std::string& camera_model,
   if (normalized_camera == "pinhole" && normalized_distortion == "equi") {
     return "pinhole-equi";
   }
+  if (normalized_camera == "omni" && normalized_distortion == "radtan") {
+    return "omni-radtan";
+  }
   return "";
 }
 
 std::vector<double> DefaultEquidistantDistortionCoeffs(
+    const std::vector<double>& input) {
+  std::vector<double> result = input;
+  result.resize(4, 0.0);
+  if (result.size() > 4) {
+    result.resize(4);
+  }
+  return result;
+}
+
+std::vector<double> DefaultRadtanDistortionCoeffs(
     const std::vector<double>& input) {
   std::vector<double> result = input;
   result.resize(4, 0.0);
@@ -112,6 +132,19 @@ boost::shared_ptr<CameraGeometryBase> MakeGeometry(
         new EquidistantDistortedPinholeCameraGeometry(
             projection, GlobalShutter(), NoMask()));
   }
+  if (family == "omni-radtan") {
+    const std::vector<double>& intrinsics = config.intrinsics;
+    const std::vector<double> distortion =
+        DefaultRadtanDistortionCoeffs(config.distortion_coeffs);
+    RadialTangentialDistortion radtan(
+        distortion[0], distortion[1], distortion[2], distortion[3]);
+    OmniProjection<RadialTangentialDistortion> projection(
+        intrinsics[0], intrinsics[1], intrinsics[2], intrinsics[3], intrinsics[4],
+        config.resolution[0], config.resolution[1], radtan);
+    return boost::shared_ptr<CameraGeometryBase>(
+        new DistortedOmniCameraGeometry(
+            projection, GlobalShutter(), NoMask()));
+  }
   throw std::runtime_error(
       "Unsupported camera family: camera_model=" + config.camera_model +
       " distortion_model=" + config.distortion_model);
@@ -123,6 +156,9 @@ bool HasExpectedIntrinsicsSize(const std::string& family, std::size_t size) {
   }
   if (family == "pinhole-equi") {
     return size == 4;
+  }
+  if (family == "omni-radtan") {
+    return size == 5;
   }
   return false;
 }
@@ -160,12 +196,18 @@ std::vector<double> OuterBootstrapCameraIntrinsics::IntrinsicsVector() const {
   if (family == "pinhole-equi") {
     return {fu, fv, cu, cv};
   }
+  if (family == "omni-radtan") {
+    return {xi, fu, fv, cu, cv};
+  }
   return {};
 }
 
 std::vector<double> OuterBootstrapCameraIntrinsics::DistortionVector() const {
   if (NormalizedFamilyString() == "pinhole-equi") {
     return DefaultEquidistantDistortionCoeffs(distortion_coeffs);
+  }
+  if (NormalizedFamilyString() == "omni-radtan") {
+    return DefaultRadtanDistortionCoeffs(distortion_coeffs);
   }
   return {};
 }
@@ -188,12 +230,18 @@ std::vector<std::string> OuterBootstrapCameraIntrinsics::IntrinsicsLabels() cons
   if (family == "pinhole-equi") {
     return {"fu", "fv", "cu", "cv"};
   }
+  if (family == "omni-radtan") {
+    return {"xi", "fu", "fv", "cu", "cv"};
+  }
   return {};
 }
 
 std::vector<std::string> OuterBootstrapCameraIntrinsics::DistortionLabels() const {
   if (NormalizedFamilyString() == "pinhole-equi") {
     return {"k1", "k2", "k3", "k4"};
+  }
+  if (NormalizedFamilyString() == "omni-radtan") {
+    return {"k1", "k2", "p1", "p2"};
   }
   return {};
 }
@@ -235,12 +283,24 @@ bool OuterBootstrapCameraIntrinsics::SetIntrinsicsVector(const std::vector<doubl
     cv = values[3];
     return true;
   }
+  if (family == "omni-radtan") {
+    xi = values[0];
+    fu = values[1];
+    fv = values[2];
+    cu = values[3];
+    cv = values[4];
+    return true;
+  }
   return false;
 }
 
 bool OuterBootstrapCameraIntrinsics::SetDistortionVector(const std::vector<double>& values) {
   if (NormalizedFamilyString() == "pinhole-equi") {
     distortion_coeffs = DefaultEquidistantDistortionCoeffs(values);
+    return true;
+  }
+  if (NormalizedFamilyString() == "omni-radtan") {
+    distortion_coeffs = DefaultRadtanDistortionCoeffs(values);
     return true;
   }
   if (!values.empty()) {
@@ -279,7 +339,8 @@ DoubleSphereCameraModel DoubleSphereCameraModel::FromConfig(
   if (config.resolution.size() != 2) {
     throw std::runtime_error("Camera resolution must be [width, height].");
   }
-  if (family != "pinhole-equi" && !config.distortion_coeffs.empty()) {
+  if (family != "pinhole-equi" && family != "omni-radtan" &&
+      !config.distortion_coeffs.empty()) {
     throw std::runtime_error(
         "This camera family expects empty distortion_coeffs.");
   }
@@ -309,6 +370,12 @@ DoubleSphereCameraModel DoubleSphereCameraModel::FromConfig(
     camera.fv_ = config.intrinsics[1];
     camera.cu_ = config.intrinsics[2];
     camera.cv_ = config.intrinsics[3];
+  } else if (family == "omni-radtan") {
+    camera.xi_ = config.intrinsics[0];
+    camera.fu_ = config.intrinsics[1];
+    camera.fv_ = config.intrinsics[2];
+    camera.cu_ = config.intrinsics[3];
+    camera.cv_ = config.intrinsics[4];
   }
   camera.valid_ = true;
   return camera;

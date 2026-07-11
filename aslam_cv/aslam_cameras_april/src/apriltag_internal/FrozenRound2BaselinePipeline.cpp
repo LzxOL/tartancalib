@@ -1133,7 +1133,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   result.final_stage5_bundle = result.stage5_round1_bundle;
   result.stage5_bundle_available = result.final_stage5_bundle.success;
 
-  if (options_.run_second_pass) {
+  if (options_.run_second_pass && !options_.outer_only_ablation_mode) {
     result.round2_available = true;
     result.round2.regeneration_results.reserve(frame_sources.size());
     result.round2.joint_inputs.reserve(frame_sources.size());

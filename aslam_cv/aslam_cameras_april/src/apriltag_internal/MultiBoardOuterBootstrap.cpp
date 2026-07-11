@@ -134,6 +134,16 @@ bool ClampIntrinsicsInPlace(OuterBootstrapCameraIntrinsics* intrinsics) {
       coeff = std::max(-2.0, std::min(2.0, coeff));
     }
     intrinsics->distortion_coeffs = clamped;
+  } else if (family == "omni-radtan") {
+    intrinsics->xi = std::max(-0.95, std::min(3.0, intrinsics->xi));
+    intrinsics->alpha = 0.0;
+    intrinsics->beta = 0.0;
+    std::vector<double> clamped = intrinsics->distortion_coeffs;
+    clamped.resize(4, 0.0);
+    for (double& coeff : clamped) {
+      coeff = std::max(-2.0, std::min(2.0, coeff));
+    }
+    intrinsics->distortion_coeffs = clamped;
   } else {
     return false;
   }

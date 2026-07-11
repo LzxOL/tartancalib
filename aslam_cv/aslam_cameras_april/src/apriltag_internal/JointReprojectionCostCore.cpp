@@ -700,10 +700,10 @@ JointCostEvaluation JointReprojectionCostCore::Evaluate(
             ? (use_normalized_angular ? ResidualModel::NormalizedSphereAngular
                                       : ResidualModel::SphereAngular)
             : ResidualModel::ImagePlane;
-    const double active_squared_norm =
-        point_eval.active_image_plane_weight * point_eval.residual_xy.squaredNorm() +
-        point_eval.active_angular_weight *
-            point_eval.angular_residual_xy.squaredNorm();
+    const Eigen::Vector2d active_residual =
+        point_eval.active_image_plane_weight * point_eval.residual_xy +
+        point_eval.active_angular_weight * point_eval.angular_residual_xy;
+    const double active_squared_norm = active_residual.squaredNorm();
     const double active_residual_norm = std::sqrt(std::max(0.0, active_squared_norm));
     const double huber_delta =
         observation.point_type == JointPointType::Outer

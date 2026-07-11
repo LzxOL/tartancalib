@@ -1619,6 +1619,7 @@ struct FrameBoardObservationFlowRow {
   bool internal_result_available = false;
   bool internal_success = false;
   std::string internal_failure_reason;
+  std::string internal_camera_source;
   bool frame_bootstrap_initialized = false;
   bool board_bootstrap_initialized = false;
   bool pose_prior_used = false;
@@ -2670,6 +2671,7 @@ void DrawInternalPointFilterOverlay(
       double outer_subpix_max_polar_deg = 0.0;
       int max_outer_subpix_radius = 0;
       int max_raw_outer_subpix_radius = 0;
+      int max_pre_boost_outer_subpix_radius = 0;
       int min_outer_subpix_clamp_limit = 0;
       bool outer_subpix_clamped = false;
       double outer_subpix_config_scale = 0.0;
@@ -2688,6 +2690,9 @@ void DrawInternalPointFilterOverlay(
           max_raw_outer_subpix_radius =
               std::max(max_raw_outer_subpix_radius,
                        debug.raw_subpix_window_radius);
+          max_pre_boost_outer_subpix_radius =
+              std::max(max_pre_boost_outer_subpix_radius,
+                       debug.pre_boost_subpix_window_radius);
           if (debug.subpix_window_clamp_limit > 0) {
             min_outer_subpix_clamp_limit =
                 min_outer_subpix_clamp_limit == 0
@@ -2702,7 +2707,19 @@ void DrawInternalPointFilterOverlay(
                        debug.configured_outer_subpix_scale);
           if (debug.subpix_window_radius > 0 &&
               IsPointNearImage(debug.subpix_corner, output->size(), 120.0f)) {
+            const int pre_radius =
+                std::max(1, debug.pre_boost_subpix_window_radius);
             const int radius = std::max(1, debug.subpix_window_radius);
+            if (pre_radius != radius) {
+              cv::rectangle(
+                  *output,
+                  cv::Rect(static_cast<int>(std::lround(debug.subpix_corner.x)) -
+                               pre_radius,
+                           static_cast<int>(std::lround(debug.subpix_corner.y)) -
+                               pre_radius,
+                           pre_radius * 2 + 1, pre_radius * 2 + 1),
+                  cv::Scalar(255, 170, 60), 1, cv::LINE_AA);
+            }
             cv::rectangle(
                 *output,
                 cv::Rect(static_cast<int>(std::lround(debug.subpix_corner.x)) - radius,
@@ -2725,7 +2742,8 @@ void DrawInternalPointFilterOverlay(
             << " polar=" << std::fixed << std::setprecision(1)
             << outer_subpix_max_polar_deg
             << " area=" << std::setprecision(3) << outer_subpix_area_ratio
-            << " subpix_r=" << max_outer_subpix_radius
+            << " subpix_r=" << max_pre_boost_outer_subpix_radius
+            << "->" << max_outer_subpix_radius
             << " raw=" << max_raw_outer_subpix_radius
             << " clamp=" << min_outer_subpix_clamp_limit
             << " scale=" << std::setprecision(2) << outer_subpix_config_scale
@@ -2754,6 +2772,7 @@ void DrawInternalPointFilterOverlay(
           bool outer_subpix_boost = false;
           int max_outer_subpix_radius = 0;
           int max_raw_outer_subpix_radius = 0;
+          int max_pre_boost_outer_subpix_radius = 0;
           int min_outer_subpix_clamp_limit = 0;
           bool outer_subpix_clamped = false;
           double max_polar_deg = 0.0;
@@ -2766,6 +2785,9 @@ void DrawInternalPointFilterOverlay(
             max_raw_outer_subpix_radius =
                 std::max(max_raw_outer_subpix_radius,
                          debug.raw_subpix_window_radius);
+            max_pre_boost_outer_subpix_radius =
+                std::max(max_pre_boost_outer_subpix_radius,
+                         debug.pre_boost_subpix_window_radius);
             if (debug.subpix_window_clamp_limit > 0) {
               min_outer_subpix_clamp_limit =
                   min_outer_subpix_clamp_limit == 0
@@ -2781,7 +2803,8 @@ void DrawInternalPointFilterOverlay(
           label << " boost=" << (outer_subpix_boost ? 1 : 0)
                 << " polar=" << std::fixed << std::setprecision(1)
                 << max_polar_deg
-                << " subpix_r=" << max_outer_subpix_radius
+                << " subpix_r=" << max_pre_boost_outer_subpix_radius
+                << "->" << max_outer_subpix_radius
                 << " raw=" << max_raw_outer_subpix_radius
                 << " clamp=" << min_outer_subpix_clamp_limit
                 << " clipped=" << (outer_subpix_clamped ? 1 : 0);
@@ -4431,6 +4454,7 @@ void WriteFrameBoardObservationFlowDiagnostics(
       row.outer_failure_reason = detection.outer_detection.failure_reason_text;
       row.internal_success = detection.success;
       row.internal_failure_reason = detection.failure_reason;
+      row.internal_camera_source = detection.internal_camera_source;
       row.attempted_internal_corner_count =
           detection.runtime_breakdown.attempted_internal_corner_count;
       row.valid_internal_corner_count =
@@ -4636,6 +4660,7 @@ void WriteFrameBoardObservationFlowDiagnostics(
   csv << "round,frame_index,frame_label,board_id,"
       << "outer_detected,outer_failure_reason,"
       << "internal_result_available,internal_success,internal_failure_reason,"
+      << "internal_camera_source,"
       << "frame_bootstrap_initialized,board_bootstrap_initialized,pose_prior_used,"
       << "attempted_internal_corner_count,valid_internal_corner_count,"
       << "valid_internal_ratio,measurement_built,pre_selection_solver_ready,"
@@ -4658,6 +4683,7 @@ void WriteFrameBoardObservationFlowDiagnostics(
         << (row.internal_result_available ? 1 : 0) << ","
         << (row.internal_success ? 1 : 0) << ","
         << CsvEscape(row.internal_failure_reason) << ","
+        << CsvEscape(row.internal_camera_source) << ","
         << (row.frame_bootstrap_initialized ? 1 : 0) << ","
         << (row.board_bootstrap_initialized ? 1 : 0) << ","
         << (row.pose_prior_used ? 1 : 0) << ","
@@ -4817,6 +4843,7 @@ void WriteFrameBoardObservationFlowDiagnostics(
   std::map<std::string, int> status_counts;
   std::map<std::string, int> non_strict_not_used_counts;
   std::map<std::string, int> internal_failure_reason_counts;
+  std::map<std::string, int> internal_camera_source_counts;
   std::map<std::string, int> point_rejection_reason_counts;
   int final_used_count = 0;
   int not_used_count = 0;
@@ -4842,6 +4869,12 @@ void WriteFrameBoardObservationFlowDiagnostics(
           row.internal_failure_reason.empty() ? "empty_failure_reason"
                                               : row.internal_failure_reason;
       ++internal_failure_reason_counts[reason];
+    }
+    if (row.internal_result_available) {
+      const std::string source =
+          row.internal_camera_source.empty() ? "empty_camera_source"
+                                             : row.internal_camera_source;
+      ++internal_camera_source_counts[source];
     }
     if (!row.point_rejection_reasons.empty()) {
       std::stringstream stream(row.point_rejection_reasons);
@@ -4883,6 +4916,10 @@ void WriteFrameBoardObservationFlowDiagnostics(
   }
   summary << "\ninternal_failure_reason_counts_outer_detected:\n";
   for (const auto& entry : internal_failure_reason_counts) {
+    summary << "  " << entry.first << ": " << entry.second << "\n";
+  }
+  summary << "\ninternal_camera_source_counts:\n";
+  for (const auto& entry : internal_camera_source_counts) {
     summary << "  " << entry.first << ": " << entry.second << "\n";
   }
   summary << "\npoint_rejection_reason_counts:\n";
@@ -4958,7 +4995,8 @@ void WriteFrameBoardObservationFlowDiagnostics(
       << "subpix_window_clamped,final_subpix_window_radius,"
       << "close_edge_subpix_boost_applied,"
       << "close_edge_subpix_area_ratio,"
-      << "close_edge_subpix_max_polar_deg,coarse_u,coarse_v,"
+      << "close_edge_subpix_max_polar_deg,"
+      << "close_edge_subpix_multiplier,coarse_u,coarse_v,"
       << "subpix_u,subpix_v,failure_reason\n";
   for (const ati::InternalRegenerationFrameResult& frame :
        artifacts.regeneration_results) {
@@ -4996,6 +5034,7 @@ void WriteFrameBoardObservationFlowDiagnostics(
             << (debug.close_edge_subpix_boost_applied ? 1 : 0) << ","
             << debug.close_edge_subpix_area_ratio << ","
             << debug.close_edge_subpix_max_polar_deg << ","
+            << debug.close_edge_subpix_multiplier << ","
             << debug.coarse_corner.x << ","
             << debug.coarse_corner.y << ","
             << debug.subpix_corner.x << ","
@@ -6228,6 +6267,21 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
   summary << "persistent_incremental_backend_estimator_failure_reason: "
           << result.persistent_incremental_backend_estimator_failure_reason
           << "\n";
+  summary << "persistent_incremental_information_gain_target: "
+          << result.persistent_incremental_information_gain_target << "\n";
+  summary << "persistent_incremental_board_layout_in_information_group: "
+          << (result.persistent_incremental_board_layout_in_information_group
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_incremental_camera_information_group_id: "
+          << result.persistent_incremental_camera_information_group_id << "\n";
+  summary << "persistent_incremental_board_layout_group_id: "
+          << result.persistent_incremental_board_layout_group_id << "\n";
+  summary << "persistent_incremental_transformation_group_id: "
+          << result.persistent_incremental_transformation_group_id << "\n";
+  summary << "persistent_incremental_seed_information_group_dim: "
+          << result.persistent_incremental_seed_information_group_dim << "\n";
   summary << "persistent_incremental_seed_batch_count: "
           << result.persistent_incremental_seed_batch_count << "\n";
   summary << "persistent_incremental_seed_frame_count: "
@@ -6246,7 +6300,70 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.persistent_incremental_rejected_batch_count << "\n";
   summary << "persistent_incremental_total_elapsed_time_seconds: "
           << result.persistent_incremental_total_elapsed_time_seconds << "\n";
+  summary << "persistent_incremental_trust_region_backtracking_batch_count: "
+          << result.persistent_incremental_trust_region_backtracking_batch_count
+          << "\n";
+  summary << "persistent_incremental_trust_region_backtracking_attempt_count: "
+          << result.persistent_incremental_trust_region_backtracking_attempt_count
+          << "\n";
+  summary << "persistent_incremental_trust_region_backtracking_accepted_count: "
+          << result.persistent_incremental_trust_region_backtracking_accepted_count
+          << "\n";
+  summary << "persistent_incremental_trust_region_backtracking_max_anchor_scale: "
+          << result
+                 .persistent_incremental_trust_region_backtracking_max_anchor_scale
+          << "\n";
+  summary << "persistent_incremental_normalize_information_gain_by_board_observation: "
+          << (result
+                      .persistent_incremental_normalize_information_gain_by_board_observation
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_incremental_split_residual_health_gate_enabled: "
+          << (result.persistent_incremental_split_residual_health_gate_enabled
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_incremental_split_residual_health_rejected_count: "
+          << result
+                 .persistent_incremental_split_residual_health_rejected_count
+          << "\n";
+  summary << "persistent_incremental_adaptive_saturation_stop_enabled: "
+          << (result.persistent_incremental_adaptive_saturation_stop_enabled
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_incremental_adaptive_saturation_stop_hit: "
+          << (result.persistent_incremental_adaptive_saturation_stop_hit ? 1
+                                                                         : 0)
+          << "\n";
+  summary << "persistent_incremental_adaptive_saturation_min_accepted_batches: "
+          << result
+                 .persistent_incremental_adaptive_saturation_min_accepted_batches
+          << "\n";
+  summary << "persistent_incremental_adaptive_saturation_nonproductive_batch_limit: "
+          << result
+                 .persistent_incremental_adaptive_saturation_nonproductive_batch_limit
+          << "\n";
+  summary << "persistent_incremental_adaptive_saturation_consecutive_nonproductive_batches: "
+          << result
+                 .persistent_incremental_adaptive_saturation_consecutive_nonproductive_batches
+          << "\n";
+  summary << "persistent_incremental_adaptive_saturation_tail_ordering_score_threshold: "
+          << result
+                 .persistent_incremental_adaptive_saturation_tail_ordering_score_threshold
+          << "\n";
+  summary << "persistent_incremental_adaptive_saturation_next_ordering_score: "
+          << result
+                 .persistent_incremental_adaptive_saturation_next_ordering_score
+          << "\n";
+  summary << "persistent_incremental_adaptive_saturation_stop_reason: "
+          << result.persistent_incremental_adaptive_saturation_stop_reason
+          << "\n";
   summary << "persistent_incremental_objective_decrease_gate_enabled: "
+          << 0
+          << "\n";
+  summary << "persistent_incremental_residual_model_aware_acceptance: "
           << (result.persistent_incremental_backend_estimator_used ? 1 : 0)
           << "\n";
   summary << "persistent_intrinsics_anchor_prior_enabled: "
@@ -6258,13 +6375,22 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.persistent_intrinsics_anchor_weight_focal << "\n";
   summary << "persistent_intrinsics_anchor_weight_principal: "
           << result.persistent_intrinsics_anchor_weight_principal << "\n";
-  const bool auto_anchor_weight =
-      result.persistent_intrinsics_anchor_prior_enabled &&
-      result.persistent_intrinsics_anchor_weight_xi_alpha <= 0.0 &&
-      result.persistent_intrinsics_anchor_weight_focal <= 0.0 &&
-      result.persistent_intrinsics_anchor_weight_principal <= 0.0;
+  const bool explicit_anchor_weights =
+      result.persistent_intrinsics_anchor_weight_xi_alpha > 0.0 ||
+      result.persistent_intrinsics_anchor_weight_focal > 0.0 ||
+      result.persistent_intrinsics_anchor_weight_principal > 0.0;
+  const bool explicit_anchor_scales =
+      result.persistent_max_focal_relative_step > 0.0 ||
+      result.persistent_max_principal_step_px > 0.0 ||
+      result.persistent_max_xi_alpha_step > 0.0;
   summary << "persistent_intrinsics_anchor_weight_mode: "
-          << (auto_anchor_weight ? "auto_from_trust_region" : "explicit")
+          << (!result.persistent_intrinsics_anchor_prior_enabled
+                  ? "disabled"
+                  : (explicit_anchor_weights
+                         ? "explicit_weights"
+                         : (explicit_anchor_scales
+                                ? "configured_step_scale"
+                                : "requested_but_no_weights_or_step")))
           << "\n";
   summary << "persistent_max_focal_relative_step: "
           << result.persistent_max_focal_relative_step << "\n";
@@ -6272,9 +6398,22 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.persistent_max_principal_step_px << "\n";
   summary << "persistent_max_xi_alpha_step: "
           << result.persistent_max_xi_alpha_step << "\n";
-  summary << "kalibr_style_acceptance_note: legacy_rmse_pass is residual "
-          << "health only; accepted_by_batch_acceptance requires the "
-          << "intrinsics information-gain proxy and score gate.\n";
+	  if (result.persistent_incremental_backend_estimator_used) {
+	    summary << "kalibr_style_acceptance_note: legacy_rmse_pass is residual "
+	            << "health only; persistent incremental acceptance is decided "
+	            << "from committed optimizer state, residual-model-aware "
+	            << "health, information/rank gain, optimizer objective validity, "
+	            << "finite/model-bound state checks, and explicit rollback. "
+            << "Camera parameter step thresholds are not acceptance gates; "
+            << "they are disabled by default and only reported when explicitly "
+            << "configured, matching Kalibr's acceptance boundary more closely; "
+	            << "pixel mode keeps the information/rank gate and angular mode "
+	            << "uses tangent-plane angular health for acceptance.\n";
+  } else {
+    summary << "kalibr_style_acceptance_note: legacy_rmse_pass is residual "
+            << "health only; proxy-path acceptance uses the configured "
+            << "intrinsics information-gain proxy and batch acceptance policy.\n";
+  }
   summary << "frame_cohesion_candidate_count: "
           << result.frame_cohesion_candidate_count << "\n";
   summary << "frame_cohesion_attempted_count: "
@@ -6291,6 +6430,37 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.frame_batch_accepted_count << "\n";
   summary << "frame_batch_rejected_count: "
           << result.frame_batch_rejected_count << "\n";
+  summary << "persistent_incremental_image_plane_residual_count: "
+          << result.persistent_incremental_image_plane_residual_count << "\n";
+	  summary << "persistent_incremental_angular_residual_count: "
+	          << result.persistent_incremental_angular_residual_count << "\n";
+	  summary << "persistent_incremental_chordal_residual_count: "
+	          << result.persistent_incremental_chordal_residual_count << "\n";
+	  summary << "persistent_incremental_hybrid_angular_selected_count: "
+	          << result.persistent_incremental_hybrid_angular_selected_count
+	          << "\n";
+	  summary << "persistent_incremental_hybrid_chordal_selected_count: "
+	          << result.persistent_incremental_hybrid_chordal_selected_count
+	          << "\n";
+	  summary << "persistent_incremental_angular_geometry_failure_count: "
+	          << result.persistent_incremental_angular_geometry_failure_count
+	          << "\n";
+  summary << "persistent_incremental_selection_metric_name: "
+          << result.persistent_incremental_selection_metric_name << "\n";
+  summary << "persistent_incremental_bearing_geometry_source: "
+          << "active_camera_model\n";
+  summary << "persistent_incremental_selection_metric_unit: "
+          << result.persistent_incremental_selection_metric_unit << "\n";
+  summary << "persistent_incremental_residual_health_threshold_source: "
+          << result.persistent_incremental_residual_health_threshold_source
+          << "\n";
+  summary << "persistent_incremental_residual_health_threshold_metric: "
+          << result.persistent_incremental_residual_health_threshold_metric
+          << "\n";
+  summary << "persistent_incremental_seed_acceptance_metric_rmse: "
+          << result.persistent_incremental_seed_acceptance_metric_rmse << "\n";
+  summary << "persistent_incremental_seed_acceptance_metric_p95: "
+          << result.persistent_incremental_seed_acceptance_metric_p95 << "\n";
   summary << "frame_consolidation_candidate_count: "
           << result.frame_consolidation_candidate_count << "\n";
   summary << "frame_consolidation_accepted_count: "
@@ -6403,13 +6573,53 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
       << "persistent_incremental_attempted,"
       << "persistent_incremental_batch_accepted,"
       << "persistent_incremental_force,"
+      << "persistent_incremental_trust_region_pass,"
+      << "persistent_incremental_trust_region_backtracking_used,"
+      << "persistent_incremental_split_residual_health_pass,"
       << "persistent_incremental_information_gain,"
+      << "persistent_incremental_normalized_information_gain,"
+      << "persistent_incremental_information_gain_normalization_count,"
+      << "persistent_incremental_rank_psi_after,"
+      << "persistent_incremental_rank_psi_deficiency_after,"
       << "persistent_incremental_rank_theta_before,"
       << "persistent_incremental_rank_theta_after,"
+      << "persistent_incremental_rank_theta_deficiency_after,"
+      << "persistent_incremental_svd_tolerance,"
+      << "persistent_incremental_qr_tolerance,"
       << "persistent_incremental_iterations,"
       << "persistent_incremental_objective_start,"
       << "persistent_incremental_objective_final,"
       << "persistent_incremental_objective_decreased,"
+      << "persistent_incremental_rmse_before,"
+      << "persistent_incremental_outer_rmse_before,"
+      << "persistent_incremental_internal_rmse_before,"
+      << "persistent_incremental_acceptance_metric_name,"
+      << "persistent_incremental_acceptance_metric_unit,"
+      << "persistent_incremental_acceptance_metric_threshold,"
+      << "persistent_incremental_acceptance_metric_before,"
+      << "persistent_incremental_acceptance_metric_after,"
+      << "persistent_incremental_acceptance_metric_candidate,"
+      << "persistent_incremental_acceptance_metric_candidate_p95,"
+      << "persistent_incremental_acceptance_metric_candidate_outer,"
+      << "persistent_incremental_acceptance_metric_candidate_internal,"
+      << "persistent_incremental_total_p95_after,"
+      << "persistent_incremental_outer_p95_after,"
+      << "persistent_incremental_internal_p95_after,"
+      << "persistent_incremental_candidate_rmse_after,"
+      << "persistent_incremental_candidate_outer_rmse_after,"
+      << "persistent_incremental_candidate_internal_rmse_after,"
+      << "persistent_incremental_candidate_total_p95_after,"
+      << "persistent_incremental_candidate_outer_p95_after,"
+      << "persistent_incremental_candidate_internal_p95_after,"
+	      << "persistent_incremental_image_plane_residual_count,"
+	      << "persistent_incremental_angular_residual_count,"
+	      << "persistent_incremental_chordal_residual_count,"
+	      << "persistent_incremental_hybrid_angular_selected_count,"
+	      << "persistent_incremental_hybrid_chordal_selected_count,"
+	      << "persistent_incremental_angular_geometry_failure_count,"
+      << "persistent_incremental_trust_region_retry_count,"
+      << "persistent_incremental_trust_region_violation_ratio,"
+      << "persistent_incremental_trust_region_anchor_weight_scale,"
       << "persistent_incremental_elapsed_time_seconds,"
       << "persistent_incremental_commit_state,"
       << "persistent_incremental_camera_xi_before,"
@@ -6509,13 +6719,70 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
         << (decision.persistent_incremental_attempted ? 1 : 0) << ","
         << (decision.persistent_incremental_batch_accepted ? 1 : 0) << ","
         << (decision.persistent_incremental_force ? 1 : 0) << ","
+        << (decision.persistent_incremental_trust_region_pass ? 1 : 0)
+        << ","
+        << (decision.persistent_incremental_trust_region_backtracking_used ? 1
+                                                                           : 0)
+        << ","
+        << (decision.persistent_incremental_split_residual_health_pass ? 1
+                                                                       : 0)
+        << ","
         << decision.persistent_incremental_information_gain << ","
+        << decision.persistent_incremental_normalized_information_gain << ","
+        << decision
+               .persistent_incremental_information_gain_normalization_count
+        << ","
+        << decision.persistent_incremental_rank_psi_after << ","
+        << decision.persistent_incremental_rank_psi_deficiency_after << ","
         << decision.persistent_incremental_rank_theta_before << ","
         << decision.persistent_incremental_rank_theta_after << ","
+        << decision.persistent_incremental_rank_theta_deficiency_after << ","
+        << decision.persistent_incremental_svd_tolerance << ","
+        << decision.persistent_incremental_qr_tolerance << ","
         << decision.persistent_incremental_iterations << ","
         << decision.persistent_incremental_objective_start << ","
         << decision.persistent_incremental_objective_final << ","
         << (decision.persistent_incremental_objective_decreased ? 1 : 0)
+        << ","
+        << decision.persistent_incremental_rmse_before << ","
+        << decision.persistent_incremental_outer_rmse_before << ","
+        << decision.persistent_incremental_internal_rmse_before << ","
+        << CsvEscape(decision.persistent_incremental_acceptance_metric_name)
+        << ","
+        << CsvEscape(decision.persistent_incremental_acceptance_metric_unit)
+        << ","
+        << decision.persistent_incremental_acceptance_metric_threshold << ","
+        << decision.persistent_incremental_acceptance_metric_before << ","
+        << decision.persistent_incremental_acceptance_metric_after << ","
+        << decision.persistent_incremental_acceptance_metric_candidate << ","
+        << decision.persistent_incremental_acceptance_metric_candidate_p95
+        << ","
+        << decision.persistent_incremental_acceptance_metric_candidate_outer
+        << ","
+        << decision
+               .persistent_incremental_acceptance_metric_candidate_internal
+        << ","
+        << decision.persistent_incremental_total_p95_after << ","
+        << decision.persistent_incremental_outer_p95_after << ","
+        << decision.persistent_incremental_internal_p95_after << ","
+        << decision.persistent_incremental_candidate_rmse_after << ","
+        << decision.persistent_incremental_candidate_outer_rmse_after << ","
+        << decision.persistent_incremental_candidate_internal_rmse_after << ","
+        << decision.persistent_incremental_candidate_total_p95_after << ","
+        << decision.persistent_incremental_candidate_outer_p95_after << ","
+        << decision.persistent_incremental_candidate_internal_p95_after << ","
+	        << decision.persistent_incremental_image_plane_residual_count << ","
+	        << decision.persistent_incremental_angular_residual_count << ","
+	        << decision.persistent_incremental_chordal_residual_count << ","
+	        << decision.persistent_incremental_hybrid_angular_selected_count
+	        << ","
+	        << decision.persistent_incremental_hybrid_chordal_selected_count
+	        << ","
+	        << decision.persistent_incremental_angular_geometry_failure_count
+	        << ","
+        << decision.persistent_incremental_trust_region_retry_count << ","
+        << decision.persistent_incremental_trust_region_violation_ratio << ","
+        << decision.persistent_incremental_trust_region_anchor_weight_scale
         << ","
         << decision.persistent_incremental_elapsed_time_seconds << ","
         << CsvEscape(decision.persistent_incremental_commit_state) << ","

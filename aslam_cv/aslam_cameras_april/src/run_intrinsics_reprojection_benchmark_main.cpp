@@ -1149,6 +1149,74 @@ double UnitRayAngularDiffDeg(const Eigen::Vector3d& lhs,
   return std::acos(dot) * 180.0 / M_PI;
 }
 
+bool UnprojectPinholeEquidistantRayCurve(
+    const ati::OuterBootstrapCameraIntrinsics& intrinsics,
+    const Eigen::Vector2d& pixel,
+    Eigen::Vector3d* ray) {
+  if (ray == nullptr || intrinsics.fu <= 0.0 || intrinsics.fv <= 0.0) {
+    return false;
+  }
+  const std::vector<double> distortion = intrinsics.DistortionVector();
+  if (distortion.size() < 4u) {
+    return false;
+  }
+  const double xd = (pixel.x() - intrinsics.cu) / intrinsics.fu;
+  const double yd = (pixel.y() - intrinsics.cv) / intrinsics.fv;
+  const double rd = std::hypot(xd, yd);
+  if (!std::isfinite(rd)) {
+    return false;
+  }
+  if (rd < 1e-12) {
+    *ray = Eigen::Vector3d(0.0, 0.0, 1.0);
+    return true;
+  }
+
+  const auto theta_distorted = [&distortion](double theta) {
+    const double theta2 = theta * theta;
+    const double theta4 = theta2 * theta2;
+    const double theta6 = theta4 * theta2;
+    const double theta8 = theta4 * theta4;
+    return theta *
+           (1.0 + distortion[0] * theta2 + distortion[1] * theta4 +
+            distortion[2] * theta6 + distortion[3] * theta8);
+  };
+  const double max_theta = 0.5 * M_PI - 1e-9;
+  const double max_rd = theta_distorted(max_theta);
+  if (!std::isfinite(max_rd) || rd > max_rd + 1e-9) {
+    return false;
+  }
+
+  double low = 0.0;
+  double high = max_theta;
+  for (int iteration = 0; iteration < 80; ++iteration) {
+    const double mid = 0.5 * (low + high);
+    if (theta_distorted(mid) < rd) {
+      low = mid;
+    } else {
+      high = mid;
+    }
+  }
+  const double theta = 0.5 * (low + high);
+  const double ru = std::tan(theta);
+  const double scale = ru / rd;
+  *ray = Eigen::Vector3d(xd * scale, yd * scale, 1.0);
+  return ray->allFinite() && ray->norm() > 1e-12;
+}
+
+bool UnprojectForRayCurve(
+    const ati::OuterBootstrapCameraIntrinsics& intrinsics,
+    const ati::DoubleSphereCameraModel& camera,
+    const Eigen::Vector2d& pixel,
+    Eigen::Vector3d* ray) {
+  if (ray == nullptr) {
+    return false;
+  }
+  if (intrinsics.NormalizedFamilyString() == "pinhole-equi") {
+    return UnprojectPinholeEquidistantRayCurve(intrinsics, pixel, ray);
+  }
+  return camera.keypointToEuclidean(pixel, ray);
+}
+
 std::string RayCurvePolarBucket(double polar_deg) {
   if (polar_deg < 30.0) return "polar_0_30";
   if (polar_deg < 50.0) return "polar_30_50";
@@ -1237,8 +1305,10 @@ void WriteRayCurveComparisonCsvs(
         const Eigen::Vector2d pixel(x, y);
         Eigen::Vector3d baseline_ray = Eigen::Vector3d::Zero();
         Eigen::Vector3d reference_ray = Eigen::Vector3d::Zero();
-        if (!baseline_camera.keypointToEuclidean(pixel, &baseline_ray) ||
-            !reference_camera.keypointToEuclidean(pixel, &reference_ray) ||
+        if (!UnprojectForRayCurve(records.front().intrinsics,
+                                  baseline_camera, pixel, &baseline_ray) ||
+            !UnprojectForRayCurve(reference.intrinsics,
+                                  reference_camera, pixel, &reference_ray) ||
             baseline_ray.norm() <= 1e-12 || reference_ray.norm() <= 1e-12 ||
             !baseline_ray.allFinite() || !reference_ray.allFinite()) {
           continue;

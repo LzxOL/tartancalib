@@ -319,10 +319,22 @@ ati::InternalProjectionMode ParseProjectionModeOrThrow(const std::string& value)
       lowered == "virtual-pinhole-patch-edge-seed") {
     return ati::InternalProjectionMode::VirtualPinholePatchBoundarySeed;
   }
+  if (lowered == "pinhole_bootstrap_patch" ||
+      lowered == "pinhole-bootstrap-patch" ||
+      lowered == "outer_corner_pinhole_bootstrap_patch" ||
+      lowered == "outer-corner-pinhole-bootstrap-patch") {
+    return ati::InternalProjectionMode::PinholeBootstrapPatch;
+  }
   if (lowered == "sphere_lattice" || lowered == "sphere-lattice") {
     return ati::InternalProjectionMode::SphereLattice;
   }
   if (lowered == "sphere_border_lattice" || lowered == "sphere-border-lattice") {
+    return ati::InternalProjectionMode::SphereBorderLattice;
+  }
+  if (lowered == "spherical_intermediate" ||
+      lowered == "spherical-intermediate" ||
+      lowered == "current" ||
+      lowered == "ours") {
     return ati::InternalProjectionMode::SphereBorderLattice;
   }
   if (lowered == "pure_spherical_boundary_seed" ||
@@ -353,6 +365,8 @@ std::string DescribeMethodForReport(ati::InternalProjectionMode mode) {
       return "将 patch 上的几何预测点回投到原图，再直接在原图上做 cornerSubPix。";
     case ati::InternalProjectionMode::VirtualPinholePatchBoundarySeed:
       return "先在 visual-pinhole patch 上围绕预测点做黑白边界跃迁一致性 seed 搜索，再把 seed 回投到原图并做 cornerSubPix。";
+    case ati::InternalProjectionMode::PinholeBootstrapPatch:
+      return "每个 board observation 只用外四角点构造局部 virtual-pinhole patch，在 patch 中搜索 internal seed，再映射回原图做相同 refinement/check。";
     case ati::InternalProjectionMode::SphereLattice:
       return "先由位姿与相机模型给出预测射线，再在局部球面晶格候选中搜索 seed，最后在原图做 cornerSubPix。";
     case ati::InternalProjectionMode::SphereBorderLattice:

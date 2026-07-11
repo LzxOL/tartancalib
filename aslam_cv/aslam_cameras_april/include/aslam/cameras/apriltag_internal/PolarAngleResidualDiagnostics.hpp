@@ -28,6 +28,7 @@ struct PolarAngleBinStatistics {
   std::string point_type;
   int point_count = 0;
   double rmse = 0.0;
+  double pixel_rmse_px = 0.0;
   double mean_abs_x = 0.0;
   double mean_abs_y = 0.0;
   double std_x = 0.0;
@@ -36,6 +37,12 @@ struct PolarAngleBinStatistics {
   double p90_residual = 0.0;
   double p95_residual = 0.0;
   double max_residual = 0.0;
+  double angular_rmse_rad = 0.0;
+  double angular_equiv_px = 0.0;
+  double angular_median_rad = 0.0;
+  double angular_p90_rad = 0.0;
+  double angular_p95_rad = 0.0;
+  double angular_max_rad = 0.0;
 };
 
 struct PolarAngleDiagnosticsResult {
@@ -47,6 +54,7 @@ struct PolarAngleDiagnosticsResult {
   std::vector<PolarAngleBinStatistics> internal_only_bins;
   std::map<int, std::vector<PolarAngleBinStatistics>> per_board_bins;
   std::map<int, std::vector<PolarAngleBinStatistics>> per_frame_bins;
+  double angular_equiv_focal_px = 0.0;
 };
 
 class PolarAngleResidualDiagnostics {
@@ -69,6 +77,8 @@ class PolarAngleResidualDiagnostics {
   void ComputeBinStatistics(
       const std::vector<double>& polar_angles,
       const std::vector<double>& residual_norms,
+      const std::vector<double>& angular_residual_norms,
+      double angular_equiv_focal_px,
       PolarAngleBinStatistics* stats) const;
 
   void WriteSummaryFile(

@@ -152,8 +152,8 @@ struct FrozenRound2BaselineOptions {
   double internal_observation_min_weight = 0.25;
   double internal_observation_quality_exponent = 1.0;
   InternalPoseRescueMode internal_pose_rescue_mode =
-      InternalPoseRescueMode::Off;
-  double internal_pose_rescue_max_ray_angle_deg = 85.0;
+      InternalPoseRescueMode::Enabled;
+  double internal_pose_rescue_max_ray_angle_deg = 88.0;
   double internal_pose_rescue_accept_max_outer_rmse = 8.0;
   bool enable_geometry_prior_outer_seed = false;
   bool geometry_prior_rescue_diagnostic_only = true;

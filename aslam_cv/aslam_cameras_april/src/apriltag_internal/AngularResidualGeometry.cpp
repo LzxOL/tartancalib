@@ -57,17 +57,24 @@ const char* ToString(ResidualModel model) {
       return "hybrid_edge_angular";
     case ResidualModel::PolarContinuousHybrid:
       return "polar_continuous_hybrid";
+    case ResidualModel::Chordal:
+      return "chordal";
+    case ResidualModel::PixelChordalHybrid:
+      return "pixel_chordal_hybrid";
   }
   return "image_plane";
 }
 
 ResidualModel ParseResidualModel(const std::string& value) {
   const std::string lowered = Lowercase(value);
-  if (lowered == "image_plane" || lowered == "imageplane") {
+  if (lowered == "image_plane" || lowered == "imageplane" ||
+      lowered == "pixel" || lowered == "pixel_only" ||
+      lowered == "pixelonly") {
     return ResidualModel::ImagePlane;
   }
   if (lowered == "sphere_angular" || lowered == "sphereangular" ||
-      lowered == "angular") {
+      lowered == "angular" || lowered == "tangent_plane" ||
+      lowered == "tangentplane" || lowered == "tangent") {
     return ResidualModel::SphereAngular;
   }
   if (lowered == "normalized_sphere_angular" ||
@@ -77,13 +84,27 @@ ResidualModel ParseResidualModel(const std::string& value) {
     return ResidualModel::NormalizedSphereAngular;
   }
   if (lowered == "hybrid_edge_angular" || lowered == "hybridedgeangular" ||
-      lowered == "hybrid") {
+      lowered == "edge_hybrid" || lowered == "hard_hybrid") {
     return ResidualModel::HybridEdgeAngular;
   }
   if (lowered == "polar_continuous_hybrid" ||
       lowered == "polarcontinuoushybrid" ||
-      lowered == "continuous_hybrid" || lowered == "continuous") {
+      lowered == "continuous_hybrid" || lowered == "continuous" ||
+      lowered == "paper_hybrid" || lowered == "hybrid_paper" ||
+      lowered == "hybrid") {
     return ResidualModel::PolarContinuousHybrid;
+  }
+  if (lowered == "chordal" || lowered == "unit_bearing" ||
+      lowered == "unitbearing" || lowered == "bearing_chordal" ||
+      lowered == "unit_bearing_chordal") {
+    return ResidualModel::Chordal;
+  }
+  if (lowered == "pixel_chordal_hybrid" ||
+      lowered == "pixelchordalhybrid" ||
+      lowered == "pixel_chordal" ||
+      lowered == "pixel_plus_chordal" ||
+      lowered == "pixel+chordal") {
+    return ResidualModel::PixelChordalHybrid;
   }
   throw std::runtime_error("Unknown residual model: " + value);
 }
@@ -102,6 +123,20 @@ bool ComputeAngularObservationGeometry(
   if (!camera.keypointToEuclidean(observed_image_xy, &observed_ray)) {
     return false;
   }
+  return ComputeAngularObservationGeometryFromRay(
+      observed_image_xy, observed_ray, geometry);
+}
+
+bool ComputeAngularObservationGeometryFromRay(
+    const Eigen::Vector2d& observed_image_xy,
+    const Eigen::Vector3d& observed_ray,
+    AngularObservationGeometry* geometry) {
+  if (geometry == nullptr) {
+    throw std::runtime_error(
+        "ComputeAngularObservationGeometryFromRay requires a valid output pointer.");
+  }
+  *geometry = AngularObservationGeometry{};
+  geometry->observed_image_xy = observed_image_xy;
   const Eigen::Vector3d unit_ray = NormalizeOrZero(observed_ray);
   if (!unit_ray.allFinite() || unit_ray.isZero(1e-12)) {
     return false;
@@ -128,6 +163,26 @@ bool ComputeAngularPredictionGeometry(
                         std::numeric_limits<double>::quiet_NaN());
     return false;
   }
+  return ComputeAngularPredictionGeometryFromPoint(
+      point_camera, geometry->predicted_image_xy, geometry);
+}
+
+bool ComputeAngularPredictionGeometryFromPoint(
+    const Eigen::Vector3d& point_camera,
+    const Eigen::Vector2d& predicted_image_xy,
+    AngularPredictionGeometry* geometry) {
+  if (geometry == nullptr) {
+    throw std::runtime_error(
+        "ComputeAngularPredictionGeometryFromPoint requires a valid output pointer.");
+  }
+  *geometry = AngularPredictionGeometry{};
+  if (!predicted_image_xy.allFinite()) {
+    geometry->predicted_image_xy =
+        Eigen::Vector2d(std::numeric_limits<double>::quiet_NaN(),
+                        std::numeric_limits<double>::quiet_NaN());
+    return false;
+  }
+  geometry->predicted_image_xy = predicted_image_xy;
   const Eigen::Vector3d unit_ray = NormalizeOrZero(point_camera);
   if (!unit_ray.allFinite() || unit_ray.isZero(1e-12)) {
     return false;
@@ -168,6 +223,10 @@ bool ShouldUseAngularResidual(
       return std::isfinite(observed_polar_angle_deg) &&
              observed_polar_angle_deg >= hybrid_threshold_deg;
     case ResidualModel::PolarContinuousHybrid:
+      return false;
+    case ResidualModel::Chordal:
+      return false;
+    case ResidualModel::PixelChordalHybrid:
       return false;
   }
   return false;

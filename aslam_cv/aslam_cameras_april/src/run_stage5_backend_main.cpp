@@ -36,6 +36,8 @@ namespace {
 namespace ati = aslam::cameras::apriltag_internal;
 namespace fs = boost::filesystem;
 
+std::string MatrixToCsv(const Eigen::Matrix4d& matrix);
+
 constexpr const char kFrozenBaselineLabel[] = "stage5_backend_auto_v1";
 
 enum class IntrinsicsReleaseMode {
@@ -48,6 +50,7 @@ struct CmdArgs {
   std::string config_path;
   std::string image_path;
   std::string test_image_path;
+  bool external_holdout_self_frontend_prepass = false;
   std::string output_path;
   std::string kalibr_camchain_yaml;
   std::vector<std::string> reference_intrinsics_specs;
@@ -58,11 +61,13 @@ struct CmdArgs {
   std::string experiment_tag;
   std::string cache_dir;
   bool all = false;
-  bool stage5_enable_final_backend_ba = false;
   int reference_board_id = 1;
   bool include_internal_points = true;
   int intrinsics_release_iteration = 3;
   int second_pass_intrinsics_release_iteration = 1;
+  std::string split_mode = "random_holdout_ratio";
+  double holdout_ratio = 0.30;
+  unsigned int split_seed = 1337;
   int holdout_stride = 5;
   int holdout_offset = 0;
   bool disable_second_pass = false;
@@ -96,13 +101,13 @@ struct CmdArgs {
   bool stage5_trial_backend_selection_optimize_intrinsics = true;
   bool stage5_trial_backend_selection_delayed_intrinsics_release = true;
   int stage5_trial_backend_selection_intrinsics_release_iteration = 1;
-  bool stage5_trial_backend_selection_persistent_intrinsics_anchor_prior = true;
+  bool stage5_trial_backend_selection_persistent_intrinsics_anchor_prior = false;
   double stage5_trial_backend_selection_persistent_intrinsics_anchor_weight_xi_alpha = 0.0;
   double stage5_trial_backend_selection_persistent_intrinsics_anchor_weight_focal = 0.0;
   double stage5_trial_backend_selection_persistent_intrinsics_anchor_weight_principal = 0.0;
-  double stage5_trial_backend_selection_persistent_max_focal_relative_step = 0.03;
-  double stage5_trial_backend_selection_persistent_max_principal_step_px = 20.0;
-  double stage5_trial_backend_selection_persistent_max_xi_alpha_step = 0.03;
+  double stage5_trial_backend_selection_persistent_max_focal_relative_step = 0.0;
+  double stage5_trial_backend_selection_persistent_max_principal_step_px = 0.0;
+  double stage5_trial_backend_selection_persistent_max_xi_alpha_step = 0.0;
   int stage5_trial_backend_selection_max_iterations = 5;
   int stage5_trial_backend_selection_max_candidate_additions = 20;
   double stage5_trial_backend_selection_adaptive_budget_ratio = 0.10;
@@ -131,6 +136,7 @@ struct CmdArgs {
   double stage5_trial_backend_selection_frame_cohesion_min_candidate_score = 3.2;
   int stage5_trial_backend_selection_min_keep_per_board = 5;
   std::string stage5_trial_backend_selection_force_include_frame_board_list;
+  bool stage5_trial_backend_selection_force_include_list_is_exact_input = false;
   bool strict_board_observation_acceptance = false;
   bool preserve_frame_board_cohesion = false;
   bool ignore_image_evidence_min_quality = false;
@@ -162,8 +168,11 @@ struct CmdArgs {
   double backend_normalized_angular_reference_sigma_px = 1.0;
   double backend_normalized_angular_min_sigma_rad = 1e-6;
   double backend_normalized_angular_max_weight_scale = 1.0e8;
+  double backend_pixel_residual_weight = 1.0;
+  double backend_chordal_residual_weight = 1.0;
   bool backend_angular_use_normalize_jacobian = false;
   std::string backend_angular_observed_ray_mode = "dynamic_current_camera";
+  std::string backend_board_pose_parameterization = "reference_chain";
   bool backend_optimize_board_poses = true;
   bool backend_board_pose_prior = false;
   double backend_board_pose_prior_translation_sigma_mm = 20.0;
@@ -197,8 +206,8 @@ struct CmdArgs {
   double internal_blur_filter_min_board_rmse_px = 5.0;
   double internal_blur_filter_min_board_p95_px = 5.0;
   ati::InternalPoseRescueMode internal_pose_rescue_mode =
-      ati::InternalPoseRescueMode::Off;
-  double internal_pose_rescue_max_ray_angle_deg = 85.0;
+      ati::InternalPoseRescueMode::Enabled;
+  double internal_pose_rescue_max_ray_angle_deg = 88.0;
   double internal_pose_rescue_accept_max_outer_rmse = 8.0;
   bool enable_geometry_prior_outer_seed = true;
   bool geometry_prior_rescue_diagnostic_only = false;
@@ -278,6 +287,7 @@ struct CmdArgs {
   bool enable_global_scene_state_consistency_audit = false;
   bool enable_stage5_selection_diagnostics = false;
   bool export_holdout_reprojection_visualizations = false;
+  bool export_selected_case_visualizations = true;
   int holdout_visualization_top_k = 30;
   int multiboard_rigidity_top_k = 30;
   double multiboard_rigidity_rotation_bad_threshold_deg = 3.0;
@@ -398,9 +408,14 @@ std::string NormalizeStage5ModelFamily(std::string model) {
   if (model == "eucm" || model == "eucm-none") {
     return "eucm-none";
   }
+  if (model == "mei" || model == "omni" || model == "omni-radtan" ||
+      model == "omni_radtan" || model == "mei-radtan" ||
+      model == "radial-tangential-omni") {
+    return "omni-radtan";
+  }
   throw std::runtime_error(
       "Unsupported --models value: " + model +
-      " (supported: ds-none, pinhole-equi/kb, eucm-none)");
+      " (supported: ds-none, pinhole-equi/kb, eucm-none, mei/omni-radtan)");
 }
 
 void ApplyStage5ModelFamily(const std::string& model_family,
@@ -423,6 +438,9 @@ void ApplyStage5ModelFamily(const std::string& model_family,
   } else if (family == "eucm-none") {
     camera.camera_model = "eucm";
     camera.distortion_model = "none";
+  } else if (family == "omni-radtan") {
+    camera.camera_model = "omni";
+    camera.distortion_model = "radtan";
   }
   config->intermediate_camera = camera;
 }
@@ -473,10 +491,12 @@ struct RequestedExperimentConfig {
   int backend_point_budget_control_total_points = 0;
   unsigned int backend_point_budget_control_seed = 1337;
   int backend_max_boards_per_frame_for_ablation = -1;
+  bool export_selected_case_visualizations = true;
   bool backend_delayed_intrinsics_release = true;
   int backend_intrinsics_release_iteration = 1;
   IntrinsicsReleaseMode backend_intrinsics_release_mode =
       IntrinsicsReleaseMode::Delayed;
+  std::string backend_board_pose_parameterization = "reference_chain";
   bool enable_residual_sanity_gate = true;
   bool enable_board_pose_fit_gate = false;
   std::string selection_mode = "baseline";
@@ -505,13 +525,13 @@ struct RequestedExperimentConfig {
   bool trial_backend_selection_optimize_intrinsics = true;
   bool trial_backend_selection_delayed_intrinsics_release = true;
   int trial_backend_selection_intrinsics_release_iteration = 1;
-  bool trial_backend_selection_persistent_intrinsics_anchor_prior = true;
+  bool trial_backend_selection_persistent_intrinsics_anchor_prior = false;
   double trial_backend_selection_persistent_intrinsics_anchor_weight_xi_alpha = 0.0;
   double trial_backend_selection_persistent_intrinsics_anchor_weight_focal = 0.0;
   double trial_backend_selection_persistent_intrinsics_anchor_weight_principal = 0.0;
-  double trial_backend_selection_persistent_max_focal_relative_step = 0.03;
-  double trial_backend_selection_persistent_max_principal_step_px = 20.0;
-  double trial_backend_selection_persistent_max_xi_alpha_step = 0.03;
+  double trial_backend_selection_persistent_max_focal_relative_step = 0.0;
+  double trial_backend_selection_persistent_max_principal_step_px = 0.0;
+  double trial_backend_selection_persistent_max_xi_alpha_step = 0.0;
   int trial_backend_selection_max_iterations = 5;
   int trial_backend_selection_max_candidate_additions = 20;
   double trial_backend_selection_adaptive_budget_ratio = 0.10;
@@ -540,6 +560,7 @@ struct RequestedExperimentConfig {
   double trial_backend_selection_frame_cohesion_min_candidate_score = 3.2;
   int trial_backend_selection_min_keep_per_board = 5;
   std::string trial_backend_selection_force_include_frame_board_list;
+  bool trial_backend_selection_force_include_list_is_exact_input = false;
   bool strict_board_observation_acceptance = false;
   bool preserve_frame_board_cohesion = false;
   bool ignore_image_evidence_min_quality = false;
@@ -571,6 +592,8 @@ struct RequestedExperimentConfig {
   double backend_normalized_angular_reference_sigma_px = 1.0;
   double backend_normalized_angular_min_sigma_rad = 1e-6;
   double backend_normalized_angular_max_weight_scale = 1.0e8;
+  double backend_pixel_residual_weight = 1.0;
+  double backend_chordal_residual_weight = 1.0;
   bool backend_angular_use_normalize_jacobian = false;
   std::string backend_angular_observed_ray_mode = "dynamic_current_camera";
   bool backend_fixed_intrinsics = false;
@@ -598,8 +621,8 @@ struct RequestedExperimentConfig {
   double internal_blur_filter_min_board_rmse_px = 5.0;
   double internal_blur_filter_min_board_p95_px = 5.0;
   ati::InternalPoseRescueMode internal_pose_rescue_mode =
-      ati::InternalPoseRescueMode::Off;
-  double internal_pose_rescue_max_ray_angle_deg = 85.0;
+      ati::InternalPoseRescueMode::Enabled;
+  double internal_pose_rescue_max_ray_angle_deg = 88.0;
   double internal_pose_rescue_accept_max_outer_rmse = 8.0;
   bool enable_geometry_prior_outer_seed = true;
   bool geometry_prior_rescue_diagnostic_only = false;
@@ -1238,6 +1261,16 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
       residual_tag << "_thr"
                    << static_cast<int>(std::lround(
                           config.backend_hybrid_angular_threshold_deg));
+    } else if (config.backend_residual_model == "polar_continuous_hybrid" ||
+               config.backend_residual_model == "hybrid" ||
+               config.backend_residual_model == "paper_hybrid" ||
+               config.backend_residual_model == "hybrid_paper") {
+      residual_tag << "_theta"
+                   << static_cast<int>(std::lround(
+                          config.backend_polar_continuous_hybrid_threshold_deg))
+                   << "_temp"
+                   << static_cast<int>(std::lround(
+                          config.backend_polar_continuous_hybrid_temperature_deg));
     }
     if (config.backend_angular_observed_ray_mode != "dynamic_current_camera") {
       residual_tag << "_"
@@ -1299,8 +1332,7 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
   config.init_refine_mode =
       ati::ParseAutoCameraInitializationRefineMode(
           args.stage5_init_refine_mode);
-  config.outer_only_ablation_mode =
-      !args.include_internal_points && args.disable_second_pass;
+  config.outer_only_ablation_mode = !args.include_internal_points;
   config.include_internal_points = args.include_internal_points;
   config.run_second_pass = !args.disable_second_pass;
   if (config.outer_only_ablation_mode) {
@@ -1382,6 +1414,8 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.stage5_trial_backend_selection_adaptive_budget_max;
   config.trial_backend_selection_runtime_safety_ceiling =
       args.stage5_trial_backend_selection_runtime_safety_ceiling;
+  config.export_selected_case_visualizations =
+      args.export_selected_case_visualizations;
   config.trial_backend_selection_outlier_sigma =
       args.stage5_trial_backend_selection_outlier_sigma;
   config.trial_backend_selection_min_abs_threshold_px =
@@ -1426,6 +1460,8 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.stage5_trial_backend_selection_min_keep_per_board;
   config.trial_backend_selection_force_include_frame_board_list =
       args.stage5_trial_backend_selection_force_include_frame_board_list;
+  config.trial_backend_selection_force_include_list_is_exact_input =
+      args.stage5_trial_backend_selection_force_include_list_is_exact_input;
   config.strict_board_observation_acceptance =
       args.strict_board_observation_acceptance;
   config.preserve_frame_board_cohesion = args.preserve_frame_board_cohesion;
@@ -1502,6 +1538,13 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.use_intermediate_for_round1_internal_regeneration;
   config.use_intermediate_for_full_frontend_regeneration =
       args.use_intermediate_for_full_frontend_regeneration;
+  if (config.outer_only_ablation_mode) {
+    config.internal_regeneration_diagnostics = false;
+    config.export_internal_seed_step_overlays = false;
+    config.internal_blur_diagnostics = false;
+    config.use_intermediate_for_round1_internal_regeneration = false;
+    config.use_intermediate_for_full_frontend_regeneration = false;
+  }
   config.intermediate_optimize_intrinsics =
       args.intermediate_optimize_intrinsics;
   config.intermediate_optimize_board_poses =
@@ -1601,10 +1644,16 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.backend_normalized_angular_min_sigma_rad;
   config.backend_normalized_angular_max_weight_scale =
       args.backend_normalized_angular_max_weight_scale;
+  config.backend_pixel_residual_weight =
+      args.backend_pixel_residual_weight;
+  config.backend_chordal_residual_weight =
+      args.backend_chordal_residual_weight;
   config.backend_angular_use_normalize_jacobian =
       args.backend_angular_use_normalize_jacobian;
 	  config.backend_angular_observed_ray_mode =
 	      args.backend_angular_observed_ray_mode;
+	  config.backend_board_pose_parameterization =
+	      args.backend_board_pose_parameterization;
 	  config.backend_optimize_board_poses = args.backend_optimize_board_poses;
 	  config.backend_board_pose_prior = args.backend_board_pose_prior;
 	  config.backend_board_pose_prior_translation_sigma_mm =
@@ -1760,13 +1809,17 @@ void PrintUsage(const char* program) {
       << "Core options:\n"
       << "  --image PATH                         Training image or directory.\n"
       << "  --test-image PATH                    Optional holdout image or directory.\n"
+      << "  --stage5-external-holdout-self-frontend-prepass\n"
+      << "                                      For external --test-image evaluation,\n"
+      << "                                      build test observations from a frozen\n"
+      << "                                      frontend prepass on the test set itself.\n"
       << "  --config PATH                        AprilTag-internal config YAML.\n"
       << "  --kalibr-camchain PATH               Kalibr reference camchain for comparison.\n"
       << "  --reference-intrinsics-yaml LABEL:PATH\n"
       << "                                      Extra reference camera YAML/camchain for\n"
       << "                                      evaluation only; repeatable. LABEL is\n"
       << "                                      optional when using just PATH.\n"
-      << "  --models ds-none|pinhole-equi|kb|eucm-none\n"
+      << "  --models ds-none|pinhole-equi|kb|eucm-none|mei\n"
       << "                                      Stage5 calibration camera model family;\n"
       << "                                      default ds-none. This follows Kalibr-style\n"
       << "                                      explicit model selection instead of target YAML.\n"
@@ -1776,11 +1829,17 @@ void PrintUsage(const char* program) {
       << "  --output PATH                        Output directory.\n"
       << "  --runtime-mode research|fast         Runtime preset.\n"
       << "  --cache-dir PATH                     Optional frontend cache directory.\n"
+      << "  --split-mode random_holdout_ratio|deterministic_stride\n"
+      << "                                      Internal train/holdout split when no\n"
+      << "                                      --test-image is provided; default random.\n"
+      << "  --holdout-ratio R                    Random holdout fraction; default 0.30.\n"
+      << "  --split-seed N                       Random split seed; default 1337.\n"
+      << "  --holdout-stride N --holdout-offset N\n"
+      << "                                      Legacy deterministic split controls.\n"
       << "  --all                                Run the full Stage5 pipeline.\n\n"
       << "Baseline controls:\n"
       << "  --include-internal-points 0|1        Internal/outer-only ablation.\n"
       << "  --backend-fixed-intrinsics           Pose/structure-only backend ablation.\n"
-      << "  --stage5-enable-final-backend-ba     Run the extra final backend BA ablation.\n"
       << "  --disable-second-pass                Disable Round2 regeneration.\n"
       << "  --intrinsics-release-mode delayed|immediate|pose_only\n"
       << "  --intrinsics-release-iteration N\n"
@@ -1807,7 +1866,7 @@ void PrintUsage(const char* program) {
       << "  --stage5-trial-backend-selection-intrinsics-release-iteration N"
       << " (default 1)\n"
       << "  --stage5-trial-backend-selection-persistent-intrinsics-anchor-prior 0|1"
-      << " (default 0; ablation for anchoring candidate intrinsics)\n"
+      << " (default 1; trust-region anchor for candidate intrinsics)\n"
       << "  --stage5-trial-backend-selection-persistent-intrinsics-anchor-weight-xi-alpha W\n"
       << "  --stage5-trial-backend-selection-persistent-intrinsics-anchor-weight-focal W\n"
       << "  --stage5-trial-backend-selection-persistent-intrinsics-anchor-weight-principal W\n"
@@ -1824,11 +1883,15 @@ void PrintUsage(const char* program) {
       << "  --stage5-trial-backend-selection-max-accepted-per-board N\n"
       << "  --stage5-trial-backend-selection-max-accepted-per-frame N\n"
       << "  --stage5-trial-backend-selection-frame-cohesion\n"
+      << "  --stage5-trial-backend-selection-force-include-list-is-exact-input 0|1"
+      << " (paper ablation: use force-list as the only backend input)\n"
       << "  --stage5-trial-backend-selection-frame-cohesion-max-companions N"
       << " (<=0 auto from observed boards)\n"
 	      << "  --stage5-trial-backend-selection-close-distance-boost\n"
 	      << "  --stage5-trial-backend-selection-close-distance-frame-admission\n\n"
 	      << "Backend input ablations:\n"
+	      << "  --backend-board-pose-parameterization "
+              << "reference_chain|independent_frame_board_pose\n"
 	      << "  --stage5-backend-board-pose-prior\n"
 	      << "  --stage5-backend-board-pose-prior-translation-sigma-mm MM\n"
 	      << "  --stage5-backend-board-pose-prior-rotation-sigma-deg DEG\n"
@@ -1840,6 +1903,7 @@ void PrintUsage(const char* program) {
       << "  --internal-regeneration-diagnostics\n"
       << "  --stage5-enable-selection-diagnostics\n"
       << "  --stage5-export-holdout-reprojection-visualizations\n"
+      << "  --stage5-disable-selected-case-visualizations\n"
       << "  --stage5-holdout-visualization-top-k N\n"
       << "  --stage5-enable-global-scene-state-consistency-audit\n"
       << "  --stage5-enable-polar-angle-diagnostics\n"
@@ -1858,6 +1922,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
     } else if ((token == "--test-image" || token == "--holdout-image") &&
                i + 1 < argc) {
       args.test_image_path = argv[++i];
+    } else if (token == "--stage5-external-holdout-self-frontend-prepass") {
+      args.external_holdout_self_frontend_prepass = true;
     } else if (token == "--config" && i + 1 < argc) {
       args.config_path = argv[++i];
     } else if (token == "--output" && i + 1 < argc) {
@@ -2181,6 +2247,12 @@ CmdArgs ParseArgs(int argc, char** argv) {
         i + 1 < argc) {
       args.stage5_trial_backend_selection_force_include_frame_board_list =
           argv[++i];
+    } else if (
+        token ==
+            "--stage5-trial-backend-selection-force-include-list-is-exact-input" &&
+        i + 1 < argc) {
+      args.stage5_trial_backend_selection_force_include_list_is_exact_input =
+          std::stoi(argv[++i]) != 0;
     } else if (token == "--strict-board-observation-acceptance") {
       args.strict_board_observation_acceptance = true;
     } else if (token == "--stage5-preserve-frame-board-cohesion") {
@@ -2255,6 +2327,12 @@ CmdArgs ParseArgs(int argc, char** argv) {
                i + 1 < argc) {
       args.backend_normalized_angular_max_weight_scale =
           std::stod(argv[++i]);
+    } else if (token == "--backend-pixel-residual-weight" &&
+               i + 1 < argc) {
+      args.backend_pixel_residual_weight = std::stod(argv[++i]);
+    } else if (token == "--backend-chordal-residual-weight" &&
+               i + 1 < argc) {
+      args.backend_chordal_residual_weight = std::stod(argv[++i]);
     } else if (token == "--backend-angular-use-normalize-jacobian" &&
                i + 1 < argc) {
       args.backend_angular_use_normalize_jacobian =
@@ -2262,6 +2340,10 @@ CmdArgs ParseArgs(int argc, char** argv) {
     } else if (token == "--backend-angular-observed-ray-mode" &&
                i + 1 < argc) {
       args.backend_angular_observed_ray_mode = argv[++i];
+    } else if ((token == "--backend-board-pose-parameterization" ||
+                token == "--stage5-backend-board-pose-parameterization") &&
+               i + 1 < argc) {
+      args.backend_board_pose_parameterization = argv[++i];
 	    } else if ((token == "--stage5-backend-optimize-board-poses" ||
 	                token == "--backend-optimize-board-poses") &&
 	               i + 1 < argc) {
@@ -2652,8 +2734,12 @@ CmdArgs ParseArgs(int argc, char** argv) {
     } else if (
         token == "--stage5-export-holdout-reprojection-visualizations") {
       args.export_holdout_reprojection_visualizations = true;
+    } else if (token == "--stage5-disable-selected-case-visualizations") {
+      args.export_selected_case_visualizations = false;
     } else if (token == "--stage5-enable-final-backend-ba") {
-      args.stage5_enable_final_backend_ba = true;
+      throw std::runtime_error(
+          "--stage5-enable-final-backend-ba has been removed. Stage5 uses only "
+          "incremental selection BA; no final backend BA is available.");
     } else if (token == "--stage5-holdout-visualization-top-k" &&
                i + 1 < argc) {
       args.holdout_visualization_top_k = std::stoi(argv[++i]);
@@ -2687,6 +2773,12 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.intrinsics_release_iteration = std::stoi(argv[++i]);
     } else if (token == "--second-pass-intrinsics-release-iteration" && i + 1 < argc) {
       args.second_pass_intrinsics_release_iteration = std::stoi(argv[++i]);
+    } else if (token == "--split-mode" && i + 1 < argc) {
+      args.split_mode = argv[++i];
+    } else if (token == "--holdout-ratio" && i + 1 < argc) {
+      args.holdout_ratio = std::stod(argv[++i]);
+    } else if (token == "--split-seed" && i + 1 < argc) {
+      args.split_seed = static_cast<unsigned int>(std::stoul(argv[++i]));
     } else if (token == "--holdout-stride" && i + 1 < argc) {
       args.holdout_stride = std::stoi(argv[++i]);
     } else if (token == "--holdout-offset" && i + 1 < argc) {
@@ -2784,6 +2876,17 @@ CmdArgs ParseArgs(int argc, char** argv) {
             "--backend-polar-angle-weight-fixed-bin-scales values must be in [0, 1].");
       }
     }
+  }
+  if (args.split_mode != "random_holdout_ratio" &&
+      args.split_mode != "random_ratio" &&
+      args.split_mode != "random_70_30" &&
+      args.split_mode != "deterministic_stride" &&
+      args.split_mode != "stride") {
+    throw std::runtime_error(
+        "--split-mode must be random_holdout_ratio or deterministic_stride.");
+  }
+  if (!(args.holdout_ratio > 0.0 && args.holdout_ratio < 1.0)) {
+    throw std::runtime_error("--holdout-ratio must be in (0, 1).");
   }
   return args;
 }
@@ -3551,6 +3654,11 @@ void ExportHoldoutReprojectionVisualizations(
   }
 }
 
+std::string JoinStringVector(const std::vector<std::string>& values,
+                             const std::string& separator);
+std::string JoinDoubleVector(const std::vector<double>& values,
+                             const std::string& separator);
+
 void WriteEvaluationSummary(const std::string& path,
                             const ati::CameraModelRefitEvaluationResult& evaluation) {
   std::ofstream output(path.c_str());
@@ -3596,9 +3704,239 @@ void WriteEvaluationSummary(const std::string& path,
   output << "camera_fv: " << evaluation.camera.fv << "\n";
   output << "camera_cu: " << evaluation.camera.cu << "\n";
   output << "camera_cv: " << evaluation.camera.cv << "\n";
+  output << "camera_model_family: "
+         << evaluation.camera.NormalizedFamilyString() << "\n";
+  output << "camera_model: " << evaluation.camera.camera_model << "\n";
+  output << "camera_distortion_model: "
+         << evaluation.camera.distortion_model << "\n";
+  output << "camera_intrinsics_labels: "
+         << JoinStringVector(evaluation.camera.IntrinsicsLabels(), ",") << "\n";
+  output << "camera_intrinsics_csv: "
+         << JoinDoubleVector(evaluation.camera.IntrinsicsVector(), ",") << "\n";
+  output << "camera_distortion_labels: "
+         << JoinStringVector(evaluation.camera.DistortionLabels(), ",") << "\n";
+  output << "camera_distortion_csv: "
+         << JoinDoubleVector(evaluation.camera.DistortionVector(), ",") << "\n";
+  output << "camera_combined_labels: "
+         << JoinStringVector(evaluation.camera.CombinedParameterLabels(), ",")
+         << "\n";
+  output << "camera_combined_csv: "
+         << JoinDoubleVector(evaluation.camera.CombinedParameterVector(), ",")
+         << "\n";
   for (const std::string& warning : evaluation.warnings) {
     output << "warning: " << warning << "\n";
   }
+}
+
+void WriteCommittedBackendTrainingSummary(
+    const std::string& path,
+    const ati::AslamBackendCalibrationResult& backend_result) {
+  const ati::JointResidualEvaluationResult& evaluation =
+      backend_result.optimized_residual;
+  std::ofstream output(path.c_str());
+  output << "success: " << (evaluation.success ? 1 : 0) << "\n";
+  output << "failure_reason: " << evaluation.failure_reason << "\n";
+  output << "method_label: backend_committed_state\n";
+  output << "split_label: training\n";
+  output << "split_signature: "
+         << backend_result.training_split_signature
+         << "_backend_committed_state\n";
+  output << "evaluation_pose_mode: committed_backend_scene_state\n";
+  output << "pose_only_refit_rmse: nan\n";
+  output << "pose_only_refit_success_rate: nan\n";
+  output << "pose_only_refit_attempt_count: 0\n";
+  output << "pose_only_refit_success_count: 0\n";
+  output << "overall_rmse: " << evaluation.overall_rmse << "\n";
+  output << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
+  output << "internal_only_rmse: " << evaluation.internal_only_rmse << "\n";
+  output << "excluded_board_id_for_rmse: "
+         << backend_result.optimized_scene_state.reference_board_id << "\n";
+  output << "overall_rmse_excluding_board: nan\n";
+  output << "outer_only_rmse_excluding_board: nan\n";
+  output << "internal_only_rmse_excluding_board: nan\n";
+  output << "mean_residual_x: nan\n";
+  output << "mean_residual_y: nan\n";
+  output << "std_residual_x: nan\n";
+  output << "std_residual_y: nan\n";
+  output << "point_count: " << evaluation.point_diagnostics.size() << "\n";
+  int outer_count = 0;
+  int internal_count = 0;
+  for (const ati::JointResidualPointDiagnostics& point :
+       evaluation.point_diagnostics) {
+    if (point.point_type == ati::JointPointType::Outer) {
+      ++outer_count;
+    } else {
+      ++internal_count;
+    }
+  }
+  output << "outer_point_count: " << outer_count << "\n";
+  output << "internal_point_count: " << internal_count << "\n";
+  output << "point_count_excluding_board: 0\n";
+  output << "outer_point_count_excluding_board: 0\n";
+  output << "internal_point_count_excluding_board: 0\n";
+  output << "camera_xi: "
+         << backend_result.optimized_scene_state.camera.xi << "\n";
+  output << "camera_alpha: "
+         << backend_result.optimized_scene_state.camera.alpha << "\n";
+  output << "camera_fu: "
+         << backend_result.optimized_scene_state.camera.fu << "\n";
+  output << "camera_fv: "
+         << backend_result.optimized_scene_state.camera.fv << "\n";
+  output << "camera_cu: "
+         << backend_result.optimized_scene_state.camera.cu << "\n";
+  output << "camera_cv: "
+         << backend_result.optimized_scene_state.camera.cv << "\n";
+  output << "camera_model_family: "
+         << backend_result.optimized_scene_state.camera
+                .NormalizedFamilyString()
+         << "\n";
+  output << "camera_model: "
+         << backend_result.optimized_scene_state.camera.camera_model
+         << "\n";
+  output << "camera_distortion_model: "
+         << backend_result.optimized_scene_state.camera
+                .distortion_model
+         << "\n";
+  output << "camera_intrinsics_labels: "
+         << JoinStringVector(
+                backend_result.optimized_scene_state.camera
+                    .IntrinsicsLabels(),
+                ",")
+         << "\n";
+  output << "camera_intrinsics_csv: "
+         << JoinDoubleVector(
+                backend_result.optimized_scene_state.camera
+                    .IntrinsicsVector(),
+                ",")
+         << "\n";
+  output << "camera_distortion_labels: "
+         << JoinStringVector(
+                backend_result.optimized_scene_state.camera
+                    .DistortionLabels(),
+                ",")
+         << "\n";
+  output << "camera_distortion_csv: "
+         << JoinDoubleVector(
+                backend_result.optimized_scene_state.camera
+                    .DistortionVector(),
+                ",")
+         << "\n";
+  output << "camera_combined_labels: "
+         << JoinStringVector(
+                backend_result.optimized_scene_state.camera
+                    .CombinedParameterLabels(),
+                ",")
+         << "\n";
+  output << "camera_combined_csv: "
+         << JoinDoubleVector(
+                backend_result.optimized_scene_state.camera
+                    .CombinedParameterVector(),
+                ",")
+         << "\n";
+  output << "warning: training summary uses committed backend scene poses; "
+            "holdout summary uses per-board pose-only refit because holdout "
+            "frames are not in the optimized training scene.\n";
+}
+
+void WriteCommittedBackendTrainingPointsCsv(
+    const std::string& path,
+    const ati::JointResidualEvaluationResult& evaluation) {
+  std::ofstream output(path.c_str());
+  output << "method,split,frame_index,frame_label,board_id,point_id,point_type,"
+         << "observed_x,observed_y,predicted_x,predicted_y,target_x,target_y,"
+         << "target_z,residual_x,residual_y,residual_norm,debug_quality,"
+         << "source_kind,source_point_index\n";
+  for (const ati::JointResidualPointDiagnostics& point :
+       evaluation.point_diagnostics) {
+    output << "backend_committed_state,training,"
+           << point.frame_index << ","
+           << point.frame_label << ","
+           << point.board_id << ","
+           << point.point_id << ","
+           << ati::ToString(point.point_type) << ","
+           << point.observed_image_xy.x() << ","
+           << point.observed_image_xy.y() << ","
+           << point.predicted_image_xy.x() << ","
+           << point.predicted_image_xy.y() << ","
+           << point.target_xyz_board.x() << ","
+           << point.target_xyz_board.y() << ","
+           << point.target_xyz_board.z() << ","
+           << point.residual_xy.x() << ","
+           << point.residual_xy.y() << ","
+           << point.residual_norm << ","
+           << point.quality << ","
+           << ati::ToString(point.source_kind) << ","
+           << point.source_point_index << "\n";
+  }
+}
+
+void WriteBackendBoardPosesCsv(
+    const std::string& path,
+    const ati::AslamBackendCalibrationResult& backend_result) {
+  std::ofstream output(path.c_str());
+  output << std::setprecision(12);
+  output << "board_id,initialized,observation_count,rmse,T_reference_board_16\n";
+  for (const ati::JointSceneBoardState& board :
+       backend_result.optimized_scene_state.boards) {
+    output << board.board_id << "," << (board.initialized ? 1 : 0)
+           << "," << board.observation_count << "," << board.rmse << ","
+           << MatrixToCsv(board.T_reference_board) << "\n";
+  }
+}
+
+ati::CameraModelRefitEvaluationResult MakeCommittedBackendTrainingEvaluation(
+    const ati::AslamBackendCalibrationResult& backend_result) {
+  ati::CameraModelRefitEvaluationResult result;
+  const ati::JointResidualEvaluationResult& residual =
+      backend_result.optimized_residual;
+  result.success = residual.success;
+  result.method_label = "backend";
+  result.split_label = "training";
+  result.split_signature =
+      backend_result.training_split_signature +
+      "_backend_committed_state";
+  result.camera = backend_result.optimized_scene_state.camera;
+  result.pose_only_refit_attempt_count = 0;
+  result.pose_only_refit_success_count = 0;
+  result.pose_only_refit_success_rate = 0.0;
+  result.pose_only_refit_rmse = residual.outer_only_rmse;
+  result.overall_rmse = residual.overall_rmse;
+  result.outer_only_rmse = residual.outer_only_rmse;
+  result.internal_only_rmse = residual.internal_only_rmse;
+  result.excluded_board_id_for_rmse =
+      backend_result.optimized_scene_state.reference_board_id;
+  result.overall_rmse_excluding_board = std::numeric_limits<double>::quiet_NaN();
+  result.outer_only_rmse_excluding_board =
+      std::numeric_limits<double>::quiet_NaN();
+  result.internal_only_rmse_excluding_board =
+      std::numeric_limits<double>::quiet_NaN();
+  result.mean_residual_x = std::numeric_limits<double>::quiet_NaN();
+  result.mean_residual_y = std::numeric_limits<double>::quiet_NaN();
+  result.std_residual_x = std::numeric_limits<double>::quiet_NaN();
+  result.std_residual_y = std::numeric_limits<double>::quiet_NaN();
+
+  for (const ati::JointResidualPointDiagnostics& point :
+       residual.point_diagnostics) {
+    ++result.point_count;
+    if (point.point_type == ati::JointPointType::Outer) {
+      ++result.outer_point_count;
+    } else {
+      ++result.internal_point_count;
+    }
+  }
+  result.point_count_excluding_board = 0;
+  result.outer_point_count_excluding_board = 0;
+  result.internal_point_count_excluding_board = 0;
+  result.evaluated_frame_count =
+      static_cast<int>(residual.frame_diagnostics.size());
+  result.evaluated_board_observation_count =
+      static_cast<int>(residual.board_observation_diagnostics.size());
+  result.warnings.push_back(
+      "training evaluation uses committed backend scene poses; "
+      "pose_only_refit fields are not used for training because accepted "
+      "training frames already have optimized pose variables.");
+  result.failure_reason = residual.failure_reason;
+  return result;
 }
 
 void WriteBackendComparisonSummary(
@@ -3990,6 +4328,31 @@ std::string MatrixToCsv(const Eigen::Matrix4d& matrix) {
   return stream.str();
 }
 
+std::string JoinStringVector(const std::vector<std::string>& values,
+                             const std::string& separator) {
+  std::ostringstream stream;
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (index != 0u) {
+      stream << separator;
+    }
+    stream << values[index];
+  }
+  return stream.str();
+}
+
+std::string JoinDoubleVector(const std::vector<double>& values,
+                             const std::string& separator) {
+  std::ostringstream stream;
+  stream << std::setprecision(12);
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (index != 0u) {
+      stream << separator;
+    }
+    stream << values[index];
+  }
+  return stream.str();
+}
+
 std::string ResidualPointKey(
     const ati::JointResidualPointDiagnostics& point) {
   std::ostringstream stream;
@@ -4280,6 +4643,10 @@ void WriteExperimentConfigSummary(
          << ati::ToString(requested.camera_init_mode) << "\n";
   output << "requested_outer_only_ablation_mode: "
          << (requested.outer_only_ablation_mode ? 1 : 0) << "\n";
+  output << "requested_strict_outer_only_ablation: "
+         << (!requested.include_internal_points ? 1 : 0) << "\n";
+  output << "requested_internal_regeneration_skipped_for_outer_only: "
+         << (requested.outer_only_ablation_mode ? 1 : 0) << "\n";
   output << "requested_ablation_mode: "
          << (requested.outer_only_ablation_mode ? "outer_only" : "with_internal")
          << "\n";
@@ -4298,6 +4665,8 @@ void WriteExperimentConfigSummary(
          << (requested.backend_optimize_intrinsics ? 1 : 0) << "\n";
   output << "requested_backend_optimize_board_poses: "
          << (requested.backend_optimize_board_poses ? 1 : 0) << "\n";
+  output << "requested_backend_board_pose_parameterization: "
+         << requested.backend_board_pose_parameterization << "\n";
   output << "requested_backend_board_pose_prior: "
          << (requested.backend_board_pose_prior ? 1 : 0) << "\n";
   output << "requested_backend_board_pose_prior_translation_sigma_mm: "
@@ -4347,6 +4716,14 @@ void WriteExperimentConfigSummary(
   output << "requested_close_edge_outer_subpix_multiplier: "
          << report.baseline_result.effective_options
                 .config.outer_detector_config.close_edge_outer_subpix_multiplier
+         << "\n";
+  output << "requested_close_edge_outer_subpix_max_multiplier: "
+         << report.baseline_result.effective_options
+                .config.outer_detector_config.close_edge_outer_subpix_max_multiplier
+         << "\n";
+  output << "requested_close_edge_outer_subpix_full_polar_deg: "
+         << report.baseline_result.effective_options
+                .config.outer_detector_config.close_edge_outer_subpix_full_polar_deg
          << "\n";
   output << "requested_enable_residual_sanity_gate: "
          << (requested.enable_residual_sanity_gate ? 1 : 0) << "\n";
@@ -4449,6 +4826,8 @@ void WriteExperimentConfigSummary(
          << requested.trial_backend_selection_adaptive_budget_max << "\n";
   output << "requested_stage5_trial_backend_selection_runtime_safety_ceiling: "
          << requested.trial_backend_selection_runtime_safety_ceiling << "\n";
+  output << "requested_stage5_export_selected_case_visualizations: "
+         << (requested.export_selected_case_visualizations ? 1 : 0) << "\n";
   output << "requested_stage5_trial_backend_selection_outlier_sigma: "
          << requested.trial_backend_selection_outlier_sigma << "\n";
   output << "requested_stage5_trial_backend_selection_min_abs_threshold_px: "
@@ -4470,6 +4849,11 @@ void WriteExperimentConfigSummary(
          << requested.trial_backend_selection_min_coverage_gain << "\n";
   output << "requested_stage5_trial_backend_selection_force_include_frame_board_list: "
          << requested.trial_backend_selection_force_include_frame_board_list
+         << "\n";
+  output << "requested_stage5_trial_backend_selection_force_include_list_is_exact_input: "
+         << (requested.trial_backend_selection_force_include_list_is_exact_input
+                 ? 1
+                 : 0)
          << "\n";
   output << "requested_stage5_trial_backend_selection_use_consistency_score: "
          << (requested.trial_backend_selection_use_consistency_score ? 1 : 0)
@@ -4580,6 +4964,10 @@ void WriteExperimentConfigSummary(
          << requested.backend_normalized_angular_min_sigma_rad << "\n";
   output << "requested_backend_normalized_angular_max_weight_scale: "
          << requested.backend_normalized_angular_max_weight_scale << "\n";
+  output << "requested_backend_pixel_residual_weight: "
+         << requested.backend_pixel_residual_weight << "\n";
+  output << "requested_backend_chordal_residual_weight: "
+         << requested.backend_chordal_residual_weight << "\n";
   output << "requested_backend_angular_use_normalize_jacobian: "
          << (requested.backend_angular_use_normalize_jacobian ? 1 : 0)
          << "\n";
@@ -4938,6 +5326,12 @@ void WriteExperimentConfigSummary(
   }
   output << "\n";
   output << "effective_outer_only_ablation_mode: "
+         << (report.baseline_result.effective_options.outer_only_ablation_mode ? 1 : 0)
+         << "\n";
+  output << "effective_strict_outer_only_ablation: "
+         << (!report.baseline_result.effective_options.include_internal_points ? 1 : 0)
+         << "\n";
+  output << "effective_internal_regeneration_skipped_for_outer_only: "
          << (report.baseline_result.effective_options.outer_only_ablation_mode ? 1 : 0)
          << "\n";
   output << "effective_ablation_mode: "
@@ -5315,6 +5709,74 @@ void WriteExperimentConfigSummary(
   output << "effective_stage5_trial_backend_batch_acceptance_rejected_score_count: "
          << report.trial_backend_selection_result
                 .batch_acceptance_rejected_score_count
+         << "\n";
+  output << "effective_stage5_persistent_incremental_trust_region_backtracking_batch_count: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_trust_region_backtracking_batch_count
+         << "\n";
+  output << "effective_stage5_persistent_incremental_trust_region_backtracking_attempt_count: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_trust_region_backtracking_attempt_count
+         << "\n";
+  output << "effective_stage5_persistent_incremental_trust_region_backtracking_accepted_count: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_trust_region_backtracking_accepted_count
+         << "\n";
+  output << "effective_stage5_persistent_incremental_trust_region_backtracking_max_anchor_scale: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_trust_region_backtracking_max_anchor_scale
+         << "\n";
+  output << "effective_stage5_persistent_incremental_normalize_information_gain_by_board_observation: "
+         << (report.trial_backend_selection_result
+                     .persistent_incremental_normalize_information_gain_by_board_observation
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_stage5_persistent_incremental_split_residual_health_gate_enabled: "
+         << (report.trial_backend_selection_result
+                     .persistent_incremental_split_residual_health_gate_enabled
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_stage5_persistent_incremental_split_residual_health_rejected_count: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_split_residual_health_rejected_count
+         << "\n";
+  output << "effective_stage5_persistent_incremental_adaptive_saturation_stop_enabled: "
+         << (report.trial_backend_selection_result
+                     .persistent_incremental_adaptive_saturation_stop_enabled
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_stage5_persistent_incremental_adaptive_saturation_stop_hit: "
+         << (report.trial_backend_selection_result
+                     .persistent_incremental_adaptive_saturation_stop_hit
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_stage5_persistent_incremental_adaptive_saturation_min_accepted_batches: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_adaptive_saturation_min_accepted_batches
+         << "\n";
+  output << "effective_stage5_persistent_incremental_adaptive_saturation_nonproductive_batch_limit: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_adaptive_saturation_nonproductive_batch_limit
+         << "\n";
+  output << "effective_stage5_persistent_incremental_adaptive_saturation_consecutive_nonproductive_batches: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_adaptive_saturation_consecutive_nonproductive_batches
+         << "\n";
+  output << "effective_stage5_persistent_incremental_adaptive_saturation_tail_ordering_score_threshold: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_adaptive_saturation_tail_ordering_score_threshold
+         << "\n";
+  output << "effective_stage5_persistent_incremental_adaptive_saturation_next_ordering_score: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_adaptive_saturation_next_ordering_score
+         << "\n";
+  output << "effective_stage5_persistent_incremental_adaptive_saturation_stop_reason: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_adaptive_saturation_stop_reason
          << "\n";
   output << "effective_stage5_close_distance_candidate_count: "
          << report.trial_backend_selection_result.close_distance_candidate_count
@@ -5770,11 +6232,9 @@ void WriteExperimentConfigSummary(
     output << "backend_failure_reason: " << backend_result->failure_reason << "\n";
     output << "backend_skip_optimization: "
            << (backend_result->options.skip_optimization ? 1 : 0) << "\n";
-    output << "backend_final_state_label: "
-           << (backend_result->options.skip_optimization
-                   ? "after_trial_backend_selection"
-                   : "after_final_backend_ba")
-           << "\n";
+    output << "backend_final_state_label: after_incremental_selection_ba\n";
+    output << "backend_board_pose_parameterization: "
+           << backend_result->board_pose_parameterization << "\n";
     output << "effective_backend_runner_optimize_intrinsics: "
            << (backend_result->effective_problem_input.optimization_masks
                        .optimize_intrinsics
@@ -6693,6 +7153,49 @@ void PrintProgress(const std::string& message) {
   std::cout << "[stage5_backend] " << message << std::endl;
 }
 
+void ValidateBackendResidualConfiguration(
+    const RequestedExperimentConfig& config) {
+  const ati::ResidualModel model =
+      ati::ParseResidualModel(config.backend_residual_model);
+  ati::ParseResidualModel(config.backend_outer_residual_model);
+  ati::ParseResidualModel(config.backend_internal_residual_model);
+  auto require_finite_nonnegative = [](double value, const char* name) {
+    if (!std::isfinite(value) || value < 0.0) {
+      throw std::runtime_error(std::string(name) +
+                               " must be finite and non-negative.");
+    }
+  };
+  require_finite_nonnegative(config.backend_pixel_residual_weight,
+                             "--backend-pixel-residual-weight");
+  require_finite_nonnegative(config.backend_chordal_residual_weight,
+                             "--backend-chordal-residual-weight");
+  if (!std::isfinite(config.backend_hybrid_angular_threshold_deg) ||
+      config.backend_hybrid_angular_threshold_deg < 0.0 ||
+      config.backend_hybrid_angular_threshold_deg > 180.0) {
+    throw std::runtime_error(
+        "--backend-hybrid-angular-threshold-deg must be in [0, 180].");
+  }
+  if (!std::isfinite(
+          config.backend_polar_continuous_hybrid_threshold_deg) ||
+      config.backend_polar_continuous_hybrid_threshold_deg < 0.0 ||
+      config.backend_polar_continuous_hybrid_threshold_deg > 180.0) {
+    throw std::runtime_error(
+        "--backend-polar-continuous-hybrid-threshold-deg must be in [0, 180].");
+  }
+  if (!std::isfinite(
+          config.backend_polar_continuous_hybrid_temperature_deg) ||
+      config.backend_polar_continuous_hybrid_temperature_deg <= 0.0) {
+    throw std::runtime_error(
+        "--backend-polar-continuous-hybrid-temperature-deg must be positive.");
+  }
+  if (model == ati::ResidualModel::PixelChordalHybrid &&
+      config.backend_pixel_residual_weight == 0.0 &&
+      config.backend_chordal_residual_weight == 0.0) {
+    throw std::runtime_error(
+        "pixel_chordal_hybrid requires a positive pixel or chordal weight.");
+  }
+}
+
 void PrintEvaluationProgress(
     const std::string& label,
     const ati::CameraModelRefitEvaluationResult& evaluation) {
@@ -6779,6 +7282,7 @@ int main(int argc, char** argv) {
     const CmdArgs args = ParseArgs(argc, argv);
     const RequestedExperimentConfig requested_config =
         BuildRequestedExperimentConfig(args);
+    ValidateBackendResidualConfiguration(requested_config);
     ati::Stage5RuntimeSummary runtime_summary;
     runtime_summary.runtime_mode = args.runtime_mode;
     runtime_summary.cache_dir =
@@ -6968,11 +7472,15 @@ int main(int argc, char** argv) {
         requested_config.backend_delayed_intrinsics_release;
     backend_options.intrinsics_release_iteration =
         requested_config.backend_intrinsics_release_iteration;
-    ati::BackendProblemOptions final_backend_options = backend_options;
-    final_backend_options.optimize_board_poses =
+    ati::BackendProblemOptions committed_backend_evaluation_options =
+        backend_options;
+    committed_backend_evaluation_options.optimize_board_poses =
         requested_config.backend_optimize_board_poses;
 
     ati::CalibrationBenchmarkSplitOptions split_options;
+    split_options.mode = args.split_mode;
+    split_options.holdout_ratio = args.holdout_ratio;
+    split_options.random_seed = args.split_seed;
     split_options.holdout_stride = args.holdout_stride;
     split_options.holdout_offset = args.holdout_offset;
     const ati::Stage5Benchmark benchmark(split_options);
@@ -7025,9 +7533,60 @@ int main(int argc, char** argv) {
         args.test_image_path.empty()
             ? std::string()
             : fs::path(args.test_image_path).stem().string();
+    benchmark_input.use_external_holdout_self_frontend_prepass =
+        args.external_holdout_self_frontend_prepass;
     benchmark_input.baseline_options = baseline_options;
     benchmark_input.backend_options = backend_options;
-    benchmark_input.final_backend_options = final_backend_options;
+    benchmark_input.committed_backend_evaluation_options =
+        committed_backend_evaluation_options;
+    benchmark_input.selection_backend_runner_options.residual_model =
+        ati::ParseResidualModel(requested_config.backend_residual_model);
+    benchmark_input.selection_backend_runner_options.hybrid_angular_threshold_deg =
+        requested_config.backend_hybrid_angular_threshold_deg;
+    benchmark_input.selection_backend_runner_options.outer_residual_model =
+        ati::ParseResidualModel(requested_config.backend_outer_residual_model);
+    benchmark_input.selection_backend_runner_options.internal_residual_model =
+        ati::ParseResidualModel(requested_config.backend_internal_residual_model);
+    benchmark_input.selection_backend_runner_options
+        .use_point_type_residual_split =
+        requested_config.backend_use_point_type_residual_split;
+    benchmark_input.selection_backend_runner_options.angular_auxiliary_enabled =
+        requested_config.backend_enable_angular_auxiliary_residual;
+    benchmark_input.selection_backend_runner_options.angular_auxiliary_weight =
+        requested_config.backend_angular_auxiliary_weight;
+    benchmark_input.selection_backend_runner_options.angular_auxiliary_normalized =
+        requested_config.backend_angular_auxiliary_normalized;
+    benchmark_input.selection_backend_runner_options
+        .angular_auxiliary_apply_to_outer =
+        requested_config.backend_angular_auxiliary_apply_to_outer;
+    benchmark_input.selection_backend_runner_options
+        .angular_auxiliary_apply_to_internal =
+        requested_config.backend_angular_auxiliary_apply_to_internal;
+    benchmark_input.selection_backend_runner_options
+        .polar_continuous_hybrid_threshold_deg =
+        requested_config.backend_polar_continuous_hybrid_threshold_deg;
+    benchmark_input.selection_backend_runner_options
+        .polar_continuous_hybrid_temperature_deg =
+        requested_config.backend_polar_continuous_hybrid_temperature_deg;
+    benchmark_input.selection_backend_runner_options
+        .normalized_angular_reference_sigma_px =
+        requested_config.backend_normalized_angular_reference_sigma_px;
+    benchmark_input.selection_backend_runner_options
+        .normalized_angular_min_sigma_rad =
+        requested_config.backend_normalized_angular_min_sigma_rad;
+    benchmark_input.selection_backend_runner_options
+        .normalized_angular_max_weight_scale =
+        requested_config.backend_normalized_angular_max_weight_scale;
+    benchmark_input.selection_backend_runner_options.pixel_residual_weight =
+        requested_config.backend_pixel_residual_weight;
+    benchmark_input.selection_backend_runner_options.chordal_residual_weight =
+        requested_config.backend_chordal_residual_weight;
+    benchmark_input.selection_backend_runner_options
+        .angular_use_normalize_jacobian =
+        requested_config.backend_angular_use_normalize_jacobian;
+    benchmark_input.selection_backend_runner_options.angular_observed_ray_mode =
+        ati::ParseAngularObservedRayMode(
+            requested_config.backend_angular_observed_ray_mode);
     benchmark_input.pre_backend_filter_options.mode =
         requested_config.pre_backend_filter_mode;
     benchmark_input.pre_backend_filter_options.threshold_mode =
@@ -7156,13 +7715,8 @@ int main(int argc, char** argv) {
               requested_config.trial_backend_selection_candidate_order);
     } else {
       benchmark_input.trial_backend_selection_options.candidate_order_mode =
-          trial_backend_selection_mode ==
-                  ati::TrialBackendFrameBoardSelectionOptions::SelectionMode::
-                      StrictRmse
-              ? ati::TrialBackendFrameBoardSelectionOptions::
-                    CandidateOrderMode::ScoreSorted
-              : ati::TrialBackendFrameBoardSelectionOptions::
-                    CandidateOrderMode::RandomShuffle;
+          ati::TrialBackendFrameBoardSelectionOptions::CandidateOrderMode::
+              ScoreSorted;
     }
     benchmark_input.trial_backend_selection_options.candidate_shuffle_seed_set =
         requested_config.trial_backend_selection_candidate_shuffle_seed_set;
@@ -7297,6 +7851,10 @@ int main(int argc, char** argv) {
             .trial_backend_selection_frame_cohesion_min_candidate_score;
     benchmark_input.trial_backend_selection_options.min_keep_observations_per_board =
         requested_config.trial_backend_selection_min_keep_per_board;
+    benchmark_input.trial_backend_selection_options
+        .force_include_list_is_exact_input =
+        requested_config
+            .trial_backend_selection_force_include_list_is_exact_input;
     benchmark_input.backend_input_ablation_options
         .point_budget_control_enabled =
         requested_config.backend_point_budget_control;
@@ -7710,6 +8268,9 @@ int main(int argc, char** argv) {
         report.camera_ray_curve_diagnostics);
     ati::WriteStage5BenchmarkWorstCasesSummary(
         (output_dir / "benchmark_worst_cases_summary.txt").string(), report, 10);
+    ati::WriteStage5BenchmarkHoldoutRobustOutlierSummary(
+        (output_dir / "benchmark_holdout_robust_outlier_summary.txt").string(),
+        report, 5.0);
     const bool write_selection_diagnostics =
         requested_config.enable_stage5_selection_diagnostics ||
         requested_config.enable_trial_backend_frame_board_selection ||
@@ -7828,11 +8389,18 @@ int main(int argc, char** argv) {
         requested_config.backend_normalized_angular_min_sigma_rad;
     runner_options.normalized_angular_max_weight_scale =
         requested_config.backend_normalized_angular_max_weight_scale;
+    runner_options.pixel_residual_weight =
+        requested_config.backend_pixel_residual_weight;
+    runner_options.chordal_residual_weight =
+        requested_config.backend_chordal_residual_weight;
     runner_options.angular_use_normalize_jacobian =
         requested_config.backend_angular_use_normalize_jacobian;
     runner_options.angular_observed_ray_mode =
         ati::ParseAngularObservedRayMode(
             requested_config.backend_angular_observed_ray_mode);
+    runner_options.board_pose_parameterization =
+        ati::ParseBoardPoseParameterization(
+            requested_config.backend_board_pose_parameterization);
     runner_options.force_pose_only = requested_config.backend_fixed_intrinsics;
     runner_options.multi_board_consistency_weighting =
         requested_config.backend_multi_board_consistency_weighting;
@@ -7871,22 +8439,22 @@ int main(int argc, char** argv) {
         requested_config.enable_angular_residual_diagnostics;
     runner_options.angular_residual_bin_edges_deg =
         requested_config.angular_residual_bin_edges_deg;
-    runner_options.skip_optimization = !args.stage5_enable_final_backend_ba;
+    // Stage5 follows the Kalibr-style paper baseline: optimization happens
+    // during incremental selection BA. The tail backend runner is diagnostics
+    // only and must never perform a final BA.
+    runner_options.skip_optimization = true;
     runner_options.export_cost_parity_diagnostics =
         args.runtime_mode == ati::Stage5RuntimeMode::Research;
     runner_options.export_variable_block_influence_diagnostics =
         runner_options.export_cost_parity_diagnostics;
     const ati::AslamBackendCalibrationRunner backend_runner(runner_options);
-    PrintProgress(args.stage5_enable_final_backend_ba
-                      ? "running full backend optimization..."
-                      : "skipping final backend BA; evaluating selection committed state...");
+    PrintProgress(
+        "final backend BA removed; evaluating incremental-selection committed state...");
     const auto backend_stage_start = std::chrono::steady_clock::now();
     const ati::AslamBackendCalibrationResult backend_result =
         backend_runner.Run(report.backend_problem_input);
     AddRuntimeStage(&runtime_summary,
-                    args.stage5_enable_final_backend_ba
-                        ? "backend_full_optimization"
-                        : "backend_committed_state_evaluation",
+                    "backend_committed_state_evaluation",
                     ElapsedSeconds(backend_stage_start), false);
     PrintBackendResultProgress(backend_result);
     WriteBackendDiagnosticArtifacts(output_dir, "backend_optimization", backend_result);
@@ -7912,10 +8480,8 @@ int main(int argc, char** argv) {
     ati::CameraModelRefitEvaluationResult backend_holdout_evaluation;
     {
       const auto stage_start = std::chrono::steady_clock::now();
-      backend_training_evaluation = benchmark.EvaluateCameraModel(
-          report.training_dataset,
-          backend_result.optimized_scene_state.camera,
-          "backend");
+      backend_training_evaluation =
+          MakeCommittedBackendTrainingEvaluation(backend_result);
       AddRuntimeStage(&runtime_summary, "backend_training_evaluation",
                       ElapsedSeconds(stage_start), false);
     }
@@ -7939,16 +8505,18 @@ int main(int argc, char** argv) {
     PrintEvaluationProgress("backend training", backend_training_evaluation);
     PrintEvaluationProgress("backend holdout", backend_holdout_evaluation);
 
-    WriteEvaluationSummary(
+    WriteCommittedBackendTrainingSummary(
         (output_dir / "backend_training_summary.txt").string(),
-        backend_training_evaluation);
+        backend_result);
     WriteEvaluationSummary(
         (output_dir / "backend_holdout_summary.txt").string(),
         backend_holdout_evaluation);
-    ati::WriteCameraModelRefitPointsCsv(
+    WriteCommittedBackendTrainingPointsCsv(
         (output_dir / "backend_training_points.csv").string(),
-        std::vector<ati::CameraModelRefitEvaluationResult>{
-            backend_training_evaluation});
+        backend_result.optimized_residual);
+    WriteBackendBoardPosesCsv(
+        (output_dir / "backend_board_poses.csv").string(),
+        backend_result);
     ati::WriteCameraModelRefitPointsCsv(
         (output_dir / "backend_holdout_points.csv").string(),
         std::vector<ati::CameraModelRefitEvaluationResult>{
@@ -8186,11 +8754,13 @@ int main(int argc, char** argv) {
           benchmark,
           report,
           backend_holdout_evaluation);
-      ExportSelectedCaseVisualizations(
-          output_dir,
-          benchmark,
-          report,
-          backend_holdout_evaluation);
+      if (args.export_selected_case_visualizations) {
+        ExportSelectedCaseVisualizations(
+            output_dir,
+            benchmark,
+            report,
+            backend_holdout_evaluation);
+      }
       AddRuntimeStage(&runtime_summary, "worst_reprojection_overlay_export",
                       ElapsedSeconds(worst_overlay_stage_start), false);
     }
@@ -8210,8 +8780,13 @@ int main(int argc, char** argv) {
               << (output_dir / "backend_vs_frontend_summary.txt").string() << "\n"
               << "Runtime summary: "
               << (output_dir / "runtime_summary.txt").string() << "\n";
-    std::cout << "Selected case visualizations: "
-              << (output_dir / "selected_case_visualizations").string() << "\n";
+    if (args.export_selected_case_visualizations) {
+      std::cout << "Selected case visualizations: "
+                << (output_dir / "selected_case_visualizations").string()
+                << "\n";
+    } else {
+      std::cout << "Selected case visualizations: skipped\n";
+    }
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "Error: " << error.what() << "\n";

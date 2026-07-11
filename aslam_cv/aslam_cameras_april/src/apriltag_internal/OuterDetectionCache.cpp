@@ -74,10 +74,14 @@ std::string MakeConfigSignature(const MultiScaleOuterTagDetectorConfig& config) 
          << config.close_edge_outer_subpix_area_ratio
          << "|close_edge_outer_subpix_min_polar_deg="
          << config.close_edge_outer_subpix_min_polar_deg
+         << "|close_edge_outer_subpix_full_polar_deg="
+         << config.close_edge_outer_subpix_full_polar_deg
          << "|close_edge_outer_subpix_border_ratio="
          << config.close_edge_outer_subpix_border_ratio
          << "|close_edge_outer_subpix_multiplier="
          << config.close_edge_outer_subpix_multiplier
+         << "|close_edge_outer_subpix_max_multiplier="
+         << config.close_edge_outer_subpix_max_multiplier
          << "|max_outer_refine_displacement=" << config.max_outer_refine_displacement
          << "|outer_refine_displacement_scale="
          << config.outer_refine_displacement_scale
@@ -346,6 +350,7 @@ void WriteOuterCornerVerificationDebug(
            << (debug.close_edge_subpix_boost_applied ? 1 : 0);
   *storage << "close_edge_subpix_area_ratio" << debug.close_edge_subpix_area_ratio;
   *storage << "close_edge_subpix_max_polar_deg" << debug.close_edge_subpix_max_polar_deg;
+  *storage << "close_edge_subpix_multiplier" << debug.close_edge_subpix_multiplier;
   *storage << "configured_outer_subpix_scale" << debug.configured_outer_subpix_scale;
   *storage << "configured_outer_subpix_window_scale"
            << debug.configured_outer_subpix_window_scale;
@@ -445,6 +450,13 @@ void ReadOuterCornerVerificationDebug(
       static_cast<double>(node["close_edge_subpix_area_ratio"]);
   debug->close_edge_subpix_max_polar_deg =
       static_cast<double>(node["close_edge_subpix_max_polar_deg"]);
+  if (!node["close_edge_subpix_multiplier"].empty()) {
+    debug->close_edge_subpix_multiplier =
+        static_cast<double>(node["close_edge_subpix_multiplier"]);
+  } else {
+    debug->close_edge_subpix_multiplier =
+        debug->close_edge_subpix_boost_applied ? 1.0 : 1.0;
+  }
   debug->configured_outer_subpix_scale =
       static_cast<double>(node["configured_outer_subpix_scale"]);
   debug->configured_outer_subpix_window_scale =

@@ -82,9 +82,14 @@ std::string NormalizeStage5ModelFamily(std::string model) {
   if (model == "eucm" || model == "eucm-none") {
     return "eucm-none";
   }
+  if (model == "mei" || model == "omni" || model == "omni-radtan" ||
+      model == "omni_radtan" || model == "mei-radtan" ||
+      model == "radial-tangential-omni") {
+    return "omni-radtan";
+  }
   throw std::runtime_error(
       "Unsupported --models value: " + model +
-      " (supported: ds-none, pinhole-equi/kb, eucm-none)");
+      " (supported: ds-none, pinhole-equi/kb, eucm-none, mei/omni-radtan)");
 }
 
 void ApplyStage5ModelFamily(const std::string& model_family,
@@ -107,6 +112,9 @@ void ApplyStage5ModelFamily(const std::string& model_family,
   } else if (family == "eucm-none") {
     camera.camera_model = "eucm";
     camera.distortion_model = "none";
+  } else if (family == "omni-radtan") {
+    camera.camera_model = "omni";
+    camera.distortion_model = "radtan";
   }
   config->intermediate_camera = camera;
 }
@@ -121,7 +129,7 @@ void PrintUsage(const char* program) {
       << " [--intrinsics-release-iteration N]"
       << " [--second-pass-intrinsics-release-iteration N]"
       << " [--holdout-stride N] [--holdout-offset N]"
-      << " [--models ds-none|pinhole-equi|kb|eucm-none]"
+      << " [--models ds-none|pinhole-equi|kb|eucm-none|mei]"
       << " [--stage5-init-refine-mode kalibr_outer_lm|coordinate_search|none]"
       << " [--camera-init-mode manual|auto|auto_with_manual_fallback]"
       << " [--kalibr-training-split-signature SIGNATURE]"
@@ -559,7 +567,7 @@ int main(int argc, char** argv) {
     benchmark_input.all_frames = all_frames;
     benchmark_input.baseline_options = baseline_options;
     benchmark_input.backend_options = backend_options;
-    benchmark_input.final_backend_options = backend_options;
+    benchmark_input.committed_backend_evaluation_options = backend_options;
     benchmark_input.kalibr_reference = kalibr_reference;
     benchmark_input.dataset_label = dataset_label;
 

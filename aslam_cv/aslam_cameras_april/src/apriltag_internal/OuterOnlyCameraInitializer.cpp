@@ -81,6 +81,10 @@ struct SeedConstructionDiagnostics {
   std::string ds_mapping = "not_applicable";
   int ds_mapping_verified_against_kalibr_source = 0;
   int ds_grid_enumeration_enabled = 0;
+  std::string ucm_seed_source = "not_applicable";
+  std::string ucm_mapping = "not_applicable";
+  int ucm_mapping_verified_against_kalibr_source = 0;
+  int ucm_multistart_enabled = 0;
   std::string fallback_reason;
 };
 
@@ -106,6 +110,56 @@ std::string JoinLabels(const std::vector<std::string>& labels,
   return stream.str();
 }
 
+bool IsPinholeEquiDistortionLabel(const std::string& label) {
+  return label == "k1" || label == "k2" || label == "k3" || label == "k4";
+}
+
+bool IsRadtanDistortionLabel(const std::string& label) {
+  return label == "k1" || label == "k2" || label == "p1" || label == "p2";
+}
+
+bool IsCameraDistortionLabel(const std::string& label) {
+  return IsPinholeEquiDistortionLabel(label) || IsRadtanDistortionLabel(label);
+}
+
+bool HasAnyMeaningfulDistortionCoefficient(
+    const OuterBootstrapCameraIntrinsics& camera) {
+  for (double coefficient : camera.DistortionVector()) {
+    if (std::isfinite(coefficient) && std::abs(coefficient) > 1e-12) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool FixKalibrOuterLmInitializationLabel(const std::string& family,
+                                         const std::string& label) {
+  if (family == "pinhole-equi") {
+    // With only outer four-corner observations, k1/k2 give the KB seed enough
+    // field-of-view flexibility without letting high-order terms absorb pose
+    // noise before the real Stage5 backend sees internal points.
+    return label == "k3" || label == "k4";
+  }
+  if (family == "omni-radtan") {
+    return IsCameraDistortionLabel(label);
+  }
+  return false;
+}
+
+std::vector<std::string> KalibrOuterLmReleasedLabels(
+    const OuterBootstrapCameraIntrinsics& camera) {
+  std::vector<std::string> labels = camera.CombinedParameterLabels();
+  const std::string family = camera.NormalizedFamilyString();
+  labels.erase(std::remove_if(labels.begin(),
+                              labels.end(),
+                              [&family](const std::string& label) {
+                                return FixKalibrOuterLmInitializationLabel(
+                                    family, label);
+                              }),
+               labels.end());
+  return labels;
+}
+
 bool ClampIntrinsicsInPlace(OuterBootstrapCameraIntrinsics* intrinsics) {
   if (intrinsics == nullptr) {
     throw std::runtime_error("ClampIntrinsicsInPlace requires a valid pointer.");
@@ -129,7 +183,17 @@ bool ClampIntrinsicsInPlace(OuterBootstrapCameraIntrinsics* intrinsics) {
       intrinsics->distortion_coeffs.resize(4, 0.0);
     }
     for (double& coefficient : intrinsics->distortion_coeffs) {
-      coefficient = std::max(-1.5, std::min(1.5, coefficient));
+      coefficient = std::max(-0.6, std::min(0.6, coefficient));
+    }
+  } else if (family == "omni-radtan") {
+    intrinsics->xi = std::max(-0.95, std::min(3.0, intrinsics->xi));
+    intrinsics->alpha = 0.0;
+    intrinsics->beta = 0.0;
+    if (intrinsics->distortion_coeffs.size() != 4) {
+      intrinsics->distortion_coeffs.resize(4, 0.0);
+    }
+    for (double& coefficient : intrinsics->distortion_coeffs) {
+      coefficient = std::max(-0.6, std::min(0.6, coefficient));
     }
   } else {
     return false;
@@ -157,7 +221,12 @@ OuterBootstrapCameraIntrinsics MakeGenericSeedIntrinsics(
           : config.intermediate_camera.camera_model;
   intrinsics.distortion_model =
       config.intermediate_camera.distortion_model.empty()
-          ? (intrinsics.camera_model == "pinhole" ? "equi" : "none")
+          ? (intrinsics.camera_model == "pinhole"
+                 ? "equi"
+                 : (intrinsics.camera_model == "omni" ||
+                    intrinsics.camera_model == "mei"
+                        ? "radtan"
+                        : "none"))
           : config.intermediate_camera.distortion_model;
   intrinsics.resolution = resolution;
   intrinsics.fu = kDefaultFuScale * static_cast<double>(resolution.width);
@@ -171,6 +240,9 @@ OuterBootstrapCameraIntrinsics MakeGenericSeedIntrinsics(
     intrinsics.alpha = kDefaultAlpha;
     intrinsics.beta = 1.0;
   } else if (intrinsics.NormalizedFamilyString() == "pinhole-equi") {
+    intrinsics.distortion_coeffs = {0.0, 0.0, 0.0, 0.0};
+  } else if (intrinsics.NormalizedFamilyString() == "omni-radtan") {
+    intrinsics.xi = 1.0;
     intrinsics.distortion_coeffs = {0.0, 0.0, 0.0, 0.0};
   }
   ClampIntrinsicsInPlace(&intrinsics);
@@ -289,6 +361,42 @@ bool EstimatePinholeFocalFromOuterHomographies(
   }
   *focal = Median(focal_guesses);
   return std::isfinite(*focal) && *focal > 0.0;
+}
+
+bool EstimateKalibrPinholeFocalFromOuterObservations(
+    const cv::Size& image_size,
+    const std::vector<OuterObservationRecord>& observations,
+    double* focal,
+    std::string* source_label,
+    std::string* failure_reason) {
+  if (focal == nullptr) {
+    return false;
+  }
+  *focal = std::numeric_limits<double>::quiet_NaN();
+  // Kalibr's pinhole-equi initializer computes a pinhole focal from target
+  // row/column circles and initializes equidistant distortion to zero. Our
+  // Stage5 bootstrap intentionally only has each large tag's outer four
+  // corners, so the exact row-circle estimator is not observable here. Do not
+  // substitute a planar homography focal and call it Kalibr-equivalent; that
+  // path strongly favors high-focal single-board pose compensation on fisheye
+  // data. Use a fisheye field-of-view focal prior as an explicit outer-only
+  // fallback and report the fallback reason in the summary.
+  const double fallback_focal = FisheyeResolutionFocalPrior(image_size);
+  if (std::isfinite(fallback_focal) && fallback_focal > 0.0) {
+    *focal = fallback_focal;
+    if (source_label != nullptr) {
+      *source_label = "outer_resolution_fisheye_focal_prior";
+    }
+    if (failure_reason != nullptr) {
+      *failure_reason =
+          "kalibr_pinhole_circle_focal_unavailable_for_outer_four_corner_tags";
+    }
+    return true;
+  }
+  if (failure_reason != nullptr) {
+    *failure_reason = "invalid_image_size_for_fisheye_focal_prior";
+  }
+  return false;
 }
 
 bool ComputeDirectOuterQuadOmniGammaCandidate(
@@ -432,7 +540,23 @@ OuterBootstrapCameraIntrinsics MakeKalibrLikeOuterSeedIntrinsics(
   const std::string family = seed.NormalizedFamilyString();
   double pinhole_focal = std::numeric_limits<double>::quiet_NaN();
   bool has_homography_focal = false;
-  if (family != "ds-none") {
+  std::string pinhole_focal_source;
+  std::string pinhole_focal_failure_reason;
+  if (family == "pinhole-equi") {
+    has_homography_focal =
+        EstimateKalibrPinholeFocalFromOuterObservations(
+            image_size,
+            observations,
+            &pinhole_focal,
+            &pinhole_focal_source,
+            &pinhole_focal_failure_reason);
+    if (!has_homography_focal) {
+      pinhole_focal =
+          0.5 * static_cast<double>(std::max(image_size.width, image_size.height));
+      pinhole_focal_source = "outer_resolution_half_extent_fallback";
+    }
+  } else if (family != "ds-none" && family != "omni-radtan" &&
+             family != "eucm-none") {
     has_homography_focal =
         EstimatePinholeFocalFromOuterHomographies(
             image_size, observations, &pinhole_focal);
@@ -521,17 +645,110 @@ OuterBootstrapCameraIntrinsics MakeKalibrLikeOuterSeedIntrinsics(
                    : omni_failure_reason),
           warnings);
     }
+  } else if (family == "omni-radtan") {
+    double omni_gamma = std::numeric_limits<double>::quiet_NaN();
+    std::string omni_failure_reason;
+    const bool has_omni_gamma =
+        EstimateOmniGammaFromDirectOuterQuads(
+            image_size, observations, &omni_gamma, &omni_failure_reason);
+    seed.xi = 1.0;
+    seed.alpha = 0.0;
+    seed.beta = 0.0;
+    seed.fu = has_omni_gamma ? omni_gamma : FisheyeResolutionFocalPrior(image_size);
+    seed.fv = seed.fu;
+    seed.distortion_coeffs = {0.0, 0.0, 0.0, 0.0};
+    if (source_label != nullptr) {
+      *source_label = has_omni_gamma
+                          ? "kalibr_omni_outer_direct_gamma_seed"
+                          : "fallback_outer_only_omni_radtan_seed";
+    }
+    if (seed_diagnostics != nullptr) {
+      seed_diagnostics->seed_method =
+          has_omni_gamma ? "kalibr_omni_outer_direct_gamma_seed"
+                         : "fallback_outer_only_omni_radtan_seed";
+      seed_diagnostics->seed_source =
+          has_omni_gamma ? "outer_quad_direct_omni_seed_observations"
+                         : "resolution_fisheye_fov_prior";
+      seed_diagnostics->omni_gamma =
+          has_omni_gamma ? omni_gamma : std::numeric_limits<double>::quiet_NaN();
+      seed_diagnostics->omni_gamma_source =
+          has_omni_gamma ? "outer_quad_direct_four_corner_groups"
+                         : "unavailable";
+      seed_diagnostics->ucm_seed_source = seed_diagnostics->seed_source;
+      seed_diagnostics->ucm_mapping =
+          has_omni_gamma ? "omni_xi_1_fu_fv_omni_gamma"
+                         : "fallback_no_omni_gamma";
+      seed_diagnostics->ucm_mapping_verified_against_kalibr_source =
+          has_omni_gamma ? 1 : 0;
+      seed_diagnostics->fallback_reason = omni_failure_reason;
+    }
+    if (!has_omni_gamma) {
+      AppendUniqueWarning(
+          "Kalibr Omni initializer source was found, but Stage5 outer-only "
+          "four-corner observations did not produce a valid direct gamma; "
+          "using xi=1, zero radtan distortion, and a resolution/pi fisheye "
+          "focal prior. fallback_reason=" +
+              (omni_failure_reason.empty()
+                   ? std::string("kalibr_omni_gamma_unavailable")
+                   : omni_failure_reason),
+          warnings);
+    }
   } else if (family == "eucm-none") {
+    double omni_gamma = std::numeric_limits<double>::quiet_NaN();
+    std::string omni_failure_reason;
+    const bool has_omni_gamma =
+        EstimateOmniGammaFromDirectOuterQuads(
+            image_size, observations, &omni_gamma, &omni_failure_reason);
     seed.alpha = 0.5;
     seed.beta = 1.0;
     seed.xi = 0.0;
-    seed.fu = 0.5 * pinhole_focal;
-    seed.fv = 0.5 * pinhole_focal;
+    seed.fu = has_omni_gamma ? 0.5 * omni_gamma
+                              : FisheyeResolutionFocalPrior(image_size);
+    seed.fv = seed.fu;
     seed.distortion_coeffs.clear();
     if (source_label != nullptr) {
-      *source_label = has_homography_focal
-                          ? "outer_homography_eucm_seed"
-                          : "outer_resolution_eucm_seed";
+      *source_label = has_omni_gamma
+                          ? "kalibr_source_verified_omni_to_eucm_seed"
+                          : "fallback_outer_only_eucm_seed";
+    }
+    if (seed_diagnostics != nullptr) {
+      seed_diagnostics->seed_method =
+          has_omni_gamma ? "kalibr_source_verified_omni_to_eucm_seed"
+                         : "fallback_outer_only_eucm_seed";
+      seed_diagnostics->seed_source =
+          has_omni_gamma ? "outer_quad_direct_omni_seed_observations"
+                         : "resolution_fisheye_fov_prior";
+      seed_diagnostics->omni_gamma =
+          has_omni_gamma ? omni_gamma : std::numeric_limits<double>::quiet_NaN();
+      seed_diagnostics->omni_gamma_source =
+          has_omni_gamma ? "outer_quad_direct_four_corner_groups"
+                         : "unavailable";
+      seed_diagnostics->ucm_seed_source = seed_diagnostics->seed_source;
+      seed_diagnostics->ucm_mapping =
+          has_omni_gamma
+              ? "alpha_0p5_beta_1_fu_fv_0p5_omni_gamma"
+              : "fallback_no_omni_gamma";
+      seed_diagnostics->ucm_mapping_verified_against_kalibr_source =
+          has_omni_gamma ? 1 : 0;
+      if (!has_omni_gamma) {
+        seed_diagnostics->fallback_reason =
+            omni_failure_reason.empty()
+                ? "kalibr_omni_gamma_unavailable"
+                : omni_failure_reason;
+      }
+    }
+    if (!has_omni_gamma) {
+      AppendUniqueWarning(
+          "Kalibr EUCM initializer source was found and maps Omni to EUCM as "
+          "alpha=0.5*omni.xi, beta=1, fu/fv=0.5*omni.fu/fv. Stage5 outer-only "
+          "four-corner observations did not produce a valid direct Omni gamma, "
+          "so the EUCM seed uses alpha=0.5, beta=1 and a resolution/pi fisheye "
+          "focal prior. No pinhole-homography focal is mapped into EUCM. "
+          "fallback_reason=" +
+              (omni_failure_reason.empty()
+                   ? std::string("kalibr_omni_gamma_unavailable")
+                   : omni_failure_reason),
+          warnings);
     }
   } else if (family == "pinhole-equi") {
     seed.xi = 0.0;
@@ -541,9 +758,27 @@ OuterBootstrapCameraIntrinsics MakeKalibrLikeOuterSeedIntrinsics(
     seed.fv = pinhole_focal;
     seed.distortion_coeffs = {0.0, 0.0, 0.0, 0.0};
     if (source_label != nullptr) {
-      *source_label = has_homography_focal
-                          ? "outer_homography_pinhole_equi_seed"
-                          : "outer_resolution_pinhole_equi_seed";
+      *source_label = "kalibr_pinhole_equi_outer_fisheye_prior_zero_distortion_seed";
+    }
+    if (seed_diagnostics != nullptr) {
+      seed_diagnostics->seed_method =
+          "kalibr_pinhole_equi_zero_distortion_seed";
+      seed_diagnostics->seed_source = pinhole_focal_source.empty()
+                                          ? "outer_fisheye_prior"
+                                          : pinhole_focal_source;
+      seed_diagnostics->fallback_reason = pinhole_focal_failure_reason;
+    }
+    if (!pinhole_focal_failure_reason.empty()) {
+      AppendUniqueWarning(
+	          "Kalibr pinhole-equi row-circle focal initialization cannot be "
+	          "exactly applied to Stage5 outer-four-corner observations; using a "
+	          "reported outer-only fisheye focal fallback. The initialization "
+	          "candidate set uses a compact focal/k1 multistart; the lightweight "
+	          "outer-only LM releases k1/k2 and keeps k3/k4 for the later backend, "
+	          "where internal points and selection provide more evidence. "
+	          "fallback_reason=" +
+	              pinhole_focal_failure_reason,
+	          warnings);
     }
   } else if (source_label != nullptr) {
     *source_label = "outer_unsupported_family_seed";
@@ -2398,6 +2633,8 @@ KalibrOuterLmSchurStep ComputeKalibrOuterLmSchurStep(
 
   const std::vector<std::string> camera_labels =
       camera_prototype.CombinedParameterLabels();
+  const std::string initialization_family =
+      camera_prototype.NormalizedFamilyString();
   Eigen::MatrixXd Hcc =
       Eigen::MatrixXd::Zero(camera_parameter_count, camera_parameter_count);
   Eigen::VectorXd gc = Eigen::VectorXd::Zero(camera_parameter_count);
@@ -2431,6 +2668,12 @@ KalibrOuterLmSchurStep ComputeKalibrOuterLmSchurStep(
     Eigen::MatrixXd Jc(residual.rows(), camera_parameter_count);
     Jc.setZero();
     for (int column = 0; column < camera_parameter_count; ++column) {
+      if (column < static_cast<int>(camera_labels.size()) &&
+          FixKalibrOuterLmInitializationLabel(
+              initialization_family,
+              camera_labels[static_cast<std::size_t>(column)])) {
+        continue;
+      }
       const double step =
           NumericJacobianStep(column, camera_parameter_count, camera_labels, x);
       Eigen::VectorXd plus_vector = x.head(camera_parameter_count);
@@ -2543,6 +2786,14 @@ KalibrOuterLmSchurStep ComputeKalibrOuterLmSchurStep(
   }
 
   result.step.head(camera_parameter_count) = camera_step;
+  for (int column = 0; column < camera_parameter_count; ++column) {
+    if (column < static_cast<int>(camera_labels.size()) &&
+        FixKalibrOuterLmInitializationLabel(
+            initialization_family,
+            camera_labels[static_cast<std::size_t>(column)])) {
+      result.step[column] = 0.0;
+    }
+  }
   for (const PoseBlock& block : pose_blocks) {
     Eigen::LDLT<Eigen::Matrix<double, 6, 6>> ldlt(block.Hpp);
     if (ldlt.info() != Eigen::Success) {
@@ -2935,6 +3186,20 @@ void AppendDsSeedCandidate(const OuterBootstrapCameraIntrinsics& seed,
   candidates->push_back(candidate);
 }
 
+void AppendSeedCandidate(
+    const OuterBootstrapCameraIntrinsics& seed,
+    const std::string& source_label,
+    std::vector<AutoCameraInitializationCandidate>* candidates) {
+  if (candidates == nullptr || !seed.IsValid()) {
+    return;
+  }
+  AutoCameraInitializationCandidate candidate;
+  candidate.source_label = source_label;
+  candidate.evaluation_scope = "outer_seed";
+  candidate.camera = seed;
+  candidates->push_back(candidate);
+}
+
 std::vector<AutoCameraInitializationCandidate> GenerateCandidateGrid(
     const cv::Size& image_size,
     const ApriltagInternalConfig& config,
@@ -3039,6 +3304,176 @@ std::vector<AutoCameraInitializationCandidate> GenerateCandidateGrid(
   }
   if (!candidates.empty() &&
       options.refine_mode == AutoCameraInitializationRefineMode::KalibrOuterLm) {
+    if (family == "pinhole-equi") {
+      std::vector<AutoCameraInitializationCandidate> kb_candidates;
+      const double base_focal = FisheyeResolutionFocalPrior(image_size);
+      const std::array<double, 8> focal_scales{
+          0.75, 0.80, 0.90, 1.00, 1.10, 1.20, 1.35, 1.50};
+      const std::array<double, 5> k1_candidates{-0.08, -0.04, 0.0, 0.04, 0.08};
+      for (double focal_scale : focal_scales) {
+        for (double k1 : k1_candidates) {
+          OuterBootstrapCameraIntrinsics physical_seed =
+              MakeGenericSeedIntrinsics(image_size, config);
+          physical_seed.xi = 0.0;
+          physical_seed.alpha = 0.0;
+          physical_seed.beta = 0.0;
+          physical_seed.fu = focal_scale * base_focal;
+          physical_seed.fv = physical_seed.fu;
+          physical_seed.cu = 0.5 * static_cast<double>(image_size.width - 1);
+          physical_seed.cv = 0.5 * static_cast<double>(image_size.height - 1);
+          physical_seed.distortion_coeffs = {k1, 0.0, 0.0, 0.0};
+          ClampIntrinsicsInPlace(&physical_seed);
+          const bool canonical_seed =
+              std::abs(focal_scale - 1.0) < 1e-12 && std::abs(k1) < 1e-12;
+          AppendSeedCandidate(
+              physical_seed,
+              canonical_seed
+                  ? "kalibr_pinhole_equi_outer_fisheye_prior_zero_distortion_seed"
+                  : "outer_only_pinhole_equi_physical_multistart_seed",
+              &kb_candidates);
+        }
+      }
+      if (!kb_candidates.empty()) {
+        candidates.swap(kb_candidates);
+      }
+      AppendUniqueWarning(
+          "Using Kalibr-style pinhole-equi initialization: image-center "
+          "principal point and an explicit outer-only fisheye focal fallback "
+          "because complete target-row circle focal initialization is not "
+          "observable from one large tag's four outer corners. The Stage5 "
+          "baseline now uses a compact KB focal/k1 multistart and releases "
+          "k1/k2 in the lightweight outer-only LM; k3/k4 remain fixed until "
+          "the full backend to keep initialization from becoming a dense BA.",
+          warnings);
+      return candidates;
+    }
+    if (family == "eucm-none") {
+      std::vector<AutoCameraInitializationCandidate> eucm_candidates;
+      if (kalibr_like_seed.IsValid()) {
+        AutoCameraInitializationCandidate candidate;
+        candidate.source_label = source_label;
+        candidate.evaluation_scope = "outer_seed";
+        candidate.camera = kalibr_like_seed;
+        eucm_candidates.push_back(candidate);
+      }
+      const std::vector<double> direct_gammas =
+          CollectDirectOuterQuadOmniGammaCandidates(
+              image_size, observations, nullptr, nullptr);
+      for (double gamma : direct_gammas) {
+        OuterBootstrapCameraIntrinsics direct_seed =
+            MakeGenericSeedIntrinsics(image_size, config);
+        direct_seed.alpha = 0.5;
+        direct_seed.beta = 1.0;
+        direct_seed.xi = 0.0;
+        direct_seed.fu = 0.5 * gamma;
+        direct_seed.fv = direct_seed.fu;
+        direct_seed.cu = 0.5 * static_cast<double>(image_size.width - 1);
+        direct_seed.cv = 0.5 * static_cast<double>(image_size.height - 1);
+        direct_seed.distortion_coeffs.clear();
+        ClampIntrinsicsInPlace(&direct_seed);
+        AppendSeedCandidate(direct_seed,
+                            "outer_quad_direct_omni_to_eucm_seed",
+                            &eucm_candidates);
+      }
+      const double base_focal = FisheyeResolutionFocalPrior(image_size);
+      const std::array<double, 8> focal_scales{
+          0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.35, 1.50};
+      const std::array<std::pair<double, double>, 7> shape_seeds{{
+          {0.50, 1.00},
+          {0.45, 1.00},
+          {0.55, 1.00},
+          {0.50, 0.80},
+          {0.50, 1.20},
+          {0.40, 0.80},
+          {0.60, 1.20},
+      }};
+      for (double focal_scale : focal_scales) {
+        for (const auto& shape_seed : shape_seeds) {
+          OuterBootstrapCameraIntrinsics physical_seed =
+              MakeGenericSeedIntrinsics(image_size, config);
+          physical_seed.alpha = shape_seed.first;
+          physical_seed.beta = shape_seed.second;
+          physical_seed.xi = 0.0;
+          physical_seed.fu = focal_scale * base_focal;
+          physical_seed.fv = physical_seed.fu;
+          physical_seed.cu = 0.5 * static_cast<double>(image_size.width - 1);
+          physical_seed.cv = 0.5 * static_cast<double>(image_size.height - 1);
+          physical_seed.distortion_coeffs.clear();
+          ClampIntrinsicsInPlace(&physical_seed);
+          const bool canonical_seed =
+              std::abs(focal_scale - 1.0) < 1e-12 &&
+              std::abs(physical_seed.alpha - 0.5) < 1e-12 &&
+              std::abs(physical_seed.beta - 1.0) < 1e-12;
+          AppendSeedCandidate(
+              physical_seed,
+              canonical_seed ? "fallback_outer_only_eucm_seed"
+                             : "outer_only_eucm_physical_multistart_seed",
+              &eucm_candidates);
+        }
+      }
+      if (!eucm_candidates.empty()) {
+        candidates.swap(eucm_candidates);
+      }
+      if (seed_diagnostics != nullptr) {
+        seed_diagnostics->ucm_multistart_enabled =
+            candidates.size() > 1u ? 1 : 0;
+      }
+      AppendUniqueWarning(
+          "Using Kalibr-style EUCM initialization: Kalibr's EUCM source maps "
+          "an Omni initializer to alpha=0.5*omni.xi, beta=1, and "
+          "fu/fv=0.5*omni.fu/fv. Because a single large tag contributes only "
+          "four outer corners, Stage5 also evaluates a compact EUCM focal/"
+          "alpha/beta multistart set around the same physical seed. This is "
+          "not the legacy wide DS-style grid, and no YAML/camchain intrinsics "
+          "or pinhole-homography focal are used as EUCM parameters.",
+          warnings);
+      return candidates;
+    }
+    if (family == "omni-radtan") {
+      std::vector<AutoCameraInitializationCandidate> omni_candidates;
+      if (kalibr_like_seed.IsValid()) {
+        AutoCameraInitializationCandidate candidate;
+        candidate.source_label = source_label;
+        candidate.evaluation_scope = "outer_seed";
+        candidate.camera = kalibr_like_seed;
+        omni_candidates.push_back(candidate);
+      }
+      const double base_extent =
+          static_cast<double>(std::max(image_size.width, image_size.height));
+      const std::array<double, 7> focal_scales{
+          0.50, 0.65, 0.80, 0.95, 1.10, 1.25, 1.45};
+      for (double focal_scale : focal_scales) {
+        OuterBootstrapCameraIntrinsics physical_seed =
+            MakeGenericSeedIntrinsics(image_size, config);
+        physical_seed.xi = 1.0;
+        physical_seed.alpha = 0.0;
+        physical_seed.beta = 0.0;
+        physical_seed.fu = focal_scale * base_extent;
+        physical_seed.fv = physical_seed.fu;
+        physical_seed.cu = 0.5 * static_cast<double>(image_size.width - 1);
+        physical_seed.cv = 0.5 * static_cast<double>(image_size.height - 1);
+        physical_seed.distortion_coeffs = {0.0, 0.0, 0.0, 0.0};
+        ClampIntrinsicsInPlace(&physical_seed);
+        AutoCameraInitializationCandidate candidate;
+        candidate.source_label =
+            std::abs(focal_scale - 0.95) < 1e-12
+                ? "kalibr_omni_resolution_scale_seed"
+                : "outer_only_physical_omni_radtan_seed";
+        candidate.evaluation_scope = "outer_seed";
+        candidate.camera = physical_seed;
+        omni_candidates.push_back(candidate);
+      }
+      candidates.swap(omni_candidates);
+      AppendUniqueWarning(
+          "Using Kalibr Omni/MEI parameterization for initialization: xi=1, "
+          "image-center principal point, zero radial-tangential distortion seed, "
+          "outer-only Omni gamma when observable, plus a compact resolution-scale "
+          "focal seed set because one large tag's four corners can produce an "
+          "unstable direct gamma. Radtan distortion is kept fixed during Stage5 "
+          "initialization LM and released later in backend.",
+          warnings);
+      return candidates;
+    }
     AppendUniqueWarning(
         "Using the outer-only model seed as the primary initialization "
         "candidate; legacy parameter grid is skipped in "
@@ -3079,6 +3514,19 @@ std::vector<AutoCameraInitializationCandidate> GenerateCandidateGrid(
         ClampIntrinsicsInPlace(&candidate.camera);
         candidates.push_back(candidate);
       }
+    } else if (family == "omni-radtan") {
+      AutoCameraInitializationCandidate candidate;
+      candidate.source_label = "auto_grid";
+      candidate.evaluation_scope = "sampled";
+      candidate.camera = seed;
+      candidate.camera.xi = 1.0;
+      candidate.camera.fu = focal_scale * static_cast<double>(image_size.width);
+      candidate.camera.fv = focal_scale * static_cast<double>(image_size.height);
+      candidate.camera.cu = center_u;
+      candidate.camera.cv = center_v;
+      candidate.camera.distortion_coeffs = {0.0, 0.0, 0.0, 0.0};
+      ClampIntrinsicsInPlace(&candidate.camera);
+      candidates.push_back(candidate);
     }
   }
   return candidates;
@@ -3104,6 +3552,20 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
   result.stage5_init_omni_gamma_source = "not_attempted";
   result.stage5_init_ds_mapping = "not_applicable";
   result.stage5_init_ds_grid_enumeration_enabled = 0;
+  result.stage5_init_kb_focal_source = "not_applicable";
+  result.stage5_init_kb_row_circle_focal_available = 0;
+  result.stage5_init_kb_zero_distortion_seed = 0;
+  result.stage5_init_kb_zero_distortion_seed_included = 0;
+  result.stage5_init_kb_nonzero_distortion_seed_count = 0;
+  result.stage5_init_kb_distortion_released_in_lm = 0;
+  result.stage5_init_kb_distortion_fixed_zero_in_init_lm = 0;
+  result.stage5_init_kb_multistart_enabled = 0;
+  result.stage5_init_ucm_seed_source = "not_applicable";
+  result.stage5_init_ucm_omni_gamma_available = 0;
+  result.stage5_init_ucm_mapping = "not_applicable";
+  result.stage5_init_ucm_mapping_verified_against_kalibr_source = 0;
+  result.stage5_init_ucm_multistart_enabled = 0;
+  result.stage5_init_ucm_shape_released_in_lm = 0;
   result.stage5_init_uses_yaml_intrinsics = 0;
   result.stage5_init_uses_kalibr_camchain_intrinsics = 0;
   result.stage5_init_outer_only = 1;
@@ -3202,6 +3664,46 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
         seed_diagnostics.ds_mapping_verified_against_kalibr_source;
     result.stage5_init_ds_grid_enumeration_enabled =
         seed_diagnostics.ds_grid_enumeration_enabled;
+    const std::string initialized_family =
+        MakeGenericSeedIntrinsics(result.image_size, config_).NormalizedFamilyString();
+    if (initialized_family == "eucm-none" ||
+        initialized_family == "omni-radtan") {
+      result.stage5_init_ucm_seed_source = seed_diagnostics.ucm_seed_source;
+      result.stage5_init_ucm_omni_gamma_available =
+          std::isfinite(seed_diagnostics.omni_gamma) ? 1 : 0;
+      result.stage5_init_ucm_mapping = seed_diagnostics.ucm_mapping;
+      result.stage5_init_ucm_mapping_verified_against_kalibr_source =
+          seed_diagnostics.ucm_mapping_verified_against_kalibr_source;
+      result.stage5_init_ucm_multistart_enabled =
+          seed_diagnostics.ucm_multistart_enabled;
+    }
+    if (initialized_family == "pinhole-equi") {
+      int nonzero_kb_seed_count = 0;
+      bool zero_kb_seed_included = false;
+      for (const AutoCameraInitializationCandidate& candidate : candidates) {
+        if (candidate.camera.NormalizedFamilyString() != "pinhole-equi") {
+          continue;
+        }
+        if (HasAnyMeaningfulDistortionCoefficient(candidate.camera)) {
+          ++nonzero_kb_seed_count;
+        } else {
+          zero_kb_seed_included = true;
+        }
+      }
+      result.stage5_init_kb_focal_source = seed_diagnostics.seed_source;
+      result.stage5_init_kb_row_circle_focal_available =
+          seed_diagnostics.seed_source == "kalibr_row_circle_pinhole_focal" ? 1 : 0;
+      result.stage5_init_kb_zero_distortion_seed =
+          zero_kb_seed_included ? 1 : 0;
+      result.stage5_init_kb_zero_distortion_seed_included =
+          zero_kb_seed_included ? 1 : 0;
+      result.stage5_init_kb_nonzero_distortion_seed_count =
+          nonzero_kb_seed_count;
+      result.stage5_init_kb_distortion_fixed_zero_in_init_lm = 0;
+      result.stage5_init_kb_distortion_released_in_lm = 1;
+      result.stage5_init_kb_multistart_enabled =
+          candidates.size() > 1u ? 1 : 0;
+    }
     result.stage5_init_selection_prefilter = "coverage_diversity_spacing";
     result.stage5_init_selection_scorer =
         "outer_initializer_intrinsics_jacobian_information_proxy";
@@ -3256,7 +3758,19 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
                      AutoCameraInitializationRefineMode::KalibrOuterLm) {
         result.stage5_init_calibrate_intrinsics_enabled = 1;
         result.stage5_init_calibrate_intrinsics_released_params =
-            JoinLabels(best_candidate.camera.CombinedParameterLabels(), ",");
+            JoinLabels(KalibrOuterLmReleasedLabels(best_candidate.camera), ",");
+        if (best_candidate.camera.NormalizedFamilyString() == "pinhole-equi") {
+          result.stage5_init_kb_distortion_released_in_lm = 1;
+          result.stage5_init_kb_distortion_fixed_zero_in_init_lm = 0;
+          result.stage5_init_kb_multistart_enabled =
+              candidates.size() > 1u ? 1 : 0;
+        }
+        if (best_candidate.camera.NormalizedFamilyString() == "eucm-none" ||
+            best_candidate.camera.NormalizedFamilyString() == "omni-radtan") {
+          result.stage5_init_ucm_multistart_enabled =
+              candidates.size() > 1u ? 1 : 0;
+          result.stage5_init_ucm_shape_released_in_lm = 1;
+        }
 	        result.stage5_init_calibrate_intrinsics_optimizer =
 	            "outer_corner_reprojection_lm_camera_intrinsics_and_pose";
 	        result.stage5_init_multiboard_frame_objective_enabled = 0;
@@ -3265,7 +3779,7 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
 	        result.stage5_init_uses_layout_to_update_intrinsics = 0;
 	        result.stage5_init_layout_loo_diagnostics_only = 1;
 		        result.stage5_init_lm_selection_objective =
-		            "independent_board_pose_outer_lm_final_reprojection";
+		            "independent_board_pose_outer_lm_plus_full_outer_health";
 	        const int max_lm_seed_count =
 	            std::max(
 	                1,
@@ -3285,13 +3799,19 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
         int best_selected_pose_success_count = 0;
         int best_selected_pose_failure_count = 0;
 
-	        for (const AutoCameraInitializationCandidate& seed_candidate :
+        for (const AutoCameraInitializationCandidate& seed_candidate :
 	             candidates) {
 	          const double max_image_extent = static_cast<double>(
 	              std::max(result.image_size.width, result.image_size.height));
+	          const std::string seed_family =
+	              seed_candidate.camera.NormalizedFamilyString();
 	          const bool priority_rank_seed =
 	              seed_candidate.rank <= max_lm_seed_count;
 	          const bool low_focal_ray_curve_probe =
+	              (seed_family == "ds-none" ||
+	               seed_family == "pinhole-equi" ||
+	               seed_family == "eucm-none" ||
+	               seed_family == "omni-radtan") &&
 	              max_image_extent > 0.0 &&
 	              seed_candidate.camera.fu >= 0.23 * max_image_extent &&
 	              seed_candidate.camera.fu <= 0.27 * max_image_extent;
@@ -3336,7 +3856,7 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
 
           KalibrOuterLmRefinementResult selection_refined = lm_refined;
           std::string selection_objective_label =
-              "independent_board_pose_outer_lm_final_reprojection";
+              "independent_board_pose_outer_lm_plus_full_outer_health";
           std::set<int> selection_frame_indices = lm_frame_indices;
           std::vector<OuterObservationRecord> selection_lm_observations =
               selected_lm_observations;
@@ -3364,6 +3884,18 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
 	                  ? selection_refined.final_rmse *
 	                        selection_refined.final_rmse
 	                  : std::numeric_limits<double>::infinity();
+	          constexpr double kFullOuterHealthSelectionWeight = 1e-3;
+	          const double full_outer_health_objective =
+	              std::isfinite(refined_objective)
+	                  ? refined_objective
+	                  : std::numeric_limits<double>::infinity();
+	          const double combined_lm_selection_objective =
+	              std::isfinite(lm_selection_objective) &&
+	                      std::isfinite(full_outer_health_objective)
+	                  ? lm_selection_objective +
+	                        kFullOuterHealthSelectionWeight *
+	                            full_outer_health_objective
+	                  : std::numeric_limits<double>::infinity();
 	          std::ostringstream trial_warning;
 	          trial_warning
 	              << "Kalibr-style multi-start LM trial rank="
@@ -3371,24 +3903,31 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
               << " source=" << seed_candidate.source_label
               << " seed_fu=" << seed_candidate.camera.fu
               << " seed_alpha=" << seed_candidate.camera.alpha
+              << " seed_beta=" << seed_candidate.camera.beta
               << " refined_fu=" << selection_refined.camera.fu
 	              << " refined_alpha=" << selection_refined.camera.alpha
+	              << " refined_beta=" << selection_refined.camera.beta
 	              << " refined_xi=" << selection_refined.camera.xi
 	              << " seed_objective=" << seed_objective
 	              << " refined_objective=" << refined_objective
 	              << " lm_initial_rmse=" << selection_refined.initial_rmse
 	              << " lm_final_rmse=" << selection_refined.final_rmse
 	              << " lm_selection_objective=" << lm_selection_objective
+	              << " full_outer_health_weight="
+	              << kFullOuterHealthSelectionWeight
+	              << " combined_lm_selection_objective="
+	              << combined_lm_selection_objective
 	              << " selected_frames=" << selection_frame_indices.size()
 	              << " selected_board_observations="
 	              << selection_refined.view_count
               << " fixed_layout_frame_constraint="
               << (used_fixed_layout_frame_constraint ? 1 : 0)
               << " layout_updates_intrinsics=0"
-              << " layout_variables_optimized=0.";
+              << " layout_variables_optimized=0"
+              << " camera_step_gate=finite_model_validity_only.";
 	          AppendUniqueWarning(trial_warning.str(), &result.warnings);
 
-		          const bool full_outer_health_acceptable =
+	          const bool full_outer_health_acceptable =
 		              selection_refined.improved &&
 		              std::isfinite(selection_refined.final_rmse) &&
 		              selection_refined.residual_count > 0 &&
@@ -3396,15 +3935,24 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
 		              IsRefinableKalibrLikeSeed(
 		                  refined_eval,
 		                  result.total_valid_outer_observation_count);
+          const bool camera_init_step_finite =
+              seed_candidate.camera.IsValid() &&
+              selection_refined.camera.IsValid() &&
+              std::isfinite(seed_candidate.camera.fu) &&
+              std::isfinite(seed_candidate.camera.fv) &&
+              std::isfinite(selection_refined.camera.fu) &&
+              std::isfinite(selection_refined.camera.fv);
 	          const bool frame_objective_improved =
-	              std::isfinite(lm_selection_objective) &&
-	              lm_selection_objective + 1e-9 <
+	              std::isfinite(combined_lm_selection_objective) &&
+	              combined_lm_selection_objective + 1e-9 <
 	                  best_lm_selection_objective;
-	          if (!full_outer_health_acceptable || !frame_objective_improved) {
+	          if (!full_outer_health_acceptable ||
+	              !camera_init_step_finite ||
+	              !frame_objective_improved) {
 	            continue;
 	          }
 	          best_objective = refined_objective;
-	          best_lm_selection_objective = lm_selection_objective;
+	          best_lm_selection_objective = combined_lm_selection_objective;
 	          best_lm_refined = selection_refined;
           best_lm_seed = seed_candidate;
           best_lm_source_label = lm_source_label;
@@ -3572,6 +4120,35 @@ void WriteAutoCameraInitializationSummary(
          << result.stage5_init_ds_mapping_verified_against_kalibr_source << "\n";
   output << "stage5_init_ds_grid_enumeration_enabled: "
          << result.stage5_init_ds_grid_enumeration_enabled << "\n";
+  output << "stage5_init_kb_focal_source: "
+         << result.stage5_init_kb_focal_source << "\n";
+  output << "stage5_init_kb_row_circle_focal_available: "
+         << result.stage5_init_kb_row_circle_focal_available << "\n";
+  output << "stage5_init_kb_zero_distortion_seed: "
+         << result.stage5_init_kb_zero_distortion_seed << "\n";
+  output << "stage5_init_kb_zero_distortion_seed_included: "
+         << result.stage5_init_kb_zero_distortion_seed_included << "\n";
+  output << "stage5_init_kb_nonzero_distortion_seed_count: "
+         << result.stage5_init_kb_nonzero_distortion_seed_count << "\n";
+  output << "stage5_init_kb_distortion_released_in_lm: "
+         << result.stage5_init_kb_distortion_released_in_lm << "\n";
+  output << "stage5_init_kb_distortion_fixed_zero_in_init_lm: "
+         << result.stage5_init_kb_distortion_fixed_zero_in_init_lm << "\n";
+  output << "stage5_init_kb_multistart_enabled: "
+         << result.stage5_init_kb_multistart_enabled << "\n";
+  output << "stage5_init_ucm_seed_source: "
+         << result.stage5_init_ucm_seed_source << "\n";
+  output << "stage5_init_ucm_omni_gamma_available: "
+         << result.stage5_init_ucm_omni_gamma_available << "\n";
+  output << "stage5_init_ucm_mapping: "
+         << result.stage5_init_ucm_mapping << "\n";
+  output << "stage5_init_ucm_mapping_verified_against_kalibr_source: "
+         << result.stage5_init_ucm_mapping_verified_against_kalibr_source
+         << "\n";
+  output << "stage5_init_ucm_multistart_enabled: "
+         << result.stage5_init_ucm_multistart_enabled << "\n";
+  output << "stage5_init_ucm_shape_released_in_lm: "
+         << result.stage5_init_ucm_shape_released_in_lm << "\n";
   output << "stage5_init_uses_yaml_intrinsics: "
          << result.stage5_init_uses_yaml_intrinsics << "\n";
   output << "stage5_init_uses_kalibr_camchain_intrinsics: "

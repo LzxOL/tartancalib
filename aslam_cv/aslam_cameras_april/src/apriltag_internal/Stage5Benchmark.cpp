@@ -35,8 +35,6 @@ namespace apriltag_internal {
 namespace {
 
 constexpr double kInvalidProjectionPenaltyPixels = 100.0;
-constexpr double kKalibrCornerSigmaThreshold = 2.0;
-constexpr double kKalibrCornerMinReprojErrorPixels = 0.2;
 constexpr double kWideFovPoseRescueTriggerRmse = 50.0;
 constexpr double kWideFovPoseRescueMaxRayAngleRadians =
     85.0 * 3.14159265358979323846 / 180.0;
@@ -60,6 +58,47 @@ std::string SanitizeMetricKey(const std::string& input) {
     sanitized.pop_back();
   }
   return sanitized.empty() ? "reference" : sanitized;
+}
+
+std::string JoinStrings(const std::vector<std::string>& values,
+                        const std::string& delimiter) {
+  std::ostringstream stream;
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (index > 0) {
+      stream << delimiter;
+    }
+    stream << values[index];
+  }
+  return stream.str();
+}
+
+std::string JoinDoubles(const std::vector<double>& values,
+                        const std::string& delimiter) {
+  std::ostringstream stream;
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (index > 0) {
+      stream << delimiter;
+    }
+    stream << values[index];
+  }
+  return stream.str();
+}
+
+std::string EscapeCsvCell(const std::string& value) {
+  const bool needs_quotes = value.find_first_of(",\"\n\r") != std::string::npos;
+  if (!needs_quotes) {
+    return value;
+  }
+  std::string escaped = "\"";
+  for (char ch : value) {
+    if (ch == '"') {
+      escaped += "\"\"";
+    } else {
+      escaped.push_back(ch);
+    }
+  }
+  escaped += "\"";
+  return escaped;
 }
 
 std::string RangeBucketLabel(double low, double high, const std::string& suffix) {
@@ -99,6 +138,72 @@ double AngularDifferenceDegrees(const Eigen::Vector3d& a,
   const double dot =
       std::max(-1.0, std::min(1.0, a.normalized().dot(b.normalized())));
   return std::acos(dot) * kRadiansToDegrees;
+}
+
+bool UnprojectPinholeEquidistantRayCurve(
+    const OuterBootstrapCameraIntrinsics& intrinsics,
+    const Eigen::Vector2d& pixel,
+    Eigen::Vector3d* ray) {
+  if (ray == nullptr || intrinsics.fu <= 0.0 || intrinsics.fv <= 0.0) {
+    return false;
+  }
+  const std::vector<double> distortion = intrinsics.DistortionVector();
+  if (distortion.size() < 4u) {
+    return false;
+  }
+  const double xd = (pixel.x() - intrinsics.cu) / intrinsics.fu;
+  const double yd = (pixel.y() - intrinsics.cv) / intrinsics.fv;
+  const double rd = std::hypot(xd, yd);
+  if (!std::isfinite(rd)) {
+    return false;
+  }
+  if (rd < 1e-12) {
+    *ray = Eigen::Vector3d(0.0, 0.0, 1.0);
+    return true;
+  }
+  const auto theta_distorted = [&distortion](double theta) {
+    const double theta2 = theta * theta;
+    const double theta4 = theta2 * theta2;
+    const double theta6 = theta4 * theta2;
+    const double theta8 = theta4 * theta4;
+    return theta *
+           (1.0 + distortion[0] * theta2 + distortion[1] * theta4 +
+            distortion[2] * theta6 + distortion[3] * theta8);
+  };
+  const double max_theta = 0.5 * std::acos(-1.0) - 1e-9;
+  const double max_rd = theta_distorted(max_theta);
+  if (!std::isfinite(max_rd) || rd > max_rd + 1e-9) {
+    return false;
+  }
+
+  double low = 0.0;
+  double high = max_theta;
+  for (int iteration = 0; iteration < 80; ++iteration) {
+    const double mid = 0.5 * (low + high);
+    if (theta_distorted(mid) < rd) {
+      low = mid;
+    } else {
+      high = mid;
+    }
+  }
+  const double theta = 0.5 * (low + high);
+  const double ru = std::tan(theta);
+  const double scale = ru / rd;
+  *ray = Eigen::Vector3d(xd * scale, yd * scale, 1.0);
+  return ray->allFinite() && ray->norm() > 1e-12;
+}
+
+bool UnprojectForRayCurve(const OuterBootstrapCameraIntrinsics& intrinsics,
+                          const DoubleSphereCameraModel& camera,
+                          const Eigen::Vector2d& pixel,
+                          Eigen::Vector3d* ray) {
+  if (ray == nullptr) {
+    return false;
+  }
+  if (intrinsics.NormalizedFamilyString() == "pinhole-equi") {
+    return UnprojectPinholeEquidistantRayCurve(intrinsics, pixel, ray);
+  }
+  return camera.keypointToEuclidean(pixel, ray);
 }
 
 struct CameraRayCurveReference {
@@ -169,11 +274,14 @@ void AddRayCurveBucketSample(
 
 CameraRayCurveDiagnostics ComputeCameraRayCurveDiagnostics(
     const OuterBootstrapCameraIntrinsics& our_intrinsics,
+    const std::string& our_camera_source,
     const std::vector<CameraRayCurveReference>& references) {
   CameraRayCurveDiagnostics diagnostics;
   diagnostics.grid_width = 41;
   diagnostics.grid_height = 41;
   diagnostics.comparison_count = static_cast<int>(references.size());
+  diagnostics.our_camera_source = our_camera_source;
+  diagnostics.our_camera = our_intrinsics;
   if (!our_intrinsics.IsValid()) {
     diagnostics.failure_reason = "ours camera intrinsics are invalid";
     return diagnostics;
@@ -235,8 +343,9 @@ CameraRayCurveDiagnostics ComputeCameraRayCurveDiagnostics(
         Eigen::Vector3d our_ray = Eigen::Vector3d::Zero();
         Eigen::Vector3d reference_ray = Eigen::Vector3d::Zero();
         const Eigen::Vector2d pixel(x, y);
-        if (!our_camera.keypointToEuclidean(pixel, &our_ray) ||
-            !reference_camera.keypointToEuclidean(pixel, &reference_ray) ||
+        if (!UnprojectForRayCurve(our_intrinsics, our_camera, pixel, &our_ray) ||
+            !UnprojectForRayCurve(reference.intrinsics, reference_camera, pixel,
+                                  &reference_ray) ||
             our_ray.norm() <= 1e-12 || reference_ray.norm() <= 1e-12 ||
             !our_ray.allFinite() || !reference_ray.allFinite()) {
           ++diagnostics.invalid_unprojection_count;
@@ -1680,7 +1789,8 @@ AslamBackendCalibrationResult RunShortTrialBackend(
 }
 
 AslamBackendCalibrationOptions MakeTrialBackendRunnerOptions(
-    const TrialBackendFrameBoardSelectionOptions& options) {
+    const TrialBackendFrameBoardSelectionOptions& options,
+    const AslamBackendCalibrationOptions& residual_options) {
   AslamBackendCalibrationOptions runner_options;
   runner_options.max_iterations = std::max(1, options.max_iterations);
   runner_options.convergence_delta_j = 1e-3;
@@ -1696,6 +1806,48 @@ AslamBackendCalibrationOptions MakeTrialBackendRunnerOptions(
   runner_options.export_cost_parity_diagnostics = false;
   runner_options.run_jacobian_consistency_check = false;
   runner_options.skip_optimization = false;
+  runner_options.residual_model = residual_options.residual_model;
+  runner_options.outer_huber_delta_radians =
+      residual_options.outer_huber_delta_radians;
+  runner_options.internal_huber_delta_radians =
+      residual_options.internal_huber_delta_radians;
+  runner_options.invalid_projection_penalty_radians =
+      residual_options.invalid_projection_penalty_radians;
+  runner_options.hybrid_angular_threshold_deg =
+      residual_options.hybrid_angular_threshold_deg;
+  runner_options.outer_residual_model = residual_options.outer_residual_model;
+  runner_options.internal_residual_model =
+      residual_options.internal_residual_model;
+  runner_options.use_point_type_residual_split =
+      residual_options.use_point_type_residual_split;
+  runner_options.angular_auxiliary_enabled =
+      residual_options.angular_auxiliary_enabled;
+  runner_options.angular_auxiliary_weight =
+      residual_options.angular_auxiliary_weight;
+  runner_options.angular_auxiliary_normalized =
+      residual_options.angular_auxiliary_normalized;
+  runner_options.angular_auxiliary_apply_to_outer =
+      residual_options.angular_auxiliary_apply_to_outer;
+  runner_options.angular_auxiliary_apply_to_internal =
+      residual_options.angular_auxiliary_apply_to_internal;
+  runner_options.polar_continuous_hybrid_threshold_deg =
+      residual_options.polar_continuous_hybrid_threshold_deg;
+  runner_options.polar_continuous_hybrid_temperature_deg =
+      residual_options.polar_continuous_hybrid_temperature_deg;
+  runner_options.normalized_angular_reference_sigma_px =
+      residual_options.normalized_angular_reference_sigma_px;
+  runner_options.normalized_angular_min_sigma_rad =
+      residual_options.normalized_angular_min_sigma_rad;
+	  runner_options.normalized_angular_max_weight_scale =
+	      residual_options.normalized_angular_max_weight_scale;
+	  runner_options.pixel_residual_weight =
+	      residual_options.pixel_residual_weight;
+	  runner_options.chordal_residual_weight =
+	      residual_options.chordal_residual_weight;
+	  runner_options.angular_use_normalize_jacobian =
+	      residual_options.angular_use_normalize_jacobian;
+  runner_options.angular_observed_ray_mode =
+      residual_options.angular_observed_ray_mode;
   return runner_options;
 }
 
@@ -1713,6 +1865,18 @@ void CopyPersistentIncrementalSummary(
       incremental_result.fallback_reason;
   result->persistent_incremental_backend_estimator_failure_reason =
       incremental_result.failure_reason;
+  result->persistent_incremental_information_gain_target =
+      incremental_result.information_gain_target;
+  result->persistent_incremental_board_layout_in_information_group =
+      incremental_result.board_layout_in_information_group;
+  result->persistent_incremental_camera_information_group_id =
+      incremental_result.camera_information_group_id;
+  result->persistent_incremental_board_layout_group_id =
+      incremental_result.board_layout_group_id;
+  result->persistent_incremental_transformation_group_id =
+      incremental_result.transformation_group_id;
+  result->persistent_incremental_seed_information_group_dim =
+      incremental_result.seed_information_group_dim;
   result->persistent_incremental_seed_batch_count =
       incremental_result.seed_batch_count;
   result->persistent_incremental_seed_frame_count =
@@ -1729,6 +1893,63 @@ void CopyPersistentIncrementalSummary(
       incremental_result.accepted_batch_count;
   result->persistent_incremental_rejected_batch_count =
       incremental_result.rejected_batch_count;
+  result->persistent_incremental_image_plane_residual_count =
+      incremental_result.image_plane_residual_count;
+	  result->persistent_incremental_angular_residual_count =
+	      incremental_result.angular_residual_count;
+	  result->persistent_incremental_chordal_residual_count =
+	      incremental_result.chordal_residual_count;
+	  result->persistent_incremental_hybrid_angular_selected_count =
+	      incremental_result.hybrid_angular_selected_count;
+	  result->persistent_incremental_hybrid_chordal_selected_count =
+	      incremental_result.hybrid_chordal_selected_count;
+	  result->persistent_incremental_angular_geometry_failure_count =
+	      incremental_result.angular_observation_geometry_failure_count;
+  result->persistent_incremental_selection_metric_name =
+      incremental_result.selection_metric_name;
+  result->persistent_incremental_selection_metric_unit =
+      incremental_result.selection_metric_unit;
+  result->persistent_incremental_residual_health_threshold_source =
+      incremental_result.residual_health_threshold_source;
+  result->persistent_incremental_residual_health_threshold_metric =
+      incremental_result.residual_health_threshold_metric;
+  result->persistent_incremental_seed_acceptance_metric_rmse =
+      incremental_result.seed_acceptance_metric_rmse;
+  result->persistent_incremental_seed_acceptance_metric_p95 =
+      incremental_result.seed_acceptance_metric_p95;
+  result->persistent_incremental_trust_region_backtracking_batch_count =
+      incremental_result.trust_region_backtracking_batch_count;
+  result->persistent_incremental_trust_region_backtracking_attempt_count =
+      incremental_result.trust_region_backtracking_attempt_count;
+  result->persistent_incremental_trust_region_backtracking_accepted_count =
+      incremental_result.trust_region_backtracking_accepted_count;
+  result->persistent_incremental_trust_region_backtracking_max_anchor_scale =
+      incremental_result.trust_region_backtracking_max_anchor_scale;
+  result
+      ->persistent_incremental_normalize_information_gain_by_board_observation =
+      incremental_result.normalize_information_gain_by_board_observation;
+  result->persistent_incremental_split_residual_health_gate_enabled =
+      incremental_result.split_residual_health_gate_enabled;
+  result->persistent_incremental_split_residual_health_rejected_count =
+      incremental_result.split_residual_health_rejected_count;
+  result->persistent_incremental_adaptive_saturation_stop_enabled =
+      incremental_result.adaptive_saturation_stop_enabled;
+  result->persistent_incremental_adaptive_saturation_stop_hit =
+      incremental_result.adaptive_saturation_stop_hit;
+  result->persistent_incremental_adaptive_saturation_min_accepted_batches =
+      incremental_result.adaptive_saturation_min_accepted_batches;
+  result->persistent_incremental_adaptive_saturation_nonproductive_batch_limit =
+      incremental_result.adaptive_saturation_nonproductive_batch_limit;
+  result
+      ->persistent_incremental_adaptive_saturation_consecutive_nonproductive_batches =
+      incremental_result.adaptive_saturation_consecutive_nonproductive_batches;
+  result
+      ->persistent_incremental_adaptive_saturation_tail_ordering_score_threshold =
+      incremental_result.adaptive_saturation_tail_ordering_score_threshold;
+  result->persistent_incremental_adaptive_saturation_next_ordering_score =
+      incremental_result.adaptive_saturation_next_ordering_score;
+  result->persistent_incremental_adaptive_saturation_stop_reason =
+      incremental_result.adaptive_saturation_stop_reason;
   result->persistent_incremental_total_elapsed_time_seconds =
       incremental_result.total_elapsed_time_seconds;
 }
@@ -1821,7 +2042,8 @@ CandidateCoverageScoreBreakdown ComputeCandidateCoverageScore(
     const CalibrationMeasurementDataset& candidate_dataset,
     const std::set<FrameBoardKey>& accepted_keys,
     double trial_rmse,
-    double threshold_px) {
+    double threshold_px,
+    bool use_pixel_trial_residual_quality) {
   CandidateCoverageScoreBreakdown score;
   const BoardObservationGeometrySummary geometry =
       SummarizeBoardObservationGeometry(key, candidate_dataset);
@@ -1878,7 +2100,9 @@ CandidateCoverageScoreBreakdown ComputeCandidateCoverageScore(
           : 0.0;
   const double safe_threshold = std::max(1e-6, threshold_px);
   score.residual_quality_score =
-      std::max(0.0, 1.0 - std::min(1.0, trial_rmse / safe_threshold));
+      use_pixel_trial_residual_quality
+          ? std::max(0.0, 1.0 - std::min(1.0, trial_rmse / safe_threshold))
+          : 0.5;
   score.coverage_gain =
       0.9 * score.polar_gain +
       0.8 * score.edge_gain +
@@ -1887,7 +2111,9 @@ CandidateCoverageScoreBreakdown ComputeCandidateCoverageScore(
       0.5 * score.grid_gain +
       0.5 * score.covisibility_gain;
   score.total_score =
-      score.coverage_gain + 0.8 * score.residual_quality_score;
+      score.coverage_gain +
+      (use_pixel_trial_residual_quality ? 0.8 * score.residual_quality_score
+                                        : 0.0);
   return score;
 }
 
@@ -2220,11 +2446,19 @@ std::map<FrameBoardKey, TrialBoardRmseAccumulator> ComputeTrialBoardResiduals(
   return accumulators;
 }
 
+bool SelectionUsesPixelTrialResidualGate(
+    const AslamBackendCalibrationOptions& selection_runner_options) {
+  return selection_runner_options.residual_model == ResidualModel::ImagePlane &&
+         !selection_runner_options.use_point_type_residual_split &&
+         !selection_runner_options.angular_auxiliary_enabled;
+}
+
 TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
     const CalibrationStateBundle& baseline_bundle,
     const CalibrationStateBundle& candidate_pool_bundle,
     const BackendProblemOptions& backend_options,
-    const TrialBackendFrameBoardSelectionOptions& options) {
+    const TrialBackendFrameBoardSelectionOptions& options,
+    const AslamBackendCalibrationOptions& selection_runner_options) {
   TrialBackendFrameBoardSelectionResult result;
   result.enabled = options.enabled;
   result.selection_mode = options.selection_mode;
@@ -2243,6 +2477,14 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
       baseline_bundle.measurement_dataset.accepted_outer_point_count;
   result.baseline_seed_internal_point_count =
       baseline_bundle.measurement_dataset.accepted_internal_point_count;
+  const bool use_pixel_trial_residual_gate =
+      SelectionUsesPixelTrialResidualGate(selection_runner_options);
+  if (!use_pixel_trial_residual_gate) {
+    result.warnings.push_back(
+        "Residual-aware Stage5 selection: disabled pixel trial-RMSE "
+        "pre-rejection/strong ordering for non-pixel BA residual mode; "
+        "persistent accept/reject uses the active residual metric.");
+  }
   result.baseline_seed_total_point_count =
       baseline_bundle.measurement_dataset.accepted_total_point_count;
 
@@ -2384,7 +2626,8 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             : 0.0;
     decision.kept = true;
     decision.reason = "kept";
-    if (decision.trial_rmse > result.threshold_px) {
+    if (use_pixel_trial_residual_gate &&
+        decision.trial_rmse > result.threshold_px) {
       const int board_kept_count = kept_count_by_board[decision.board_id];
       if (board_kept_count >= options.min_keep_observations_per_board) {
         decision.kept = false;
@@ -2461,7 +2704,8 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             candidate_pool_bundle.measurement_dataset,
             baseline_keys,
             candidate.trial_rmse,
-            result.threshold_px);
+            result.threshold_px,
+            use_pixel_trial_residual_gate);
     const CandidateConsistencyScoreBreakdown consistency =
         ComputeCandidateConsistencyScore(
             key,
@@ -2508,7 +2752,10 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
         candidate_pool_bundle.measurement_dataset,
         baseline_keys);
       candidate.candidate_score =
-          candidate.coverage_gain + 0.8 * candidate.residual_quality_score -
+          candidate.coverage_gain +
+          (use_pixel_trial_residual_gate
+               ? 0.8 * candidate.residual_quality_score
+               : 0.0) -
           candidate.consistency_penalty;
     }
   }
@@ -2617,10 +2864,20 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
       TrialBackendFrameBoardSelectionOptions::CandidateOrderMode
           ::RandomShuffle;
   if (result.candidate_shuffle_seed_set) {
+    unsigned int deterministic_seed = 2166136261u;
+    for (const TrialBackendFrameBoardObservationDecision& candidate :
+         candidate_decisions) {
+      deterministic_seed ^= static_cast<unsigned int>(
+          candidate.frame_index * 73856093u);
+      deterministic_seed *= 16777619u;
+      deterministic_seed ^= static_cast<unsigned int>(
+          candidate.board_id * 19349663u);
+      deterministic_seed *= 16777619u;
+    }
     result.candidate_shuffle_seed =
         options.candidate_shuffle_seed_set
             ? options.candidate_shuffle_seed
-            : std::random_device{}();
+            : deterministic_seed;
     std::mt19937 rng(result.candidate_shuffle_seed);
     std::shuffle(candidate_decisions.begin(), candidate_decisions.end(), rng);
   }
@@ -2749,7 +3006,11 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             gain.intrinsics_jacobian_info_term;
         candidate->frame_completion_bonus = gain.frame_completion_bonus;
         candidate->new_board_bonus = gain.new_board_bonus;
-        candidate->information_gain_proxy = gain.information_gain_proxy;
+        candidate->information_gain_proxy =
+            options.acceptance_policy ==
+                    KalibrStyleBatchAcceptancePolicy::KalibrInformationGain
+                ? candidate->intrinsics_jacobian_logdet_gain
+                : gain.information_gain_proxy;
         if (batch_members != nullptr && !batch_members->empty()) {
           Eigen::Matrix<double, 6, 6> batch_fisher =
               Eigen::Matrix<double, 6, 6>::Zero();
@@ -2794,6 +3055,9 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
                 aggregate_intrinsics_anchor ||
                 member.intrinsics_diversity_anchor;
           }
+          const double batch_member_count =
+              static_cast<double>(std::max<std::size_t>(
+                  1u, batch_members->size()));
           const Eigen::Matrix<double, 6, 6> combined_fisher =
               accepted_intrinsics_fisher + batch_fisher;
           const double accepted_logdet =
@@ -2804,9 +3068,9 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
               FisherRankProxy(accepted_intrinsics_fisher);
           const double combined_rank = FisherRankProxy(combined_fisher);
           candidate->score_term =
-              aggregate_score_term /
-              static_cast<double>(batch_members->size());
-          candidate->coverage_term = aggregate_coverage_term;
+              aggregate_score_term / batch_member_count;
+          candidate->coverage_term =
+              aggregate_coverage_term / batch_member_count;
           candidate->intrinsics_jacobian_logdet_gain =
               available_jacobian_count > 0
                   ? std::max(0.0, combined_logdet - accepted_logdet)
@@ -2834,12 +3098,16 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
               logdet_term + 0.35 * trace_term + 0.35 * rank_term;
           candidate->frame_completion_bonus =
               aggregate_frame_completion_bonus;
-          candidate->new_board_bonus = aggregate_new_board_bonus;
+          candidate->new_board_bonus =
+              aggregate_new_board_bonus / batch_member_count;
           candidate->information_gain_proxy =
-              candidate->coverage_term +
-              candidate->intrinsics_jacobian_info_term +
-              candidate->frame_completion_bonus +
-              candidate->new_board_bonus;
+              options.acceptance_policy ==
+                      KalibrStyleBatchAcceptancePolicy::KalibrInformationGain
+                  ? candidate->intrinsics_jacobian_logdet_gain
+                  : candidate->coverage_term +
+                        candidate->intrinsics_jacobian_info_term +
+                        candidate->frame_completion_bonus +
+                        candidate->new_board_bonus;
           candidate->intrinsics_diversity_anchor =
               candidate->intrinsics_diversity_anchor ||
               aggregate_intrinsics_anchor;
@@ -2881,10 +3149,13 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             options.acceptance_policy ==
                     KalibrStyleBatchAcceptancePolicy
                         ::KalibrInformationGain
-                ? candidate->intrinsics_jacobian_info_term
+                ? candidate->intrinsics_jacobian_logdet_gain
                 : candidate->information_gain_proxy;
         acceptance_input.rank_gain_proxy =
-            candidate->intrinsics_jacobian_rank_gain;
+            options.acceptance_policy ==
+                    KalibrStyleBatchAcceptancePolicy::KalibrInformationGain
+                ? 0.0
+                : candidate->intrinsics_jacobian_rank_gain;
         acceptance_input.residual_score = candidate->batch_acceptance_score;
         acceptance_input.residual_overage_penalty =
             candidate->residual_overage_penalty;
@@ -2943,15 +3214,31 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
     result.persistent_max_xi_alpha_step =
         options.persistent_max_xi_alpha_step;
     const AslamBackendCalibrationOptions persistent_runner_options =
-        MakeTrialBackendRunnerOptions(options);
+        MakeTrialBackendRunnerOptions(options, selection_runner_options);
 
     std::vector<Stage5IncrementalBackendBatchInput> persistent_batches;
     std::map<int, Stage5IncrementalBackendBatchInput> persistent_batch_by_frame;
     bool persistent_safety_ceiling_hit = false;
     int persistent_candidate_observation_attempt_count = 0;
+    const bool persistent_uses_fixed_traversal_limit =
+        options.budget_mode ==
+        TrialBackendFrameBoardSelectionOptions::BudgetMode::Fixed;
+    const int persistent_traversal_limit =
+        persistent_uses_fixed_traversal_limit
+            ? traversal_budget.traversal_limit
+            : (traversal_budget.runtime_safety_ceiling > 0
+                   ? traversal_budget.runtime_safety_ceiling
+                   : std::numeric_limits<int>::max());
+    if (options.budget_mode ==
+        TrialBackendFrameBoardSelectionOptions::BudgetMode::Adaptive) {
+      result.warnings.push_back(
+          "Persistent incremental estimator ignores adaptive attempted-batch "
+          "truncation and traverses candidate frame batches until information "
+          "acceptance saturates or runtime_safety_ceiling is reached.");
+    }
     for (int frame_index : frame_order) {
       if (static_cast<int>(persistent_batches.size()) >=
-          traversal_budget.traversal_limit) {
+          persistent_traversal_limit) {
         persistent_safety_ceiling_hit = true;
         break;
       }
@@ -2960,6 +3247,9 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
       Stage5IncrementalBackendBatchInput batch_input;
       batch_input.frame_index = frame_index;
       batch_input.residual_health_threshold_px = result.threshold_px;
+      double ordering_score_sum = 0.0;
+      double coverage_gain_sum = 0.0;
+      int ordering_score_count = 0;
       for (std::size_t index : indices) {
         const TrialBackendFrameBoardObservationDecision& member =
             candidate_decisions[index];
@@ -2975,10 +3265,23 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
         batch_input.frame_board_keys.insert(key);
         batch_input.force =
             batch_input.force || member.force_include_candidate;
+        batch_input.has_intrinsics_diversity_anchor =
+            batch_input.has_intrinsics_diversity_anchor ||
+            member.intrinsics_diversity_anchor;
+        ordering_score_sum +=
+            std::isfinite(member.candidate_score) ? member.candidate_score
+                                                  : 0.0;
+        coverage_gain_sum +=
+            std::isfinite(member.coverage_gain) ? member.coverage_gain : 0.0;
+        ++ordering_score_count;
       }
       if (batch_input.frame_board_keys.empty()) {
         continue;
       }
+      const double ordering_denominator =
+          static_cast<double>(std::max(1, ordering_score_count));
+      batch_input.ordering_score = ordering_score_sum / ordering_denominator;
+      batch_input.coverage_gain = coverage_gain_sum / ordering_denominator;
       persistent_candidate_observation_attempt_count +=
           static_cast<int>(batch_input.frame_board_keys.size());
       persistent_batch_by_frame[frame_index] = batch_input;
@@ -2990,6 +3293,21 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             baseline_bundle, candidate_pool_bundle, persistent_backend_options,
             options, persistent_runner_options, persistent_batches);
     CopyPersistentIncrementalSummary(persistent_result, &result);
+
+    const bool persistent_required_for_residual_ablation =
+        persistent_runner_options.residual_model != ResidualModel::ImagePlane ||
+        persistent_runner_options.use_point_type_residual_split ||
+        persistent_runner_options.angular_auxiliary_enabled;
+    if (!persistent_result.success && persistent_required_for_residual_ablation) {
+      result.failure_reason =
+          "Requested backend residual model must be applied inside persistent "
+          "incremental selection BA, but the persistent estimator is not "
+          "compatible: " + persistent_result.fallback_reason;
+      result.warnings.insert(result.warnings.end(),
+                             persistent_result.warnings.begin(),
+                             persistent_result.warnings.end());
+      return result;
+    }
 
     if (persistent_result.success) {
       result.persistent_incremental_backend_estimator_used = true;
@@ -3061,9 +3379,19 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
         candidate.persistent_incremental_attempted = in_attempted_batch;
         if (!in_attempted_batch) {
           candidate.kept = false;
-          candidate.reason = result.safety_ceiling_hit
-                                 ? "runtime_safety_ceiling"
-                                 : "not_attempted_persistent_incremental";
+          if (result.safety_ceiling_hit) {
+            candidate.reason = "runtime_safety_ceiling";
+          } else if (
+              result.persistent_incremental_adaptive_saturation_stop_hit) {
+            candidate.reason =
+                result.persistent_incremental_adaptive_saturation_stop_reason
+                    .empty()
+                    ? "adaptive_information_saturation"
+                    : result
+                          .persistent_incremental_adaptive_saturation_stop_reason;
+          } else {
+            candidate.reason = "not_attempted_persistent_incremental";
+          }
           decision_by_key[key] = candidate;
           continue;
         }
@@ -3075,12 +3403,33 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
         candidate.persistent_incremental_batch_accepted =
             batch_result.batch_accepted;
         candidate.persistent_incremental_force = batch_result.force;
+        candidate.persistent_incremental_trust_region_pass =
+            batch_result.trust_region_pass;
+        candidate.persistent_incremental_trust_region_backtracking_used =
+            batch_result.trust_region_backtracking_used;
+        candidate.persistent_incremental_split_residual_health_pass =
+            batch_result.split_residual_health_pass;
         candidate.persistent_incremental_information_gain =
             batch_result.information_gain;
+        candidate.persistent_incremental_normalized_information_gain =
+            batch_result.normalized_information_gain;
+        candidate
+            .persistent_incremental_information_gain_normalization_count =
+            batch_result.information_gain_normalization_count;
+        candidate.persistent_incremental_rank_psi_after =
+            batch_result.rank_psi_after;
+        candidate.persistent_incremental_rank_psi_deficiency_after =
+            batch_result.rank_psi_deficiency_after;
         candidate.persistent_incremental_rank_theta_before =
             batch_result.rank_theta_before;
         candidate.persistent_incremental_rank_theta_after =
             batch_result.rank_theta_after;
+        candidate.persistent_incremental_rank_theta_deficiency_after =
+            batch_result.rank_theta_deficiency_after;
+        candidate.persistent_incremental_svd_tolerance =
+            batch_result.svd_tolerance;
+        candidate.persistent_incremental_qr_tolerance =
+            batch_result.qr_tolerance;
         candidate.persistent_incremental_iterations =
             batch_result.num_iterations;
         candidate.persistent_incremental_objective_start =
@@ -3089,6 +3438,66 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             batch_result.objective_final;
         candidate.persistent_incremental_objective_decreased =
             batch_result.objective_decreased;
+        candidate.persistent_incremental_rmse_before =
+            batch_result.rmse_before;
+        candidate.persistent_incremental_outer_rmse_before =
+            batch_result.outer_rmse_before;
+        candidate.persistent_incremental_internal_rmse_before =
+            batch_result.internal_rmse_before;
+        candidate.persistent_incremental_acceptance_metric_name =
+            batch_result.acceptance_metric_name;
+        candidate.persistent_incremental_acceptance_metric_unit =
+            batch_result.acceptance_metric_unit;
+        candidate.persistent_incremental_acceptance_metric_threshold =
+            batch_result.acceptance_metric_threshold;
+        candidate.persistent_incremental_acceptance_metric_before =
+            batch_result.acceptance_metric_before;
+        candidate.persistent_incremental_acceptance_metric_after =
+            batch_result.acceptance_metric_after;
+        candidate.persistent_incremental_acceptance_metric_candidate =
+            batch_result.acceptance_metric_candidate;
+        candidate.persistent_incremental_acceptance_metric_candidate_p95 =
+            batch_result.acceptance_metric_candidate_p95;
+        candidate.persistent_incremental_acceptance_metric_candidate_outer =
+            batch_result.acceptance_metric_candidate_outer;
+        candidate.persistent_incremental_acceptance_metric_candidate_internal =
+            batch_result.acceptance_metric_candidate_internal;
+        candidate.persistent_incremental_total_p95_after =
+            batch_result.total_p95_after;
+        candidate.persistent_incremental_outer_p95_after =
+            batch_result.outer_p95_after;
+        candidate.persistent_incremental_internal_p95_after =
+            batch_result.internal_p95_after;
+        candidate.persistent_incremental_candidate_rmse_after =
+            batch_result.candidate_rmse_after;
+        candidate.persistent_incremental_candidate_outer_rmse_after =
+            batch_result.candidate_outer_rmse_after;
+        candidate.persistent_incremental_candidate_internal_rmse_after =
+            batch_result.candidate_internal_rmse_after;
+        candidate.persistent_incremental_candidate_total_p95_after =
+            batch_result.candidate_total_p95_after;
+        candidate.persistent_incremental_candidate_outer_p95_after =
+            batch_result.candidate_outer_p95_after;
+        candidate.persistent_incremental_candidate_internal_p95_after =
+            batch_result.candidate_internal_p95_after;
+        candidate.persistent_incremental_image_plane_residual_count =
+            batch_result.image_plane_residual_count;
+	        candidate.persistent_incremental_angular_residual_count =
+	            batch_result.angular_residual_count;
+	        candidate.persistent_incremental_chordal_residual_count =
+	            batch_result.chordal_residual_count;
+	        candidate.persistent_incremental_hybrid_angular_selected_count =
+	            batch_result.hybrid_angular_selected_count;
+	        candidate.persistent_incremental_hybrid_chordal_selected_count =
+	            batch_result.hybrid_chordal_selected_count;
+	        candidate.persistent_incremental_angular_geometry_failure_count =
+	            batch_result.angular_observation_geometry_failure_count;
+        candidate.persistent_incremental_trust_region_retry_count =
+            batch_result.trust_region_retry_count;
+        candidate.persistent_incremental_trust_region_violation_ratio =
+            batch_result.trust_region_violation_ratio;
+        candidate.persistent_incremental_trust_region_anchor_weight_scale =
+            batch_result.trust_region_anchor_weight_scale;
         candidate.persistent_incremental_elapsed_time_seconds =
             batch_result.elapsed_time_seconds;
         candidate.persistent_incremental_commit_state =
@@ -3228,6 +3637,11 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             frame_decision.intrinsics_diversity_anchor ||
             member.intrinsics_diversity_anchor;
       }
+      const double batch_member_count =
+          static_cast<double>(std::max<std::size_t>(
+              1u, batch_members.size()));
+      frame_decision.candidate_score /= batch_member_count;
+      frame_decision.coverage_gain /= batch_member_count;
 
       record_candidate_traversal();
       ++result.frame_batch_attempted_count;
@@ -4604,105 +5018,6 @@ bool AccumulatePointBounds(const CameraModelRefitPointDiagnostics& point,
   return true;
 }
 
-void FilterInternalEvaluationPointsByReprojection(
-    const OuterBootstrapCameraIntrinsics& camera,
-    CalibrationEvaluationBoardObservation* board_observation) {
-  if (board_observation == nullptr || !camera.IsValid()) {
-    return;
-  }
-
-  std::vector<Eigen::Vector3d> outer_targets;
-  std::vector<cv::Point2f> outer_pixels;
-  std::vector<std::size_t> internal_indices;
-  for (std::size_t index = 0; index < board_observation->points.size(); ++index) {
-    const CalibrationEvaluationPointObservation& point = board_observation->points[index];
-    if (point.point_type == JointPointType::Outer) {
-      outer_targets.push_back(point.target_xyz_board);
-      outer_pixels.push_back(
-          cv::Point2f(static_cast<float>(point.image_xy.x()),
-                      static_cast<float>(point.image_xy.y())));
-    } else {
-      internal_indices.push_back(index);
-    }
-  }
-
-  if (outer_targets.size() < 4 || internal_indices.empty()) {
-    return;
-  }
-
-  Eigen::Isometry3d T_camera_board = Eigen::Isometry3d::Identity();
-  double pose_fit_rmse = 0.0;
-  if (!EstimatePoseForBenchmarkRefit(camera, outer_targets, outer_pixels,
-                                     &T_camera_board, &pose_fit_rmse)) {
-    return;
-  }
-
-  const DoubleSphereCameraModel camera_model =
-      DoubleSphereCameraModel::FromConfig(MakeIntermediateCameraConfig(camera));
-  std::vector<double> residual_norms;
-  residual_norms.reserve(internal_indices.size());
-  std::vector<double> per_point_residuals(
-      internal_indices.size(), std::numeric_limits<double>::infinity());
-  for (std::size_t i = 0; i < internal_indices.size(); ++i) {
-    const CalibrationEvaluationPointObservation& point =
-        board_observation->points[internal_indices[i]];
-    Eigen::Vector2d predicted = Eigen::Vector2d::Zero();
-    if (!camera_model.vsEuclideanToKeypoint(T_camera_board * point.target_xyz_board,
-                                            &predicted)) {
-      continue;
-    }
-    per_point_residuals[i] = (predicted - point.image_xy).norm();
-    residual_norms.push_back(per_point_residuals[i]);
-  }
-
-  if (residual_norms.empty()) {
-    board_observation->points.erase(
-        std::remove_if(board_observation->points.begin(), board_observation->points.end(),
-                       [](const CalibrationEvaluationPointObservation& point) {
-                         return point.point_type == JointPointType::Internal;
-                       }),
-        board_observation->points.end());
-    board_observation->internal_point_count = 0;
-    return;
-  }
-
-  const double mean_residual = std::accumulate(
-      residual_norms.begin(), residual_norms.end(), 0.0) /
-      static_cast<double>(residual_norms.size());
-  double variance = 0.0;
-  for (double residual : residual_norms) {
-    const double delta = residual - mean_residual;
-    variance += delta * delta;
-  }
-  variance /= static_cast<double>(residual_norms.size());
-  const double std_residual = std::sqrt(std::max(0.0, variance));
-  const double threshold =
-      mean_residual + kKalibrCornerSigmaThreshold * std_residual;
-
-  std::vector<CalibrationEvaluationPointObservation> filtered_points;
-  filtered_points.reserve(board_observation->points.size());
-  std::size_t internal_offset = 0;
-  int filtered_internal_count = 0;
-  for (const CalibrationEvaluationPointObservation& point : board_observation->points) {
-    if (point.point_type == JointPointType::Outer) {
-      filtered_points.push_back(point);
-      continue;
-    }
-
-    const double residual = per_point_residuals[internal_offset++];
-    const bool keep =
-        std::isfinite(residual) &&
-        !(residual > threshold && residual > kKalibrCornerMinReprojErrorPixels);
-    if (keep) {
-      filtered_points.push_back(point);
-      ++filtered_internal_count;
-    }
-  }
-
-  board_observation->points.swap(filtered_points);
-  board_observation->internal_point_count = filtered_internal_count;
-}
-
 }  // namespace
 
 Stage5Benchmark::Stage5Benchmark(CalibrationBenchmarkSplitOptions split_options)
@@ -4714,35 +5029,94 @@ CalibrationBenchmarkSplit Stage5Benchmark::BuildDeterministicSplit(
   split.mode = split_options_.mode;
   split.holdout_stride = split_options_.holdout_stride;
   split.holdout_offset = split_options_.holdout_offset;
+  split.holdout_ratio = split_options_.holdout_ratio;
+  split.random_seed = split_options_.random_seed;
 
   if (frames.empty()) {
     split.failure_reason = "Stage 5 benchmark split requires non-empty frame sources.";
     return split;
   }
-  if (split_options_.holdout_stride <= 1) {
-    split.failure_reason = "holdout_stride must be greater than 1 for deterministic split.";
+
+  const std::string mode =
+      split_options_.mode.empty() ? "deterministic_stride" : split_options_.mode;
+  if (mode == "random_holdout_ratio" || mode == "random_ratio" ||
+      mode == "random_70_30") {
+    if (!(split_options_.holdout_ratio > 0.0 &&
+          split_options_.holdout_ratio < 1.0)) {
+      split.failure_reason =
+          "holdout_ratio must be in (0, 1) for random_holdout_ratio split.";
+      return split;
+    }
+    if (static_cast<int>(frames.size()) <
+        split_options_.minimum_training_frames +
+            split_options_.minimum_holdout_frames) {
+      split.failure_reason =
+          "Not enough frames for requested minimum train/holdout split.";
+      return split;
+    }
+
+    std::vector<std::size_t> indices(frames.size());
+    std::iota(indices.begin(), indices.end(), 0u);
+    std::mt19937 generator(split_options_.random_seed);
+    std::shuffle(indices.begin(), indices.end(), generator);
+    int holdout_count = static_cast<int>(std::lround(
+        static_cast<double>(frames.size()) * split_options_.holdout_ratio));
+    holdout_count = std::max(holdout_count, split_options_.minimum_holdout_frames);
+    holdout_count = std::min(
+        holdout_count,
+        static_cast<int>(frames.size()) - split_options_.minimum_training_frames);
+    if (holdout_count <= 0) {
+      split.failure_reason =
+          "Random split produced zero holdout frames after minimum constraints.";
+      return split;
+    }
+
+    std::set<std::size_t> holdout_indices;
+    for (int index = 0; index < holdout_count; ++index) {
+      holdout_indices.insert(indices[static_cast<std::size_t>(index)]);
+    }
+    for (std::size_t index = 0; index < frames.size(); ++index) {
+      if (holdout_indices.find(index) != holdout_indices.end()) {
+        split.holdout_frames.push_back(frames[index]);
+      } else {
+        split.training_frames.push_back(frames[index]);
+      }
+    }
+    split.mode = "random_holdout_ratio";
+    split.split_signature =
+        "random_holdout_ratio_" + std::to_string(split_options_.holdout_ratio) +
+        "_seed_" + std::to_string(split_options_.random_seed) +
+        "_holdout_indices_" + JoinIndices(split.holdout_frames);
+  } else if (mode == "deterministic_stride" || mode == "stride") {
+    if (split_options_.holdout_stride <= 1) {
+      split.failure_reason =
+          "holdout_stride must be greater than 1 for deterministic split.";
+      return split;
+    }
+
+    for (std::size_t index = 0; index < frames.size(); ++index) {
+      const int normalized_offset =
+          ((split_options_.holdout_offset % split_options_.holdout_stride) +
+           split_options_.holdout_stride) %
+          split_options_.holdout_stride;
+      const bool is_holdout =
+          static_cast<int>((index + split_options_.holdout_stride - normalized_offset) %
+                           split_options_.holdout_stride) == 0;
+      if (is_holdout) {
+        split.holdout_frames.push_back(frames[index]);
+      } else {
+        split.training_frames.push_back(frames[index]);
+      }
+    }
+
+    split.split_signature =
+        "deterministic_stride_" + std::to_string(split.holdout_stride) +
+        "_offset_" + std::to_string(split.holdout_offset) +
+        "_holdout_indices_" + JoinIndices(split.holdout_frames);
+  } else {
+    split.failure_reason = "Unsupported Stage 5 split mode: " + mode;
     return split;
   }
-
-  for (std::size_t index = 0; index < frames.size(); ++index) {
-    const int normalized_offset =
-        ((split_options_.holdout_offset % split_options_.holdout_stride) +
-         split_options_.holdout_stride) %
-        split_options_.holdout_stride;
-    const bool is_holdout =
-        static_cast<int>((index + split_options_.holdout_stride - normalized_offset) %
-                         split_options_.holdout_stride) == 0;
-    if (is_holdout) {
-      split.holdout_frames.push_back(frames[index]);
-    } else {
-      split.training_frames.push_back(frames[index]);
-    }
-  }
-
-  split.split_signature =
-      "deterministic_stride_" + std::to_string(split.holdout_stride) +
-      "_offset_" + std::to_string(split.holdout_offset) +
-      "_holdout_indices_" + JoinIndices(split.holdout_frames);
 
   if (static_cast<int>(split.training_frames.size()) <
       split_options_.minimum_training_frames) {
@@ -4767,6 +5141,8 @@ CalibrationBenchmarkSplit Stage5Benchmark::BuildExternalHoldoutSplit(
   split.mode = "explicit_external_holdout";
   split.holdout_stride = 0;
   split.holdout_offset = 0;
+  split.holdout_ratio = 0.0;
+  split.random_seed = 0;
   split.training_frames = training_frames;
   split.holdout_frames = holdout_frames;
 
@@ -4865,6 +5241,94 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildTrainingEvaluationDataset(
                     dataset.total_point_count > 0;
   if (!dataset.success) {
     dataset.failure_reason = "Training evaluation dataset is empty.";
+  }
+  return dataset;
+}
+
+CalibrationEvaluationDataset
+Stage5Benchmark::BuildEvaluationDatasetFromMeasurementResult(
+    const JointMeasurementBuildResult& measurement_result,
+    const std::vector<InternalRegenerationFrameResult>& regeneration_results,
+    const std::string& dataset_label,
+    const std::string& split_label,
+    const std::string& split_signature) const {
+  CalibrationEvaluationDataset dataset;
+  dataset.dataset_label = dataset_label;
+  dataset.split_label = split_label;
+  dataset.split_signature = split_signature;
+  dataset.internal_regeneration_results = regeneration_results;
+
+  for (const JointMeasurementFrameResult& frame_result :
+       measurement_result.frames) {
+    CalibrationEvaluationFrameInput frame_input;
+    frame_input.frame_index = frame_result.frame_index;
+    frame_input.frame_label = frame_result.frame_label;
+    frame_input.visible_board_ids = frame_result.visible_board_ids;
+
+    for (const JointBoardObservation& board_observation :
+         frame_result.board_observations) {
+      CalibrationEvaluationBoardObservation eval_board;
+      eval_board.frame_index = frame_result.frame_index;
+      eval_board.frame_label = frame_result.frame_label;
+      eval_board.board_id = board_observation.board_id;
+
+      for (const JointPointObservation& point : board_observation.points) {
+        if (!point.used_in_solver) {
+          continue;
+        }
+        CalibrationEvaluationPointObservation eval_point;
+        eval_point.frame_index = point.frame_index;
+        eval_point.frame_label = point.frame_label;
+        eval_point.board_id = point.board_id;
+        eval_point.point_id = point.point_id;
+        eval_point.point_type = point.point_type;
+        eval_point.image_xy = point.image_xy;
+        eval_point.target_xyz_board = point.target_xyz_board;
+        eval_point.quality = point.quality;
+        eval_point.frame_storage_index = point.frame_storage_index;
+        eval_point.source_board_observation_index =
+            point.source_board_observation_index;
+        eval_point.source_point_index = point.source_point_index;
+        eval_point.source_kind = point.source_kind;
+        eval_board.points.push_back(eval_point);
+        if (eval_point.point_type == JointPointType::Outer) {
+          ++eval_board.outer_point_count;
+        } else {
+          ++eval_board.internal_point_count;
+        }
+      }
+
+      eval_board.has_pose_fit_outer_points =
+          (eval_board.outer_point_count >= 4);
+      if (!eval_board.points.empty() && eval_board.has_pose_fit_outer_points) {
+        frame_input.board_observations.push_back(eval_board);
+        ++dataset.board_observation_count;
+        dataset.outer_point_count += eval_board.outer_point_count;
+        dataset.internal_point_count += eval_board.internal_point_count;
+      }
+    }
+
+    if (!frame_input.board_observations.empty()) {
+      dataset.frames.push_back(frame_input);
+    }
+  }
+
+  dataset.frame_count = static_cast<int>(dataset.frames.size());
+  dataset.total_point_count =
+      dataset.outer_point_count + dataset.internal_point_count;
+  dataset.success = dataset.frame_count > 0 &&
+                    dataset.board_observation_count > 0 &&
+                    dataset.total_point_count > 0;
+  if (!measurement_result.success) {
+    dataset.warnings.push_back(
+        "Source measurement_result.success is false: " +
+        measurement_result.failure_reason);
+  }
+  for (const std::string& warning : measurement_result.warnings) {
+    dataset.warnings.push_back(warning);
+  }
+  if (!dataset.success) {
+    dataset.failure_reason = split_label + " evaluation dataset is empty.";
   }
   return dataset;
 }
@@ -5061,9 +5525,6 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
           ++eval_board.internal_point_count;
         }
       }
-
-      FilterInternalEvaluationPointsByReprojection(
-          optimized_scene_state.camera, &eval_board);
 
       if (!eval_board.points.empty() && eval_board.has_pose_fit_outer_points) {
         frame_input.board_observations.push_back(eval_board);
@@ -5272,6 +5733,50 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
           pose_fit_outer_rmse * pose_fit_outer_rmse;
       board_diag.pose_only_refit_success = true;
       board_diag.pose_fit_outer_rmse = pose_fit_outer_rmse;
+
+      std::vector<Eigen::Vector3d> all_targets;
+      std::vector<cv::Point2f> all_pixels;
+      all_targets.reserve(board.points.size());
+      all_pixels.reserve(board.points.size());
+      for (const CalibrationEvaluationPointObservation& point : board.points) {
+        all_targets.push_back(point.target_xyz_board);
+        all_pixels.push_back(
+            cv::Point2f(static_cast<float>(point.image_xy.x()),
+                        static_cast<float>(point.image_xy.y())));
+      }
+      board_diag.all_point_pose_refit_point_count =
+          static_cast<int>(all_targets.size());
+      Eigen::Isometry3d T_camera_board_all_points =
+          Eigen::Isometry3d::Identity();
+      double all_point_pose_refit_rmse = 0.0;
+      if (all_targets.size() >= 4 &&
+          EstimatePoseForBenchmarkRefit(camera, all_targets, all_pixels,
+                                        &T_camera_board_all_points,
+                                        &all_point_pose_refit_rmse)) {
+        board_diag.all_point_pose_refit_success = true;
+        board_diag.all_point_pose_refit_rmse = all_point_pose_refit_rmse;
+        double all_point_internal_squared_error = 0.0;
+        int all_point_internal_count = 0;
+        for (const CalibrationEvaluationPointObservation& point : board.points) {
+          if (point.point_type != JointPointType::Internal) {
+            continue;
+          }
+          Eigen::Vector2d predicted = Eigen::Vector2d::Zero();
+          if (!camera_model.vsEuclideanToKeypoint(
+                  T_camera_board_all_points * point.target_xyz_board,
+                  &predicted)) {
+            continue;
+          }
+          all_point_internal_squared_error +=
+              (predicted - point.image_xy).squaredNorm();
+          ++all_point_internal_count;
+        }
+        board_diag.all_point_pose_refit_internal_rmse =
+            all_point_internal_count > 0
+                ? std::sqrt(all_point_internal_squared_error /
+                            static_cast<double>(all_point_internal_count))
+                : 0.0;
+      }
 
       double board_squared_error = 0.0;
       double board_outer_squared_error = 0.0;
@@ -5711,6 +6216,13 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
   }
   report.split_signature = report.split.split_signature;
   report.kalibr_reference = input.kalibr_reference;
+  report.external_holdout_self_frontend_prepass_used =
+      input.use_external_holdout_self_frontend_prepass &&
+      !input.external_holdout_frames.empty();
+  report.external_holdout_observation_source =
+      report.external_holdout_self_frontend_prepass_used
+          ? "external_holdout_self_frontend_prepass_full_measurements"
+          : "training_scene_regeneration";
 
   FrozenRound2BaselineOptions baseline_options = input.baseline_options;
   baseline_options.dataset_label = report.dataset_label;
@@ -5833,12 +6345,49 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
                 curated_backend_seed_bundle,
                 trial_source_artifacts)
           : curated_backend_seed_bundle;
+
+  CalibrationStateBundle exact_trial_candidate_bundle;
+  const CalibrationStateBundle* selection_seed_bundle =
+      &curated_backend_seed_bundle;
+  const CalibrationStateBundle* selection_candidate_bundle =
+      &trial_candidate_bundle;
+  const bool force_list_exact_input =
+      input.trial_backend_selection_options.force_include_list_is_exact_input &&
+      (!input.trial_backend_selection_options.force_include_frame_board_keys
+            .empty() ||
+       !input.trial_backend_selection_options.force_include_frame_label_board_keys
+            .empty());
+  if (force_list_exact_input) {
+    std::set<FrameBoardKey> exact_keys;
+    for (const JointMeasurementFrameResult& frame :
+         trial_candidate_bundle.measurement_dataset.frames) {
+      for (const JointBoardObservation& board : frame.board_observations) {
+        const FrameBoardKey key(frame.frame_index, board.board_id);
+        if (IsForceIncludeFrameBoardCandidate(
+                key, frame.frame_label,
+                input.trial_backend_selection_options)) {
+          exact_keys.insert(key);
+        }
+      }
+    }
+    exact_trial_candidate_bundle = BuildBundleForAcceptedFrameBoardKeys(
+        trial_candidate_bundle,
+        trial_candidate_bundle,
+        exact_keys,
+        trial_candidate_bundle.measurement_dataset.source_stage_label +
+            "_force_include_exact_backend_input");
+    exact_trial_candidate_bundle.warnings.push_back(
+        "Stage5 trial backend selection force-include list was used as the exact backend input for a controlled ablation.");
+    selection_seed_bundle = &exact_trial_candidate_bundle;
+    selection_candidate_bundle = &exact_trial_candidate_bundle;
+  }
   report.trial_backend_selection_result =
       ApplyTrialBackendFrameBoardSelection(
-          curated_backend_seed_bundle,
-          trial_candidate_bundle,
+          *selection_seed_bundle,
+          *selection_candidate_bundle,
           input.backend_options,
-          input.trial_backend_selection_options);
+          input.trial_backend_selection_options,
+          input.selection_backend_runner_options);
   report.trial_backend_selection_result.source_joint_input_frame_count =
       static_cast<int>(trial_source_artifacts.joint_inputs.size());
   const HierarchicalMeasurementCounts source_hierarchical_counts =
@@ -5932,7 +6481,7 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
       backend_input_ablation.bundle;
   report.backend_problem_input = BuildBackendProblemInput(
       final_backend_bundle,
-      input.final_backend_options);
+      input.committed_backend_evaluation_options);
   {
     const auto stage_start = std::chrono::steady_clock::now();
     report.training_dataset =
@@ -5949,11 +6498,58 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
     return report;
   }
 
-  const JointReprojectionSceneState optimized_scene_state =
-      report.baseline_result.round2_available
-          ? report.baseline_result.round2.optimization_result.optimized_state
-          : report.baseline_result.round1.optimization_result.optimized_state;
-  {
+  if (report.external_holdout_self_frontend_prepass_used) {
+    const auto stage_start = std::chrono::steady_clock::now();
+    FrozenRound2BaselineOptions holdout_prepass_options = baseline_options;
+    holdout_prepass_options.outer_only_ablation_mode = false;
+    holdout_prepass_options.include_internal_points = true;
+    holdout_prepass_options.run_second_pass = true;
+    holdout_prepass_options.dataset_label =
+        input.external_holdout_label.empty()
+            ? report.dataset_label + "_external_holdout_self_prepass"
+            : input.external_holdout_label + "_self_frontend_prepass";
+    holdout_prepass_options.training_split_signature =
+        report.split.split_signature + "_external_holdout_self_frontend_prepass";
+    const FrozenRound2BaselinePipeline holdout_prepass_pipeline(
+        holdout_prepass_options);
+    const FrozenRound2BaselineResult holdout_prepass_result =
+        holdout_prepass_pipeline.Run(report.split.holdout_frames);
+    report.runtime_breakdown.external_holdout_self_frontend_prepass_seconds =
+        ElapsedSeconds(stage_start);
+    if (!holdout_prepass_result.success ||
+        !holdout_prepass_result.stage5_bundle_available) {
+      report.external_holdout_self_frontend_prepass_success = false;
+      report.external_holdout_self_frontend_prepass_failure_reason =
+          holdout_prepass_result.failure_reason.empty()
+              ? "External holdout self frontend prepass failed."
+              : holdout_prepass_result.failure_reason;
+      report.failure_reason =
+          report.external_holdout_self_frontend_prepass_failure_reason;
+      return report;
+    }
+    report.external_holdout_self_frontend_prepass_success = true;
+    {
+      const auto dataset_start = std::chrono::steady_clock::now();
+      const FrozenRoundArtifacts& holdout_frontend_artifacts =
+          holdout_prepass_result.round2_available
+              ? holdout_prepass_result.round2
+              : holdout_prepass_result.round1;
+      report.holdout_dataset = BuildEvaluationDatasetFromMeasurementResult(
+          holdout_frontend_artifacts.measurement_result,
+          holdout_frontend_artifacts.regeneration_results,
+          holdout_prepass_options.dataset_label,
+          "holdout",
+          report.split.split_signature +
+              "_external_holdout_self_frontend_prepass_full_measurements");
+      report.holdout_dataset.split_label = "holdout";
+      report.runtime_breakdown.holdout_dataset_build_seconds =
+          ElapsedSeconds(dataset_start);
+    }
+  } else {
+    const JointReprojectionSceneState optimized_scene_state =
+        report.baseline_result.round2_available
+            ? report.baseline_result.round2.optimization_result.optimized_state
+            : report.baseline_result.round1.optimization_result.optimized_state;
     const auto stage_start = std::chrono::steady_clock::now();
     report.holdout_dataset = BuildHoldoutEvaluationDataset(
         report.split.holdout_frames, baseline_options, optimized_scene_state,
@@ -5975,8 +6571,10 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
     return report;
   }
 
+  const OuterBootstrapCameraIntrinsics& final_backend_camera =
+      final_backend_bundle.scene_state.camera;
   const std::string our_family =
-      report.baseline_result.final_stage5_bundle.scene_state.camera.NormalizedFamilyString();
+      final_backend_camera.NormalizedFamilyString();
   const std::string kalibr_family = kalibr_intrinsics.NormalizedFamilyString();
   report.fair_protocol_matched =
       (input.kalibr_reference.camera_model_family == kalibr_family) &&
@@ -6000,13 +6598,13 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
 
   report.our_training_evaluation = EvaluateCameraModel(
       report.training_dataset,
-      report.baseline_result.final_stage5_bundle.scene_state.camera,
+      final_backend_camera,
       "ours");
   report.kalibr_training_evaluation =
       EvaluateCameraModel(report.training_dataset, kalibr_intrinsics, "kalibr");
   report.our_holdout_evaluation = EvaluateCameraModel(
       report.holdout_dataset,
-      report.baseline_result.final_stage5_bundle.scene_state.camera,
+      final_backend_camera,
       "ours");
   report.kalibr_holdout_evaluation =
       EvaluateCameraModel(report.holdout_dataset, kalibr_intrinsics, "kalibr");
@@ -6044,7 +6642,8 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
                             method_label));
   }
   report.camera_ray_curve_diagnostics = ComputeCameraRayCurveDiagnostics(
-      report.baseline_result.final_stage5_bundle.scene_state.camera,
+      final_backend_camera,
+      "stage5_final_backend_bundle_after_selection_ablation",
       ray_curve_references);
   if (!report.camera_ray_curve_diagnostics.success &&
       !report.camera_ray_curve_diagnostics.failure_reason.empty()) {
@@ -6434,8 +7033,24 @@ void WriteStage5BenchmarkProtocolSummary(const std::string& path,
   output << "split_mode: " << report.split.mode << "\n";
   output << "holdout_stride: " << report.split.holdout_stride << "\n";
   output << "holdout_offset: " << report.split.holdout_offset << "\n";
+  output << "holdout_ratio: " << report.split.holdout_ratio << "\n";
+  output << "split_random_seed: " << report.split.random_seed << "\n";
   output << "training_frame_count: " << report.split.training_frames.size() << "\n";
   output << "holdout_frame_count: " << report.split.holdout_frames.size() << "\n";
+  output << "external_holdout_observation_source: "
+         << report.external_holdout_observation_source << "\n";
+  output << "external_holdout_self_frontend_prepass_used: "
+         << (report.external_holdout_self_frontend_prepass_used ? 1 : 0)
+         << "\n";
+  output << "external_holdout_self_frontend_prepass_success: "
+         << (report.external_holdout_self_frontend_prepass_success ? 1 : 0)
+         << "\n";
+  output << "external_holdout_self_frontend_prepass_failure_reason: "
+         << report.external_holdout_self_frontend_prepass_failure_reason
+         << "\n";
+  output << "external_holdout_self_frontend_prepass_seconds: "
+         << report.runtime_breakdown.external_holdout_self_frontend_prepass_seconds
+         << "\n";
   output << "fair_protocol_matched: " << (report.fair_protocol_matched ? 1 : 0) << "\n";
   output << "diagnostic_only: " << (report.diagnostic_only ? 1 : 0) << "\n";
   output << "kalibr_camera_model_family: " << report.kalibr_reference.camera_model_family
@@ -6533,11 +7148,46 @@ void WriteStage5BenchmarkProtocolSummary(const std::string& path,
   }
 }
 
+void WriteEvaluationCameraSummary(std::ostream& output,
+                                  const std::string& prefix,
+                                  const CameraModelRefitEvaluationResult& evaluation) {
+  const OuterBootstrapCameraIntrinsics& camera = evaluation.camera;
+  output << prefix << "camera_model_family: "
+         << camera.NormalizedFamilyString() << "\n";
+  output << prefix << "camera_model: " << camera.NormalizedCameraModel() << "\n";
+  output << prefix << "distortion_model: "
+         << camera.NormalizedDistortionModel() << "\n";
+  output << prefix << "camera_intrinsics_labels: "
+         << JoinStrings(camera.IntrinsicsLabels(), ",") << "\n";
+  output << prefix << "camera_intrinsics_csv: ";
+  const std::vector<double> intrinsics = camera.IntrinsicsVector();
+  for (std::size_t index = 0; index < intrinsics.size(); ++index) {
+    if (index > 0) {
+      output << ",";
+    }
+    output << intrinsics[index];
+  }
+  output << "\n";
+  output << prefix << "camera_distortion_labels: "
+         << JoinStrings(camera.DistortionLabels(), ",") << "\n";
+  output << prefix << "camera_distortion_csv: ";
+  const std::vector<double> distortion = camera.DistortionVector();
+  for (std::size_t index = 0; index < distortion.size(); ++index) {
+    if (index > 0) {
+      output << ",";
+    }
+    output << distortion[index];
+  }
+  output << "\n";
+}
+
 void WriteStage5BenchmarkTrainingSummary(const std::string& path,
                                          const Stage5BenchmarkReport& report) {
   std::ofstream output(path.c_str());
   output << "split_label: training\n";
   output << "split_signature: " << report.split_signature << "\n";
+  WriteEvaluationCameraSummary(output, "our_", report.our_training_evaluation);
+  WriteEvaluationCameraSummary(output, "kalibr_", report.kalibr_training_evaluation);
   output << "our_overall_rmse: " << report.our_training_evaluation.overall_rmse << "\n";
   output << "our_outer_only_rmse: " << report.our_training_evaluation.outer_only_rmse << "\n";
   output << "our_internal_only_rmse: " << report.our_training_evaluation.internal_only_rmse
@@ -6580,6 +7230,7 @@ void WriteStage5BenchmarkTrainingSummary(const std::string& path,
         report.additional_training_evaluations[index];
     const std::string prefix =
         "reference_" + SanitizeMetricKey(evaluation.method_label) + "_";
+    WriteEvaluationCameraSummary(output, prefix, evaluation);
     output << prefix << "overall_rmse: " << evaluation.overall_rmse << "\n";
     output << prefix << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
     output << prefix << "internal_only_rmse: "
@@ -6605,6 +7256,8 @@ void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
   std::ofstream output(path.c_str());
   output << "split_label: holdout\n";
   output << "split_signature: " << report.split_signature << "\n";
+  WriteEvaluationCameraSummary(output, "our_", report.our_holdout_evaluation);
+  WriteEvaluationCameraSummary(output, "kalibr_", report.kalibr_holdout_evaluation);
   output << "our_overall_rmse: " << report.our_holdout_evaluation.overall_rmse << "\n";
   output << "our_pose_only_refit_rmse: "
          << report.our_holdout_evaluation.pose_only_refit_rmse << "\n";
@@ -6668,6 +7321,22 @@ void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
   output << "camera_ray_curve_invalid_unprojection_count: "
          << report.camera_ray_curve_diagnostics.invalid_unprojection_count
          << "\n";
+  output << "camera_ray_curve_our_camera_source: "
+         << report.camera_ray_curve_diagnostics.our_camera_source << "\n";
+  output << "camera_ray_curve_our_camera_family: "
+         << report.camera_ray_curve_diagnostics.our_camera
+                .NormalizedFamilyString()
+         << "\n";
+  output << "camera_ray_curve_our_camera_labels: "
+         << JoinStrings(report.camera_ray_curve_diagnostics.our_camera
+                            .CombinedParameterLabels(),
+                        ",")
+         << "\n";
+  output << "camera_ray_curve_our_camera_csv: "
+         << JoinDoubles(report.camera_ray_curve_diagnostics.our_camera
+                            .CombinedParameterVector(),
+                        ",")
+         << "\n";
   if (!report.camera_ray_curve_diagnostics.failure_reason.empty()) {
     output << "camera_ray_curve_failure_reason: "
            << report.camera_ray_curve_diagnostics.failure_reason << "\n";
@@ -6679,6 +7348,7 @@ void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
         report.additional_holdout_evaluations[index];
     const std::string prefix =
         "reference_" + SanitizeMetricKey(evaluation.method_label) + "_";
+    WriteEvaluationCameraSummary(output, prefix, evaluation);
     output << prefix << "overall_rmse: " << evaluation.overall_rmse << "\n";
     output << prefix << "pose_only_refit_rmse: "
            << evaluation.pose_only_refit_rmse << "\n";
@@ -6762,12 +7432,21 @@ void WriteCameraRayCurveSummaryCsv(
     const std::string& path,
     const CameraRayCurveDiagnostics& diagnostics) {
   std::ofstream output(path.c_str());
-  output << "reference_label,reference_family,bucket_type,bucket_label,"
+  output << "our_camera_source,our_camera_family,our_camera_labels,"
+         << "our_camera_csv,reference_label,reference_family,bucket_type,bucket_label,"
          << "sample_count,mean_angular_diff_deg,rms_angular_diff_deg,"
          << "max_angular_diff_deg,mean_our_polar_deg,mean_reference_polar_deg\n";
   for (const CameraRayCurveBucketSummary& summary :
        diagnostics.bucket_summaries) {
-    output << summary.reference_label << ","
+    output << EscapeCsvCell(diagnostics.our_camera_source) << ","
+           << diagnostics.our_camera.NormalizedFamilyString() << ","
+           << EscapeCsvCell(JoinStrings(
+                  diagnostics.our_camera.CombinedParameterLabels(), ";"))
+           << ","
+           << EscapeCsvCell(JoinDoubles(
+                  diagnostics.our_camera.CombinedParameterVector(), ";"))
+           << ","
+           << summary.reference_label << ","
            << summary.reference_family << ","
            << summary.bucket_type << ","
            << summary.bucket_label << ","
@@ -6823,6 +7502,8 @@ void WriteCameraModelRefitBoardObservationsCsv(
   output << "method,split,frame_index,frame_label,board_id,"
          << "pose_only_refit_success,pose_fit_outer_rmse,evaluation_rmse,"
          << "outer_evaluation_rmse,internal_evaluation_rmse,"
+         << "all_point_pose_refit_success,all_point_pose_refit_point_count,"
+         << "all_point_pose_refit_rmse,all_point_pose_refit_internal_rmse,"
          << "point_count,outer_point_count,internal_point_count,failure_reason\n";
   for (const CameraModelRefitEvaluationResult& evaluation : evaluations) {
     for (const CameraModelRefitBoardObservationDiagnostics& board :
@@ -6837,6 +7518,10 @@ void WriteCameraModelRefitBoardObservationsCsv(
              << board.evaluation_rmse << ","
              << board.outer_evaluation_rmse << ","
              << board.internal_evaluation_rmse << ","
+             << (board.all_point_pose_refit_success ? 1 : 0) << ","
+             << board.all_point_pose_refit_point_count << ","
+             << board.all_point_pose_refit_rmse << ","
+             << board.all_point_pose_refit_internal_rmse << ","
              << board.point_count << ","
              << board.outer_point_count << ","
              << board.internal_point_count << ","
@@ -6951,6 +7636,190 @@ void WriteStage5BenchmarkWorstCasesSummary(const std::string& path,
 
   write_eval(report.our_holdout_evaluation);
   write_eval(report.kalibr_holdout_evaluation);
+}
+
+namespace {
+
+struct RmseAccumulator {
+  double squared_error_sum = 0.0;
+  int point_count = 0;
+
+  void Add(double rmse, int count) {
+    if (count <= 0 || !std::isfinite(rmse)) {
+      return;
+    }
+    squared_error_sum += rmse * rmse * static_cast<double>(count);
+    point_count += count;
+  }
+
+  double Rmse() const {
+    return point_count > 0
+               ? std::sqrt(squared_error_sum /
+                           static_cast<double>(point_count))
+               : std::numeric_limits<double>::quiet_NaN();
+  }
+};
+
+struct RobustHoldoutAggregate {
+  RmseAccumulator overall;
+  RmseAccumulator outer;
+  RmseAccumulator internal;
+};
+
+RobustHoldoutAggregate AggregateBoardObservations(
+    const std::vector<CameraModelRefitBoardObservationDiagnostics>& boards) {
+  RobustHoldoutAggregate aggregate;
+  for (const CameraModelRefitBoardObservationDiagnostics& board : boards) {
+    aggregate.overall.Add(board.evaluation_rmse, board.point_count);
+    aggregate.outer.Add(board.outer_evaluation_rmse, board.outer_point_count);
+    aggregate.internal.Add(board.internal_evaluation_rmse,
+                           board.internal_point_count);
+  }
+  return aggregate;
+}
+
+double BoardObservationSquaredErrorContribution(
+    const CameraModelRefitBoardObservationDiagnostics& board) {
+  if (board.point_count <= 0 || !std::isfinite(board.evaluation_rmse)) {
+    return 0.0;
+  }
+  return board.evaluation_rmse * board.evaluation_rmse *
+         static_cast<double>(board.point_count);
+}
+
+}  // namespace
+
+void WriteStage5BenchmarkHoldoutRobustOutlierSummary(
+    const std::string& path,
+    const Stage5BenchmarkReport& report,
+    double board_outlier_rmse_threshold_px) {
+  std::ofstream output(path.c_str());
+  output << "dataset_label: " << report.dataset_label << "\n";
+  output << "split_signature: " << report.split_signature << "\n";
+  output << "board_outlier_rmse_threshold_px: "
+         << board_outlier_rmse_threshold_px << "\n";
+  output << "purpose: quantify whether holdout RMSE is dominated by a small "
+         << "number of high-residual frame-board observations; this diagnostic "
+         << "does not change backend selection or optimization.\n";
+
+  const auto write_eval =
+      [&output, board_outlier_rmse_threshold_px](
+          const CameraModelRefitEvaluationResult& evaluation) {
+        output << "\n[" << evaluation.method_label << "_"
+               << evaluation.split_label << "]\n";
+        output << "overall_rmse: " << evaluation.overall_rmse << "\n";
+        output << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
+        output << "internal_only_rmse: " << evaluation.internal_only_rmse
+               << "\n";
+        output << "pose_only_refit_rmse: "
+               << evaluation.pose_only_refit_rmse << "\n";
+        output << "pose_only_refit_success_rate: "
+               << evaluation.pose_only_refit_success_rate << "\n";
+
+        std::vector<CameraModelRefitBoardObservationDiagnostics> sorted_boards =
+            evaluation.board_observation_diagnostics;
+        std::sort(sorted_boards.begin(), sorted_boards.end(),
+                  [](const CameraModelRefitBoardObservationDiagnostics& lhs,
+                     const CameraModelRefitBoardObservationDiagnostics& rhs) {
+                    return BoardObservationSquaredErrorContribution(lhs) >
+                           BoardObservationSquaredErrorContribution(rhs);
+                  });
+
+        std::vector<CameraModelRefitBoardObservationDiagnostics> inlier_boards;
+        std::vector<CameraModelRefitBoardObservationDiagnostics> outlier_boards;
+        for (const CameraModelRefitBoardObservationDiagnostics& board :
+             evaluation.board_observation_diagnostics) {
+          if (std::isfinite(board.evaluation_rmse) &&
+              board.evaluation_rmse > board_outlier_rmse_threshold_px) {
+            outlier_boards.push_back(board);
+          } else {
+            inlier_boards.push_back(board);
+          }
+        }
+        const RobustHoldoutAggregate inlier_aggregate =
+            AggregateBoardObservations(inlier_boards);
+        output << "outlier_board_observation_count: "
+               << outlier_boards.size() << "\n";
+        output << "inlier_board_observation_count: "
+               << inlier_boards.size() << "\n";
+        output << "rmse_excluding_outlier_board_observations: "
+               << inlier_aggregate.overall.Rmse() << "\n";
+        output << "outer_rmse_excluding_outlier_board_observations: "
+               << inlier_aggregate.outer.Rmse() << "\n";
+        output << "internal_rmse_excluding_outlier_board_observations: "
+               << inlier_aggregate.internal.Rmse() << "\n";
+        output << "point_count_excluding_outlier_board_observations: "
+               << inlier_aggregate.overall.point_count << "\n";
+        output << "internal_point_count_excluding_outlier_board_observations: "
+               << inlier_aggregate.internal.point_count << "\n";
+
+        const int exclusion_counts[] = {1, 2, 3, 5, 8, 9, 10, 12, 15};
+        for (const int exclusion_count : exclusion_counts) {
+          std::vector<CameraModelRefitBoardObservationDiagnostics> kept_boards;
+          for (std::size_t index = 0; index < sorted_boards.size(); ++index) {
+            if (index >= static_cast<std::size_t>(exclusion_count)) {
+              kept_boards.push_back(sorted_boards[index]);
+            }
+          }
+          const RobustHoldoutAggregate kept =
+              AggregateBoardObservations(kept_boards);
+          output << "rmse_excluding_top" << exclusion_count
+                 << "_sse_board_observations: " << kept.overall.Rmse()
+                 << "\n";
+          output << "internal_rmse_excluding_top" << exclusion_count
+                 << "_sse_board_observations: " << kept.internal.Rmse()
+                 << "\n";
+          output << "outer_rmse_excluding_top" << exclusion_count
+                 << "_sse_board_observations: " << kept.outer.Rmse()
+                 << "\n";
+          output << "point_count_excluding_top" << exclusion_count
+                 << "_sse_board_observations: "
+                 << kept.overall.point_count << "\n";
+        }
+
+        output << "outlier_board_observations:\n";
+        for (const CameraModelRefitBoardObservationDiagnostics& board :
+             outlier_boards) {
+          output << "  frame_index=" << board.frame_index
+                 << " frame_label=" << board.frame_label
+                 << " board_id=" << board.board_id
+                 << " rmse=" << board.evaluation_rmse
+                 << " outer_rmse=" << board.outer_evaluation_rmse
+                 << " internal_rmse=" << board.internal_evaluation_rmse
+                 << " pose_fit_outer_rmse=" << board.pose_fit_outer_rmse
+                 << " point_count=" << board.point_count
+                 << " outer_point_count=" << board.outer_point_count
+                 << " internal_point_count=" << board.internal_point_count
+                 << "\n";
+        }
+
+        output << "per_board_aggregate:\n";
+        std::map<int, std::vector<CameraModelRefitBoardObservationDiagnostics> >
+            boards_by_id;
+        for (const CameraModelRefitBoardObservationDiagnostics& board :
+             evaluation.board_observation_diagnostics) {
+          boards_by_id[board.board_id].push_back(board);
+        }
+        for (const auto& entry : boards_by_id) {
+          const RobustHoldoutAggregate aggregate =
+              AggregateBoardObservations(entry.second);
+          output << "  board_id=" << entry.first
+                 << " observation_count=" << entry.second.size()
+                 << " overall_rmse=" << aggregate.overall.Rmse()
+                 << " outer_rmse=" << aggregate.outer.Rmse()
+                 << " internal_rmse=" << aggregate.internal.Rmse()
+                 << " point_count=" << aggregate.overall.point_count
+                 << " internal_point_count=" << aggregate.internal.point_count
+                 << "\n";
+        }
+      };
+
+  write_eval(report.our_holdout_evaluation);
+  write_eval(report.kalibr_holdout_evaluation);
+  for (const CameraModelRefitEvaluationResult& evaluation :
+       report.additional_holdout_evaluations) {
+    write_eval(evaluation);
+  }
 }
 
 void WriteMultiBoardConsistencyPerObservationCsv(

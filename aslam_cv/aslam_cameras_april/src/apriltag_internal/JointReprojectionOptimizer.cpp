@@ -65,6 +65,16 @@ bool ClampIntrinsicsInPlace(OuterBootstrapCameraIntrinsics* intrinsics) {
     for (double& coefficient : intrinsics->distortion_coeffs) {
       coefficient = std::max(-1.5, std::min(1.5, coefficient));
     }
+  } else if (family == "omni-radtan") {
+    intrinsics->xi = std::max(-0.95, std::min(3.0, intrinsics->xi));
+    intrinsics->alpha = 0.0;
+    intrinsics->beta = 0.0;
+    if (intrinsics->distortion_coeffs.size() != 4) {
+      intrinsics->distortion_coeffs.resize(4, 0.0);
+    }
+    for (double& coefficient : intrinsics->distortion_coeffs) {
+      coefficient = std::max(-1.5, std::min(1.5, coefficient));
+    }
   } else {
     return false;
   }
@@ -100,7 +110,8 @@ OuterBootstrapCameraIntrinsics FromVector(const Eigen::VectorXd& vector,
 double PriorWeightForLabel(const JointOptimizationOptions& options,
                            const std::string& label) {
   if (label == "xi" || label == "alpha" || label == "beta" ||
-      label == "k1" || label == "k2" || label == "k3" || label == "k4") {
+      label == "k1" || label == "k2" || label == "k3" || label == "k4" ||
+      label == "p1" || label == "p2") {
     return options.intrinsics_anchor_weight_xi_alpha;
   }
   if (label == "fu" || label == "fv") {

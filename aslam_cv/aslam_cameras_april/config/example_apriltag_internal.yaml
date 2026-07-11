@@ -1,7 +1,5 @@
 target_type: apriltag_internal
 tagFamily: t36h11
-tagId: 1
-# When non-empty, tagIds takes precedence over tagId.
 tagIds: [1, 2, 3, 4, 5]
 tagSize: 0.15625
 tagSpacing: 0.25
@@ -18,17 +16,7 @@ max_internal_subpix_displacement: 6.0
 enable_debug_output: true
 internal_projection_mode: sphere_border_lattice
 enable_internal_structure_correction_after_ss: true
-# Optional alternatives:
-# internal_projection_mode: sphere_lattice
-# internal_projection_mode: sphere_ray_refine
-sphere_lattice_use_initial_camera: true # 使用粗初始值
-sphere_lattice_init_xi: -0.2
-sphere_lattice_init_alpha: 0.6
-sphere_lattice_init_fu_scale: 0.55
-sphere_lattice_init_fv_scale: 0.55
-sphere_lattice_init_cu_offset: 0.0
-sphere_lattice_init_cv_offset: 0.0
-camera_initialization_mode: auto_with_manual_fallback
+camera_initialization_mode: auto
 # Image resolution is detector/frontend metadata only. Stage5 optimized camera
 # model and initialization seeds are selected by --models, not by this YAML.
 resolution: [4512, 4512]
@@ -36,10 +24,12 @@ resolution: [4512, 4512]
 # Outer-tag detector / fixed C-S outer corner pipeline.
 outer_local_context_scale: 0.05
 enable_outer_spherical_refinement: false
-outer_spherical_use_initial_camera: true # 使用粗初始值
 do_outer_subpix_refinement: true
 # If outer subpix is enabled, subpix radius = outer_subpix_scale * (tagSpacing * local_scale)
 outer_subpix_scale: 0.3
+# Set to 0 to disable the upper clamp; the radius still respects
+# outer_subpix_window_min and the image-border crop.
+outer_subpix_window_max: 0
 # Near-board outer-corner protection: keep normal-area boards on
 # outer_subpix_scale, but enlarge the verification/subpix window when a board
 # occupies a large image footprint.  This primarily handles close-distance
@@ -49,8 +39,10 @@ outer_subpix_scale: 0.3
 enable_close_edge_outer_subpix_boost: true
 close_edge_outer_subpix_area_ratio: 0.012
 close_edge_outer_subpix_min_polar_deg: 40.0
+close_edge_outer_subpix_full_polar_deg: 78.0
 close_edge_outer_subpix_border_ratio: 0.25
-close_edge_outer_subpix_multiplier: 1.5
+close_edge_outer_subpix_multiplier: 1.1
+close_edge_outer_subpix_max_multiplier: 1.8
 outer_refine_gate_scale: 0.025
 outer_refine_gate_min: 6.0
 

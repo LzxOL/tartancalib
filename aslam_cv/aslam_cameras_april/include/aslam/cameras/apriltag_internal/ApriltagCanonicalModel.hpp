@@ -21,6 +21,7 @@ enum class InternalProjectionMode {
   VirtualPinholePatch,
   VirtualPinholeImageSubpix,
   VirtualPinholePatchBoundarySeed,
+  PinholeBootstrapPatch,
   SphereLattice,
   SphereBorderLattice,
   PureSphericalBoundarySeed,

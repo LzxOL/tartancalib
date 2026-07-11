@@ -382,10 +382,22 @@ InternalProjectionMode ParseProjectionMode(const std::string& value) {
       lowered == "virtual-pinhole-patch-edge-seed") {
     return InternalProjectionMode::VirtualPinholePatchBoundarySeed;
   }
+  if (lowered == "pinhole_bootstrap_patch" ||
+      lowered == "pinhole-bootstrap-patch" ||
+      lowered == "outer_corner_pinhole_bootstrap_patch" ||
+      lowered == "outer-corner-pinhole-bootstrap-patch") {
+    return InternalProjectionMode::PinholeBootstrapPatch;
+  }
   if (lowered == "sphere_lattice" || lowered == "sphere-lattice") {
     return InternalProjectionMode::SphereLattice;
   }
   if (lowered == "sphere_border_lattice" || lowered == "sphere-border-lattice") {
+    return InternalProjectionMode::SphereBorderLattice;
+  }
+  if (lowered == "spherical_intermediate" ||
+      lowered == "spherical-intermediate" ||
+      lowered == "current" ||
+      lowered == "ours") {
     return InternalProjectionMode::SphereBorderLattice;
   }
   if (lowered == "pure_spherical_boundary_seed" ||
@@ -606,7 +618,7 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.enable_debug_output =
           Lowercase(value) == "1" || Lowercase(value) == "true" ||
           Lowercase(value) == "yes" || Lowercase(value) == "on";
-    } else if (key == "internal_projection_mode") {
+    } else if (key == "internal_projection_mode" || key == "generation_mode") {
       config.internal_projection_mode = ParseProjectionMode(value);
     } else if (key == "sphereLatticeUseInitialCamera" ||
                key == "sphere_lattice_use_initial_camera") {
@@ -672,6 +684,10 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
                key == "close_edge_outer_subpix_min_polar_deg") {
       config.outer_detector_config.close_edge_outer_subpix_min_polar_deg =
           ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixFullPolarDeg" ||
+               key == "close_edge_outer_subpix_full_polar_deg") {
+      config.outer_detector_config.close_edge_outer_subpix_full_polar_deg =
+          ParseDouble(key, value);
     } else if (key == "closeEdgeOuterSubpixBorderRatio" ||
                key == "close_edge_outer_subpix_border_ratio") {
       config.outer_detector_config.close_edge_outer_subpix_border_ratio =
@@ -679,6 +695,10 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
     } else if (key == "closeEdgeOuterSubpixMultiplier" ||
                key == "close_edge_outer_subpix_multiplier") {
       config.outer_detector_config.close_edge_outer_subpix_multiplier =
+          ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixMaxMultiplier" ||
+               key == "close_edge_outer_subpix_max_multiplier") {
+      config.outer_detector_config.close_edge_outer_subpix_max_multiplier =
           ParseDouble(key, value);
     } else if (key == "outerRefineGateScale" || key == "outer_refine_gate_scale") {
       config.outer_detector_config.outer_refine_gate_scale = ParseDouble(key, value);
@@ -3525,6 +3545,338 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
   }
 }
 
+struct PinholeBootstrapPatchContext {
+  cv::Mat board_to_image;
+  cv::Mat image_to_patch;
+  cv::Mat patch_to_image;
+  cv::Mat patch;
+  cv::Size patch_size;
+  std::array<cv::Point2f, 4> patch_outer_corners{};
+};
+
+PatchSeedCandidate EvaluatePinholeBootstrapPatchCandidate(
+    const cv::Mat& patch,
+    const PinholeBootstrapPatchContext& context,
+    const CanonicalCorner& corner_info,
+    const PatchSeedFrame& frame,
+    const ApriltagInternalDetectionOptions& options,
+    double alpha,
+    double beta) {
+  PatchSeedCandidate candidate;
+  candidate.alpha = alpha;
+  candidate.beta = beta;
+  candidate.patch_point = frame.predicted_patch +
+                          static_cast<float>(alpha) * frame.unit_u +
+                          static_cast<float>(beta) * frame.unit_v;
+  if (!IsInsideImage(candidate.patch_point, context.patch_size)) {
+    return candidate;
+  }
+  candidate.image_point =
+      PerspectiveTransformPoint(context.patch_to_image, candidate.patch_point);
+
+  const TemplateScore score = ComputeBoundaryAlignmentScoreAtPoint(
+      patch, corner_info, candidate.patch_point, frame.module_u_axis,
+      frame.module_v_axis, options.min_template_contrast,
+      kSphereSeedSampleRadiusScale);
+  const double offset = std::hypot(alpha, beta);
+  const double search_radius =
+      std::max(kPatchSeedSearchRadiusMinPx, frame.search_radius);
+  const double normalized_offset = offset / search_radius;
+  const double prior_quality =
+      normalized_offset <= kSphereSeedPriorInnerRatio
+          ? 1.0
+          : ClampUnit(1.0 - (normalized_offset - kSphereSeedPriorInnerRatio) /
+                                 std::max(1e-6, 1.0 - kSphereSeedPriorInnerRatio));
+  const double raw_quality = std::min(score.template_quality, score.gradient_quality);
+
+  double best_neighbor_raw = 0.0;
+  const std::array<cv::Point2f, 8> neighbor_offsets{{
+      cv::Point2f(-1.0f, 0.0f), cv::Point2f(1.0f, 0.0f),
+      cv::Point2f(0.0f, -1.0f), cv::Point2f(0.0f, 1.0f),
+      cv::Point2f(-1.0f, -1.0f), cv::Point2f(1.0f, -1.0f),
+      cv::Point2f(-1.0f, 1.0f), cv::Point2f(1.0f, 1.0f),
+  }};
+  for (const cv::Point2f& neighbor_offset : neighbor_offsets) {
+    const cv::Point2f neighbor_patch = candidate.patch_point + neighbor_offset;
+    if (!IsInsideImage(neighbor_patch, context.patch_size)) {
+      continue;
+    }
+    const TemplateScore neighbor_score = ComputeBoundaryAlignmentScoreAtPoint(
+        patch, corner_info, neighbor_patch, frame.module_u_axis,
+        frame.module_v_axis, options.min_template_contrast,
+        kSphereSeedSampleRadiusScale);
+    best_neighbor_raw =
+        std::max(best_neighbor_raw,
+                 std::min(neighbor_score.template_quality,
+                          neighbor_score.gradient_quality));
+  }
+  const double peak_quality =
+      raw_quality > 1e-9
+          ? ClampUnit(0.5 + 0.5 * (raw_quality - best_neighbor_raw) /
+                                 std::max(raw_quality, 1e-6))
+          : 0.0;
+
+  candidate.valid = true;
+  candidate.template_quality = score.template_quality;
+  candidate.gradient_quality = score.gradient_quality;
+  candidate.prior_quality = prior_quality;
+  candidate.peak_quality = peak_quality;
+  candidate.raw_quality = raw_quality;
+  candidate.final_quality =
+      ClampUnit(kSphereSeedRawWeight * candidate.raw_quality +
+                kSphereSeedPeakWeight * candidate.peak_quality +
+                kSphereSeedPriorWeight * candidate.prior_quality);
+  return candidate;
+}
+
+PatchSeedCandidate SearchPinholeBootstrapPatchSeed(
+    const cv::Mat& patch,
+    const PinholeBootstrapPatchContext& context,
+    const CanonicalCorner& corner_info,
+    const PatchSeedFrame& frame,
+    const ApriltagInternalDetectionOptions& options) {
+  auto search_grid = [&](double center_alpha, double center_beta, double radius,
+                         int grid_size) {
+    PatchSeedCandidate best_candidate =
+        EvaluatePinholeBootstrapPatchCandidate(
+            patch, context, corner_info, frame, options, center_alpha,
+            center_beta);
+    if (grid_size <= 1) {
+      return best_candidate;
+    }
+    const double denominator = static_cast<double>(grid_size - 1);
+    for (int row = 0; row < grid_size; ++row) {
+      for (int col = 0; col < grid_size; ++col) {
+        const double alpha =
+            center_alpha - radius +
+            2.0 * radius * static_cast<double>(col) / denominator;
+        const double beta =
+            center_beta - radius +
+            2.0 * radius * static_cast<double>(row) / denominator;
+        const PatchSeedCandidate candidate =
+            EvaluatePinholeBootstrapPatchCandidate(
+                patch, context, corner_info, frame, options, alpha, beta);
+        if (IsBetterPatchCandidate(candidate, best_candidate)) {
+          best_candidate = candidate;
+        }
+      }
+    }
+    return best_candidate;
+  };
+
+  const PatchSeedCandidate coarse_best =
+      search_grid(0.0, 0.0, frame.search_radius, kPatchSeedCoarseGridSize);
+  const double fine_radius = 0.5 * frame.search_radius;
+  return search_grid(coarse_best.alpha, coarse_best.beta, fine_radius,
+                     kPatchSeedFineGridSize);
+}
+
+bool BuildPinholeBootstrapPatchFrame(
+    const PinholeBootstrapPatchContext& context,
+    int module_dimension,
+    const CanonicalCorner& corner_info,
+    const ApriltagInternalDetectionOptions& options,
+    PatchSeedFrame* frame) {
+  if (frame == nullptr) {
+    throw std::runtime_error("BuildPinholeBootstrapPatchFrame requires output.");
+  }
+  frame->predicted_patch =
+      BoardToPatchPoint(corner_info, module_dimension,
+                        options.canonical_pixels_per_module);
+  frame->predicted_image =
+      PerspectiveTransformPoint(context.patch_to_image, frame->predicted_patch);
+  frame->module_u_axis =
+      cv::Point2f(static_cast<float>(options.canonical_pixels_per_module), 0.0f);
+  frame->module_v_axis =
+      cv::Point2f(0.0f, -static_cast<float>(options.canonical_pixels_per_module));
+  frame->unit_u = cv::Point2f(1.0f, 0.0f);
+  frame->unit_v = cv::Point2f(0.0f, -1.0f);
+  frame->local_module_scale =
+      static_cast<double>(options.canonical_pixels_per_module);
+  frame->search_radius =
+      std::max(kPatchSeedSearchRadiusMinPx,
+               kPatchSeedSearchRadiusScale * frame->local_module_scale);
+  return IsInsideImage(frame->predicted_patch, context.patch_size);
+}
+
+void PopulateInternalCornersFromPinholeBootstrapPatch(
+    const cv::Mat& gray,
+    const PinholeBootstrapPatchContext& context,
+    const std::array<int, 4>& outer_point_ids,
+    const ApriltagCanonicalModel& model,
+    const ApriltagInternalDetectionOptions& options,
+    ApriltagInternalDetectionResult* result) {
+  if (result == nullptr) {
+    throw std::runtime_error("Result pointer must not be null.");
+  }
+  const IntegralMeanImage gray_integral(gray);
+
+  for (const int point_id : model.VisiblePointIds()) {
+    if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) !=
+        outer_point_ids.end()) {
+      continue;
+    }
+
+    const CanonicalCorner& corner_info = model.corner(point_id);
+    PatchSeedFrame patch_frame;
+    const bool has_patch_frame =
+        BuildPinholeBootstrapPatchFrame(context, model.ModuleDimension(),
+                                        corner_info, options,
+                                        &patch_frame);
+    PatchSeedCandidate seed_candidate;
+    if (has_patch_frame) {
+      seed_candidate = SearchPinholeBootstrapPatchSeed(
+          context.patch, context, corner_info, patch_frame, options);
+    }
+
+    cv::Point2f seed_patch = patch_frame.predicted_patch;
+    cv::Point2f seed_image = patch_frame.predicted_image;
+    double seed_template_quality = 1.0;
+    double seed_gradient_quality = 1.0;
+    double seed_prior_quality = 1.0;
+    double seed_peak_quality = 1.0;
+    double seed_raw_quality = 1.0;
+    double seed_quality = 1.0;
+    if (seed_candidate.valid) {
+      seed_patch = seed_candidate.patch_point;
+      seed_image = seed_candidate.image_point;
+      seed_template_quality = seed_candidate.template_quality;
+      seed_gradient_quality = seed_candidate.gradient_quality;
+      seed_prior_quality = seed_candidate.prior_quality;
+      seed_peak_quality = seed_candidate.peak_quality;
+      seed_raw_quality = seed_candidate.raw_quality;
+      seed_quality = seed_candidate.final_quality;
+    }
+
+    const std::pair<cv::Point2f, cv::Point2f> local_axes =
+        ComputeHomographyLocalAxes(context.board_to_image, corner_info);
+    const cv::Point2f image_module_u_axis = local_axes.first;
+    const cv::Point2f image_module_v_axis = local_axes.second;
+    const double image_module_scale_px =
+        ComputeModuleScalePx(image_module_u_axis, image_module_v_axis,
+                             static_cast<double>(
+                                 options.canonical_pixels_per_module));
+    const int subpix_window_radius =
+        ComputeAdaptiveInternalSubpixRadius(image_module_scale_px, options);
+    const double subpix_displacement_limit =
+        ComputeAdaptiveInternalSubpixDisplacementLimit(image_module_scale_px,
+                                                       options);
+    const int image_evidence_search_radius =
+        ComputeAdaptiveImageEvidenceSearchRadius(image_module_scale_px, options);
+
+    cv::Point2f refined_image = seed_image;
+    if (has_patch_frame &&
+        IsInsideImageWithBorder(seed_image, gray.size(),
+                                options.min_border_distance) &&
+        options.do_subpix_refinement) {
+      std::vector<cv::Point2f> corners{refined_image};
+      cv::cornerSubPix(
+          gray, corners, cv::Size(subpix_window_radius, subpix_window_radius),
+          cv::Size(-1, -1),
+          cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER,
+                           30, 0.1));
+      refined_image = corners.front();
+    }
+
+    cv::Point2f refined_patch = seed_patch;
+    if (IsInsideImageWithBorder(refined_image, gray.size(),
+                                options.min_border_distance)) {
+      refined_patch =
+          PerspectiveTransformPoint(context.image_to_patch, refined_image);
+    }
+
+    const double displacement =
+        std::hypot(refined_image.x - seed_image.x,
+                   refined_image.y - seed_image.y);
+    const double q_refine =
+        has_patch_frame &&
+                IsInsideImageWithBorder(seed_image, gray.size(),
+                                        options.min_border_distance)
+            ? (options.do_subpix_refinement
+                   ? ClampUnit(1.0 -
+                               (displacement * displacement) /
+                                   std::max(1e-9,
+                                            subpix_displacement_limit *
+                                                subpix_displacement_limit))
+                   : 1.0)
+            : 0.0;
+    const TemplateScore patch_score =
+        ComputeTemplateScoreAtPoint(context.patch, corner_info, refined_patch,
+                                    options.canonical_pixels_per_module,
+                                    options.min_template_contrast);
+    const ImageEvidenceScore image_score =
+        EvaluateImageEvidenceAroundPoint(
+            gray, corner_info, refined_image, image_module_u_axis,
+            image_module_v_axis, options.min_template_contrast,
+            subpix_displacement_limit * subpix_displacement_limit,
+            image_evidence_search_radius, &gray_integral);
+    const double image_final_quality = image_score.final_quality;
+    const double final_quality =
+        std::min({seed_quality, q_refine, image_final_quality});
+    const bool valid =
+        has_patch_frame &&
+        IsInsideImageWithBorder(refined_image, result->image_size,
+                                options.min_border_distance);
+    const bool image_evidence_valid =
+        valid && ImageEvidencePassesQualityGate(options, image_final_quality);
+
+    CornerMeasurement& measurement =
+        result->corners[static_cast<std::size_t>(point_id)];
+    measurement.image_xy = Eigen::Vector2d(refined_image.x, refined_image.y);
+    measurement.quality = final_quality;
+    measurement.valid = valid;
+
+    if (valid) {
+      ++result->valid_corner_count;
+      ++result->valid_internal_corner_count;
+    }
+
+    InternalCornerDebugInfo debug;
+    debug.point_id = point_id;
+    debug.corner_type = corner_info.corner_type;
+    debug.predicted_image = patch_frame.predicted_image;
+    debug.sphere_seed_image = seed_image;
+    debug.refined_image = refined_image;
+    debug.predicted_patch = patch_frame.predicted_patch;
+    debug.sphere_seed_patch = seed_patch;
+    debug.refined_patch = refined_patch;
+    debug.module_u_axis = image_module_u_axis;
+    debug.module_v_axis = image_module_v_axis;
+    debug.local_module_scale = image_module_scale_px;
+    debug.sphere_search_radius =
+        has_patch_frame ? patch_frame.search_radius : 0.0;
+    debug.sphere_template_quality = seed_template_quality;
+    debug.sphere_gradient_quality = seed_gradient_quality;
+    debug.sphere_prior_quality = seed_prior_quality;
+    debug.sphere_peak_quality = seed_peak_quality;
+    debug.sphere_raw_quality = seed_raw_quality;
+    debug.sphere_seed_quality = seed_quality;
+    debug.subpix_window_radius = subpix_window_radius;
+    debug.subpix_displacement_limit = subpix_displacement_limit;
+    debug.image_evidence_search_radius = image_evidence_search_radius;
+    debug.q_refine = q_refine;
+    debug.template_quality = patch_score.template_quality;
+    debug.gradient_quality = patch_score.gradient_quality;
+    debug.final_quality = final_quality;
+    debug.image_template_quality = image_score.best_score.template_quality;
+    debug.image_gradient_quality = image_score.best_score.gradient_quality;
+    debug.image_centering_quality = image_score.centering_quality;
+    debug.image_final_quality = image_final_quality;
+    debug.predicted_to_seed_displacement =
+        std::hypot(seed_image.x - patch_frame.predicted_image.x,
+                   seed_image.y - patch_frame.predicted_image.y);
+    debug.seed_to_refined_displacement =
+        std::hypot(refined_image.x - seed_image.x,
+                   refined_image.y - seed_image.y);
+    debug.predicted_to_refined_displacement =
+        std::hypot(refined_image.x - patch_frame.predicted_image.x,
+                   refined_image.y - patch_frame.predicted_image.y);
+    debug.valid = valid;
+    debug.image_evidence_valid = image_evidence_valid;
+    result->internal_corner_debug.push_back(debug);
+  }
+}
+
 void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
                                               const DoubleSphereCameraModel& camera,
                                               const cv::Matx33d& target_to_camera_rotation,
@@ -4061,6 +4413,96 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
   }
 }
 
+struct InternalTopologyTarget {
+  int point_id = -1;
+  std::size_t debug_index = 0;
+  cv::Point2f predicted_image{};
+  double assignment_radius_px = 0.0;
+};
+
+struct InternalTopologyObservation {
+  int source_point_id = -1;
+  std::size_t debug_index = 0;
+  cv::Point2f refined_image{};
+  double quality = 0.0;
+  bool image_evidence_valid = false;
+};
+
+struct InternalTopologyEdge {
+  std::size_t observation_index = 0;
+  std::size_t target_index = 0;
+  double distance_px = 0.0;
+
+  bool operator<(const InternalTopologyEdge& other) const {
+    if (std::abs(distance_px - other.distance_px) > 1e-9) {
+      return distance_px < other.distance_px;
+    }
+    return std::tie(observation_index, target_index) <
+           std::tie(other.observation_index, other.target_index);
+  }
+};
+
+bool IsFinitePoint(const cv::Point2f& point) {
+  return std::isfinite(point.x) && std::isfinite(point.y);
+}
+
+double PointDistancePx(const cv::Point2f& lhs, const cv::Point2f& rhs) {
+  const double dx = static_cast<double>(lhs.x) - static_cast<double>(rhs.x);
+  const double dy = static_cast<double>(lhs.y) - static_cast<double>(rhs.y);
+  return std::sqrt(dx * dx + dy * dy);
+}
+
+void RecomputeCornerCounts(ApriltagInternalDetectionResult* result) {
+  if (result == nullptr) {
+    return;
+  }
+  result->valid_corner_count = 0;
+  result->valid_internal_corner_count = 0;
+  result->runtime_breakdown.valid_internal_corner_count = 0;
+  for (const CornerMeasurement& measurement : result->corners) {
+    if (!measurement.valid) {
+      continue;
+    }
+    ++result->valid_corner_count;
+    if (measurement.corner_type != CornerType::Outer) {
+      ++result->valid_internal_corner_count;
+      ++result->runtime_breakdown.valid_internal_corner_count;
+    }
+  }
+}
+
+void EnforceInternalTopologyAssignment(ApriltagInternalDetectionResult* result) {
+  if (result == nullptr) {
+    return;
+  }
+
+  for (InternalCornerDebugInfo& debug : result->internal_corner_debug) {
+    if (debug.point_id < 0 || debug.corner_type == CornerType::Outer ||
+        static_cast<std::size_t>(debug.point_id) >= result->corners.size()) {
+      continue;
+    }
+
+    CornerMeasurement& measurement =
+        result->corners[static_cast<std::size_t>(debug.point_id)];
+    const bool refined_ok =
+        IsFinitePoint(debug.refined_image) &&
+        IsInsideImageWithBorder(debug.refined_image, result->image_size, 0.0);
+    if (refined_ok) {
+      measurement.image_xy =
+          Eigen::Vector2d(debug.refined_image.x, debug.refined_image.y);
+      measurement.valid = true;
+      debug.valid = true;
+    } else {
+      measurement.valid = false;
+      measurement.quality = 0.0;
+      debug.valid = false;
+      debug.final_quality = 0.0;
+    }
+  }
+
+  RecomputeCornerCounts(result);
+}
+
 void SuppressDuplicateRefinedInternalCorners(ApriltagInternalDetectionResult* result) {
   if (result == nullptr || result->internal_corner_debug.size() < 2) {
     return;
@@ -4108,16 +4550,81 @@ void SuppressDuplicateRefinedInternalCorners(ApriltagInternalDetectionResult* re
     debug.valid = false;
     debug.image_evidence_valid = false;
     debug.final_quality = 0.0;
-    if (result->valid_corner_count > 0) {
-      --result->valid_corner_count;
+  }
+  RecomputeCornerCounts(result);
+}
+
+void SuppressTopologyMismatchedInternalCorners(ApriltagInternalDetectionResult* result) {
+  if (result == nullptr || result->internal_corner_debug.size() < 2) {
+    return;
+  }
+
+  std::vector<bool> suppress(result->internal_corner_debug.size(), false);
+  for (std::size_t i = 0; i < result->internal_corner_debug.size(); ++i) {
+    const InternalCornerDebugInfo& debug = result->internal_corner_debug[i];
+    if (!debug.valid || debug.corner_type == CornerType::Outer ||
+        debug.point_id < 0 ||
+        static_cast<std::size_t>(debug.point_id) >= result->corners.size() ||
+        !IsFinitePoint(debug.refined_image) ||
+        !IsFinitePoint(debug.predicted_image)) {
+      continue;
     }
-    if (result->valid_internal_corner_count > 0) {
-      --result->valid_internal_corner_count;
+
+    const double own_distance =
+        PointDistancePx(debug.refined_image, debug.predicted_image);
+    double nearest_other_distance = std::numeric_limits<double>::infinity();
+    int nearest_other_point_id = -1;
+    for (std::size_t j = 0; j < result->internal_corner_debug.size(); ++j) {
+      if (i == j) {
+        continue;
+      }
+      const InternalCornerDebugInfo& other = result->internal_corner_debug[j];
+      if (other.corner_type == CornerType::Outer || other.point_id < 0 ||
+          other.point_id == debug.point_id ||
+          !IsFinitePoint(other.predicted_image)) {
+        continue;
+      }
+      const double other_distance =
+          PointDistancePx(debug.refined_image, other.predicted_image);
+      if (other_distance < nearest_other_distance) {
+        nearest_other_distance = other_distance;
+        nearest_other_point_id = other.point_id;
+      }
     }
-    if (result->runtime_breakdown.valid_internal_corner_count > 0) {
-      --result->runtime_breakdown.valid_internal_corner_count;
+
+    if (nearest_other_point_id < 0 ||
+        !std::isfinite(nearest_other_distance)) {
+      continue;
+    }
+
+    const double ambiguity_margin_px =
+        std::max(2.0, 0.05 * std::max(1.0, debug.local_module_scale));
+    const bool owned_by_other_lattice_point =
+        nearest_other_distance + ambiguity_margin_px < own_distance &&
+        nearest_other_distance < 0.45 * own_distance;
+    if (owned_by_other_lattice_point) {
+      suppress[i] = true;
     }
   }
+
+  for (std::size_t i = 0; i < suppress.size(); ++i) {
+    if (!suppress[i]) {
+      continue;
+    }
+    InternalCornerDebugInfo& debug = result->internal_corner_debug[i];
+    if (debug.point_id < 0 ||
+        static_cast<std::size_t>(debug.point_id) >= result->corners.size()) {
+      continue;
+    }
+    CornerMeasurement& measurement =
+        result->corners[static_cast<std::size_t>(debug.point_id)];
+    measurement.valid = false;
+    measurement.quality = 0.0;
+    debug.valid = false;
+    debug.image_evidence_valid = false;
+    debug.final_quality = 0.0;
+  }
+  RecomputeCornerCounts(result);
 }
 
 void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
@@ -4804,7 +5311,10 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
     }
   }
 
-  if (board_config.internal_projection_mode == InternalProjectionMode::Homography) {
+  if (board_config.internal_projection_mode == InternalProjectionMode::Homography ||
+      board_config.internal_projection_mode ==
+          InternalProjectionMode::PinholeBootstrapPatch) {
+    result.internal_camera_source = "not_required";
     std::vector<cv::Point2f> board_outer{
         cv::Point2f(0.0f, 0.0f),
         cv::Point2f(static_cast<float>(model.ModuleDimension()), 0.0f),
@@ -4828,20 +5338,44 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
                         cv::BORDER_CONSTANT, cv::Scalar(255));
 
     result.patch_outer_corners = {patch_outer[0], patch_outer[1], patch_outer[2], patch_outer[3]};
-    PopulateInternalCornersFromHomography(gray, board_to_image, image_to_patch, outer_point_ids, model,
-                                          options_, &result);
+    if (board_config.internal_projection_mode == InternalProjectionMode::Homography) {
+      PopulateInternalCornersFromHomography(gray, board_to_image, image_to_patch,
+                                            outer_point_ids, model, options_,
+                                            &result);
+    } else {
+      PinholeBootstrapPatchContext context;
+      context.board_to_image = board_to_image;
+      context.image_to_patch = image_to_patch;
+      context.patch_to_image = cv::getPerspectiveTransform(patch_outer, image_outer);
+      context.patch = result.canonical_patch;
+      context.patch_size = result.canonical_patch.size();
+      context.patch_outer_corners = result.patch_outer_corners;
+      PopulateInternalCornersFromPinholeBootstrapPatch(
+          gray, context, outer_point_ids, model, options_, &result);
+    }
   } else {
+    const bool has_camera_override =
+        camera_override != nullptr && camera_override->IsConfigured();
     const bool sphere_lattice_has_initial_camera =
         UsesSphereSeedPipeline(board_config.internal_projection_mode) &&
         board_config.sphere_lattice_use_initial_camera;
-    if (!board_config.intermediate_camera.IsConfigured() && !sphere_lattice_has_initial_camera) {
+    result.internal_camera_source =
+        has_camera_override
+            ? "stage5_camera_override"
+            : (sphere_lattice_has_initial_camera
+                   ? "coarse_initial_camera"
+                   : (board_config.intermediate_camera.IsConfigured()
+                          ? "config_intermediate_camera"
+                          : "missing"));
+    if (!has_camera_override && !board_config.intermediate_camera.IsConfigured() &&
+        !sphere_lattice_has_initial_camera) {
       throw std::runtime_error(
           std::string(ToString(board_config.internal_projection_mode)) +
-          " mode requires an intermediate camera model in the config.");
+          " mode requires an intermediate camera model from Stage5 or the config.");
     }
 
     const IntermediateCameraConfig internal_camera_config =
-        camera_override != nullptr && camera_override->IsConfigured()
+        has_camera_override
             ? *camera_override
             : ((UsesSphereSeedPipeline(board_config.internal_projection_mode) &&
                 board_config.sphere_lattice_use_initial_camera)
@@ -4948,7 +5482,10 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
     }
   }
 
+  EnforceInternalTopologyAssignment(&result);
+  SuppressTopologyMismatchedInternalCorners(&result);
   SuppressDuplicateRefinedInternalCorners(&result);
+  RecomputeCornerCounts(&result);
 
   result.success =
       result.valid_internal_corner_count > 0 &&

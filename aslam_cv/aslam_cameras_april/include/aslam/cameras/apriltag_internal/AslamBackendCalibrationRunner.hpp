@@ -33,6 +33,11 @@ struct ConsistencyObservationWeightSummaryEntry {
 };
 
 struct AslamBackendCalibrationOptions {
+  enum class BoardPoseParameterization {
+    ReferenceChain,
+    IndependentFrameBoardPose,
+  };
+
   enum class PolarAngleWeightMode {
     None,
     DiagnosticOnly,
@@ -77,6 +82,8 @@ struct AslamBackendCalibrationOptions {
   double normalized_angular_reference_sigma_px = 1.0;
   double normalized_angular_min_sigma_rad = 1e-6;
   double normalized_angular_max_weight_scale = 1.0e8;
+  double pixel_residual_weight = 1.0;
+  double chordal_residual_weight = 1.0;
   bool angular_use_normalize_jacobian = false;
   AngularObservedRayMode angular_observed_ray_mode =
       AngularObservedRayMode::DynamicCurrentCamera;
@@ -108,6 +115,8 @@ struct AslamBackendCalibrationOptions {
   double consistency_hard_reject_rotation_deg = 5.0;
   double consistency_hard_reject_residual_px = 8.0;
   bool consistency_dump_weight_summary = true;
+  BoardPoseParameterization board_pose_parameterization =
+      BoardPoseParameterization::ReferenceChain;
   bool board_pose_prior_enabled = false;
   double board_pose_prior_translation_sigma_mm = 20.0;
   double board_pose_prior_rotation_sigma_deg = 5.0;
@@ -122,6 +131,10 @@ struct AslamBackendCalibrationOptions {
 const char* ToString(AslamBackendCalibrationOptions::PolarAngleWeightMode mode);
 AslamBackendCalibrationOptions::PolarAngleWeightMode ParsePolarAngleWeightMode(
     const std::string& value);
+const char* ToString(
+    AslamBackendCalibrationOptions::BoardPoseParameterization mode);
+AslamBackendCalibrationOptions::BoardPoseParameterization
+ParseBoardPoseParameterization(const std::string& value);
 const char* ToString(AslamBackendCalibrationOptions::ConsistencyWeightMode mode);
 AslamBackendCalibrationOptions::ConsistencyWeightMode ParseConsistencyWeightMode(
     const std::string& value);
@@ -236,12 +249,15 @@ struct AngularResidualDiagnosticsResult {
 struct ResidualBlockConstructionStats {
   int image_plane_residual_count = 0;
   int angular_residual_count = 0;
+  int chordal_residual_count = 0;
   int angular_auxiliary_residual_count = 0;
   int outer_image_plane_residual_count = 0;
   int outer_angular_residual_count = 0;
+  int outer_chordal_residual_count = 0;
   int outer_angular_auxiliary_residual_count = 0;
   int internal_image_plane_residual_count = 0;
   int internal_angular_residual_count = 0;
+  int internal_chordal_residual_count = 0;
   int internal_angular_auxiliary_residual_count = 0;
   int skipped_solver_observation_count = 0;
 };
@@ -313,6 +329,7 @@ struct AslamBackendCalibrationResult {
   std::string dataset_label;
   std::string baseline_protocol_label;
   std::string training_split_signature;
+  std::string board_pose_parameterization = "reference_chain";
   CalibrationBackendProblemInput problem_input;
   CalibrationBackendProblemInput effective_problem_input;
   AslamBackendCalibrationOptions options;

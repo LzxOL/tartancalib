@@ -338,11 +338,20 @@ struct StereoExtrinsicSolverOptions {
 
   bool enable_kalibr_style_pair_selection = true;
   bool enable_committing_pair_batch_selection = false;
+  bool enable_persistent_incremental_stereo_ba = true;
+  bool allow_legacy_selection_fallback_after_persistent_failure = false;
   bool enable_stage6_incremental_estimator = false;
   bool enable_incremental_pair_diversity_rescue = false;
   int incremental_pair_diversity_rescue_min_boards = 1;
   double incremental_mi_tol = 0.2;
   double incremental_rank_threshold = 1e-6;
+  int persistent_incremental_max_iterations = 8;
+  double persistent_incremental_convergence_delta_j = 1e-3;
+  double persistent_incremental_convergence_delta_x = 1e-4;
+  double persistent_incremental_baseline_prior_translation_weight = 1e-6;
+  double persistent_incremental_baseline_prior_rotation_weight = 1e-6;
+  double persistent_incremental_invalid_projection_penalty_px = 100.0;
+  int persistent_incremental_seed_pair_count = 1;
   Stage6IncrementalInfoBlock incremental_info_block =
       Stage6IncrementalInfoBlock::StereoExtrinsic;
   StereoSelectionOptimizationMode selection_optimization_mode =
@@ -583,6 +592,9 @@ struct StereoPairResidualSummary {
   double shared_internal_rmse = 0.0;
   double cam0_only_rmse = 0.0;
   double cam1_only_rmse = 0.0;
+  double layout_transfer_gap_rmse = 0.0;
+  double layout_transfer_gap_outer_rmse = 0.0;
+  double layout_transfer_gap_internal_rmse = 0.0;
   double mean_residual_x = 0.0;
   double mean_residual_y = 0.0;
   double std_residual_x = 0.0;
@@ -766,6 +778,7 @@ struct StereoPairTrialSelectionDecision {
   double baseline_rotation_delta_deg = std::numeric_limits<double>::infinity();
   double baseline_translation_delta_m = std::numeric_limits<double>::infinity();
   bool incremental_estimator_enabled = false;
+  bool persistent_incremental_estimator_used = false;
   std::string candidate_batch_type;
   bool batchAccepted = false;
   std::string accept_reason;
@@ -775,6 +788,14 @@ struct StereoPairTrialSelectionDecision {
   double objective_before = std::numeric_limits<double>::infinity();
   double objective_after = std::numeric_limits<double>::infinity();
   double marginal_information_gain_proxy = 0.0;
+  double normalized_information_gain = 0.0;
+  int information_gain_normalization_count = 1;
+  int rank_psi_after = -1;
+  int rank_psi_deficiency_after = -1;
+  int rank_theta_deficiency_after = -1;
+  double svd_tolerance = 0.0;
+  double qr_tolerance = 0.0;
+  double elapsed_time_seconds = 0.0;
   int rank_before = 0;
   int rank_after = 0;
   bool rank_proxy_increases = false;
@@ -867,6 +888,7 @@ struct StereoPairBoardTrialSelectionDecision {
   double batch_acceptance_score = 0.0;
   bool accepted_by_batch_acceptance = false;
   bool incremental_estimator_enabled = false;
+  bool persistent_incremental_estimator_used = false;
   std::string candidate_batch_type;
   bool batchAccepted = false;
   std::string accept_reason;
@@ -876,6 +898,14 @@ struct StereoPairBoardTrialSelectionDecision {
   double objective_before = std::numeric_limits<double>::infinity();
   double objective_after = std::numeric_limits<double>::infinity();
   double marginal_information_gain_proxy = 0.0;
+  double normalized_information_gain = 0.0;
+  int information_gain_normalization_count = 1;
+  int rank_psi_after = -1;
+  int rank_psi_deficiency_after = -1;
+  int rank_theta_deficiency_after = -1;
+  double svd_tolerance = 0.0;
+  double qr_tolerance = 0.0;
+  double elapsed_time_seconds = 0.0;
   int rank_before = 0;
   int rank_after = 0;
   bool rank_proxy_increases = false;
@@ -920,6 +950,15 @@ struct StereoPairBoardTrialSelectionSummary {
   StereoPairBoardSelectionMode pairboard_selection_mode =
       StereoPairBoardSelectionMode::KalibrStyleBatch;
   bool incremental_estimator_enabled = false;
+  bool persistent_incremental_estimator_used = false;
+  std::string persistent_incremental_information_group;
+  int persistent_incremental_seed_batch_count = 0;
+  int persistent_incremental_seed_pair_count = 0;
+  int persistent_incremental_seed_pair_board_count = 0;
+  int persistent_incremental_seed_point_count = 0;
+  int persistent_incremental_seed_rank_theta = -1;
+  double persistent_incremental_seed_information_gain = 0.0;
+  double persistent_incremental_elapsed_time_seconds = 0.0;
   bool marginal_information_gain_proxy_enabled = false;
   bool rmse_delta_diagnostics_only = false;
   double incremental_mi_tol = 0.0;
@@ -931,6 +970,7 @@ struct StereoPairBoardTrialSelectionSummary {
   int batch_acceptance_rejected_hard_validity_count = 0;
   int batch_acceptance_rejected_catastrophic_residual_count = 0;
   int batch_acceptance_rejected_score_count = 0;
+  int persistent_incremental_residual_health_guard_rejected_count = 0;
   int pair_cohesion_candidate_count = 0;
   int pair_cohesion_attempted_count = 0;
   int pair_cohesion_accepted_count = 0;
@@ -1091,6 +1131,12 @@ void WriteStereoPerCameraResidualsCsv(const std::string& path,
                                       const StereoExtrinsicCalibrationResult& result);
 void WriteStereoPerFrameResidualsCsv(const std::string& path,
                                      const StereoExtrinsicCalibrationResult& result);
+void WriteStereoHoldoutLayoutTransferGapCsv(
+    const std::string& path,
+    const StereoExtrinsicCalibrationResult& result);
+void WriteStereoHoldoutLocalLayoutDriftCsv(
+    const std::string& path,
+    const StereoExtrinsicCalibrationResult& result);
 void WriteStereoBaFrameFactorTraceCsv(
     const std::string& path,
     const StereoExtrinsicCalibrationResult& result);
@@ -1121,6 +1167,9 @@ void WriteStereoPairTrialSelectionSummary(
     const std::string& path,
     const StereoExtrinsicCalibrationResult& result);
 void WriteStereoPairTrialSelectionDecisionsCsv(
+    const std::string& path,
+    const StereoExtrinsicCalibrationResult& result);
+void WriteStage6PersistentIncrementalBatchDecisionsCsv(
     const std::string& path,
     const StereoExtrinsicCalibrationResult& result);
 void WriteStereoPairTrialSelectedPairsCsv(

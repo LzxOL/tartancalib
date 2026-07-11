@@ -200,10 +200,12 @@ int ComputeGeometryPriorRescueSubpixWindowRadius(
           ? outer_config.outer_subpix_scale * marker_width
           : static_cast<double>(outer_config.outer_subpix_window_min);
   const int min_radius = std::max(2, outer_config.outer_subpix_window_min);
-  const int max_radius = std::max(min_radius, outer_config.outer_subpix_window_max);
-  return std::max(min_radius,
-                  std::min(max_radius,
-                           static_cast<int>(std::lround(scaled_radius))));
+  const int raw_radius = static_cast<int>(std::lround(scaled_radius));
+  if (outer_config.outer_subpix_window_max > 0) {
+    const int max_radius = std::max(min_radius, outer_config.outer_subpix_window_max);
+    return std::max(min_radius, std::min(max_radius, raw_radius));
+  }
+  return std::max(min_radius, raw_radius);
 }
 
 bool IsInsideImage(const cv::Point2f& point,
@@ -2145,6 +2147,7 @@ ApriltagInternalDetectionResult BuildFailedDetectionResult(
   detection.outer_detection = outer_detection;
   detection.tag_detected = outer_detection.success;
   detection.failure_reason = failure_reason;
+  detection.internal_camera_source = "missing";
   return detection;
 }
 
@@ -2299,14 +2302,25 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
     }
 
     const OuterBootstrapBoardState* board_state = FindBoardState(bootstrap_result, board_id);
-    const bool pose_prior_available =
-        frame_state != nullptr && frame_state->initialized &&
+    const bool board_pose_available =
         board_state != nullptr && board_state->initialized;
-    const Eigen::Matrix4d T_camera_board = pose_prior_available
-                                               ? ComposeCameraBoardTransform(
-                                                     frame_state->T_camera_reference,
-                                                     board_state->T_reference_board)
-                                               : Eigen::Matrix4d::Identity();
+    const bool scene_pose_prior_available =
+        frame_state != nullptr && frame_state->initialized &&
+        board_pose_available;
+    const bool visible_refit_pose_prior_available =
+        !scene_pose_prior_available && visible_frame_refit.success &&
+        board_pose_available;
+    const bool pose_prior_available =
+        scene_pose_prior_available || visible_refit_pose_prior_available;
+    Eigen::Matrix4d T_camera_board = Eigen::Matrix4d::Identity();
+    if (scene_pose_prior_available) {
+      T_camera_board = ComposeCameraBoardTransform(
+          frame_state->T_camera_reference, board_state->T_reference_board);
+    } else if (visible_refit_pose_prior_available) {
+      T_camera_board =
+          visible_frame_refit.T_camera_reference *
+          board_state->T_reference_board;
+    }
 
     const std::string original_outer_failure_reason =
         outer_detection.failure_reason_text.empty()
@@ -2355,7 +2369,7 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
           };
       evaluate_prediction(T_camera_board, result.state_source_label, -1, 0.0,
                           result.visible_board_ids);
-      if (visible_frame_refit.success) {
+      if (visible_frame_refit.success && board_pose_available) {
         const Eigen::Matrix4d T_camera_board_visible_refit =
             visible_frame_refit.T_camera_reference *
             board_state->T_reference_board;
@@ -2386,8 +2400,14 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
     measurement.board_id = board_id;
     measurement.frame_bootstrap_initialized = frame_state != nullptr && frame_state->initialized;
     measurement.board_bootstrap_initialized = board_state != nullptr && board_state->initialized;
+    const bool has_local_outer_pose_seed =
+        outer_detection.success &&
+        std::all_of(outer_detection.refined_valid.begin(),
+                    outer_detection.refined_valid.end(),
+                    [](bool valid) { return valid; });
     const bool use_pose_prior_for_internal_generation =
-        pose_prior_available && !outer_detection.used_local_patch_rescue;
+        pose_prior_available && !outer_detection.used_local_patch_rescue &&
+        !has_local_outer_pose_seed;
     measurement.pose_prior_used = use_pose_prior_for_internal_generation;
     try {
       measurement.detection = detector_.DetectFromOuterDetection(
@@ -2473,14 +2493,25 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
     }
 
     const JointSceneBoardState* board_state = FindBoardState(scene_state, board_id);
-    const bool pose_prior_available =
-        frame_state != nullptr && frame_state->initialized &&
+    const bool board_pose_available =
         board_state != nullptr && board_state->initialized;
-    const Eigen::Matrix4d T_camera_board = pose_prior_available
-                                               ? ComposeCameraBoardTransform(
-                                                     frame_state->T_camera_reference,
-                                                     board_state->T_reference_board)
-                                               : Eigen::Matrix4d::Identity();
+    const bool scene_pose_prior_available =
+        frame_state != nullptr && frame_state->initialized &&
+        board_pose_available;
+    const bool visible_refit_pose_prior_available =
+        !scene_pose_prior_available && visible_frame_refit.success &&
+        board_pose_available;
+    const bool pose_prior_available =
+        scene_pose_prior_available || visible_refit_pose_prior_available;
+    Eigen::Matrix4d T_camera_board = Eigen::Matrix4d::Identity();
+    if (scene_pose_prior_available) {
+      T_camera_board = ComposeCameraBoardTransform(
+          frame_state->T_camera_reference, board_state->T_reference_board);
+    } else if (visible_refit_pose_prior_available) {
+      T_camera_board =
+          visible_frame_refit.T_camera_reference *
+          board_state->T_reference_board;
+    }
 
     const std::string original_outer_failure_reason =
         outer_detection.failure_reason_text.empty()
@@ -2529,7 +2560,7 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
           };
       evaluate_prediction(T_camera_board, result.state_source_label, -1, 0.0,
                           result.visible_board_ids);
-      if (visible_frame_refit.success) {
+      if (visible_frame_refit.success && board_pose_available) {
         const Eigen::Matrix4d T_camera_board_visible_refit =
             visible_frame_refit.T_camera_reference *
             board_state->T_reference_board;
@@ -2560,8 +2591,14 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
     measurement.board_id = board_id;
     measurement.frame_bootstrap_initialized = frame_state != nullptr && frame_state->initialized;
     measurement.board_bootstrap_initialized = board_state != nullptr && board_state->initialized;
+    const bool has_local_outer_pose_seed =
+        outer_detection.success &&
+        std::all_of(outer_detection.refined_valid.begin(),
+                    outer_detection.refined_valid.end(),
+                    [](bool valid) { return valid; });
     const bool use_pose_prior_for_internal_generation =
-        pose_prior_available && !outer_detection.used_local_patch_rescue;
+        pose_prior_available && !outer_detection.used_local_patch_rescue &&
+        !has_local_outer_pose_seed;
     measurement.pose_prior_used = use_pose_prior_for_internal_generation;
     try {
       measurement.detection = detector_.DetectFromOuterDetection(

@@ -56,8 +56,10 @@ struct MultiScaleOuterTagDetectorConfig {
   bool enable_close_edge_outer_subpix_boost = true;
   double close_edge_outer_subpix_area_ratio = 0.02;
   double close_edge_outer_subpix_min_polar_deg = 50.0;
+  double close_edge_outer_subpix_full_polar_deg = 78.0;
   double close_edge_outer_subpix_border_ratio = 0.15;
   double close_edge_outer_subpix_multiplier = 1.4;
+  double close_edge_outer_subpix_max_multiplier = 2.4;
   double outer_refine_gate_scale = 0.025;
   double outer_refine_gate_min = 6.0;
   double min_detection_quality = 0.0;
@@ -172,6 +174,7 @@ struct OuterCornerVerificationDebugInfo {
   bool close_edge_subpix_boost_applied = false;
   double close_edge_subpix_area_ratio = 0.0;
   double close_edge_subpix_max_polar_deg = 0.0;
+  double close_edge_subpix_multiplier = 1.0;
   double configured_outer_subpix_scale = 0.0;
   double configured_outer_subpix_window_scale = 0.0;
   int configured_outer_subpix_window_radius = 0;
