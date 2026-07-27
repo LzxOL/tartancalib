@@ -49,7 +49,11 @@ struct CmdArgs {
   std::string output_path;
   std::string cache_dir;
   std::string stereo_reference_camchain_path;
+  std::string stereo_reference_left_intrinsics_path;
+  std::string stereo_reference_right_intrinsics_path;
   std::string stage6_stereo_measurement_source = "all_valid";
+  std::string stage6_frame_pairing_mode = "exact_timestamp";
+  double stage6_frame_pairing_max_delta_ms = 250.0;
   int holdout_stride = 5;
   int holdout_offset = 0;
   int stage6_max_alternating_iterations = 10;
@@ -69,6 +73,9 @@ struct CmdArgs {
   std::string stage6_view_selection_mode = "off";
   int stage6_selected_pair_count = 0;
   std::string stage6_solver_mode = "global_sparse_ba";
+  std::string stage6_intrinsics_mode =
+      "adaptive_regularized_joint_projection";
+  std::string stage6_persistent_pose_structure = "independent_pair_board";
   std::string stage6_ba_mode = "pixel";
   std::string stage6_final_ba_residual_mode = "pixel";
   std::string stage6_selection_ba_residual_mode = "pixel";
@@ -165,6 +172,15 @@ struct CmdArgs {
   double stage6_persistent_incremental_convergence_delta_x = 1e-4;
   double stage6_persistent_incremental_baseline_prior_translation_weight = 1e-6;
   double stage6_persistent_incremental_baseline_prior_rotation_weight = 1e-6;
+  double stage6_persistent_incremental_projection_prior_shape_sigma = 0.01;
+  double stage6_persistent_incremental_projection_prior_focal_relative_sigma =
+      0.01;
+  double stage6_persistent_incremental_projection_prior_principal_sigma_px =
+      5.0;
+  int stage6_adaptive_joint_projection_min_training_pairs = 8;
+  int stage6_adaptive_joint_projection_min_shared_pair_boards = 20;
+  int stage6_adaptive_joint_projection_min_distinct_boards = 3;
+  int stage6_adaptive_joint_projection_min_observation_points = 1000;
   double stage6_persistent_incremental_invalid_projection_penalty_px = 100.0;
   int stage6_persistent_incremental_seed_pair_count = 1;
   std::string stage6_incremental_info_block = "stereo_extrinsic";
@@ -215,7 +231,7 @@ struct CmdArgs {
   bool stage6_geometry_prior_rescue_diagnostic_only = false;
   bool stage6_geometry_prior_rescue_use_as_observation = true;
   bool stage6_geometry_prior_rescue_keep_outer_on_internal_failure = false;
-  bool stage6_geometry_prior_rescue_allow_geometry_only_pose_refit = true;
+  bool stage6_geometry_prior_rescue_allow_geometry_only_pose_refit = false;
   int stage6_geometry_prior_rescue_subpix_window_radius = 0;
   double stage6_geometry_prior_rescue_max_corner_displacement_px = 0.0;
   double stage6_geometry_prior_rescue_min_corner_response_ratio = 0.03;
@@ -333,7 +349,11 @@ void PrintUsage(const char* program) {
       << " --output OUTPUT_DIR"
       << " [--cache-dir PATH]"
       << " [--stereo-reference-camchain YAML]"
+      << " [--stereo-reference-left-intrinsics YAML]"
+      << " [--stereo-reference-right-intrinsics YAML]"
       << " [--stage6-stereo-measurement-source backend_selected_only|all_valid]"
+      << " [--stage6-frame-pairing-mode exact_timestamp|frame_index]"
+      << " [--stage6-frame-pairing-max-delta-ms X]"
       << " [--holdout-stride N] [--holdout-offset N]"
       << " [--stage6-max-alternating-iterations N]"
       << " [--stage6-min-total-rmse-improvement X]"
@@ -353,6 +373,8 @@ void PrintUsage(const char* program) {
       << " [--stage6-view-selection-mode off|topk]"
       << " [--stage6-selected-pair-count N]"
       << " [--stage6-solver-mode alternating|global_sparse_ba|shared_only_global_sparse_ba]"
+      << " [--stage6-intrinsics-mode fixed_stage5|kalibr_joint_projection|regularized_joint_projection|adaptive_regularized_joint_projection]"
+      << " [--stage6-persistent-pose-structure independent_pair_board|shared_frame_layout]"
       << " [--stage6-ba-mode pixel|angular|hybrid_polar]"
       << " [--stage6-residual-mode pixel|spherical_chordal|spherical_tangent|hybrid_pixel_spherical]"
       << " [--stage6-final-ba-residual-mode pixel|spherical_chordal|spherical_tangent|hybrid_pixel_spherical]"
@@ -401,6 +423,13 @@ void PrintUsage(const char* program) {
       << " [--stage6-persistent-incremental-convergence-delta-x X]"
       << " [--stage6-persistent-incremental-baseline-prior-translation-weight X]"
       << " [--stage6-persistent-incremental-baseline-prior-rotation-weight X]"
+      << " [--stage6-persistent-incremental-projection-prior-shape-sigma X]"
+      << " [--stage6-persistent-incremental-projection-prior-focal-relative-sigma X]"
+      << " [--stage6-persistent-incremental-projection-prior-principal-sigma-px X]"
+      << " [--stage6-adaptive-joint-projection-min-training-pairs N]"
+      << " [--stage6-adaptive-joint-projection-min-shared-pair-boards N]"
+      << " [--stage6-adaptive-joint-projection-min-distinct-boards N]"
+      << " [--stage6-adaptive-joint-projection-min-observation-points N]"
       << " [--stage6-persistent-incremental-invalid-projection-penalty-px X]"
       << " [--stage6-persistent-incremental-seed-pair-count N]"
       << " [--stage6-enable-stage6-incremental-estimator]"
@@ -546,8 +575,19 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.cache_dir = argv[++i];
     } else if (token == "--stereo-reference-camchain" && i + 1 < argc) {
       args.stereo_reference_camchain_path = argv[++i];
+    } else if (token == "--stereo-reference-left-intrinsics" &&
+               i + 1 < argc) {
+      args.stereo_reference_left_intrinsics_path = argv[++i];
+    } else if (token == "--stereo-reference-right-intrinsics" &&
+               i + 1 < argc) {
+      args.stereo_reference_right_intrinsics_path = argv[++i];
     } else if (token == "--stage6-stereo-measurement-source" && i + 1 < argc) {
       args.stage6_stereo_measurement_source = argv[++i];
+    } else if (token == "--stage6-frame-pairing-mode" && i + 1 < argc) {
+      args.stage6_frame_pairing_mode = argv[++i];
+    } else if (token == "--stage6-frame-pairing-max-delta-ms" &&
+               i + 1 < argc) {
+      args.stage6_frame_pairing_max_delta_ms = std::stod(argv[++i]);
     } else if (token == "--holdout-stride" && i + 1 < argc) {
       args.holdout_stride = std::stoi(argv[++i]);
     } else if (token == "--holdout-offset" && i + 1 < argc) {
@@ -603,6 +643,11 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.stage6_selected_pair_count = std::stoi(argv[++i]);
     } else if (token == "--stage6-solver-mode" && i + 1 < argc) {
       args.stage6_solver_mode = argv[++i];
+    } else if (token == "--stage6-intrinsics-mode" && i + 1 < argc) {
+      args.stage6_intrinsics_mode = argv[++i];
+    } else if (token == "--stage6-persistent-pose-structure" &&
+               i + 1 < argc) {
+      args.stage6_persistent_pose_structure = argv[++i];
     } else if (token == "--stage6-ba-mode" && i + 1 < argc) {
       ApplyStage6BaMode(&args, argv[++i]);
     } else if ((token == "--stage6-final-ba-residual-mode" ||
@@ -923,6 +968,46 @@ CmdArgs ParseArgs(int argc, char** argv) {
           std::stod(argv[++i]);
     } else if (
         token ==
+            "--stage6-persistent-incremental-projection-prior-shape-sigma" &&
+        i + 1 < argc) {
+      args.stage6_persistent_incremental_projection_prior_shape_sigma =
+          std::stod(argv[++i]);
+    } else if (
+        token ==
+            "--stage6-persistent-incremental-projection-prior-focal-relative-sigma" &&
+        i + 1 < argc) {
+      args.stage6_persistent_incremental_projection_prior_focal_relative_sigma =
+          std::stod(argv[++i]);
+    } else if (
+        token ==
+            "--stage6-persistent-incremental-projection-prior-principal-sigma-px" &&
+        i + 1 < argc) {
+      args.stage6_persistent_incremental_projection_prior_principal_sigma_px =
+          std::stod(argv[++i]);
+    } else if (
+        token == "--stage6-adaptive-joint-projection-min-training-pairs" &&
+        i + 1 < argc) {
+      args.stage6_adaptive_joint_projection_min_training_pairs =
+          std::stoi(argv[++i]);
+    } else if (
+        token ==
+            "--stage6-adaptive-joint-projection-min-shared-pair-boards" &&
+        i + 1 < argc) {
+      args.stage6_adaptive_joint_projection_min_shared_pair_boards =
+          std::stoi(argv[++i]);
+    } else if (
+        token == "--stage6-adaptive-joint-projection-min-distinct-boards" &&
+        i + 1 < argc) {
+      args.stage6_adaptive_joint_projection_min_distinct_boards =
+          std::stoi(argv[++i]);
+    } else if (
+        token ==
+            "--stage6-adaptive-joint-projection-min-observation-points" &&
+        i + 1 < argc) {
+      args.stage6_adaptive_joint_projection_min_observation_points =
+          std::stoi(argv[++i]);
+    } else if (
+        token ==
             "--stage6-persistent-incremental-invalid-projection-penalty-px" &&
         i + 1 < argc) {
       args.stage6_persistent_incremental_invalid_projection_penalty_px =
@@ -1165,6 +1250,15 @@ CmdArgs ParseArgs(int argc, char** argv) {
     throw std::runtime_error(
         "--test-left-image and --test-right-image must be provided together.");
   }
+  const bool has_reference_left =
+      !args.stereo_reference_left_intrinsics_path.empty();
+  const bool has_reference_right =
+      !args.stereo_reference_right_intrinsics_path.empty();
+  if (has_reference_left != has_reference_right) {
+    throw std::runtime_error(
+        "--stereo-reference-left-intrinsics and "
+        "--stereo-reference-right-intrinsics must be provided together.");
+  }
   if (args.left_image_path.empty() || args.right_image_path.empty() ||
       args.left_config_path.empty() || args.right_config_path.empty() ||
       args.left_intrinsics_path.empty() || args.right_intrinsics_path.empty() ||
@@ -1406,6 +1500,53 @@ void WriteStereoReferenceHoldoutSummary(
   output << "extrinsic_only_holdout_mode: local_stereo_board_pose_refit\n";
 }
 
+void WriteStereoFullReferenceHoldoutSummary(
+    const std::string& path,
+    const StereoReferenceComparison& comparison,
+    const std::string& reference_left_intrinsics_path,
+    const std::string& reference_right_intrinsics_path,
+    const ati::StereoResidualSummary& ours,
+    const ati::StereoResidualSummary& reference_full) {
+  std::ofstream output(path.c_str());
+  output << "success: "
+         << (comparison.success && reference_full.success ? 1 : 0) << "\n";
+  output << "failure_reason: "
+         << (comparison.success ? reference_full.failure_reason
+                                : comparison.failure_reason)
+         << "\n";
+  output << "reference_camchain_path: " << comparison.reference_camchain_path
+         << "\n";
+  output << "reference_left_intrinsics_path: "
+         << reference_left_intrinsics_path << "\n";
+  output << "reference_right_intrinsics_path: "
+         << reference_right_intrinsics_path << "\n";
+  output << "comparison_metric: full_camera_frozen_measurement_holdout\n";
+  output << "measurements_reused_without_redetection: 1\n";
+  output << "ours_holdout_total_stereo_rmse: "
+         << ours.total_stereo_rmse << "\n";
+  output << "reference_full_holdout_total_stereo_rmse: "
+         << reference_full.total_stereo_rmse << "\n";
+  output << "ours_minus_reference_full_holdout_total_stereo_rmse: "
+         << (ours.total_stereo_rmse - reference_full.total_stereo_rmse) << "\n";
+  output << "ours_holdout_cam0_rmse: " << ours.cam0_rmse << "\n";
+  output << "reference_full_holdout_cam0_rmse: "
+         << reference_full.cam0_rmse << "\n";
+  output << "ours_holdout_cam1_rmse: " << ours.cam1_rmse << "\n";
+  output << "reference_full_holdout_cam1_rmse: "
+         << reference_full.cam1_rmse << "\n";
+  output << "ours_holdout_outer_only_rmse: " << ours.outer_only_rmse << "\n";
+  output << "reference_full_holdout_outer_only_rmse: "
+         << reference_full.outer_only_rmse << "\n";
+  output << "ours_holdout_internal_only_rmse: "
+         << ours.internal_only_rmse << "\n";
+  output << "reference_full_holdout_internal_only_rmse: "
+         << reference_full.internal_only_rmse << "\n";
+  output << "ours_holdout_used_pair_count: " << ours.used_pair_count << "\n";
+  output << "reference_full_holdout_used_pair_count: "
+         << reference_full.used_pair_count << "\n";
+  output << "holdout_mode: local_stereo_board_pose_refit\n";
+}
+
 void WriteStereoResidualPerBoardCsv(
     const std::string& path,
     const std::string& split_label,
@@ -1522,6 +1663,28 @@ ati::StereoMeasurementDataset MergeTrainAndTestStereoDatasets(
                          holdout_dataset.warnings.end());
   merged.success = true;
   return merged;
+}
+
+void RestoreFrontendPairingPopulationCounts(
+    const ati::StereoFrontendImagePairSelection& selection,
+    ati::StereoMeasurementDataset* dataset) {
+  if (dataset == nullptr) {
+    throw std::runtime_error(
+        "RestoreFrontendPairingPopulationCounts requires a dataset.");
+  }
+  dataset->left_frame_count = selection.original_left_frame_count;
+  dataset->right_frame_count = selection.original_right_frame_count;
+  dataset->unmatched_left_count = selection.unmatched_left_count;
+  dataset->unmatched_right_count = selection.unmatched_right_count;
+  std::ostringstream warning;
+  warning << "frontend_pairing_prefilter pairing_mode="
+          << selection.pairing_mode
+          << " original_left=" << selection.original_left_frame_count
+          << " original_right=" << selection.original_right_frame_count
+          << " processed_pairs=" << selection.paired_frame_count
+          << " skipped_left=" << selection.unmatched_left_count
+          << " skipped_right=" << selection.unmatched_right_count;
+  dataset->warnings.push_back(warning.str());
 }
 
 const ati::StereoFramePair* FindStereoFramePair(
@@ -1977,6 +2140,34 @@ ati::StereoSolverMode ParseSolverMode(const std::string& value) {
   throw std::runtime_error("Unsupported --stage6-solver-mode: " + value);
 }
 
+ati::StereoIntrinsicsMode ParseIntrinsicsMode(const std::string& value) {
+  if (value == "fixed_stage5") {
+    return ati::StereoIntrinsicsMode::FixedStage5;
+  }
+  if (value == "kalibr_joint_projection") {
+    return ati::StereoIntrinsicsMode::KalibrJointProjection;
+  }
+  if (value == "regularized_joint_projection") {
+    return ati::StereoIntrinsicsMode::RegularizedJointProjection;
+  }
+  if (value == "adaptive_regularized_joint_projection") {
+    return ati::StereoIntrinsicsMode::AdaptiveRegularizedJointProjection;
+  }
+  throw std::runtime_error("Unsupported --stage6-intrinsics-mode: " + value);
+}
+
+ati::StereoPersistentPoseStructure ParsePersistentPoseStructure(
+    const std::string& value) {
+  if (value == "independent_pair_board") {
+    return ati::StereoPersistentPoseStructure::IndependentPairBoard;
+  }
+  if (value == "shared_frame_layout") {
+    return ati::StereoPersistentPoseStructure::SharedFrameLayout;
+  }
+  throw std::runtime_error(
+      "Unsupported --stage6-persistent-pose-structure: " + value);
+}
+
 ati::StereoFinalBaResidualMode ParseFinalBaResidualMode(
     const std::string& value) {
   if (value == "pixel") {
@@ -2147,6 +2338,18 @@ ati::StereoMeasurementSourceMode ParseStereoMeasurementSourceMode(
       "Unsupported --stage6-stereo-measurement-source: " + value);
 }
 
+ati::StereoFramePairingMode ParseStereoFramePairingMode(
+    const std::string& value) {
+  if (value == "exact_timestamp" || value == "exact-timestamp") {
+    return ati::StereoFramePairingMode::ExactTimestamp;
+  }
+  if (value == "frame_index" || value == "frame-index") {
+    return ati::StereoFramePairingMode::FrameIndex;
+  }
+  throw std::runtime_error(
+      "Unsupported --stage6-frame-pairing-mode: " + value);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2161,21 +2364,61 @@ int main(int argc, char** argv) {
 
     std::cout << "[Stage6] collecting stereo image paths..." << std::endl;
 
-    const std::vector<std::string> left_image_paths =
+    const std::vector<std::string> original_left_image_paths =
         CollectImagePaths(args.left_image_path);
-    const std::vector<std::string> right_image_paths =
+    const std::vector<std::string> original_right_image_paths =
         CollectImagePaths(args.right_image_path);
     const bool use_cross_dataset_holdout =
         !args.test_left_image_path.empty() && !args.test_right_image_path.empty();
+    const ati::StereoFramePairingMode frame_pairing_mode =
+        ParseStereoFramePairingMode(args.stage6_frame_pairing_mode);
+    const ati::StereoFrontendImagePairSelection training_frontend_selection =
+        ati::SelectStereoFrontendImagePairs(
+            original_left_image_paths, original_right_image_paths,
+            frame_pairing_mode, args.stage6_frame_pairing_max_delta_ms);
+    if (!training_frontend_selection.success) {
+      throw std::runtime_error(
+          training_frontend_selection.failure_reason.empty()
+              ? "Stage6 frontend pairing prefilter failed."
+              : training_frontend_selection.failure_reason);
+    }
+    const std::vector<std::string>& left_image_paths =
+        training_frontend_selection.left_image_paths;
+    const std::vector<std::string>& right_image_paths =
+        training_frontend_selection.right_image_paths;
+    std::vector<std::string> original_test_left_image_paths;
+    std::vector<std::string> original_test_right_image_paths;
+    ati::StereoFrontendImagePairSelection holdout_frontend_selection;
     std::vector<std::string> test_left_image_paths;
     std::vector<std::string> test_right_image_paths;
-    std::cout << "[Stage6] left frames: " << left_image_paths.size()
-              << ", right frames: " << right_image_paths.size() << std::endl;
+    std::cout << "[Stage6] original left frames: "
+              << original_left_image_paths.size()
+              << ", original right frames: "
+              << original_right_image_paths.size()
+              << ", frontend paired frames: " << left_image_paths.size()
+              << std::endl;
     if (use_cross_dataset_holdout) {
-      test_left_image_paths = CollectImagePaths(args.test_left_image_path);
-      test_right_image_paths = CollectImagePaths(args.test_right_image_path);
-      std::cout << "[Stage6] test left frames: " << test_left_image_paths.size()
-                << ", test right frames: " << test_right_image_paths.size()
+      original_test_left_image_paths =
+          CollectImagePaths(args.test_left_image_path);
+      original_test_right_image_paths =
+          CollectImagePaths(args.test_right_image_path);
+      holdout_frontend_selection = ati::SelectStereoFrontendImagePairs(
+          original_test_left_image_paths, original_test_right_image_paths,
+          frame_pairing_mode, args.stage6_frame_pairing_max_delta_ms);
+      if (!holdout_frontend_selection.success) {
+        throw std::runtime_error(
+            holdout_frontend_selection.failure_reason.empty()
+                ? "Stage6 holdout frontend pairing prefilter failed."
+                : holdout_frontend_selection.failure_reason);
+      }
+      test_left_image_paths = holdout_frontend_selection.left_image_paths;
+      test_right_image_paths = holdout_frontend_selection.right_image_paths;
+      std::cout << "[Stage6] original test left frames: "
+                << original_test_left_image_paths.size()
+                << ", original test right frames: "
+                << original_test_right_image_paths.size()
+                << ", frontend test paired frames: "
+                << test_left_image_paths.size()
                 << std::endl;
     }
     std::cout << "[Stage6] outer detection cache: " << cache_dir << std::endl;
@@ -2246,25 +2489,35 @@ int main(int argc, char** argv) {
                                               std::to_string(args.holdout_stride) +
                                               "_offset_" +
                                               std::to_string(args.holdout_offset);
+    problem_input.measurement_source_mode =
+        args.stage6_stereo_measurement_source;
     problem_input.left_bundle = left_bundle;
     problem_input.right_bundle = right_bundle;
     if (use_cross_dataset_holdout) {
-      const ati::StereoMeasurementDataset training_dataset =
+      ati::StereoMeasurementDataset training_dataset =
           ati::BuildStereoMeasurementDataset(
               left_image_paths, right_image_paths, 0, 0, left_bundle, right_bundle,
               ParseStereoMeasurementSourceMode(
-                  args.stage6_stereo_measurement_source));
+                  args.stage6_stereo_measurement_source),
+              frame_pairing_mode,
+              args.stage6_frame_pairing_max_delta_ms);
+      RestoreFrontendPairingPopulationCounts(training_frontend_selection,
+                                             &training_dataset);
       if (test_left_frontend.bundle.scene_state.reference_board_id !=
           test_right_frontend.bundle.scene_state.reference_board_id) {
         throw std::runtime_error(
             "Holdout left/right reference_board_id mismatch in cross-dataset Stage6.");
       }
-      const ati::StereoMeasurementDataset holdout_dataset =
+      ati::StereoMeasurementDataset holdout_dataset =
           ati::BuildStereoMeasurementDataset(
               test_left_image_paths, test_right_image_paths, 1, 0,
               test_left_frontend.bundle, test_right_frontend.bundle,
               ParseStereoMeasurementSourceMode(
-                  args.stage6_stereo_measurement_source));
+                  args.stage6_stereo_measurement_source),
+              frame_pairing_mode,
+              args.stage6_frame_pairing_max_delta_ms);
+      RestoreFrontendPairingPopulationCounts(holdout_frontend_selection,
+                                             &holdout_dataset);
       problem_input.measurement_dataset =
           MergeTrainAndTestStereoDatasets(training_dataset, holdout_dataset);
     } else {
@@ -2273,7 +2526,11 @@ int main(int argc, char** argv) {
               left_image_paths, right_image_paths, args.holdout_stride,
               args.holdout_offset, left_bundle, right_bundle,
               ParseStereoMeasurementSourceMode(
-                  args.stage6_stereo_measurement_source));
+                  args.stage6_stereo_measurement_source),
+              frame_pairing_mode,
+              args.stage6_frame_pairing_max_delta_ms);
+      RestoreFrontendPairingPopulationCounts(training_frontend_selection,
+                                             &problem_input.measurement_dataset);
     }
     problem_input.measurement_dataset = ApplyStage6TrainingPairSample(
         problem_input.measurement_dataset,
@@ -2314,6 +2571,23 @@ int main(int argc, char** argv) {
         right_frontend.runtime_breakdown.training_detection_cache.load_failures;
     result.runtime_summary.cam1_training_detection_cache_store_failures =
         right_frontend.runtime_breakdown.training_detection_cache.store_failures;
+    result.runtime_summary.frontend_pairing_prefilter_enabled = true;
+    result.runtime_summary.frontend_original_left_frame_count =
+        training_frontend_selection.original_left_frame_count +
+        holdout_frontend_selection.original_left_frame_count;
+    result.runtime_summary.frontend_original_right_frame_count =
+        training_frontend_selection.original_right_frame_count +
+        holdout_frontend_selection.original_right_frame_count;
+    result.runtime_summary.frontend_processed_left_frame_count =
+        static_cast<int>(left_image_paths.size() + test_left_image_paths.size());
+    result.runtime_summary.frontend_processed_right_frame_count =
+        static_cast<int>(right_image_paths.size() + test_right_image_paths.size());
+    result.runtime_summary.frontend_skipped_unpaired_left_frame_count =
+        training_frontend_selection.unmatched_left_count +
+        holdout_frontend_selection.unmatched_left_count;
+    result.runtime_summary.frontend_skipped_unpaired_right_frame_count =
+        training_frontend_selection.unmatched_right_count +
+        holdout_frontend_selection.unmatched_right_count;
     result.runtime_summary.pairing_build_dataset_runtime_seconds =
         std::chrono::duration<double>(Clock::now() - total_start).count();
     if (!problem_input.measurement_dataset.success) {
@@ -2366,6 +2640,10 @@ int main(int argc, char** argv) {
         args.stage6_selected_pair_count;
     problem_input.solver_options.solver_mode =
         ParseSolverMode(args.stage6_solver_mode);
+    problem_input.solver_options.intrinsics_mode =
+        ParseIntrinsicsMode(args.stage6_intrinsics_mode);
+    problem_input.solver_options.persistent_pose_structure =
+        ParsePersistentPoseStructure(args.stage6_persistent_pose_structure);
     problem_input.solver_options.ba_mode_label = args.stage6_ba_mode;
     problem_input.solver_options.final_ba_residual_mode =
         ParseFinalBaResidualMode(args.stage6_final_ba_residual_mode);
@@ -2557,6 +2835,25 @@ int main(int argc, char** argv) {
         .persistent_incremental_baseline_prior_rotation_weight =
         args.stage6_persistent_incremental_baseline_prior_rotation_weight;
     problem_input.solver_options
+        .persistent_incremental_projection_prior_shape_sigma =
+        args.stage6_persistent_incremental_projection_prior_shape_sigma;
+    problem_input.solver_options
+        .persistent_incremental_projection_prior_focal_relative_sigma =
+        args.stage6_persistent_incremental_projection_prior_focal_relative_sigma;
+    problem_input.solver_options
+        .persistent_incremental_projection_prior_principal_sigma_px =
+        args.stage6_persistent_incremental_projection_prior_principal_sigma_px;
+    problem_input.solver_options.adaptive_joint_projection_min_training_pairs =
+        args.stage6_adaptive_joint_projection_min_training_pairs;
+    problem_input.solver_options
+        .adaptive_joint_projection_min_shared_pair_boards =
+        args.stage6_adaptive_joint_projection_min_shared_pair_boards;
+    problem_input.solver_options.adaptive_joint_projection_min_distinct_boards =
+        args.stage6_adaptive_joint_projection_min_distinct_boards;
+    problem_input.solver_options
+        .adaptive_joint_projection_min_observation_points =
+        args.stage6_adaptive_joint_projection_min_observation_points;
+    problem_input.solver_options
         .persistent_incremental_invalid_projection_penalty_px =
         args.stage6_persistent_incremental_invalid_projection_penalty_px;
     problem_input.solver_options.persistent_incremental_seed_pair_count =
@@ -2691,6 +2988,20 @@ int main(int argc, char** argv) {
         frontend_runtime_summary.cam1_training_detection_cache_load_failures;
     result.runtime_summary.cam1_training_detection_cache_store_failures =
         frontend_runtime_summary.cam1_training_detection_cache_store_failures;
+    result.runtime_summary.frontend_pairing_prefilter_enabled =
+        frontend_runtime_summary.frontend_pairing_prefilter_enabled;
+    result.runtime_summary.frontend_original_left_frame_count =
+        frontend_runtime_summary.frontend_original_left_frame_count;
+    result.runtime_summary.frontend_original_right_frame_count =
+        frontend_runtime_summary.frontend_original_right_frame_count;
+    result.runtime_summary.frontend_processed_left_frame_count =
+        frontend_runtime_summary.frontend_processed_left_frame_count;
+    result.runtime_summary.frontend_processed_right_frame_count =
+        frontend_runtime_summary.frontend_processed_right_frame_count;
+    result.runtime_summary.frontend_skipped_unpaired_left_frame_count =
+        frontend_runtime_summary.frontend_skipped_unpaired_left_frame_count;
+    result.runtime_summary.frontend_skipped_unpaired_right_frame_count =
+        frontend_runtime_summary.frontend_skipped_unpaired_right_frame_count;
     result.runtime_summary.pairing_build_dataset_runtime_seconds =
         std::chrono::duration<double>(Clock::now() - total_start).count() -
         result.runtime_summary.initialization_runtime_seconds -
@@ -2740,6 +3051,38 @@ int main(int argc, char** argv) {
                 .string(),
             "reference_holdout_extrinsic_only",
             reference_extrinsic_only_holdout_summary);
+        if (!args.stereo_reference_left_intrinsics_path.empty() &&
+            !args.stereo_reference_right_intrinsics_path.empty()) {
+          ati::StereoSceneState full_reference_scene = reference_scene;
+          full_reference_scene.cam0 = ToStereoCalibration(
+              ati::LoadExternalCameraConfig(
+                  args.stereo_reference_left_intrinsics_path),
+              args.stereo_reference_left_intrinsics_path);
+          full_reference_scene.cam1 = ToStereoCalibration(
+              ati::LoadExternalCameraConfig(
+                  args.stereo_reference_right_intrinsics_path),
+              args.stereo_reference_right_intrinsics_path);
+          const ati::StereoResidualSummary full_reference_holdout_summary =
+              reference_extrinsic_only_holdout_evaluator.Evaluate(
+                  problem_input.measurement_dataset, full_reference_scene,
+                  std::set<int>(
+                      problem_input.measurement_dataset.holdout_pair_indices.begin(),
+                      problem_input.measurement_dataset.holdout_pair_indices.end()),
+                  "reference_holdout_full_camera");
+          WriteStereoFullReferenceHoldoutSummary(
+              (output_dir / "stereo_reference_full_holdout_summary.txt").string(),
+              reference_comparison,
+              args.stereo_reference_left_intrinsics_path,
+              args.stereo_reference_right_intrinsics_path,
+              result.holdout_extrinsic_only_residual_summary,
+              full_reference_holdout_summary);
+          WriteStereoResidualPerBoardCsv(
+              (output_dir /
+               "stereo_reference_full_per_board_residuals.csv")
+                  .string(),
+              "reference_holdout_full_camera",
+              full_reference_holdout_summary);
+        }
         if (problem_input.solver_options.export_stereo_reprojection_visualizations) {
           ati::WriteStereoExtrinsicOnlyTopBadPairBoardVisualizations(
               (output_dir / "stereo_reprojection_visualizations" /

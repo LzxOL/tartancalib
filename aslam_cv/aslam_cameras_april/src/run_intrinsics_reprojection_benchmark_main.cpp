@@ -46,7 +46,7 @@ struct CmdArgs {
   int progress_every = 1;
   bool enable_geometry_prior_rescue = true;
   bool geometry_prior_rescue_use_as_observation = true;
-  bool geometry_prior_rescue_allow_geometry_only_pose_refit = true;
+  bool geometry_prior_rescue_allow_geometry_only_pose_refit = false;
   bool geometry_prior_rescue_enable_spherical_refine = true;
 };
 

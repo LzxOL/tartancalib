@@ -1,6 +1,7 @@
 #ifndef ASLAM_CAMERAS_APRILTAG_INTERNAL_FROZEN_ROUND2_BASELINE_PIPELINE_HPP
 #define ASLAM_CAMERAS_APRILTAG_INTERNAL_FROZEN_ROUND2_BASELINE_PIPELINE_HPP
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -67,6 +68,7 @@ struct FrozenRound2BaselineRuntimeBreakdown {
   OuterDetectionCacheStats training_detection_cache;
   double training_outer_detection_seconds = 0.0;
   double auto_camera_initialization_seconds = 0.0;
+  double camera_aware_outer_rescue_seconds = 0.0;
   double outer_bootstrap_seconds = 0.0;
   double outer_only_intermediate_measurement_build_seconds = 0.0;
   double outer_only_intermediate_residual_evaluation_seconds = 0.0;
@@ -114,6 +116,45 @@ struct FrozenRound2BaselineRuntimeBreakdown {
   double round2_optimization_intrinsics_update_seconds = 0.0;
 };
 
+struct CameraAwareOuterRescueRecord {
+  int frame_index = -1;
+  std::string frame_label;
+  int board_id = -1;
+  std::string baseline_failure_reason;
+  std::string rescue_summary;
+  int hamming = -1;
+  std::array<Eigen::Vector2d, 4> committed_corners{};
+};
+
+struct CameraAwareOuterRescueSummary {
+  bool requested = false;
+  bool enabled = false;
+  bool camera_family_supported = false;
+  std::string camera_source = "unavailable";
+  int uses_yaml_intrinsics = 0;
+  int uses_kalibr_camchain_intrinsics = 0;
+  int patch_size = 640;
+  std::string patch_plan = "dense_5x5_fov56_plus_wide_3x3_fov72";
+  int max_hamming = 0;
+  int frame_count = 0;
+  int requested_board_observation_count = 0;
+  int baseline_success_count = 0;
+  int baseline_all_boards_frame_count = 0;
+  int attempted_frame_count = 0;
+  int attempted_board_observation_count = 0;
+  int rescued_board_observation_count = 0;
+  int final_success_count = 0;
+  int final_all_boards_frame_count = 0;
+  bool camera_initialization_rerun = false;
+  bool camera_initialization_rerun_success = false;
+  OuterBootstrapCameraIntrinsics provisional_camera;
+  OuterBootstrapCameraIntrinsics final_initialization_camera;
+  double runtime_seconds = 0.0;
+  std::string skip_reason;
+  std::vector<CameraAwareOuterRescueRecord> records;
+  std::vector<std::string> warnings;
+};
+
 struct FrozenRound2BaselineOptions {
   ApriltagInternalConfig config;
   int reference_board_id = 1;
@@ -147,6 +188,27 @@ struct FrozenRound2BaselineOptions {
   std::string explicit_initial_camera_source_label = "explicit_initial_camera";
   AutoCameraInitializationRefineMode camera_initialization_refine_mode =
       AutoCameraInitializationRefineMode::KalibrOuterLm;
+  AutoCameraInitializationSelectionScorer camera_initialization_selection_scorer =
+      AutoCameraInitializationSelectionScorer::PoseMarginalizedPrincipal;
+  bool enable_camera_initialization_principal_profile = false;
+  double camera_initialization_principal_profile_radius_px = 10.0;
+  bool enable_camera_initialization_fixed_layout_diagnostic = false;
+  bool enable_camera_initialization_board_jackknife_diagnostic = false;
+  bool enable_camera_initialization_coverage_weighted_diagnostic = false;
+  bool camera_initialization_prefer_lower_focal_in_near_tie = false;
+  double camera_initialization_near_tie_relative_objective_tolerance = 0.0;
+  double checkerboard_initialization_huber_delta_pixels = 1.5;
+  bool precomputed_initialization_use_all_points = false;
+  std::string precomputed_initialization_point_scope = "all";
+  bool enable_camera_aware_outer_rescue = false;
+  bool rerun_camera_initialization_after_outer_rescue = true;
+  int camera_aware_outer_rescue_max_hamming = 0;
+  // Auxiliary sessions participate only in camera initialization. Their
+  // frame-board observations retain independent poses and never enter the
+  // primary session's layout, selection, or backend problem.
+  std::vector<OuterBootstrapFrameInput>
+      camera_initialization_auxiliary_bootstrap_frames;
+  int camera_initialization_auxiliary_session_count = 0;
   bool enable_internal_observation_quality_weighting = false;
   double internal_observation_low_quality_quantile = 0.2;
   double internal_observation_min_weight = 0.25;
@@ -210,8 +272,26 @@ struct FrozenRound2BaselineResult {
   CalibrationStateBundle final_stage5_bundle;
   bool stage5_bundle_available = false;
   AutoCameraInitializationResult auto_camera_initialization;
+  CameraAwareOuterRescueSummary camera_aware_outer_rescue;
   FrozenRound2BaselineOptions effective_options;
   FrozenRound2BaselineRuntimeBreakdown runtime_breakdown;
+  std::vector<std::string> warnings;
+  std::string failure_reason;
+};
+
+struct FrozenPrecomputedMeasurementInput {
+  bool success = false;
+  std::string schema_version = "stage5_precomputed_observations_v1";
+  std::string source_path;
+  cv::Size image_size;
+  int reference_board_id = 1;
+  std::string target_mode_requested = "auto";
+  std::string target_mode_resolved = "multi_board";
+  int board_count = 0;
+  bool single_board_mode = false;
+  std::vector<FrozenRound2BaselineFrameSource> frame_sources;
+  std::vector<OuterBootstrapFrameInput> bootstrap_frames;
+  JointMeasurementBuildResult measurement_result;
   std::vector<std::string> warnings;
   std::string failure_reason;
 };
@@ -223,6 +303,9 @@ class FrozenRound2BaselinePipeline {
 
   FrozenRound2BaselineResult Run(
       const std::vector<FrozenRound2BaselineFrameSource>& frame_sources) const;
+
+  FrozenRound2BaselineResult RunPrecomputed(
+      const FrozenPrecomputedMeasurementInput& input) const;
 
   const FrozenRound2BaselineOptions& options() const { return options_; }
 

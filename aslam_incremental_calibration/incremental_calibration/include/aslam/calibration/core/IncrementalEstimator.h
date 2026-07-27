@@ -137,6 +137,12 @@ namespace aslam {
         double JStart;
         /// Cost function at end
         double JFinal;
+        /// Last accepted state update magnitude
+        double dXFinal;
+        /// Last objective decrease
+        double dJFinal;
+        /// Whether the final linear solve failed
+        bool linearSolverFailure;
         /// Elapsed time for processing this batch [s]
         double elapsedTime;
       };

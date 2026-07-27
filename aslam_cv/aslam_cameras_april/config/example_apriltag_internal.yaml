@@ -50,3 +50,11 @@ outer_refine_gate_min: 6.0
 # Board ids are not a spatial ordering; layout-aware rescue is handled by
 # Stage5/Stage6 geometry-prior code using T_reference_board(board_id).
 enable_anonymous_tag_like_geometry_rescue: false
+
+# Stage5 baseline camera-aware outer rescue. The first detector pass does not
+# consume camera intrinsics. After outer-only camera initialization, Stage5
+# injects its provisional DS camera, runs dense sphere-tile AprilTag decoding,
+# and accepts only exact-ID zero-Hamming results.
+enable_camera_aware_sphere_patch_rescue: true
+camera_aware_sphere_patch_max_hamming: 0
+camera_aware_sphere_patch_commit_mapped_corners: true

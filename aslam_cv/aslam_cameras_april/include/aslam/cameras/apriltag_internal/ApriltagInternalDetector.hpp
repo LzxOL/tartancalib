@@ -64,8 +64,8 @@ struct ApriltagInternalDetectionOptions {
   // 0 means adapt from the predicted board pixel scale, positive forces a
   // fixed radius, and negative disables geometry-prior subpixel refinement.
   int geometry_prior_rescue_subpix_window_radius = 0;
-  // <= 0 disables the displacement upper bound. Geometry-prior rescue often
-  // starts farther from the true corner than normal decoded-tag refinement.
+  // Zero uses a scale-adaptive displacement upper bound, positive forces a
+  // fixed pixel bound, and negative disables the bound for debug ablations.
   double geometry_prior_rescue_max_corner_displacement_px = 0.0;
   double geometry_prior_rescue_min_corner_response_ratio = 0.03;
   bool geometry_prior_rescue_enable_spherical_refine = false;

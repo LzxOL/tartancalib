@@ -220,6 +220,110 @@ struct StereoIndexPair {
   long long timestamp_delta_ns = 0;
 };
 
+bool ParseFrameOrdinalFromImagePath(const std::string& image_path,
+                                    int* ordinal) {
+  if (ordinal == nullptr) {
+    return false;
+  }
+  const std::string stem = fs::path(image_path).stem().string();
+  const std::size_t separator = stem.find('_');
+  if (separator == std::string::npos || separator == 0) {
+    return false;
+  }
+  const std::string token = stem.substr(0, separator);
+  if (!std::all_of(token.begin(), token.end(),
+                   [](unsigned char ch) { return std::isdigit(ch); })) {
+    return false;
+  }
+  try {
+    *ordinal = std::stoi(token);
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+void FillPairingDeltaStatistics(const std::vector<StereoIndexPair>& pairs,
+                                StereoMeasurementDataset* dataset) {
+  if (dataset == nullptr) {
+    return;
+  }
+  long long abs_delta_sum = 0;
+  long long abs_delta_max = 0;
+  for (const StereoIndexPair& pair : pairs) {
+    const long long abs_delta = std::llabs(pair.timestamp_delta_ns);
+    abs_delta_sum += abs_delta;
+    abs_delta_max = std::max(abs_delta_max, abs_delta);
+  }
+  dataset->max_pair_timestamp_delta_ns = abs_delta_max;
+  dataset->max_abs_pair_timestamp_delta_ms =
+      static_cast<double>(abs_delta_max) / 1.0e6;
+  dataset->mean_abs_pair_timestamp_delta_ms =
+      pairs.empty()
+          ? 0.0
+          : static_cast<double>(abs_delta_sum) /
+                static_cast<double>(pairs.size()) / 1.0e6;
+}
+
+std::vector<StereoIndexPair> BuildFrameIndexPairs(
+    const std::vector<std::string>& left_image_paths,
+    const std::vector<std::string>& right_image_paths,
+    double max_delta_ms,
+    StereoMeasurementDataset* dataset) {
+  std::vector<StereoIndexPair> pairs;
+  if (dataset == nullptr) {
+    return pairs;
+  }
+  dataset->pairing_mode = "filename_frame_index_with_timestamp_guard";
+  std::map<int, StereoImageTimestampEntry> left_by_ordinal;
+  std::map<int, StereoImageTimestampEntry> right_by_ordinal;
+  const auto build_index = [](const std::vector<std::string>& paths,
+                              std::map<int, StereoImageTimestampEntry>* index) {
+    for (std::size_t path_index = 0; path_index < paths.size(); ++path_index) {
+      int ordinal = -1;
+      if (!ParseFrameOrdinalFromImagePath(paths[path_index], &ordinal)) {
+        continue;
+      }
+      StereoImageTimestampEntry entry;
+      entry.frame_index = static_cast<int>(path_index);
+      entry.image_path = paths[path_index];
+      ParseTimestampTokenFromImagePath(paths[path_index], &entry.timestamp_ns);
+      (*index)[ordinal] = entry;
+    }
+  };
+  build_index(left_image_paths, &left_by_ordinal);
+  build_index(right_image_paths, &right_by_ordinal);
+  const long long max_delta_ns =
+      max_delta_ms > 0.0
+          ? static_cast<long long>(std::llround(max_delta_ms * 1.0e6))
+          : std::numeric_limits<long long>::max();
+  int rejected_by_delta = 0;
+  for (const auto& left_entry : left_by_ordinal) {
+    const auto right_it = right_by_ordinal.find(left_entry.first);
+    if (right_it == right_by_ordinal.end()) {
+      continue;
+    }
+    StereoIndexPair pair;
+    pair.left_index = left_entry.second.frame_index;
+    pair.right_index = right_it->second.frame_index;
+    pair.left_timestamp_ns = left_entry.second.timestamp_ns;
+    pair.right_timestamp_ns = right_it->second.timestamp_ns;
+    pair.timestamp_delta_ns =
+        pair.right_timestamp_ns - pair.left_timestamp_ns;
+    if (std::llabs(pair.timestamp_delta_ns) > max_delta_ns) {
+      ++rejected_by_delta;
+      continue;
+    }
+    pairs.push_back(pair);
+  }
+  FillPairingDeltaStatistics(pairs, dataset);
+  std::ostringstream warning;
+  warning << "frame_index_pairing max_delta_ms=" << max_delta_ms
+          << " rejected_by_delta=" << rejected_by_delta;
+  dataset->warnings.push_back(warning.str());
+  return pairs;
+}
+
 std::vector<StereoIndexPair> BuildTimestampAwarePairs(
     const std::vector<std::string>& left_image_paths,
     const std::vector<std::string>& right_image_paths,
@@ -252,8 +356,6 @@ std::vector<StereoIndexPair> BuildTimestampAwarePairs(
   dataset->pairing_mode = "filename_timestamp_exact";
   std::size_t left_cursor = 0;
   std::size_t right_cursor = 0;
-  long long abs_delta_sum = 0;
-  long long abs_delta_max = 0;
   while (left_cursor < left_entries.size() &&
          right_cursor < right_entries.size()) {
     const StereoImageTimestampEntry& left = left_entries[left_cursor];
@@ -276,25 +378,60 @@ std::vector<StereoIndexPair> BuildTimestampAwarePairs(
       ++right_cursor;
     }
   }
-  for (const StereoIndexPair& pair : pairs) {
-    const long long abs_delta = std::llabs(pair.timestamp_delta_ns);
-    abs_delta_sum += abs_delta;
-    abs_delta_max = std::max(abs_delta_max, abs_delta);
-  }
-  dataset->max_pair_timestamp_delta_ns = abs_delta_max;
-  dataset->max_abs_pair_timestamp_delta_ms =
-      static_cast<double>(abs_delta_max) / 1.0e6;
-  if (!pairs.empty()) {
-    dataset->mean_abs_pair_timestamp_delta_ms =
-        static_cast<double>(abs_delta_sum) /
-        static_cast<double>(pairs.size()) / 1.0e6;
-  }
+  FillPairingDeltaStatistics(pairs, dataset);
   return pairs;
 }
 
 }  // namespace
 
 // Intentionally kept in this translation unit for Stage6 only.
+StereoFrontendImagePairSelection SelectStereoFrontendImagePairs(
+    const std::vector<std::string>& left_image_paths,
+    const std::vector<std::string>& right_image_paths,
+    StereoFramePairingMode pairing_mode,
+    double pairing_max_delta_ms) {
+  StereoFrontendImagePairSelection selection;
+  selection.original_left_frame_count =
+      static_cast<int>(left_image_paths.size());
+  selection.original_right_frame_count =
+      static_cast<int>(right_image_paths.size());
+
+  StereoMeasurementDataset pairing_diagnostics;
+  const std::vector<StereoIndexPair> pairs =
+      pairing_mode == StereoFramePairingMode::FrameIndex
+          ? BuildFrameIndexPairs(left_image_paths, right_image_paths,
+                                 pairing_max_delta_ms, &pairing_diagnostics)
+          : BuildTimestampAwarePairs(left_image_paths, right_image_paths,
+                                     &pairing_diagnostics);
+  selection.pairing_mode = pairing_diagnostics.pairing_mode;
+  selection.warnings = pairing_diagnostics.warnings;
+  selection.paired_frame_count = static_cast<int>(pairs.size());
+  selection.unmatched_left_count =
+      selection.original_left_frame_count - selection.paired_frame_count;
+  selection.unmatched_right_count =
+      selection.original_right_frame_count - selection.paired_frame_count;
+  selection.left_image_paths.reserve(pairs.size());
+  selection.right_image_paths.reserve(pairs.size());
+  for (const StereoIndexPair& pair : pairs) {
+    if (pair.left_index < 0 || pair.right_index < 0 ||
+        pair.left_index >= static_cast<int>(left_image_paths.size()) ||
+        pair.right_index >= static_cast<int>(right_image_paths.size())) {
+      selection.failure_reason =
+          "Stereo frontend pairing produced an invalid image index.";
+      return selection;
+    }
+    selection.left_image_paths.push_back(left_image_paths[pair.left_index]);
+    selection.right_image_paths.push_back(right_image_paths[pair.right_index]);
+  }
+  if (selection.left_image_paths.empty()) {
+    selection.failure_reason =
+        "No synchronized stereo frame pairs available for frontend.";
+    return selection;
+  }
+  selection.success = true;
+  return selection;
+}
+
 StereoMeasurementDataset BuildStereoMeasurementDataset(
     const std::vector<std::string>& left_image_paths,
     const std::vector<std::string>& right_image_paths,
@@ -302,7 +439,9 @@ StereoMeasurementDataset BuildStereoMeasurementDataset(
     int holdout_offset,
     const CalibrationStateBundle& left_bundle,
     const CalibrationStateBundle& right_bundle,
-    StereoMeasurementSourceMode source_mode) {
+    StereoMeasurementSourceMode source_mode,
+    StereoFramePairingMode pairing_mode,
+    double pairing_max_delta_ms) {
   StereoMeasurementDataset dataset;
   dataset.success = false;
   dataset.reference_board_id = left_bundle.scene_state.reference_board_id;
@@ -310,7 +449,11 @@ StereoMeasurementDataset BuildStereoMeasurementDataset(
   dataset.right_frame_count = static_cast<int>(right_image_paths.size());
 
   const std::vector<StereoIndexPair> stereo_pairs =
-      BuildTimestampAwarePairs(left_image_paths, right_image_paths, &dataset);
+      pairing_mode == StereoFramePairingMode::FrameIndex
+          ? BuildFrameIndexPairs(left_image_paths, right_image_paths,
+                                 pairing_max_delta_ms, &dataset)
+          : BuildTimestampAwarePairs(left_image_paths, right_image_paths,
+                                     &dataset);
   const int paired_count = static_cast<int>(stereo_pairs.size());
   dataset.paired_frame_count = paired_count;
   dataset.unmatched_left_count = dataset.left_frame_count - paired_count;

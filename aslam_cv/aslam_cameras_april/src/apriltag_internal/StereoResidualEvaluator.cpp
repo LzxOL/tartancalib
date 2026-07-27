@@ -612,7 +612,9 @@ StereoResidualSummary StereoResidualEvaluator::Evaluate(
     if (options_.extrinsic_only_local_board_pose) {
       have_pose = true;
       pair_summary.pose_refit_success = true;
-      pair_summary.pose_source = "local_stereo_board_refit_extrinsic_only";
+      pair_summary.pose_source = options_.use_committed_pair_board_pose
+                                     ? "committed_pair_board_pose"
+                                     : "local_stereo_board_refit_extrinsic_only";
     } else {
       const auto pose_it = scene_state.T_cam0_world_by_pair.find(pair_index);
       if (pose_it != scene_state.T_cam0_world_by_pair.end()) {
@@ -689,9 +691,23 @@ StereoResidualSummary StereoResidualEvaluator::Evaluate(
             local_T_cam0_board_by_board_id.find(observation.board_id);
         if (local_pose_it == local_T_cam0_board_by_board_id.end()) {
           Eigen::Matrix4d T_cam0_board = Eigen::Matrix4d::Identity();
-          if (!RefitStereoBoardPoseFromOuterObservations(
-                  dataset, scene_state, pair_index, observation.board_id,
-                  options_, &T_cam0_board)) {
+          bool have_local_pose = false;
+          if (options_.use_committed_pair_board_pose) {
+            const auto committed_pose_it =
+                scene_state.T_cam0_board_by_pair_board.find(
+                    std::make_pair(pair_index, observation.board_id));
+            if (committed_pose_it !=
+                scene_state.T_cam0_board_by_pair_board.end()) {
+              T_cam0_board = committed_pose_it->second;
+              have_local_pose = T_cam0_board.allFinite();
+            }
+          }
+          if (!have_local_pose) {
+            have_local_pose = RefitStereoBoardPoseFromOuterObservations(
+                dataset, scene_state, pair_index, observation.board_id,
+                options_, &T_cam0_board);
+          }
+          if (!have_local_pose) {
             failed_local_board_ids.insert(observation.board_id);
             continue;
           }

@@ -137,6 +137,10 @@ void exportIncrementalEstimator() {
       &IncrementalEstimator::ReturnValue::numIterations)
     .def_readwrite("JStart", &IncrementalEstimator::ReturnValue::JStart)
     .def_readwrite("JFinal", &IncrementalEstimator::ReturnValue::JFinal)
+    .def_readwrite("dXFinal", &IncrementalEstimator::ReturnValue::dXFinal)
+    .def_readwrite("dJFinal", &IncrementalEstimator::ReturnValue::dJFinal)
+    .def_readwrite("linearSolverFailure",
+      &IncrementalEstimator::ReturnValue::linearSolverFailure)
     .def_readwrite("elapsedTime",
       &IncrementalEstimator::ReturnValue::elapsedTime)
     ;

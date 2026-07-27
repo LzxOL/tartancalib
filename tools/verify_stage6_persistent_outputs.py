@@ -91,6 +91,28 @@ def require_positive_int(data: Dict[str, str], key: str,
         add_result(results, "FAIL", f"{key} positive", f"got {data.get(key, '')!r}")
 
 
+def require_close_float(lhs_data: Dict[str, str], lhs_key: str,
+                        rhs_data: Dict[str, str], rhs_key: str,
+                        tolerance: float,
+                        results: List[Tuple[str, str, str]]) -> None:
+    lhs = to_float(lhs_data.get(lhs_key, ""))
+    rhs = to_float(rhs_data.get(rhs_key, ""))
+    if lhs is not None and rhs is not None and abs(lhs - rhs) <= tolerance:
+        add_result(
+            results,
+            "PASS",
+            f"{lhs_key} matches {rhs_key}",
+            f"{lhs:.6g} vs {rhs:.6g}",
+        )
+    else:
+        add_result(
+            results,
+            "FAIL",
+            f"{lhs_key} matches {rhs_key}",
+            f"got {lhs_data.get(lhs_key, '')!r} vs {rhs_data.get(rhs_key, '')!r}",
+        )
+
+
 def require_columns(columns: Sequence[str], required: Iterable[str],
                     csv_name: str,
                     results: List[Tuple[str, str, str]]) -> None:
@@ -146,9 +168,41 @@ def verify_polar_rows(rows: List[Dict[str, str]],
         add_result(results, "FAIL", "polar positive point counts")
 
 
+def verify_frontend_prefilter(runtime: Dict[str, str],
+                              results: List[Tuple[str, str, str]]) -> None:
+    require_kv(runtime, "frontend_pairing_prefilter_enabled", "1", results)
+    for side in ("left", "right"):
+        original_key = f"frontend_original_{side}_frame_count"
+        processed_key = f"frontend_processed_{side}_frame_count"
+        skipped_key = f"frontend_skipped_unpaired_{side}_frame_count"
+        original = to_int(runtime.get(original_key, ""))
+        processed = to_int(runtime.get(processed_key, ""))
+        skipped = to_int(runtime.get(skipped_key, ""))
+        if (original is not None and processed is not None and skipped is not None and
+                original > 0 and processed > 0 and processed <= original and
+                skipped == original - processed):
+            add_result(
+                results,
+                "PASS",
+                f"frontend {side} prefilter counts",
+                f"original={original} processed={processed} skipped={skipped}",
+            )
+        else:
+            add_result(
+                results,
+                "FAIL",
+                f"frontend {side} prefilter counts",
+                f"original={runtime.get(original_key, '')!r} "
+                f"processed={runtime.get(processed_key, '')!r} "
+                f"skipped={runtime.get(skipped_key, '')!r}",
+            )
+
+
 def verify_directory(directory: Path,
                      require_rejection: bool,
-                     require_reference: bool) -> Tuple[bool, List[Tuple[str, str, str]]]:
+                     require_reference: bool,
+                     expected_pose_structure: str,
+                     require_visualizations: bool) -> Tuple[bool, List[Tuple[str, str, str]]]:
     results: List[Tuple[str, str, str]] = []
     required_artifacts = [
         "stage6_init_summary.txt",
@@ -160,7 +214,7 @@ def verify_directory(directory: Path,
         "stereo_intrinsics_sanity_summary.txt",
         "stereo_reprojection_summary.txt",
         "stereo_holdout_board_polar_rmse.csv",
-        "stereo_backend_input_visualizations",
+        "stage6_runtime_summary.txt",
     ]
     for relative_path in required_artifacts:
         require_file(directory, relative_path, results)
@@ -172,6 +226,8 @@ def verify_directory(directory: Path,
     reprojection = parse_key_value_file(directory / "stereo_reprojection_summary.txt")
     extrinsic = parse_key_value_file(directory / "stereo_extrinsic.yaml")
     intrinsics = parse_key_value_file(directory / "stereo_intrinsics_sanity_summary.txt")
+    pairing = parse_key_value_file(directory / "stereo_pairing_summary.txt")
+    runtime = parse_key_value_file(directory / "stage6_runtime_summary.txt")
     reference = parse_key_value_file(directory / "stereo_reference_holdout_summary.txt")
 
     require_kv(init, "stage6_initialization_role", "seed_only_no_selection", results)
@@ -198,6 +254,18 @@ def verify_directory(directory: Path,
     }
     for key, expected in expected_flags.items():
         require_kv(persistent, key, expected, results)
+    require_kv(
+        persistent,
+        "persistent_incremental_pose_structure",
+        expected_pose_structure,
+        results,
+    )
+    require_kv(
+        persistent,
+        "persistent_incremental_layout_updates_extrinsic",
+        "0" if expected_pose_structure == "independent_pair_board" else "1",
+        results,
+    )
     for key in (
         "attempted_count",
         "accepted_count",
@@ -214,6 +282,15 @@ def verify_directory(directory: Path,
     else:
         add_result(results, "PASS", "reprojection uses extrinsic-only holdout only")
     require_positive_float(reprojection, "training_total_stereo_rmse", results)
+    if expected_pose_structure == "independent_pair_board":
+        require_close_float(
+            persistent,
+            "final_selected_rmse",
+            reprojection,
+            "training_total_stereo_rmse",
+            1e-4,
+            results,
+        )
     require_positive_float(
         reprojection, "holdout_extrinsic_only_total_stereo_rmse", results
     )
@@ -230,6 +307,35 @@ def verify_directory(directory: Path,
     require_kv(intrinsics, "same_intrinsics_parameters", "0", results)
     require_kv(intrinsics, "same_resolution", "1", results)
     require_kv(intrinsics, "likely_intrinsics_shared_scale_issue", "0", results)
+    require_nonempty_kv(intrinsics, "stage6_intrinsics_mode", results)
+    requested_intrinsics_mode = intrinsics.get("stage6_requested_intrinsics_mode", "")
+    if requested_intrinsics_mode in {
+        "regularized_joint_projection",
+        "adaptive_regularized_joint_projection",
+    }:
+        require_nonempty_kv(
+            intrinsics, "stage6_effective_intrinsics_mode", results
+        )
+        require_nonempty_kv(
+            intrinsics, "stage6_projection_release_reason", results
+        )
+        require_nonempty_kv(
+            persistent,
+            "persistent_incremental_projection_prior_enabled",
+            results,
+        )
+        for key in (
+            "persistent_incremental_projection_policy_training_pair_count",
+            "persistent_incremental_projection_policy_shared_pair_board_count",
+            "persistent_incremental_projection_policy_distinct_board_count",
+            "persistent_incremental_projection_policy_observation_point_count",
+        ):
+            require_positive_int(persistent, key, results)
+    require_nonempty_kv(pairing, "measurement_source_mode", results)
+    require_nonempty_kv(
+        pairing, "inherits_stage5_persistent_accepted_set", results
+    )
+    verify_frontend_prefilter(runtime, results)
 
     if reference:
         require_kv(reference, "comparison_metric", "extrinsic_only_holdout", results)
@@ -333,14 +439,18 @@ def verify_directory(directory: Path,
     )
     verify_polar_rows(polar_rows, results)
 
-    viz_dir = directory / "stereo_backend_input_visualizations"
-    image_count = len(list(viz_dir.glob("*.png"))) if viz_dir.exists() else 0
-    if image_count > 0:
-        add_result(results, "PASS", "backend input visualizations",
-                   f"png_count={image_count}")
+    if require_visualizations:
+        viz_dir = directory / "stereo_backend_input_visualizations"
+        image_count = len(list(viz_dir.glob("*.png"))) if viz_dir.exists() else 0
+        if image_count > 0:
+            add_result(results, "PASS", "backend input visualizations",
+                       f"png_count={image_count}")
+        else:
+            add_result(results, "FAIL", "backend input visualizations",
+                       "no png files")
     else:
-        add_result(results, "FAIL", "backend input visualizations",
-                   "no png files")
+        add_result(results, "INFO", "backend input visualizations",
+                   "not required")
 
     success = not any(status == "FAIL" for status, _, _ in results)
     return success, results
@@ -366,13 +476,28 @@ def main() -> int:
         action="store_true",
         help="Fail unless stereo_reference_holdout_summary.txt is present and valid.",
     )
+    parser.add_argument(
+        "--expected-pose-structure",
+        choices=("independent_pair_board", "shared_frame_layout"),
+        default="independent_pair_board",
+        help="Require the persistent estimator to use this pose structure.",
+    )
+    parser.add_argument(
+        "--require-visualizations",
+        action="store_true",
+        help="Fail unless backend-input PNG visualizations are present.",
+    )
     args = parser.parse_args()
 
     overall_success = True
     for entry in args.directories:
         directory = Path(entry).resolve()
         success, results = verify_directory(
-            directory, args.require_rejection, args.require_reference
+            directory,
+            args.require_rejection,
+            args.require_reference,
+            args.expected_pose_structure,
+            args.require_visualizations,
         )
         overall_success = overall_success and success
         lines = [f"directory: {directory}", f"success: {1 if success else 0}"]

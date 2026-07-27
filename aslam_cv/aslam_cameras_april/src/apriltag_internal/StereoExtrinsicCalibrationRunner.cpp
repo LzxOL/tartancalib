@@ -30,6 +30,7 @@
 #include <aslam/backend/CameraDesignVariable.hpp>
 #include <aslam/backend/DesignVariable.hpp>
 #include <aslam/backend/ErrorTerm.hpp>
+#include <aslam/backend/ErrorTermDs.hpp>
 #include <aslam/backend/ErrorTermTransformation.hpp>
 #include <aslam/backend/HomogeneousExpression.hpp>
 #include <aslam/backend/MapTransformation.hpp>
@@ -68,12 +69,133 @@ using PinholeEquiGeometry =
     aslam::cameras::EquidistantDistortedPinholeCameraGeometry;
 using PinholeEquiProjection =
     aslam::cameras::PinholeProjection<aslam::cameras::EquidistantDistortion>;
+using OmniGeometry = aslam::cameras::OmniCameraGeometry;
+using OmniProjection =
+    aslam::cameras::OmniProjection<aslam::cameras::NoDistortion>;
+using OmniRadtanGeometry = aslam::cameras::DistortedOmniCameraGeometry;
+using OmniRadtanProjection =
+    aslam::cameras::OmniProjection<
+        aslam::cameras::RadialTangentialDistortion>;
 namespace fs = boost::filesystem;
 using CalibrationBatch = aslam::calibration::OptimizationProblem;
 
 constexpr std::size_t kStage6StereoExtrinsicInformationGroupId = 0;
 constexpr std::size_t kStage6BoardLayoutGroupId = 1;
 constexpr std::size_t kStage6PairPoseGroupId = 2;
+
+const char* StereoIntrinsicsModeToString(StereoIntrinsicsMode mode) {
+  switch (mode) {
+    case StereoIntrinsicsMode::FixedStage5:
+      return "fixed_stage5";
+    case StereoIntrinsicsMode::KalibrJointProjection:
+      return "kalibr_joint_projection";
+    case StereoIntrinsicsMode::RegularizedJointProjection:
+      return "regularized_joint_projection";
+    case StereoIntrinsicsMode::AdaptiveRegularizedJointProjection:
+      return "adaptive_regularized_joint_projection";
+  }
+  return "unknown";
+}
+
+struct StereoIntrinsicsPolicyDecision {
+  StereoIntrinsicsMode requested_mode = StereoIntrinsicsMode::FixedStage5;
+  StereoIntrinsicsMode effective_mode = StereoIntrinsicsMode::FixedStage5;
+  bool projection_active = false;
+  bool projection_prior_enabled = false;
+  int training_pair_count = 0;
+  int shared_pair_board_count = 0;
+  int distinct_board_count = 0;
+  int observation_point_count = 0;
+  std::string reason;
+};
+
+StereoIntrinsicsPolicyDecision EvaluateStereoIntrinsicsPolicy(
+    const StereoMeasurementDataset& dataset,
+    const StereoExtrinsicSolverOptions& options) {
+  StereoIntrinsicsPolicyDecision decision;
+  decision.requested_mode = options.intrinsics_mode;
+  decision.effective_mode = options.intrinsics_mode;
+  const std::set<int> training_pairs(dataset.training_pair_indices.begin(),
+                                     dataset.training_pair_indices.end());
+  decision.training_pair_count = static_cast<int>(training_pairs.size());
+  std::set<int> distinct_boards;
+  std::set<PairBoardKey> shared_pair_boards;
+  for (int pair_index : training_pairs) {
+    const auto shared_it = dataset.pair_shared_board_ids.find(pair_index);
+    if (shared_it == dataset.pair_shared_board_ids.end()) {
+      continue;
+    }
+    for (int board_id : shared_it->second) {
+      shared_pair_boards.insert(PairBoardKey(pair_index, board_id));
+      distinct_boards.insert(board_id);
+    }
+  }
+  decision.shared_pair_board_count =
+      static_cast<int>(shared_pair_boards.size());
+  decision.distinct_board_count = static_cast<int>(distinct_boards.size());
+  for (const StereoObservation& observation : dataset.observations) {
+    if (!observation.used_in_solver ||
+        training_pairs.count(observation.pair_index) == 0 ||
+        shared_pair_boards.count(
+            PairBoardKey(observation.pair_index, observation.board_id)) == 0) {
+      continue;
+    }
+    ++decision.observation_point_count;
+  }
+
+  if (options.intrinsics_mode == StereoIntrinsicsMode::FixedStage5) {
+    decision.projection_active = false;
+    decision.reason = "requested_fixed_stage5";
+    return decision;
+  }
+  if (options.intrinsics_mode ==
+      StereoIntrinsicsMode::KalibrJointProjection) {
+    decision.projection_active = true;
+    decision.reason = "requested_unregularized_kalibr_joint_projection";
+    return decision;
+  }
+  if (options.intrinsics_mode ==
+      StereoIntrinsicsMode::RegularizedJointProjection) {
+    decision.projection_active = true;
+    decision.projection_prior_enabled = true;
+    decision.reason = "requested_regularized_joint_projection";
+    return decision;
+  }
+
+  const bool enough_pairs =
+      decision.training_pair_count >=
+      std::max(1, options.adaptive_joint_projection_min_training_pairs);
+  const bool enough_pair_boards =
+      decision.shared_pair_board_count >=
+      std::max(1, options.adaptive_joint_projection_min_shared_pair_boards);
+  const bool enough_boards =
+      decision.distinct_board_count >=
+      std::max(1, options.adaptive_joint_projection_min_distinct_boards);
+  const bool enough_points =
+      decision.observation_point_count >=
+      std::max(1, options.adaptive_joint_projection_min_observation_points);
+  if (enough_pairs && enough_pair_boards && enough_boards && enough_points) {
+    decision.effective_mode = StereoIntrinsicsMode::RegularizedJointProjection;
+    decision.projection_active = true;
+    decision.projection_prior_enabled = true;
+    decision.reason = "adaptive_data_sufficiency_passed";
+  } else {
+    decision.effective_mode = StereoIntrinsicsMode::FixedStage5;
+    decision.projection_active = false;
+    std::ostringstream reason;
+    reason << "adaptive_data_sufficiency_failed"
+           << " pairs=" << decision.training_pair_count << "/"
+           << options.adaptive_joint_projection_min_training_pairs
+           << " pair_boards=" << decision.shared_pair_board_count << "/"
+           << options.adaptive_joint_projection_min_shared_pair_boards
+           << " boards=" << decision.distinct_board_count << "/"
+           << options.adaptive_joint_projection_min_distinct_boards
+           << " points=" << decision.observation_point_count << "/"
+           << options.adaptive_joint_projection_min_observation_points;
+    decision.reason = reason.str();
+  }
+  return decision;
+}
 
 struct StereoCandidateTraversalBudget {
   StereoCandidateBudgetMode mode = StereoCandidateBudgetMode::Fixed;
@@ -968,7 +1090,8 @@ class StereoCameraReprojectionError : public aslam::backend::ErrorTermFs<2> {
                                 double weight,
                                 const aslam::backend::HomogeneousExpression& point_camera,
                                 const camera_dv_t& camera_dv,
-                                double invalid_projection_penalty_pixels)
+                                double invalid_projection_penalty_pixels,
+                                bool use_robust_loss = true)
       : measurement_(measurement),
         point_camera_(point_camera),
         camera_dv_(camera_dv),
@@ -980,7 +1103,7 @@ class StereoCameraReprojectionError : public aslam::backend::ErrorTermFs<2> {
     camera_dv_.getDesignVariables(design_variables);
     parent_t::setDesignVariablesIterator(design_variables.begin(),
                                          design_variables.end());
-    if (weight_ > 0.0) {
+    if (use_robust_loss && weight_ > 0.0) {
       parent_t::setMEstimatorPolicy(
           boost::shared_ptr<aslam::backend::MEstimator>(
               new aslam::backend::HuberMEstimator(std::sqrt(weight_) * 2.0)));
@@ -1430,6 +1553,34 @@ boost::shared_ptr<PinholeEquiGeometry> MakePinholeEquiGeometry(
                               aslam::cameras::NoMask()));
 }
 
+boost::shared_ptr<OmniGeometry> MakeOmniGeometry(
+    const StereoCameraFixedCalibration& calibration) {
+  const OuterBootstrapCameraIntrinsics intrinsics =
+      MakeOuterBootstrapCameraIntrinsics(calibration);
+  OmniProjection projection(
+      intrinsics.xi, intrinsics.fu, intrinsics.fv, intrinsics.cu,
+      intrinsics.cv, intrinsics.resolution.width, intrinsics.resolution.height);
+  return boost::shared_ptr<OmniGeometry>(
+      new OmniGeometry(projection, aslam::cameras::GlobalShutter(),
+                       aslam::cameras::NoMask()));
+}
+
+boost::shared_ptr<OmniRadtanGeometry> MakeOmniRadtanGeometry(
+    const StereoCameraFixedCalibration& calibration) {
+  const OuterBootstrapCameraIntrinsics intrinsics =
+      MakeOuterBootstrapCameraIntrinsics(calibration);
+  std::vector<double> distortion = intrinsics.DistortionVector();
+  distortion.resize(4, 0.0);
+  OmniRadtanProjection projection(
+      intrinsics.xi, intrinsics.fu, intrinsics.fv, intrinsics.cu,
+      intrinsics.cv, intrinsics.resolution.width, intrinsics.resolution.height,
+      aslam::cameras::RadialTangentialDistortion(
+          distortion[0], distortion[1], distortion[2], distortion[3]));
+  return boost::shared_ptr<OmniRadtanGeometry>(
+      new OmniRadtanGeometry(projection, aslam::cameras::GlobalShutter(),
+                             aslam::cameras::NoMask()));
+}
+
 template <typename GeometryT>
 boost::shared_ptr<GeometryT> MakeTypedStereoGeometry(
     const StereoCameraFixedCalibration& calibration);
@@ -1450,6 +1601,19 @@ template <>
 boost::shared_ptr<PinholeEquiGeometry> MakeTypedStereoGeometry<PinholeEquiGeometry>(
     const StereoCameraFixedCalibration& calibration) {
   return MakePinholeEquiGeometry(calibration);
+}
+
+template <>
+boost::shared_ptr<OmniGeometry> MakeTypedStereoGeometry<OmniGeometry>(
+    const StereoCameraFixedCalibration& calibration) {
+  return MakeOmniGeometry(calibration);
+}
+
+template <>
+boost::shared_ptr<OmniRadtanGeometry>
+MakeTypedStereoGeometry<OmniRadtanGeometry>(
+    const StereoCameraFixedCalibration& calibration) {
+  return MakeOmniRadtanGeometry(calibration);
 }
 
 template <>
@@ -1509,6 +1673,49 @@ IntermediateCameraConfig MakeCameraConfigFromGeometry<PinholeEquiGeometry>(
   return config;
 }
 
+template <>
+IntermediateCameraConfig MakeCameraConfigFromGeometry<OmniGeometry>(
+    const OmniGeometry& geometry,
+    const StereoCameraFixedCalibration& seed_calibration) {
+  IntermediateCameraConfig config;
+  config.camera_yaml = seed_calibration.source_yaml_path;
+  config.camera_model = "omni";
+  config.distortion_model = "none";
+  config.intrinsics = {
+      geometry.projection().xi(), geometry.projection().fu(),
+      geometry.projection().fv(), geometry.projection().cu(),
+      geometry.projection().cv()};
+  config.distortion_coeffs.clear();
+  config.resolution = {geometry.projection().width(),
+                       geometry.projection().height()};
+  return config;
+}
+
+template <>
+IntermediateCameraConfig MakeCameraConfigFromGeometry<OmniRadtanGeometry>(
+    const OmniRadtanGeometry& geometry,
+    const StereoCameraFixedCalibration& seed_calibration) {
+  IntermediateCameraConfig config;
+  config.camera_yaml = seed_calibration.source_yaml_path;
+  config.camera_model = "omni";
+  config.distortion_model = "radtan";
+  config.intrinsics = {
+      geometry.projection().xi(), geometry.projection().fu(),
+      geometry.projection().fv(), geometry.projection().cu(),
+      geometry.projection().cv()};
+  Eigen::MatrixXd parameters;
+  geometry.projection().distortion().getParameters(parameters);
+  config.distortion_coeffs.resize(
+      static_cast<std::size_t>(parameters.rows()), 0.0);
+  for (Eigen::Index index = 0; index < parameters.rows(); ++index) {
+    config.distortion_coeffs[static_cast<std::size_t>(index)] =
+        parameters(index, 0);
+  }
+  config.resolution = {geometry.projection().width(),
+                       geometry.projection().height()};
+  return config;
+}
+
 template <typename GeometryT>
 StereoCameraFixedCalibration UpdateStereoCalibrationFromGeometry(
     const StereoCameraFixedCalibration& seed_calibration,
@@ -1524,6 +1731,17 @@ StereoCameraFixedCalibration UpdateStereoCalibrationFromGeometry(
   calibration.distortion_coeffs = config.distortion_coeffs;
   calibration.resolution = config.resolution;
   return calibration;
+}
+
+bool IsStereoCalibrationModelValid(
+    const StereoCameraFixedCalibration& calibration) {
+  try {
+    return DoubleSphereCameraModel::FromConfig(
+               MakeCameraConfig(calibration))
+        .IsValid();
+  } catch (const std::exception&) {
+    return false;
+  }
 }
 
 struct Stage6PersistentResidualStats {
@@ -1584,6 +1802,85 @@ void FillPersistentResidualDiagnostics(
   decision->cam1_rmse_delta = after.Cam1Rmse() - before.Cam1Rmse();
 }
 
+Eigen::VectorXd MakeProjectionPriorSigmas(
+    const Eigen::MatrixXd& anchor,
+    const StereoExtrinsicSolverOptions& options) {
+  Eigen::VectorXd sigma(anchor.size());
+  sigma.setConstant(std::max(
+      1e-9, options.persistent_incremental_projection_prior_shape_sigma));
+  const int dimension = static_cast<int>(anchor.size());
+  int focal_begin = 0;
+  int principal_begin = 2;
+  if (dimension == 5) {
+    focal_begin = 1;
+    principal_begin = 3;
+  } else if (dimension == 6) {
+    focal_begin = 2;
+    principal_begin = 4;
+  }
+  const double focal_relative_sigma = std::max(
+      1e-9,
+      options.persistent_incremental_projection_prior_focal_relative_sigma);
+  for (int index = focal_begin;
+       index < std::min(dimension, focal_begin + 2); ++index) {
+    sigma[index] = std::max(
+        1e-6, focal_relative_sigma * std::max(1.0, std::abs(anchor(index))));
+  }
+  const double principal_sigma = std::max(
+      1e-6, options.persistent_incremental_projection_prior_principal_sigma_px);
+  for (int index = principal_begin;
+       index < std::min(dimension, principal_begin + 2); ++index) {
+    sigma[index] = principal_sigma;
+  }
+  return sigma;
+}
+
+template <typename ProjectionT>
+class StereoProjectionPriorError : public aslam::backend::ErrorTermDs {
+ public:
+  using ProjectionDv = aslam::backend::DesignVariableAdapter<ProjectionT>;
+
+  StereoProjectionPriorError(
+      const boost::shared_ptr<ProjectionDv>& projection_dv,
+      const Eigen::MatrixXd& anchor,
+      const Eigen::VectorXd& sigma)
+      : aslam::backend::ErrorTermDs(static_cast<int>(anchor.size())),
+        projection_dv_(projection_dv),
+        anchor_(Eigen::Map<const Eigen::VectorXd>(anchor.data(), anchor.size())),
+        inverse_sigma_(sigma.cwiseInverse()) {
+    if (!projection_dv_ || anchor_.size() <= 0 ||
+        sigma.size() != anchor_.size() || !anchor_.allFinite() ||
+        !sigma.allFinite() || (sigma.array() <= 0.0).any()) {
+      throw std::runtime_error("Invalid Stage6 projection prior parameters.");
+    }
+    this->setInvR(Eigen::MatrixXd::Identity(anchor_.size(), anchor_.size()));
+    this->setDesignVariables(projection_dv_.get());
+  }
+
+ protected:
+  double evaluateErrorImplementation() override {
+    const Eigen::MatrixXd parameters = projection_dv_->getParameters();
+    if (parameters.size() != anchor_.size()) {
+      throw std::runtime_error("Stage6 projection prior dimension changed.");
+    }
+    const Eigen::Map<const Eigen::VectorXd> current(parameters.data(),
+                                                     parameters.size());
+    this->setError((current - anchor_).cwiseProduct(inverse_sigma_));
+    return this->evaluateChiSquaredError();
+  }
+
+  void evaluateJacobiansImplementation(
+      aslam::backend::JacobianContainer& jacobians) const override {
+    const Eigen::MatrixXd jacobian = inverse_sigma_.asDiagonal();
+    jacobians.add(projection_dv_.get(), jacobian);
+  }
+
+ private:
+  boost::shared_ptr<ProjectionDv> projection_dv_;
+  Eigen::VectorXd anchor_;
+  Eigen::VectorXd inverse_sigma_;
+};
+
 template <typename GeometryT0, typename GeometryT1>
 class Stage6PersistentStereoProblemBuilder {
  public:
@@ -1593,14 +1890,19 @@ class Stage6PersistentStereoProblemBuilder {
       const StereoSceneState& seed_scene)
       : dataset_(dataset),
         options_(options),
+        seed_cam0_(seed_scene.cam0),
+        seed_cam1_(seed_scene.cam1),
         cam0_geometry_(MakeTypedStereoGeometry<GeometryT0>(seed_scene.cam0)),
         cam1_geometry_(MakeTypedStereoGeometry<GeometryT1>(seed_scene.cam1)),
         cam0_dv_(cam0_geometry_),
         cam1_dv_(cam1_geometry_),
+        intrinsics_policy_(EvaluateStereoIntrinsicsPolicy(dataset, options)),
         gauge_fixed_board_id_(seed_scene.gauge_fixed_board_id),
         baseline_seed_(seed_scene.T_cam1_cam0) {
     cam0_dv_.setActive(false, false, false);
     cam1_dv_.setActive(false, false, false);
+    cam0_geometry_->projection().getParameters(cam0_projection_seed_);
+    cam1_geometry_->projection().getParameters(cam1_projection_seed_);
     seed_scene_pair_poses_.insert(seed_scene.T_cam0_world_by_pair.begin(),
                                   seed_scene.T_cam0_world_by_pair.end());
     InitializeStereoPoseVariable(&baseline_variable_, seed_scene.T_cam1_cam0,
@@ -1610,17 +1912,22 @@ class Stage6PersistentStereoProblemBuilder {
 
   struct StateSnapshot {
     Eigen::Matrix4d baseline = Eigen::Matrix4d::Identity();
+    Eigen::MatrixXd cam0_projection;
+    Eigen::MatrixXd cam1_projection;
     StereoPoseMatrixMap pair_poses;
     StereoPoseMatrixMap board_poses;
+    std::map<PairBoardKey, Eigen::Matrix4d> local_pair_board_poses;
   };
 
   boost::shared_ptr<CalibrationBatch> BuildBatch(
       const std::set<PairBoardKey>& keys,
       bool force_add_pair_variables,
-      const StateSnapshot* anchor_state) {
+      const StateSnapshot* anchor_state,
+      bool add_static_projection_prior) {
     boost::shared_ptr<CalibrationBatch> batch =
         boost::make_shared<CalibrationBatch>();
     AddCameraVariables(batch);
+    MaybeAddProjectionPrior(add_static_projection_prior, batch);
     AddBaselineVariable(batch);
     MaybeAddBaselineAnchorPrior(anchor_state, batch);
     AddBoardVariables(batch);
@@ -1632,17 +1939,28 @@ class Stage6PersistentStereoProblemBuilder {
   StateSnapshot CaptureState() const {
     StateSnapshot snapshot;
     snapshot.baseline = baseline_variable_.transform.T();
+    cam0_geometry_->projection().getParameters(snapshot.cam0_projection);
+    cam1_geometry_->projection().getParameters(snapshot.cam1_projection);
     for (const auto& entry : pair_variables_) {
       snapshot.pair_poses[entry.first] = entry.second.transform.T();
     }
     for (const auto& entry : board_variables_) {
       snapshot.board_poses[entry.first] = entry.second.transform.T();
     }
+    for (const auto& entry : local_pair_board_variables_) {
+      snapshot.local_pair_board_poses[entry.first] = entry.second.transform.T();
+    }
     return snapshot;
   }
 
   void RestoreState(const StateSnapshot& snapshot) {
     SetStereoPoseVariableFromMatrix(&baseline_variable_, snapshot.baseline);
+    if (snapshot.cam0_projection.size() > 0) {
+      cam0_geometry_->projection().setParameters(snapshot.cam0_projection);
+    }
+    if (snapshot.cam1_projection.size() > 0) {
+      cam1_geometry_->projection().setParameters(snapshot.cam1_projection);
+    }
     for (auto it = pair_variables_.begin(); it != pair_variables_.end();) {
       if (snapshot.pair_poses.count(it->first) == 0) {
         it = pair_variables_.erase(it);
@@ -1662,9 +1980,34 @@ class Stage6PersistentStereoProblemBuilder {
         SetStereoPoseVariableFromMatrix(&variable_it->second, entry.second);
       }
     }
+    for (auto it = local_pair_board_variables_.begin();
+         it != local_pair_board_variables_.end();) {
+      if (snapshot.local_pair_board_poses.count(it->first) == 0) {
+        it = local_pair_board_variables_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (const auto& entry : snapshot.local_pair_board_poses) {
+      auto variable_it = local_pair_board_variables_.find(entry.first);
+      if (variable_it != local_pair_board_variables_.end()) {
+        SetStereoPoseVariableFromMatrix(&variable_it->second, entry.second);
+      }
+    }
   }
 
   bool CurrentStateFinite(std::string* reason) const {
+    const StereoCameraFixedCalibration current_cam0 =
+        UpdateStereoCalibrationFromGeometry(seed_cam0_, *cam0_geometry_);
+    const StereoCameraFixedCalibration current_cam1 =
+        UpdateStereoCalibrationFromGeometry(seed_cam1_, *cam1_geometry_);
+    if (!IsStereoCalibrationModelValid(current_cam0) ||
+        !IsStereoCalibrationModelValid(current_cam1)) {
+      if (reason != nullptr) {
+        *reason = "invalid_camera_projection_parameters";
+      }
+      return false;
+    }
     if (!IsStereoPoseVariableFinite(baseline_variable_)) {
       if (reason != nullptr) {
         *reason = "nonfinite_stereo_baseline";
@@ -1687,6 +2030,16 @@ class Stage6PersistentStereoProblemBuilder {
         return false;
       }
     }
+    for (const auto& entry : local_pair_board_variables_) {
+      if (!IsStereoPoseVariableFinite(entry.second)) {
+        if (reason != nullptr) {
+          *reason = "nonfinite_local_pair_board_pose_" +
+                    std::to_string(entry.first.first) + "_" +
+                    std::to_string(entry.first.second);
+        }
+        return false;
+      }
+    }
     if (reason != nullptr) {
       reason->clear();
     }
@@ -1695,12 +2048,24 @@ class Stage6PersistentStereoProblemBuilder {
 
   StereoSceneState BuildSceneState(const StereoSceneState& scene_template) const {
     StereoSceneState scene = scene_template;
+    scene.cam0 = UpdateStereoCalibrationFromGeometry(
+        scene_template.cam0, *cam0_geometry_);
+    scene.cam1 = UpdateStereoCalibrationFromGeometry(
+        scene_template.cam1, *cam1_geometry_);
     scene.T_cam1_cam0 = baseline_variable_.transform.T();
     for (const auto& entry : pair_variables_) {
       scene.T_cam0_world_by_pair[entry.first] = entry.second.transform.T();
     }
     for (const auto& entry : board_variables_) {
       scene.T_world_board_by_id[entry.first] = entry.second.transform.T();
+    }
+    scene.T_cam0_board_by_pair_board.clear();
+    if (options_.persistent_pose_structure ==
+        StereoPersistentPoseStructure::IndependentPairBoard) {
+      for (const auto& entry : local_pair_board_variables_) {
+        scene.T_cam0_board_by_pair_board[entry.first] =
+            entry.second.transform.T();
+      }
     }
     scene.success = true;
     scene.failure_reason.clear();
@@ -1717,28 +2082,41 @@ class Stage6PersistentStereoProblemBuilder {
                                            observation.board_id)) == 0) {
         continue;
       }
-      const StereoPoseVariableState* pair_variable =
-          FindPairVariable(observation.pair_index);
-      if (pair_variable == nullptr) {
-        ++stats.invalid_projection_count;
-        continue;
-      }
-      Eigen::Matrix4d T_world_board = Eigen::Matrix4d::Identity();
-      if (observation.board_id != gauge_fixed_board_id_) {
-        const StereoPoseVariableState* board_variable =
-            FindBoardVariable(observation.board_id);
-        if (board_variable == nullptr) {
+      Eigen::Matrix4d T_cam0_board = Eigen::Matrix4d::Identity();
+      if (options_.persistent_pose_structure ==
+          StereoPersistentPoseStructure::IndependentPairBoard) {
+        const StereoPoseVariableState* local_variable =
+            FindLocalPairBoardVariable(
+                PairBoardKey(observation.pair_index, observation.board_id));
+        if (local_variable == nullptr) {
           ++stats.invalid_projection_count;
           continue;
         }
-        T_world_board = board_variable->transform.T();
+        T_cam0_board = local_variable->transform.T();
+      } else {
+        const StereoPoseVariableState* pair_variable =
+            FindPairVariable(observation.pair_index);
+        if (pair_variable == nullptr) {
+          ++stats.invalid_projection_count;
+          continue;
+        }
+        Eigen::Matrix4d T_world_board = Eigen::Matrix4d::Identity();
+        if (observation.board_id != gauge_fixed_board_id_) {
+          const StereoPoseVariableState* board_variable =
+              FindBoardVariable(observation.board_id);
+          if (board_variable == nullptr) {
+            ++stats.invalid_projection_count;
+            continue;
+          }
+          T_world_board = board_variable->transform.T();
+        }
+        T_cam0_board = pair_variable->transform.T() * T_world_board;
       }
       const Eigen::Vector4d point_board(observation.target_point_board.x(),
                                         observation.target_point_board.y(),
                                         observation.target_point_board.z(),
                                         1.0);
-      Eigen::Vector4d point_camera =
-          pair_variable->transform.T() * T_world_board * point_board;
+      Eigen::Vector4d point_camera = T_cam0_board * point_board;
       if (observation.camera_index == 1) {
         point_camera = T_cam1_cam0 * point_camera;
       }
@@ -1768,20 +2146,47 @@ class Stage6PersistentStereoProblemBuilder {
 
  private:
   void AddCameraVariables(const boost::shared_ptr<CalibrationBatch>& batch) {
-    cam0_dv_.setActive(false, false, false);
-    cam1_dv_.setActive(false, false, false);
+    const bool optimize_projection = intrinsics_policy_.projection_active;
+    cam0_dv_.setActive(optimize_projection, false, false);
+    cam1_dv_.setActive(optimize_projection, false, false);
+    const std::size_t group_id =
+        optimize_projection ? kStage6StereoExtrinsicInformationGroupId
+                            : kStage6PairPoseGroupId;
     batch->addDesignVariable(cam0_dv_.projectionDesignVariable(),
-                             kStage6PairPoseGroupId);
+                             group_id);
     batch->addDesignVariable(cam0_dv_.distortionDesignVariable(),
                              kStage6PairPoseGroupId);
     batch->addDesignVariable(cam0_dv_.shutterDesignVariable(),
                              kStage6PairPoseGroupId);
     batch->addDesignVariable(cam1_dv_.projectionDesignVariable(),
-                             kStage6PairPoseGroupId);
+                             group_id);
     batch->addDesignVariable(cam1_dv_.distortionDesignVariable(),
                              kStage6PairPoseGroupId);
     batch->addDesignVariable(cam1_dv_.shutterDesignVariable(),
                              kStage6PairPoseGroupId);
+  }
+
+  void MaybeAddProjectionPrior(
+      bool add_static_projection_prior,
+      const boost::shared_ptr<CalibrationBatch>& batch) {
+    if (!add_static_projection_prior ||
+        !intrinsics_policy_.projection_prior_enabled) {
+      return;
+    }
+    const Eigen::VectorXd cam0_sigma =
+        MakeProjectionPriorSigmas(cam0_projection_seed_, options_);
+    const Eigen::VectorXd cam1_sigma =
+        MakeProjectionPriorSigmas(cam1_projection_seed_, options_);
+    using ProjectionT0 = typename GeometryT0::projection_t;
+    using ProjectionT1 = typename GeometryT1::projection_t;
+    batch->addErrorTerm(boost::shared_ptr<aslam::backend::ErrorTerm>(
+        new StereoProjectionPriorError<ProjectionT0>(
+            cam0_dv_.projectionDesignVariable(), cam0_projection_seed_,
+            cam0_sigma)));
+    batch->addErrorTerm(boost::shared_ptr<aslam::backend::ErrorTerm>(
+        new StereoProjectionPriorError<ProjectionT1>(
+            cam1_dv_.projectionDesignVariable(), cam1_projection_seed_,
+            cam1_sigma)));
   }
 
   void AddBaselineVariable(const boost::shared_ptr<CalibrationBatch>& batch) {
@@ -1823,6 +2228,10 @@ class Stage6PersistentStereoProblemBuilder {
   }
 
   void AddBoardVariables(const boost::shared_ptr<CalibrationBatch>& batch) {
+    if (options_.persistent_pose_structure ==
+        StereoPersistentPoseStructure::IndependentPairBoard) {
+      return;
+    }
     for (auto& entry : board_variables_) {
       entry.second.rotation_dv->setActive(true);
       entry.second.translation_dv->setActive(true);
@@ -1833,6 +2242,11 @@ class Stage6PersistentStereoProblemBuilder {
   void AddPairVariables(const std::set<PairBoardKey>& keys,
                         bool force_add_pair_variables,
                         const boost::shared_ptr<CalibrationBatch>& batch) {
+    if (options_.persistent_pose_structure ==
+        StereoPersistentPoseStructure::IndependentPairBoard) {
+      AddLocalPairBoardVariables(keys, force_add_pair_variables, batch);
+      return;
+    }
     std::set<int> pairs;
     for (const PairBoardKey& key : keys) {
       pairs.insert(key.first);
@@ -1858,6 +2272,41 @@ class Stage6PersistentStereoProblemBuilder {
     }
   }
 
+  void AddLocalPairBoardVariables(
+      const std::set<PairBoardKey>& keys,
+      bool force_add_variables,
+      const boost::shared_ptr<CalibrationBatch>& batch) {
+    for (const PairBoardKey& key : keys) {
+      auto variable_it = local_pair_board_variables_.find(key);
+      if (variable_it == local_pair_board_variables_.end()) {
+        const auto pair_pose_it = seed_scene_pair_poses_.find(key.first);
+        if (pair_pose_it == seed_scene_pair_poses_.end()) {
+          throw std::runtime_error(
+              "Stage6 persistent estimator missing pair pose for local board.");
+        }
+        Eigen::Matrix4d T_world_board = Eigen::Matrix4d::Identity();
+        if (key.second != gauge_fixed_board_id_) {
+          const auto board_pose_it = board_variables_.find(key.second);
+          if (board_pose_it == board_variables_.end()) {
+            throw std::runtime_error(
+                "Stage6 persistent estimator missing board pose for local board.");
+          }
+          T_world_board = board_pose_it->second.transform.T();
+        }
+        StereoPoseVariableState& variable = local_pair_board_variables_[key];
+        InitializeStereoPoseVariable(
+            &variable, pair_pose_it->second * T_world_board, true);
+        variable_it = local_pair_board_variables_.find(key);
+      } else if (!force_add_variables) {
+        continue;
+      }
+      variable_it->second.rotation_dv->setActive(true);
+      variable_it->second.translation_dv->setActive(true);
+      AddStereoPoseVariableDvs(variable_it->second, kStage6PairPoseGroupId,
+                               batch);
+    }
+  }
+
   void AddResiduals(const std::set<PairBoardKey>& keys,
                     const boost::shared_ptr<CalibrationBatch>& batch) {
     const aslam::backend::TransformationExpression identity_transform(
@@ -1868,25 +2317,40 @@ class Stage6PersistentStereoProblemBuilder {
                                   observation.board_id)) == 0) {
         continue;
       }
-      const StereoPoseVariableState* pair_variable =
-          FindPairVariable(observation.pair_index);
-      if (pair_variable == nullptr) {
-        continue;
-      }
-      aslam::backend::TransformationExpression board_expression =
+      aslam::backend::TransformationExpression T_cam0_board_expression =
           identity_transform;
-      if (observation.board_id != gauge_fixed_board_id_) {
-        const StereoPoseVariableState* board_variable =
-            FindBoardVariable(observation.board_id);
-        if (board_variable == nullptr) {
+      if (options_.persistent_pose_structure ==
+          StereoPersistentPoseStructure::IndependentPairBoard) {
+        const StereoPoseVariableState* local_variable =
+            FindLocalPairBoardVariable(
+                PairBoardKey(observation.pair_index, observation.board_id));
+        if (local_variable == nullptr) {
           continue;
         }
-        board_expression = board_variable->expression;
+        T_cam0_board_expression = local_variable->expression;
+      } else {
+        const StereoPoseVariableState* pair_variable =
+            FindPairVariable(observation.pair_index);
+        if (pair_variable == nullptr) {
+          continue;
+        }
+        aslam::backend::TransformationExpression board_expression =
+            identity_transform;
+        if (observation.board_id != gauge_fixed_board_id_) {
+          const StereoPoseVariableState* board_variable =
+              FindBoardVariable(observation.board_id);
+          if (board_variable == nullptr) {
+            continue;
+          }
+          board_expression = board_variable->expression;
+        }
+        T_cam0_board_expression =
+            pair_variable->expression * board_expression;
       }
       const aslam::backend::HomogeneousExpression point_board(
           observation.target_point_board);
       aslam::backend::HomogeneousExpression point_camera =
-          pair_variable->expression * (board_expression * point_board);
+          T_cam0_board_expression * point_board;
       if (observation.camera_index == 1) {
         point_camera = baseline_variable_.expression * point_camera;
       }
@@ -1919,17 +2383,29 @@ class Stage6PersistentStereoProblemBuilder {
     return it == board_variables_.end() ? nullptr : &it->second;
   }
 
+  const StereoPoseVariableState* FindLocalPairBoardVariable(
+      const PairBoardKey& key) const {
+    const auto it = local_pair_board_variables_.find(key);
+    return it == local_pair_board_variables_.end() ? nullptr : &it->second;
+  }
+
   const StereoMeasurementDataset& dataset_;
   const StereoExtrinsicSolverOptions& options_;
+  StereoCameraFixedCalibration seed_cam0_;
+  StereoCameraFixedCalibration seed_cam1_;
   boost::shared_ptr<GeometryT0> cam0_geometry_;
   boost::shared_ptr<GeometryT1> cam1_geometry_;
   CameraDv<GeometryT0> cam0_dv_;
   CameraDv<GeometryT1> cam1_dv_;
+  StereoIntrinsicsPolicyDecision intrinsics_policy_;
+  Eigen::MatrixXd cam0_projection_seed_;
+  Eigen::MatrixXd cam1_projection_seed_;
   int gauge_fixed_board_id_ = 1;
   Eigen::Matrix4d baseline_seed_ = Eigen::Matrix4d::Identity();
   StereoPoseVariableState baseline_variable_;
   StereoPoseVariableMap pair_variables_;
   StereoPoseVariableMap board_variables_;
+  std::map<PairBoardKey, StereoPoseVariableState> local_pair_board_variables_;
   StereoPoseMatrixMap seed_scene_pair_poses_;
 };
 
@@ -4401,7 +4877,10 @@ bool RunPairOnlyStereoBaTyped(
     const std::vector<TransformCandidateWithMeta>& accepted_candidates,
     const Eigen::Isometry3d& initial_baseline,
     Eigen::Isometry3d* refined_baseline,
-    std::map<PairBoardKey, Eigen::Isometry3d>* optimized_local_poses) {
+    std::map<PairBoardKey, Eigen::Isometry3d>* optimized_local_poses,
+    StereoPairOnlyBaInitSummary* summary,
+    StereoCameraFixedCalibration* refined_cam0,
+    StereoCameraFixedCalibration* refined_cam1) {
   if (refined_baseline == nullptr || optimized_local_poses == nullptr) {
     throw std::runtime_error(
         "RunPairOnlyStereoBaTyped requires valid baseline/local-pose outputs.");
@@ -4417,8 +4896,10 @@ bool RunPairOnlyStereoBaTyped(
 
   CameraDv<GeometryT0> cam0_dv(cam0_geometry);
   CameraDv<GeometryT1> cam1_dv(cam1_geometry);
-  cam0_dv.setActive(false, false, false);
-  cam1_dv.setActive(false, false, false);
+  const bool optimize_projection =
+      options.intrinsics_mode == StereoIntrinsicsMode::KalibrJointProjection;
+  cam0_dv.setActive(optimize_projection, false, false);
+  cam1_dv.setActive(optimize_projection, false, false);
 
   boost::shared_ptr<aslam::backend::OptimizationProblem> problem(
       new aslam::backend::OptimizationProblem);
@@ -4490,14 +4971,16 @@ bool RunPairOnlyStereoBaTyped(
     if (observation.camera_index == 0) {
       boost::shared_ptr<aslam::backend::ErrorTerm> error(
           new StereoCameraReprojectionError<GeometryT0>(
-              observation.observed_image_xy, weight, point_cam0, cam0_dv, 100.0));
+              observation.observed_image_xy, weight, point_cam0, cam0_dv, 100.0,
+              options.pair_init_use_huber_loss));
       problem->addErrorTerm(error);
     } else {
       const aslam::backend::HomogeneousExpression point_cam1 =
           T_cam1_cam0_expr * point_cam0;
       boost::shared_ptr<aslam::backend::ErrorTerm> error(
           new StereoCameraReprojectionError<GeometryT1>(
-              observation.observed_image_xy, weight, point_cam1, cam1_dv, 100.0));
+              observation.observed_image_xy, weight, point_cam1, cam1_dv, 100.0,
+              options.pair_init_use_huber_loss));
       problem->addErrorTerm(error);
     }
     ++reprojection_error_count;
@@ -4516,9 +4999,42 @@ bool RunPairOnlyStereoBaTyped(
   optimizer_options.verbose = false;
   aslam::backend::Optimizer optimizer(optimizer_options);
   optimizer.setProblem(problem);
-  optimizer.optimize();
+  const aslam::backend::SolutionReturnValue solution = optimizer.optimize();
+  const bool objective_finite = std::isfinite(solution.JStart) &&
+                                std::isfinite(solution.JFinal);
+  const bool objective_decreased =
+      objective_finite && solution.JFinal <= solution.JStart;
+  if (summary != nullptr) {
+    summary->robust_loss_enabled = options.pair_init_use_huber_loss;
+    summary->objective_finite = objective_finite;
+    summary->objective_decreased = objective_decreased;
+    summary->linear_solver_failure = solution.linearSolverFailure;
+    summary->reached_max_iterations =
+        solution.iterations >= optimizer_options.maxIterations;
+    summary->optimization_iterations = solution.iterations;
+    summary->objective_start = solution.JStart;
+    summary->objective_final = solution.JFinal;
+  }
+  if (solution.linearSolverFailure || !objective_decreased ||
+      !baseline_transform.T().allFinite()) {
+    return false;
+  }
 
   *refined_baseline = ToIsometry3d(baseline_transform.T());
+  const StereoCameraFixedCalibration candidate_cam0 =
+      UpdateStereoCalibrationFromGeometry(cam0_calibration, *cam0_geometry);
+  const StereoCameraFixedCalibration candidate_cam1 =
+      UpdateStereoCalibrationFromGeometry(cam1_calibration, *cam1_geometry);
+  if (!IsStereoCalibrationModelValid(candidate_cam0) ||
+      !IsStereoCalibrationModelValid(candidate_cam1)) {
+    return false;
+  }
+  if (refined_cam0 != nullptr) {
+    *refined_cam0 = candidate_cam0;
+  }
+  if (refined_cam1 != nullptr) {
+    *refined_cam1 = candidate_cam1;
+  }
   optimized_local_poses->clear();
   for (const auto& entry : local_pose_variables) {
     (*optimized_local_poses)[entry.first] = ToIsometry3d(entry.second.transform.T());
@@ -4612,6 +5128,8 @@ StereoPairOnlyBaInitSummary RunPairOnlyStereoBaInitialization(
     summary.failure_reason = "missing_scene_state";
     return summary;
   }
+  const StereoCameraFixedCalibration initial_cam0 = scene_state->cam0;
+  const StereoCameraFixedCalibration initial_cam1 = scene_state->cam1;
   const Eigen::Isometry3d medoid_baseline =
       ToIsometry3d(scene_state->T_cam1_cam0);
   summary.medoid_baseline_length = medoid_baseline.translation().norm();
@@ -4681,6 +5199,8 @@ StereoPairOnlyBaInitSummary RunPairOnlyStereoBaInitialization(
   }
 
   Eigen::Isometry3d refined_baseline = refined_consensus_baseline;
+  StereoCameraFixedCalibration refined_cam0 = scene_state->cam0;
+  StereoCameraFixedCalibration refined_cam1 = scene_state->cam1;
   std::map<PairBoardKey, Eigen::Isometry3d> optimized_local_poses;
   const std::string cam0_family = scene_state->cam0.camera_model_family;
   const std::string cam1_family = scene_state->cam1.camera_model_family;
@@ -4688,54 +5208,78 @@ StereoPairOnlyBaInitSummary RunPairOnlyStereoBaInitialization(
   if (cam0_family == "ds-none" && cam1_family == "ds-none") {
     local_ba_success = RunPairOnlyStereoBaTyped<DsGeometry, DsGeometry>(
         dataset, options, scene_state->cam0, scene_state->cam1, accepted_candidates,
-        medoid_baseline, &refined_baseline, &optimized_local_poses);
+        medoid_baseline, &refined_baseline, &optimized_local_poses, &summary,
+        &refined_cam0, &refined_cam1);
   } else if (cam0_family == "ds-none" && cam1_family == "eucm-none") {
     local_ba_success = RunPairOnlyStereoBaTyped<DsGeometry, EucmGeometry>(
         dataset, options, scene_state->cam0, scene_state->cam1, accepted_candidates,
-        medoid_baseline, &refined_baseline, &optimized_local_poses);
+        medoid_baseline, &refined_baseline, &optimized_local_poses, &summary,
+        &refined_cam0, &refined_cam1);
   } else if (cam0_family == "eucm-none" && cam1_family == "ds-none") {
     local_ba_success = RunPairOnlyStereoBaTyped<EucmGeometry, DsGeometry>(
         dataset, options, scene_state->cam0, scene_state->cam1, accepted_candidates,
-        medoid_baseline, &refined_baseline, &optimized_local_poses);
+        medoid_baseline, &refined_baseline, &optimized_local_poses, &summary,
+        &refined_cam0, &refined_cam1);
   } else if (cam0_family == "eucm-none" && cam1_family == "eucm-none") {
     local_ba_success = RunPairOnlyStereoBaTyped<EucmGeometry, EucmGeometry>(
         dataset, options, scene_state->cam0, scene_state->cam1, accepted_candidates,
-        medoid_baseline, &refined_baseline, &optimized_local_poses);
+        medoid_baseline, &refined_baseline, &optimized_local_poses, &summary,
+        &refined_cam0, &refined_cam1);
   } else if (cam0_family == "pinhole-equi" && cam1_family == "pinhole-equi") {
     local_ba_success =
         RunPairOnlyStereoBaTyped<PinholeEquiGeometry, PinholeEquiGeometry>(
             dataset, options, scene_state->cam0, scene_state->cam1,
             accepted_candidates, medoid_baseline, &refined_baseline,
-            &optimized_local_poses);
+            &optimized_local_poses, &summary, &refined_cam0, &refined_cam1);
   } else if (cam0_family == "ds-none" && cam1_family == "pinhole-equi") {
     local_ba_success =
         RunPairOnlyStereoBaTyped<DsGeometry, PinholeEquiGeometry>(
             dataset, options, scene_state->cam0, scene_state->cam1,
             accepted_candidates, medoid_baseline, &refined_baseline,
-            &optimized_local_poses);
+            &optimized_local_poses, &summary, &refined_cam0, &refined_cam1);
   } else if (cam0_family == "pinhole-equi" && cam1_family == "ds-none") {
     local_ba_success =
         RunPairOnlyStereoBaTyped<PinholeEquiGeometry, DsGeometry>(
             dataset, options, scene_state->cam0, scene_state->cam1,
             accepted_candidates, medoid_baseline, &refined_baseline,
-            &optimized_local_poses);
+            &optimized_local_poses, &summary, &refined_cam0, &refined_cam1);
   } else if (cam0_family == "eucm-none" && cam1_family == "pinhole-equi") {
     local_ba_success =
         RunPairOnlyStereoBaTyped<EucmGeometry, PinholeEquiGeometry>(
             dataset, options, scene_state->cam0, scene_state->cam1,
             accepted_candidates, medoid_baseline, &refined_baseline,
-            &optimized_local_poses);
+            &optimized_local_poses, &summary, &refined_cam0, &refined_cam1);
   } else if (cam0_family == "pinhole-equi" && cam1_family == "eucm-none") {
     local_ba_success =
         RunPairOnlyStereoBaTyped<PinholeEquiGeometry, EucmGeometry>(
             dataset, options, scene_state->cam0, scene_state->cam1,
             accepted_candidates, medoid_baseline, &refined_baseline,
-            &optimized_local_poses);
+            &optimized_local_poses, &summary, &refined_cam0, &refined_cam1);
+  } else if (cam0_family == "omni-none" && cam1_family == "omni-none") {
+    local_ba_success = RunPairOnlyStereoBaTyped<OmniGeometry, OmniGeometry>(
+        dataset, options, scene_state->cam0, scene_state->cam1,
+        accepted_candidates, medoid_baseline, &refined_baseline,
+        &optimized_local_poses, &summary, &refined_cam0, &refined_cam1);
+  } else if (cam0_family == "omni-radtan" &&
+             cam1_family == "omni-radtan") {
+    local_ba_success =
+        RunPairOnlyStereoBaTyped<OmniRadtanGeometry, OmniRadtanGeometry>(
+            dataset, options, scene_state->cam0, scene_state->cam1,
+            accepted_candidates, medoid_baseline, &refined_baseline,
+            &optimized_local_poses, &summary, &refined_cam0, &refined_cam1);
   }
   if (!local_ba_success) {
     summary.failure_reason = "pair_only_local_ba_failed";
     return summary;
   }
+
+  if (summary.reached_max_iterations) {
+    summary.warnings.push_back(
+        "pair_only_optimizer_reached_max_iterations_seed_kept_after_health_checks");
+  }
+
+  scene_state->cam0 = refined_cam0;
+  scene_state->cam1 = refined_cam1;
 
   summary.pair_ba_baseline_length = refined_baseline.translation().norm();
   summary.baseline_rotation_delta_deg =
@@ -4754,7 +5298,7 @@ StereoPairOnlyBaInitSummary RunPairOnlyStereoBaInitialization(
     }
     Eigen::Isometry3d T_cam0_board = Eigen::Isometry3d::Identity();
     double cam0_rmse = 0.0;
-    if (!EstimateCameraBoardPoseWithRmse(dataset, scene_state->cam0,
+    if (!EstimateCameraBoardPoseWithRmse(dataset, initial_cam0,
                                          candidate.pair_index, 0,
                                          candidate.board_id, &T_cam0_board,
                                          &cam0_rmse)) {
@@ -4773,7 +5317,7 @@ StereoPairOnlyBaInitSummary RunPairOnlyStereoBaInitialization(
         CountStereoObservations(dataset, candidate.pair_index, 1,
                                 candidate.board_id, JointPointType::Internal);
     row.before_rmse = EvaluateSharedBoardCandidateRmse(
-        dataset, scene_state->cam0, scene_state->cam1, candidate.pair_index,
+        dataset, initial_cam0, initial_cam1, candidate.pair_index,
         candidate.board_id, medoid_baseline, T_cam0_board);
     row.after_rmse = EvaluateSharedBoardCandidateRmse(
         dataset, scene_state->cam0, scene_state->cam1, candidate.pair_index,
@@ -4802,6 +5346,9 @@ StereoPairOnlyBaInitSummary RunPairOnlyStereoBaInitialization(
   summary.used_refined_baseline = refined_is_better;
   if (refined_is_better) {
     scene_state->T_cam1_cam0 = ToMatrix4d(refined_baseline);
+  } else {
+    scene_state->cam0 = initial_cam0;
+    scene_state->cam1 = initial_cam1;
   }
   summary.success = true;
   return summary;
@@ -8033,8 +8580,40 @@ RunPersistentIncrementalPairCohesiveSelectionTyped(
   board_summary.incremental_mi_tol = options.incremental_mi_tol;
   board_summary.incremental_rank_threshold = options.incremental_rank_threshold;
   board_summary.incremental_info_block = ToString(options.incremental_info_block);
+  const StereoIntrinsicsPolicyDecision intrinsics_policy =
+      EvaluateStereoIntrinsicsPolicy(dataset, options);
   board_summary.persistent_incremental_information_group =
-      "stereo_extrinsic";
+      intrinsics_policy.projection_active
+          ? "stereo_extrinsic_plus_camera_projection"
+          : "stereo_extrinsic";
+  board_summary.persistent_pose_structure =
+      options.persistent_pose_structure ==
+              StereoPersistentPoseStructure::IndependentPairBoard
+          ? "independent_pair_board"
+          : "shared_frame_layout";
+  board_summary.requested_intrinsics_mode =
+      StereoIntrinsicsModeToString(intrinsics_policy.requested_mode);
+  board_summary.effective_intrinsics_mode =
+      StereoIntrinsicsModeToString(intrinsics_policy.effective_mode);
+  board_summary.projection_intrinsics_active =
+      intrinsics_policy.projection_active;
+  board_summary.projection_prior_enabled =
+      intrinsics_policy.projection_prior_enabled;
+  board_summary.projection_release_reason = intrinsics_policy.reason;
+  board_summary.projection_policy_training_pair_count =
+      intrinsics_policy.training_pair_count;
+  board_summary.projection_policy_shared_pair_board_count =
+      intrinsics_policy.shared_pair_board_count;
+  board_summary.projection_policy_distinct_board_count =
+      intrinsics_policy.distinct_board_count;
+  board_summary.projection_policy_observation_point_count =
+      intrinsics_policy.observation_point_count;
+  board_summary.projection_prior_shape_sigma =
+      options.persistent_incremental_projection_prior_shape_sigma;
+  board_summary.projection_prior_focal_relative_sigma =
+      options.persistent_incremental_projection_prior_focal_relative_sigma;
+  board_summary.projection_prior_principal_sigma_px =
+      options.persistent_incremental_projection_prior_principal_sigma_px;
   if (pair_summary != nullptr) {
     *pair_summary = StereoPairTrialSelectionSummary();
     pair_summary->enabled = true;
@@ -8226,7 +8805,7 @@ RunPersistentIncrementalPairCohesiveSelectionTyped(
   typename Stage6PersistentStereoProblemBuilder<GeometryT0, GeometryT1>::
       StateSnapshot seed_state = builder.CaptureState();
   boost::shared_ptr<CalibrationBatch> seed_batch =
-      builder.BuildBatch(seed_pair_boards, true, &seed_state);
+      builder.BuildBatch(seed_pair_boards, true, &seed_state, true);
   aslam::calibration::IncrementalEstimator::ReturnValue seed_ret{};
   bool seed_add_exception = false;
   std::string seed_invalid_reason;
@@ -8407,8 +8986,10 @@ RunPersistentIncrementalPairCohesiveSelectionTyped(
         std::max(1, static_cast<int>(batch_keys.size()));
     typename Stage6PersistentStereoProblemBuilder<GeometryT0, GeometryT1>::
         StateSnapshot state = builder.CaptureState();
+    const Stage6PersistentResidualStats before_stats =
+        builder.EvaluateAccepted(selected_pair_boards);
     boost::shared_ptr<CalibrationBatch> batch =
-        builder.BuildBatch(batch_keys, true, &state);
+        builder.BuildBatch(batch_keys, true, &state, false);
     aslam::calibration::IncrementalEstimator::ReturnValue ret{};
     bool add_exception = false;
     std::string state_invalid_reason;
@@ -8429,8 +9010,6 @@ RunPersistentIncrementalPairCohesiveSelectionTyped(
         objective_finite && (ret.JFinal <= ret.JStart || force);
     const bool incremental_kept = !add_exception && ret.batchAccepted;
     bool accepted = incremental_kept && state_valid && objective_decreased;
-    const Stage6PersistentResidualStats before_stats =
-        builder.EvaluateAccepted(selected_pair_boards);
     std::set<PairBoardKey> trial_pair_boards = selected_pair_boards;
     trial_pair_boards.insert(batch_keys.begin(), batch_keys.end());
     const Stage6PersistentResidualStats trial_stats =
@@ -8640,6 +9219,18 @@ RunPersistentIncrementalPairCohesiveSelection(
   if (cam0_family == "ds-none" && cam1_family == "ds-none") {
     return RunPersistentIncrementalPairCohesiveSelectionTyped
         <DsGeometry, DsGeometry>(
+            dataset, options, base_selection, pair_summary, final_selection,
+            scene_state);
+  }
+  if (cam0_family == "omni-none" && cam1_family == "omni-none") {
+    return RunPersistentIncrementalPairCohesiveSelectionTyped
+        <OmniGeometry, OmniGeometry>(
+            dataset, options, base_selection, pair_summary, final_selection,
+            scene_state);
+  }
+  if (cam0_family == "omni-radtan" && cam1_family == "omni-radtan") {
+    return RunPersistentIncrementalPairCohesiveSelectionTyped
+        <OmniRadtanGeometry, OmniRadtanGeometry>(
             dataset, options, base_selection, pair_summary, final_selection,
             scene_state);
   }
@@ -9570,7 +10161,8 @@ StereoExtrinsicCalibrationResult StereoExtrinsicCalibrationRunner::Run(
             options_.pair_pose_refit_mode,
             options_.symmetric_refit_max_iterations,
             options_.symmetric_refit_step,
-            false});
+            options_.persistent_pose_structure ==
+                StereoPersistentPoseStructure::IndependentPairBoard});
     const StereoMeasurementDataset selected_eval_dataset =
         MakePairBoardMaskedDataset(
             input.measurement_dataset,
@@ -9695,7 +10287,10 @@ StereoExtrinsicCalibrationResult StereoExtrinsicCalibrationRunner::Run(
           options_.pair_pose_refit_mode,
           options_.symmetric_refit_max_iterations,
           options_.symmetric_refit_step,
-          false});
+          options_.persistent_pose_structure ==
+              StereoPersistentPoseStructure::IndependentPairBoard,
+          options_.persistent_pose_structure ==
+              StereoPersistentPoseStructure::IndependentPairBoard});
   const bool holdout_uses_local_stereo_board_refit =
       options_.board_masking_use_local_board_pose_ba;
   StereoResidualEvaluator holdout_evaluator(
@@ -11256,8 +11851,12 @@ void WriteStereoIntrinsicsSanitySummary(
     const std::string& path,
     const StereoExtrinsicCalibrationResult& result) {
   std::ofstream output(path.c_str());
-  const StereoCameraFixedCalibration& cam0 = result.problem_input.initial_scene.cam0;
-  const StereoCameraFixedCalibration& cam1 = result.problem_input.initial_scene.cam1;
+  const StereoCameraFixedCalibration& initial_cam0 =
+      result.problem_input.initial_scene.cam0;
+  const StereoCameraFixedCalibration& initial_cam1 =
+      result.problem_input.initial_scene.cam1;
+  const StereoCameraFixedCalibration& cam0 = result.optimized_scene.cam0;
+  const StereoCameraFixedCalibration& cam1 = result.optimized_scene.cam1;
   const bool same_path =
       result.problem_input.left_intrinsics_path == result.problem_input.right_intrinsics_path;
   const bool same_model = cam0.camera_model == cam1.camera_model &&
@@ -11274,6 +11873,10 @@ void WriteStereoIntrinsicsSanitySummary(
       std::abs(result.training_residual_summary.shared_cam1_rmse /
                    result.training_residual_summary.shared_cam0_rmse -
                1.0) > 0.15;
+  const StereoIntrinsicsPolicyDecision intrinsics_policy =
+      EvaluateStereoIntrinsicsPolicy(
+          result.problem_input.measurement_dataset,
+          result.problem_input.solver_options);
 
   output << "left_intrinsics_path: " << result.problem_input.left_intrinsics_path << "\n";
   output << "right_intrinsics_path: " << result.problem_input.right_intrinsics_path << "\n";
@@ -11295,6 +11898,31 @@ void WriteStereoIntrinsicsSanitySummary(
   output << "right_resolution: " << FormatIntVector(cam1.resolution) << "\n";
   output << "left_intrinsics: " << FormatDoubleVector(cam0.intrinsics) << "\n";
   output << "right_intrinsics: " << FormatDoubleVector(cam1.intrinsics) << "\n";
+  output << "stage6_intrinsics_mode: "
+         << StereoIntrinsicsModeToString(intrinsics_policy.requested_mode)
+         << "\n";
+  output << "stage6_requested_intrinsics_mode: "
+         << StereoIntrinsicsModeToString(intrinsics_policy.requested_mode)
+         << "\n";
+  output << "stage6_effective_intrinsics_mode: "
+         << StereoIntrinsicsModeToString(intrinsics_policy.effective_mode)
+         << "\n";
+  output << "stage6_projection_intrinsics_active: "
+         << (intrinsics_policy.projection_active ? 1 : 0) << "\n";
+  output << "stage6_projection_prior_enabled: "
+         << (intrinsics_policy.projection_prior_enabled ? 1 : 0) << "\n";
+  output << "stage6_projection_release_reason: "
+         << intrinsics_policy.reason << "\n";
+  output << "left_initial_intrinsics: "
+         << FormatDoubleVector(initial_cam0.intrinsics) << "\n";
+  output << "right_initial_intrinsics: "
+         << FormatDoubleVector(initial_cam1.intrinsics) << "\n";
+  output << "left_intrinsics_changed: "
+         << (!VectorsEqual(initial_cam0.intrinsics, cam0.intrinsics) ? 1 : 0)
+         << "\n";
+  output << "right_intrinsics_changed: "
+         << (!VectorsEqual(initial_cam1.intrinsics, cam1.intrinsics) ? 1 : 0)
+         << "\n";
   output << "left_distortion_coeffs: "
          << FormatDoubleVector(cam0.distortion_coeffs) << "\n";
   output << "right_distortion_coeffs: "
@@ -11329,6 +11957,10 @@ void WriteStereoIntrinsicsSanitySummary(
 void WriteStereoPairingSummary(const std::string& path,
                                const StereoExtrinsicProblemInput& input) {
   std::ofstream output(path.c_str());
+  output << "measurement_source_mode: " << input.measurement_source_mode << "\n";
+  output << "inherits_stage5_persistent_accepted_set: "
+         << (input.measurement_source_mode == "backend_selected_only" ? 1 : 0)
+         << "\n";
   output << "left_frame_count: " << input.measurement_dataset.left_frame_count << "\n";
   output << "right_frame_count: " << input.measurement_dataset.right_frame_count << "\n";
   output << "paired_frame_count: " << input.measurement_dataset.paired_frame_count << "\n";
@@ -11420,6 +12052,22 @@ void WriteStereoInitializationSummary(const std::string& path,
          << result.pair_init_summary.baseline_rotation_delta_deg << "\n";
   output << "pair_only_baseline_translation_delta_m: "
          << result.pair_init_summary.baseline_translation_delta_m << "\n";
+  output << "pair_only_robust_loss_enabled: "
+         << (result.pair_init_summary.robust_loss_enabled ? 1 : 0) << "\n";
+  output << "pair_only_objective_finite: "
+         << (result.pair_init_summary.objective_finite ? 1 : 0) << "\n";
+  output << "pair_only_objective_decreased: "
+         << (result.pair_init_summary.objective_decreased ? 1 : 0) << "\n";
+  output << "pair_only_linear_solver_failure: "
+         << (result.pair_init_summary.linear_solver_failure ? 1 : 0) << "\n";
+  output << "pair_only_reached_max_iterations: "
+         << (result.pair_init_summary.reached_max_iterations ? 1 : 0) << "\n";
+  output << "pair_only_optimization_iterations: "
+         << result.pair_init_summary.optimization_iterations << "\n";
+  output << "pair_only_objective_start: "
+         << result.pair_init_summary.objective_start << "\n";
+  output << "pair_only_objective_final: "
+         << result.pair_init_summary.objective_final << "\n";
   output << "stage6_initialization_role: seed_only_no_selection\n";
   for (int pair_index : result.initialization.reachable_training_pair_indices) {
     output << "reachable_training_pair: " << pair_index << "\n";
@@ -11536,6 +12184,23 @@ void WriteStage6RuntimeSummary(const std::string& path,
          << "\n";
   output << "cam1_training_detection_cache_store_failures: "
          << result.runtime_summary.cam1_training_detection_cache_store_failures
+         << "\n";
+  output << "frontend_pairing_prefilter_enabled: "
+         << (result.runtime_summary.frontend_pairing_prefilter_enabled ? 1 : 0)
+         << "\n";
+  output << "frontend_original_left_frame_count: "
+         << result.runtime_summary.frontend_original_left_frame_count << "\n";
+  output << "frontend_original_right_frame_count: "
+         << result.runtime_summary.frontend_original_right_frame_count << "\n";
+  output << "frontend_processed_left_frame_count: "
+         << result.runtime_summary.frontend_processed_left_frame_count << "\n";
+  output << "frontend_processed_right_frame_count: "
+         << result.runtime_summary.frontend_processed_right_frame_count << "\n";
+  output << "frontend_skipped_unpaired_left_frame_count: "
+         << result.runtime_summary.frontend_skipped_unpaired_left_frame_count
+         << "\n";
+  output << "frontend_skipped_unpaired_right_frame_count: "
+         << result.runtime_summary.frontend_skipped_unpaired_right_frame_count
          << "\n";
   output << "symmetric_refit_call_count: "
          << result.runtime_summary.symmetric_refit_call_count << "\n";
@@ -11802,6 +12467,22 @@ void WriteStereoPairInitSummary(const std::string& path,
          << result.pair_init_summary.baseline_translation_delta_m << "\n";
   output << "used_refined_baseline: "
          << (result.pair_init_summary.used_refined_baseline ? 1 : 0) << "\n";
+  output << "robust_loss_enabled: "
+         << (result.pair_init_summary.robust_loss_enabled ? 1 : 0) << "\n";
+  output << "objective_finite: "
+         << (result.pair_init_summary.objective_finite ? 1 : 0) << "\n";
+  output << "objective_decreased: "
+         << (result.pair_init_summary.objective_decreased ? 1 : 0) << "\n";
+  output << "linear_solver_failure: "
+         << (result.pair_init_summary.linear_solver_failure ? 1 : 0) << "\n";
+  output << "reached_max_iterations: "
+         << (result.pair_init_summary.reached_max_iterations ? 1 : 0) << "\n";
+  output << "optimization_iterations: "
+         << result.pair_init_summary.optimization_iterations << "\n";
+  output << "objective_start: "
+         << result.pair_init_summary.objective_start << "\n";
+  output << "objective_final: "
+         << result.pair_init_summary.objective_final << "\n";
   output << "shared_board_quality_gate_enabled: "
          << (result.problem_input.solver_options.enable_shared_board_quality_gate ? 1 : 0)
          << "\n";
@@ -11814,6 +12495,9 @@ void WriteStereoPairInitSummary(const std::string& path,
   output << "shared_board_quality_filter_final_ba: "
          << (result.problem_input.solver_options.shared_board_quality_filter_final_ba ? 1 : 0)
          << "\n";
+  for (const std::string& warning : result.pair_init_summary.warnings) {
+    output << "warning: " << warning << "\n";
+  }
 }
 
 void WriteStereoPairInitCandidatesCsv(const std::string& path,
@@ -12238,6 +12922,15 @@ void WriteStereoPairBoardTrialSelectionSummary(
                  : 0)
          << "\n";
   output << "persistent_incremental_batch_unit: pair_cohesive\n";
+  output << "persistent_incremental_pose_structure: "
+         << result.pair_board_trial_selection_summary
+                .persistent_pose_structure
+         << "\n";
+  output << "persistent_incremental_layout_updates_extrinsic: "
+         << (result.problem_input.solver_options.persistent_pose_structure ==
+                     StereoPersistentPoseStructure::SharedFrameLayout
+                 ? 1 : 0)
+         << "\n";
   output << "pair_board_selection_role: "
          << (result.problem_input.solver_options
                      .enable_persistent_incremental_stereo_ba
@@ -12265,6 +12958,59 @@ void WriteStereoPairBoardTrialSelectionSummary(
          << result.pair_board_trial_selection_summary
                 .persistent_incremental_information_group
          << "\n";
+  output << "stage6_intrinsics_mode: "
+         << result.pair_board_trial_selection_summary
+                .requested_intrinsics_mode
+         << "\n";
+  output << "stage6_requested_intrinsics_mode: "
+         << result.pair_board_trial_selection_summary
+                .requested_intrinsics_mode
+         << "\n";
+  output << "stage6_effective_intrinsics_mode: "
+         << result.pair_board_trial_selection_summary
+                .effective_intrinsics_mode
+         << "\n";
+  output << "persistent_incremental_projection_intrinsics_active: "
+         << (result.pair_board_trial_selection_summary
+                     .projection_intrinsics_active
+                 ? 1 : 0) << "\n";
+  output << "persistent_incremental_projection_prior_enabled: "
+         << (result.pair_board_trial_selection_summary
+                     .projection_prior_enabled
+                 ? 1 : 0) << "\n";
+  output << "persistent_incremental_projection_release_reason: "
+         << result.pair_board_trial_selection_summary
+                .projection_release_reason
+         << "\n";
+  output << "persistent_incremental_projection_policy_training_pair_count: "
+         << result.pair_board_trial_selection_summary
+                .projection_policy_training_pair_count
+         << "\n";
+  output << "persistent_incremental_projection_policy_shared_pair_board_count: "
+         << result.pair_board_trial_selection_summary
+                .projection_policy_shared_pair_board_count
+         << "\n";
+  output << "persistent_incremental_projection_policy_distinct_board_count: "
+         << result.pair_board_trial_selection_summary
+                .projection_policy_distinct_board_count
+         << "\n";
+  output << "persistent_incremental_projection_policy_observation_point_count: "
+         << result.pair_board_trial_selection_summary
+                .projection_policy_observation_point_count
+         << "\n";
+  output << "persistent_incremental_projection_prior_shape_sigma: "
+         << result.pair_board_trial_selection_summary
+                .projection_prior_shape_sigma
+         << "\n";
+  output << "persistent_incremental_projection_prior_focal_relative_sigma: "
+         << result.pair_board_trial_selection_summary
+                .projection_prior_focal_relative_sigma
+         << "\n";
+  output << "persistent_incremental_projection_prior_principal_sigma_px: "
+         << result.pair_board_trial_selection_summary
+                .projection_prior_principal_sigma_px
+         << "\n";
+  output << "persistent_incremental_distortion_active: 0\n";
   output << "persistent_incremental_requested_seed_pair_count: "
          << result.problem_input.solver_options
                 .persistent_incremental_seed_pair_count
@@ -12712,11 +13458,15 @@ void WriteStereoRobustLossSummary(const std::string& path,
                                   const StereoExtrinsicCalibrationResult& result) {
   std::ofstream output(path.c_str());
   output << "robust_loss_type: Huber\n";
-  output << "enabled: 1\n";
+  output << "enabled: "
+         << (result.problem_input.solver_options.pair_init_use_huber_loss ? 1 : 0)
+         << "\n";
   output << "stereo_camera_reprojection_error_huber_delta_formula: sqrt(weight) * 2.0\n";
   output << "pair_only_stereo_ba_init_enabled: "
          << (result.problem_input.solver_options.enable_pair_only_stereo_ba_init ? 1 : 0)
          << "\n";
+  output << "pair_only_stereo_ba_init_robust_loss_enabled: "
+         << (result.pair_init_summary.robust_loss_enabled ? 1 : 0) << "\n";
   output << "kalibr_style_pair_selection_enabled: "
          << (result.problem_input.solver_options.enable_kalibr_style_pair_selection ? 1 : 0)
          << "\n";
@@ -13185,11 +13935,6 @@ void WriteStereoAngularFixedKCornerTraceCsv(
         output << "," << (valid ? 1 : 0) << "," << invalid_reason << "\n";
       };
 
-  if (result.optimized_scene.cam0.camera_model_family != "ds-none" ||
-      result.optimized_scene.cam1.camera_model_family != "ds-none") {
-    return;
-  }
-
   const DoubleSphereCameraModel cam0 =
       DoubleSphereCameraModel::FromConfig(MakeCameraConfig(result.optimized_scene.cam0));
   const DoubleSphereCameraModel cam1 =
@@ -13488,12 +14233,6 @@ void WriteStereoAngularFixedKSummary(
         write_metric(prefix + "_chordal_rmse", rmse_chordal(acc));
         write_metric(prefix + "_pixel_rmse_px", rmse_pixel(acc));
       };
-
-  if (result.optimized_scene.cam0.camera_model_family != "ds-none" ||
-      result.optimized_scene.cam1.camera_model_family != "ds-none") {
-    output << "failure_reason,non_ds_none_camera_model\n";
-    return;
-  }
 
   const DoubleSphereCameraModel cam0 =
       DoubleSphereCameraModel::FromConfig(MakeCameraConfig(result.optimized_scene.cam0));
@@ -13810,11 +14549,6 @@ void WriteStereoHoldoutBoardPolarRmseCsv(
          << "pixel_rmse_px,angular_rmse_rad,angular_rmse_deg,chordal_rmse,"
          << "mean_pixel_error_px,mean_angular_error_deg,"
          << "max_pixel_error_px,max_angular_error_deg\n";
-
-  if (result.optimized_scene.cam0.camera_model_family != "ds-none" ||
-      result.optimized_scene.cam1.camera_model_family != "ds-none") {
-    return;
-  }
 
   struct BucketInfo {
     std::string name;
@@ -14422,12 +15156,6 @@ void WriteStereoReprojectionVisualizations(
         note << "label: " << summary_label << "\n";
         note << "top_k: " << top_k << "\n";
         note << "requested_pair_count: " << include_pairs.size() << "\n";
-        if (result.optimized_scene.cam0.camera_model_family != "ds-none" ||
-            result.optimized_scene.cam1.camera_model_family != "ds-none") {
-          note << "status: skipped_non_ds_camera_family\n";
-          return;
-        }
-
         const DoubleSphereCameraModel cam0 =
             DoubleSphereCameraModel::FromConfig(MakeCameraConfig(result.optimized_scene.cam0));
         const DoubleSphereCameraModel cam1 =
@@ -14674,12 +15402,6 @@ void WriteStereoExtrinsicOnlyTopBadPairBoardVisualizations(
   note << "top_k: " << top_k << "\n";
   note << "metric: holdout extrinsic-only pair-board RMSE with local stereo "
           "board pose refit\n";
-  if (scene_state.cam0.camera_model_family != "ds-none" ||
-      scene_state.cam1.camera_model_family != "ds-none") {
-    note << "status: skipped_non_ds_camera_family\n";
-    return;
-  }
-
   struct PairBoardResidual {
     int pair_index = -1;
     int board_id = -1;
@@ -15013,10 +15735,6 @@ void WriteStereoBackendInputVisualizations(
 
   auto write_selected_only =
       [&](const std::string& subdir) {
-        if (result.optimized_scene.cam0.camera_model_family != "ds-none" ||
-            result.optimized_scene.cam1.camera_model_family != "ds-none") {
-          return;
-        }
         fs::create_directories(subdir);
         std::ofstream note(
             (fs::path(subdir) / "visualization_summary.txt").string().c_str());
@@ -15265,10 +15983,6 @@ void WriteStereoPairSelectionVisualizations(
         if (pairs.empty()) {
           return;
         }
-        if (result.optimized_scene.cam0.camera_model_family != "ds-none" ||
-            result.optimized_scene.cam1.camera_model_family != "ds-none") {
-          return;
-        }
         fs::create_directories(subdir);
         std::ofstream note(
             (fs::path(subdir) / "visualization_summary.txt").string().c_str());
@@ -15421,12 +16135,6 @@ void WriteStereoPairBoardSelectionVisualizations(
   summary << "note: each image highlights one pair-board decision; rejected "
              "boards may use a local stereo outer-pose refit for visualization "
              "when no final backend pose exists.\n";
-
-  if (result.optimized_scene.cam0.camera_model_family != "ds-none" ||
-      result.optimized_scene.cam1.camera_model_family != "ds-none") {
-    summary << "status: skipped_non_ds_camera_family\n";
-    return;
-  }
 
   const DoubleSphereCameraModel cam0 =
       DoubleSphereCameraModel::FromConfig(MakeCameraConfig(result.optimized_scene.cam0));

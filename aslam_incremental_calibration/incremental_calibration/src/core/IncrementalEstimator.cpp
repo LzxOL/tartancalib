@@ -67,7 +67,9 @@ namespace aslam {
       OptimizerOptions& optOptions = _optimizer->options();
       optOptions.linearSystemSolver =
         boost::make_shared<LinearSolver>(linearSolverOptions);
-      optOptions.trustRegionPolicy = boost::make_shared<TrustRegionPolicy>();
+      if (!optOptions.trustRegionPolicy) {
+        optOptions.trustRegionPolicy = boost::make_shared<TrustRegionPolicy>();
+      }
       _optimizer->initializeLinearSolver();
       _optimizer->initializeTrustRegionPolicy();
 
@@ -331,6 +333,9 @@ namespace aslam {
       ret.numIterations = srv.iterations;
       ret.JStart = _initialCost;
       ret.JFinal = _finalCost;
+      ret.dXFinal = srv.dXFinal;
+      ret.dJFinal = srv.dJFinal;
+      ret.linearSolverFailure = srv.linearSolverFailure;
       ret.elapsedTime = Timestamp::now() - timeStart;
       return ret;
     }
@@ -381,6 +386,9 @@ namespace aslam {
       ret.numIterations = srv.iterations;
       ret.JStart = srv.JStart;
       ret.JFinal = srv.JFinal;
+      ret.dXFinal = srv.dXFinal;
+      ret.dJFinal = srv.dJFinal;
+      ret.linearSolverFailure = srv.linearSolverFailure;
 
       // grep the scaled singular values if scaling enabled
       if (linearSolver->getOptions().columnScaling) {

@@ -144,6 +144,11 @@ bool ClampIntrinsicsInPlace(OuterBootstrapCameraIntrinsics* intrinsics) {
       coeff = std::max(-2.0, std::min(2.0, coeff));
     }
     intrinsics->distortion_coeffs = clamped;
+  } else if (family == "omni-none") {
+    intrinsics->xi = std::max(-0.95, std::min(3.0, intrinsics->xi));
+    intrinsics->alpha = 0.0;
+    intrinsics->beta = 0.0;
+    intrinsics->distortion_coeffs.clear();
   } else {
     return false;
   }
@@ -1661,6 +1666,35 @@ OuterBootstrapResult MultiBoardOuterBootstrap::Solve(
   std::map<int, std::array<Eigen::Vector3d, 4> > board_corner_points;
   for (auto board_it = board_ids.begin(); board_it != board_ids.end(); ++board_it) {
     board_corner_points[*board_it] = BuildOuterCornerPoints(ModelForBoardId(*board_it));
+  }
+  for (const OuterBootstrapFrameInput& frame : frame_inputs) {
+    for (const OuterBoardMeasurement& measurement :
+         frame.measurements.board_measurements) {
+      if (!measurement.has_target_outer_corners) {
+        continue;
+      }
+      auto geometry_it = board_corner_points.find(measurement.board_id);
+      if (geometry_it == board_corner_points.end()) {
+        board_corner_points[measurement.board_id] =
+            measurement.target_outer_corners_board;
+        continue;
+      }
+      bool matches_existing_imported_geometry = true;
+      for (int corner_index = 0; corner_index < 4; ++corner_index) {
+        const Eigen::Vector3d& expected =
+            geometry_it->second[static_cast<std::size_t>(corner_index)];
+        const Eigen::Vector3d& imported =
+            measurement.target_outer_corners_board[
+                static_cast<std::size_t>(corner_index)];
+        if ((expected - imported).norm() > 1e-10) {
+          matches_existing_imported_geometry = false;
+          break;
+        }
+      }
+      if (!matches_existing_imported_geometry) {
+        geometry_it->second = measurement.target_outer_corners_board;
+      }
+    }
   }
 
   std::vector<std::string> warnings;

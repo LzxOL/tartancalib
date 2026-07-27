@@ -33,6 +33,7 @@ struct ConsistencyObservationWeightSummaryEntry {
 };
 
 struct AslamBackendCalibrationOptions {
+  bool uniform_control_point_mode = false;
   enum class BoardPoseParameterization {
     ReferenceChain,
     IndependentFrameBoardPose,
@@ -84,7 +85,17 @@ struct AslamBackendCalibrationOptions {
   double normalized_angular_max_weight_scale = 1.0e8;
   double pixel_residual_weight = 1.0;
   double chordal_residual_weight = 1.0;
+  bool pixel_ray_hybrid_refinement_mode = false;
+  double pixel_ray_hybrid_lambda = 0.5;
+  double pixel_ray_hybrid_pixel_scale_floor = 1e-3;
+  double pixel_ray_hybrid_ray_scale_floor = 1e-6;
+  double pixel_ray_hybrid_huber_delta = 3.0;
   bool angular_use_normalize_jacobian = false;
+  bool angular_local_whitening_enabled = false;
+  double angular_local_whitening_pixel_sigma_px = 1.0;
+  double angular_local_whitening_covariance_damping = 1e-12;
+  double angular_local_whitening_min_sigma_rad = 1e-6;
+  double angular_local_whitening_max_weight = 1e5;
   AngularObservedRayMode angular_observed_ray_mode =
       AngularObservedRayMode::DynamicCurrentCamera;
   bool export_cost_parity_diagnostics = false;
@@ -250,14 +261,17 @@ struct ResidualBlockConstructionStats {
   int image_plane_residual_count = 0;
   int angular_residual_count = 0;
   int chordal_residual_count = 0;
+  int pixel_ray_hybrid_residual_count = 0;
   int angular_auxiliary_residual_count = 0;
   int outer_image_plane_residual_count = 0;
   int outer_angular_residual_count = 0;
   int outer_chordal_residual_count = 0;
+  int outer_pixel_ray_hybrid_residual_count = 0;
   int outer_angular_auxiliary_residual_count = 0;
   int internal_image_plane_residual_count = 0;
   int internal_angular_residual_count = 0;
   int internal_chordal_residual_count = 0;
+  int internal_pixel_ray_hybrid_residual_count = 0;
   int internal_angular_auxiliary_residual_count = 0;
   int skipped_solver_observation_count = 0;
 };
@@ -362,6 +376,11 @@ struct AslamBackendCalibrationResult {
   double board_pose_prior_rotation_sigma_deg = 0.0;
   std::vector<ConsistencyObservationWeightSummaryEntry>
       consistency_observation_summaries;
+  bool pixel_ray_hybrid_scales_computed_once = false;
+  int pixel_ray_hybrid_valid_observation_count = 0;
+  int pixel_ray_hybrid_invalid_observation_count = 0;
+  double pixel_ray_hybrid_pixel_scale = 0.0;
+  double pixel_ray_hybrid_ray_scale = 0.0;
   std::vector<AslamBackendOptimizationStageSummary> stages;
   std::vector<std::string> warnings;
   std::string failure_reason;

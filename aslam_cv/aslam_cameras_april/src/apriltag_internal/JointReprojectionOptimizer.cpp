@@ -75,6 +75,11 @@ bool ClampIntrinsicsInPlace(OuterBootstrapCameraIntrinsics* intrinsics) {
     for (double& coefficient : intrinsics->distortion_coeffs) {
       coefficient = std::max(-1.5, std::min(1.5, coefficient));
     }
+  } else if (family == "omni-none") {
+    intrinsics->xi = std::max(-0.95, std::min(3.0, intrinsics->xi));
+    intrinsics->alpha = 0.0;
+    intrinsics->beta = 0.0;
+    intrinsics->distortion_coeffs.clear();
   } else {
     return false;
   }
@@ -340,7 +345,9 @@ bool RefineBoardPoseFromSelection(
       const bool has_internal = budget.internal_count > 0;
       double type_budget = 1.0;
       int type_count = 1;
-      if (has_outer && has_internal) {
+      if (cost_core.options().uniform_control_point_mode) {
+        type_count = 1;
+      } else if (has_outer && has_internal) {
         type_budget = 0.5;
         type_count = point.point_type == JointPointType::Outer
                          ? budget.outer_count
@@ -353,10 +360,13 @@ bool RefineBoardPoseFromSelection(
 
       const double balance_weight =
           type_budget / std::max(1, type_count);
-      const double huber_delta =
-          point.point_type == JointPointType::Outer
-              ? cost_core.options().outer_huber_delta_pixels
-              : cost_core.options().internal_huber_delta_pixels;
+      const double huber_delta = cost_core.options().uniform_control_point_mode
+                                     ? std::min(
+                                           cost_core.options().outer_huber_delta_pixels,
+                                           cost_core.options().internal_huber_delta_pixels)
+                                     : point.point_type == JointPointType::Outer
+                                           ? cost_core.options().outer_huber_delta_pixels
+                                           : cost_core.options().internal_huber_delta_pixels;
       const double huber_weight = HuberWeight(residual_norm, huber_delta);
       const double final_weight = balance_weight * huber_weight;
       const double scale = std::sqrt(std::max(0.0, final_weight));
@@ -646,7 +656,9 @@ bool OptimizeIntrinsicsIfEnabled(const JointMeasurementBuildResult& measurement_
       const bool has_internal = budget.internal_count > 0;
       double type_budget = 1.0;
       int type_count = 1;
-      if (has_outer && has_internal) {
+      if (cost_core.options().uniform_control_point_mode) {
+        type_count = 1;
+      } else if (has_outer && has_internal) {
         type_budget = 0.5;
         type_count = point.point_type == JointPointType::Outer
                          ? budget.outer_count
@@ -659,10 +671,13 @@ bool OptimizeIntrinsicsIfEnabled(const JointMeasurementBuildResult& measurement_
 
       const double balance_weight =
           type_budget / std::max(1, type_count);
-      const double huber_delta =
-          point.point_type == JointPointType::Outer
-              ? cost_core.options().outer_huber_delta_pixels
-              : cost_core.options().internal_huber_delta_pixels;
+      const double huber_delta = cost_core.options().uniform_control_point_mode
+                                     ? std::min(
+                                           cost_core.options().outer_huber_delta_pixels,
+                                           cost_core.options().internal_huber_delta_pixels)
+                                     : point.point_type == JointPointType::Outer
+                                           ? cost_core.options().outer_huber_delta_pixels
+                                           : cost_core.options().internal_huber_delta_pixels;
       const double huber_weight = HuberWeight(residual_norm, huber_delta);
       const double final_weight = balance_weight * huber_weight;
       const double scale = std::sqrt(std::max(0.0, final_weight));

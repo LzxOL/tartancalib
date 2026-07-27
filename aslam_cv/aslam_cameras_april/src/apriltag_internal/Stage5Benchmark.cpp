@@ -5,14 +5,18 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 #include <Eigen/Eigenvalues>
@@ -138,6 +142,521 @@ double AngularDifferenceDegrees(const Eigen::Vector3d& a,
   const double dot =
       std::max(-1.0, std::min(1.0, a.normalized().dot(b.normalized())));
   return std::acos(dot) * kRadiansToDegrees;
+}
+
+void ReevaluateCalibrationStateBundle(CalibrationStateBundle* bundle);
+
+bool UnprojectPinholeEquidistantRayCurve(
+    const OuterBootstrapCameraIntrinsics& intrinsics,
+    const Eigen::Vector2d& pixel,
+    Eigen::Vector3d* ray);
+
+bool UnprojectForRayCurve(const OuterBootstrapCameraIntrinsics& intrinsics,
+                          const DoubleSphereCameraModel& camera,
+                          const Eigen::Vector2d& pixel,
+                          Eigen::Vector3d* ray);
+
+struct LargeDsPerturbationDefinition {
+  std::string label;
+  double focal_scale = 1.0;
+  double xi_delta = 0.0;
+  double alpha_delta = 0.0;
+};
+
+bool GetLargeDsPerturbationDefinition(
+    const std::string& requested,
+    LargeDsPerturbationDefinition* definition) {
+  if (definition == nullptr) {
+    return false;
+  }
+  std::string label = requested;
+  std::transform(label.begin(), label.end(), label.begin(),
+                 [](unsigned char ch) {
+                   return static_cast<char>(std::toupper(ch));
+                 });
+  if (label == "P1") {
+    *definition = {"P1", 0.70, -0.20, 0.10};
+  } else if (label == "P1F50") {
+    *definition = {"P1F50", 0.50, -0.20, 0.10};
+  } else if (label == "P2") {
+    *definition = {"P2", 0.70, 0.20, -0.10};
+  } else if (label == "P2F50") {
+    *definition = {"P2F50", 0.50, 0.20, -0.10};
+  } else if (label == "P3") {
+    *definition = {"P3", 1.30, -0.20, 0.10};
+  } else if (label == "P4") {
+    *definition = {"P4", 1.30, 0.20, -0.10};
+  } else if (label == "N0") {
+    *definition = {"N0", 0.70, -0.20, 0.10};
+  } else if (label == "N1") {
+    *definition = {"N1", std::exp(0.9 * std::log(0.70)), -0.20, 0.10};
+  } else if (label == "N2") {
+    *definition = {"N2", std::exp(1.1 * std::log(0.70)), -0.20, 0.10};
+  } else if (label == "N3") {
+    *definition = {"N3", 0.70, -0.18, 0.11};
+  } else if (label == "N4") {
+    *definition = {"N4", 0.70, -0.22, 0.09};
+  } else {
+    return false;
+  }
+  return true;
+}
+
+std::string LargePerturbationSceneFingerprint(
+    const CalibrationSceneState& scene) {
+  std::ostringstream stream;
+  stream << std::setprecision(17);
+  stream << scene.camera.NormalizedFamilyString() << ":";
+  for (double value : scene.camera.CombinedParameterVector()) {
+    stream << value << ",";
+  }
+  stream << "|";
+  for (const JointSceneFrameState& frame : scene.frames) {
+    stream << "f" << frame.frame_index << ":";
+    for (int row = 0; row < 4; ++row) {
+      for (int col = 0; col < 4; ++col) {
+        stream << frame.T_camera_reference(row, col) << ",";
+      }
+    }
+  }
+  for (const JointSceneBoardState& board : scene.boards) {
+    stream << "b" << board.board_id << ":";
+    for (int row = 0; row < 4; ++row) {
+      for (int col = 0; col < 4; ++col) {
+        stream << board.T_reference_board(row, col) << ",";
+      }
+    }
+  }
+  const std::string serialized = stream.str();
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (unsigned char value : serialized) {
+    hash ^= static_cast<std::uint64_t>(value);
+    hash *= 1099511628211ULL;
+  }
+  std::ostringstream digest;
+  digest << "fnv1a64:" << std::hex << hash;
+  return digest.str();
+}
+
+std::string LargePerturbationObservationFingerprint(
+    const CalibrationMeasurementDataset& dataset) {
+  std::vector<const JointPointObservation*> observations;
+  for (const JointMeasurementFrameResult& frame : dataset.frames) {
+    for (const JointBoardObservation& board : frame.board_observations) {
+      for (const JointPointObservation& point : board.points) {
+        observations.push_back(&point);
+      }
+    }
+  }
+  std::sort(observations.begin(), observations.end(),
+            [](const JointPointObservation* lhs,
+               const JointPointObservation* rhs) {
+              return std::make_tuple(
+                         lhs->frame_index, lhs->board_id, lhs->point_id,
+                         lhs->point_type, lhs->image_xy.x(), lhs->image_xy.y()) <
+                     std::make_tuple(
+                         rhs->frame_index, rhs->board_id, rhs->point_id,
+                         rhs->point_type, rhs->image_xy.x(), rhs->image_xy.y());
+            });
+  std::ostringstream stream;
+  stream << std::setprecision(17);
+  for (const JointPointObservation* point : observations) {
+    stream << point->frame_index << "," << point->board_id << ","
+           << point->point_id << "," << static_cast<int>(point->point_type)
+           << "," << point->image_xy.x() << "," << point->image_xy.y()
+           << "," << point->target_xyz_board.x() << ","
+           << point->target_xyz_board.y() << ","
+           << point->target_xyz_board.z() << "|";
+  }
+  const std::string serialized = stream.str();
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (unsigned char value : serialized) {
+    hash ^= static_cast<std::uint64_t>(value);
+    hash *= 1099511628211ULL;
+  }
+  std::ostringstream digest;
+  digest << "fnv1a64:" << std::hex << hash;
+  return digest.str();
+}
+
+bool SameLargePerturbationCamera(
+    const OuterBootstrapCameraIntrinsics& lhs,
+    const OuterBootstrapCameraIntrinsics& rhs) {
+  const std::vector<double> lhs_values = lhs.CombinedParameterVector();
+  const std::vector<double> rhs_values = rhs.CombinedParameterVector();
+  if (lhs.NormalizedFamilyString() != rhs.NormalizedFamilyString() ||
+      lhs_values.size() != rhs_values.size()) {
+    return false;
+  }
+  for (std::size_t index = 0; index < lhs_values.size(); ++index) {
+    const double scale = std::max(
+        1.0, std::max(std::abs(lhs_values[index]), std::abs(rhs_values[index])));
+    if (std::abs(lhs_values[index] - rhs_values[index]) > 1e-12 * scale) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool LoadLargePerturbationSceneSnapshot(
+    const std::string& path,
+    CalibrationSceneState* scene,
+    std::string* error_message) {
+  if (scene == nullptr || path.empty()) {
+    if (error_message != nullptr) {
+      *error_message = "Scene snapshot path or output scene is empty.";
+    }
+    return false;
+  }
+  std::ifstream input(path.c_str());
+  if (!input.is_open()) {
+    if (error_message != nullptr) {
+      *error_message = "Failed to open scene snapshot: " + path;
+    }
+    return false;
+  }
+  scene->frames.clear();
+  scene->boards.clear();
+  std::string tag;
+  bool have_camera = false;
+  while (input >> tag) {
+    if (tag == "camera") {
+      if (!(input >> scene->camera.xi >> scene->camera.alpha >>
+            scene->camera.fu >> scene->camera.fv >> scene->camera.cu >>
+            scene->camera.cv)) {
+        break;
+      }
+      have_camera = true;
+    } else if (tag == "distortion") {
+      std::size_t coefficient_count = 0;
+      if (!(input >> coefficient_count)) {
+        break;
+      }
+      std::vector<double> coefficients(coefficient_count, 0.0);
+      for (std::size_t index = 0; index < coefficient_count; ++index) {
+        if (!(input >> coefficients[index])) {
+          break;
+        }
+      }
+      if (!scene->camera.SetDistortionVector(coefficients)) {
+        if (error_message != nullptr) {
+          *error_message = "Scene snapshot has invalid distortion coefficients: " +
+                           path;
+        }
+        return false;
+      }
+    } else if (tag == "frame") {
+      JointSceneFrameState frame;
+      int initialized = 0;
+      if (!(input >> frame.frame_index >> initialized >> frame.observation_count >>
+            frame.rmse)) {
+        break;
+      }
+      frame.initialized = initialized != 0;
+      for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+          if (!(input >> frame.T_camera_reference(row, col))) {
+            break;
+          }
+        }
+      }
+      bool replaced = false;
+      for (JointSceneFrameState& current : scene->frames) {
+        if (current.frame_index == frame.frame_index) {
+          current.initialized = frame.initialized;
+          current.observation_count = frame.observation_count;
+          current.rmse = frame.rmse;
+          current.T_camera_reference = frame.T_camera_reference;
+          replaced = true;
+          break;
+        }
+      }
+      if (!replaced) {
+        scene->frames.push_back(frame);
+      }
+    } else if (tag == "board") {
+      JointSceneBoardState board;
+      int initialized = 0;
+      if (!(input >> board.board_id >> initialized >> board.observation_count >>
+            board.rmse)) {
+        break;
+      }
+      board.initialized = initialized != 0;
+      for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+          if (!(input >> board.T_reference_board(row, col))) {
+            break;
+          }
+        }
+      }
+      bool replaced = false;
+      for (JointSceneBoardState& current : scene->boards) {
+        if (current.board_id == board.board_id) {
+          current.initialized = board.initialized;
+          current.observation_count = board.observation_count;
+          current.rmse = board.rmse;
+          current.T_reference_board = board.T_reference_board;
+          replaced = true;
+          break;
+        }
+      }
+      if (!replaced) {
+        scene->boards.push_back(board);
+      }
+    } else {
+      std::string ignored;
+      std::getline(input, ignored);
+    }
+  }
+  if (!have_camera || !scene->camera.IsValid()) {
+    if (error_message != nullptr) {
+      *error_message = "Scene snapshot has no valid camera record: " + path;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool EvaluateLargeDsProjectionGrid(
+    const OuterBootstrapCameraIntrinsics& camera,
+    int grid_width,
+    int grid_height,
+    int* valid_count,
+    int* invalid_count,
+    const OuterBootstrapCameraIntrinsics* reference_domain_camera = nullptr) {
+  if (valid_count == nullptr || invalid_count == nullptr ||
+      grid_width < 2 || grid_height < 2 ||
+      (camera.NormalizedFamilyString() != "ds-none" &&
+       camera.NormalizedFamilyString() != "pinhole-equi")) {
+    return false;
+  }
+  *valid_count = 0;
+  *invalid_count = 0;
+  try {
+    const DoubleSphereCameraModel model =
+        DoubleSphereCameraModel::FromConfig(MakeIntermediateCameraConfig(camera));
+    std::unique_ptr<DoubleSphereCameraModel> reference_model;
+    double reference_radius_px = 0.0;
+    if (reference_domain_camera != nullptr) {
+      reference_model.reset(new DoubleSphereCameraModel(
+          DoubleSphereCameraModel::FromConfig(
+              MakeIntermediateCameraConfig(*reference_domain_camera))));
+      reference_radius_px = std::min(
+          std::min(reference_domain_camera->cu, reference_domain_camera->cv),
+          std::min(reference_domain_camera->resolution.width - 1.0 -
+                       reference_domain_camera->cu,
+                   reference_domain_camera->resolution.height - 1.0 -
+                       reference_domain_camera->cv));
+      if (!(reference_radius_px > 0.0) || !std::isfinite(reference_radius_px)) {
+        return false;
+      }
+    }
+    for (int y_index = 0; y_index < grid_height; ++y_index) {
+      const double y = static_cast<double>(y_index) *
+                       static_cast<double>(camera.resolution.height - 1) /
+                       static_cast<double>(grid_height - 1);
+      for (int x_index = 0; x_index < grid_width; ++x_index) {
+        const double x = static_cast<double>(x_index) *
+                         static_cast<double>(camera.resolution.width - 1) /
+                         static_cast<double>(grid_width - 1);
+        const Eigen::Vector2d pixel(x, y);
+        if (reference_model) {
+          const double radius_px =
+              (pixel - Eigen::Vector2d(reference_domain_camera->cu,
+                                       reference_domain_camera->cv)).norm();
+          if (radius_px > reference_radius_px) {
+            continue;
+          }
+          Eigen::Vector3d reference_ray = Eigen::Vector3d::Zero();
+          Eigen::Vector2d reference_roundtrip = Eigen::Vector2d::Zero();
+          const bool reference_valid =
+              UnprojectForRayCurve(*reference_domain_camera, *reference_model,
+                                   pixel, &reference_ray) &&
+              reference_ray.allFinite() && reference_ray.norm() > 1e-12 &&
+              reference_model->vsEuclideanToKeypoint(reference_ray,
+                                                     &reference_roundtrip) &&
+              reference_roundtrip.allFinite();
+          if (!reference_valid) {
+            continue;
+          }
+        }
+        Eigen::Vector3d ray = Eigen::Vector3d::Zero();
+        Eigen::Vector2d roundtrip = Eigen::Vector2d::Zero();
+        const bool valid = UnprojectForRayCurve(camera, model, pixel, &ray) &&
+                           ray.allFinite() && ray.norm() > 1e-12 &&
+                           model.vsEuclideanToKeypoint(ray, &roundtrip) &&
+                           roundtrip.allFinite();
+        if (valid) {
+          ++(*valid_count);
+        } else {
+          ++(*invalid_count);
+        }
+      }
+    }
+  } catch (const std::exception&) {
+    *valid_count = 0;
+    *invalid_count = grid_width * grid_height;
+    return false;
+  }
+  return *invalid_count == 0;
+}
+
+bool ApplyLargeDsIntrinsicPerturbation(
+    const Stage5BenchmarkInput& input,
+    CalibrationStateBundle* bundle,
+    Stage5LargeIntrinsicPerturbationState* state) {
+  if (bundle == nullptr || state == nullptr) {
+    return false;
+  }
+  state->enabled = input.enable_large_intrinsic_perturbation;
+  state->requested_profile = input.large_intrinsic_perturbation_profile;
+  if (!state->enabled) {
+    return true;
+  }
+  CalibrationSceneState reference_scene = bundle->scene_state;
+  if (!input.large_intrinsic_perturbation_reference_scene_path.empty()) {
+    std::string snapshot_error;
+    if (!LoadLargePerturbationSceneSnapshot(
+            input.large_intrinsic_perturbation_reference_scene_path,
+            &reference_scene, &snapshot_error)) {
+      state->failure_reason = snapshot_error;
+      return false;
+    }
+  }
+  bundle->scene_state.camera = reference_scene.camera;
+  bundle->scene_state.frames = reference_scene.frames;
+  bundle->scene_state.boards = reference_scene.boards;
+  state->reference_scene = reference_scene;
+  state->reference_camera = reference_scene.camera;
+  state->reference_scene_fingerprint =
+      LargePerturbationSceneFingerprint(bundle->scene_state);
+  LargeDsPerturbationDefinition definition;
+  if (!GetLargeDsPerturbationDefinition(
+          input.large_intrinsic_perturbation_profile, &definition)) {
+    state->failure_reason =
+        "Unknown large DS perturbation profile; expected P1-P4, P1F50, P2F50, or N0-N4.";
+    return false;
+  }
+  state->effective_profile = definition.label;
+  state->requested_focal_scale = definition.focal_scale;
+  state->requested_xi_delta = definition.xi_delta;
+  state->requested_alpha_delta = definition.alpha_delta;
+  state->requested_scale = input.large_intrinsic_perturbation_scale;
+  const double maximum_scale =
+      input.large_intrinsic_perturbation_strict_scale ? 2.0 : 1.0;
+  if (!std::isfinite(state->requested_scale) ||
+      state->requested_scale < 0.0 ||
+      state->requested_scale > maximum_scale) {
+    state->failure_reason =
+        "Large DS perturbation scale is outside the configured valid range.";
+    return false;
+  }
+  const std::string camera_family =
+      state->reference_camera.NormalizedFamilyString();
+  if (camera_family != "ds-none" && camera_family != "pinhole-equi") {
+    state->failure_reason =
+        "Large intrinsic perturbation is implemented only for ds-none and pinhole-equi.";
+    return false;
+  }
+  if (camera_family == "pinhole-equi") {
+    if (definition.label != "P1") {
+      state->failure_reason =
+          "KB perturbation currently supports only the explicitly defined P1 branch.";
+      return false;
+    }
+    definition.xi_delta = 0.0;
+    definition.alpha_delta = 0.0;
+    state->effective_profile = "KB-P1-focal-plus-principal-point";
+    state->requested_xi_delta = 0.0;
+    state->requested_alpha_delta = 0.0;
+  }
+
+  constexpr int kGridWidth = 41;
+  constexpr int kGridHeight = 41;
+  state->projection_grid_width = kGridWidth;
+  state->projection_grid_height = kGridHeight;
+  // Back off the perturbation vector as a whole. This preserves the requested
+  // direction and never silently clips xi or alpha to a model boundary.
+  const int max_backoff_index =
+      (input.large_intrinsic_perturbation_strict_scale ||
+       state->requested_scale == 0.0) ? 0 : 9;
+  for (int backoff_index = 0; backoff_index <= max_backoff_index;
+       ++backoff_index) {
+    const double backoff = 1.0 - 0.1 * static_cast<double>(backoff_index);
+    const double effective_scale = state->requested_scale * backoff;
+    OuterBootstrapCameraIntrinsics candidate = state->reference_camera;
+    // A logarithmic focal interpolation preserves the profile's multiplicative
+    // definition: scale=0 is exactly clean and scale=1 is P1--P4.
+    candidate.fu = state->reference_camera.fu *
+                   std::exp(effective_scale * std::log(definition.focal_scale));
+    candidate.fv = state->reference_camera.fv *
+                   std::exp(effective_scale * std::log(definition.focal_scale));
+    if (camera_family == "ds-none") {
+      candidate.xi = state->reference_camera.xi +
+                     definition.xi_delta * effective_scale;
+      candidate.alpha =
+          state->reference_camera.alpha +
+          definition.alpha_delta * effective_scale;
+      if (input.large_intrinsic_perturbation_strict_scale) {
+        candidate.cu = state->reference_camera.cu + 150.0 * effective_scale;
+        candidate.cv = state->reference_camera.cv - 150.0 * effective_scale;
+      }
+    } else if (input.large_intrinsic_perturbation_strict_scale) {
+      // KB has no xi/alpha shape parameters. The strict robustness protocol
+      // therefore couples its focal P1 direction with a fixed signed
+      // projection-center displacement, recorded through the initial camera.
+      candidate.cu = state->reference_camera.cu + 150.0 * effective_scale;
+      candidate.cv = state->reference_camera.cv - 150.0 * effective_scale;
+    }
+    int valid_count = 0;
+    int invalid_count = 0;
+    EvaluateLargeDsProjectionGrid(candidate, kGridWidth, kGridHeight,
+                                  &valid_count, &invalid_count,
+                                  &state->reference_camera);
+    bool parameter_domain_valid =
+        candidate.IsValid() && std::isfinite(candidate.fu) &&
+        std::isfinite(candidate.fv);
+    if (camera_family == "ds-none") {
+      parameter_domain_valid =
+          parameter_domain_valid && std::isfinite(candidate.xi) &&
+          std::isfinite(candidate.alpha) && candidate.alpha > 0.0 &&
+          candidate.alpha < 1.0 && candidate.xi > -1.0 && candidate.xi < 1.0;
+    } else {
+      const std::vector<double> distortion = candidate.DistortionVector();
+      parameter_domain_valid =
+          parameter_domain_valid && distortion.size() == 4u &&
+          std::all_of(distortion.begin(), distortion.end(),
+                      [](double value) { return std::isfinite(value); });
+    }
+    // Pixel-domain validity is a measured outcome, not a reason to weaken an
+    // otherwise legal P1--P4 parameter perturbation. Invalid fixed-mask pixels
+    // are retained in valid_grid_ratio/invalid_grid_count diagnostics.
+    if (!parameter_domain_valid || valid_count <= 0) {
+      state->valid_projection_grid_count = valid_count;
+      state->invalid_projection_grid_count = invalid_count;
+      continue;
+    }
+    state->actual_focal_scale = candidate.fu / state->reference_camera.fu;
+    state->actual_xi_delta = candidate.xi - state->reference_camera.xi;
+    state->actual_alpha_delta = candidate.alpha - state->reference_camera.alpha;
+    state->effective_scale = effective_scale;
+    state->valid_projection_grid_count = valid_count;
+    state->invalid_projection_grid_count = invalid_count;
+    state->valid_projection_grid = invalid_count == 0;
+    state->perturbed_camera = candidate;
+    bundle->scene_state.camera = candidate;
+    bundle->scene_state.coarse_or_optimized_level =
+        "large_intrinsic_perturbation_before_selection";
+    // This only recomputes residual diagnostics for already imported/frozen
+    // observations. It never regenerates or filters internal image points.
+    ReevaluateCalibrationStateBundle(bundle);
+    state->perturbed_scene_fingerprint =
+        LargePerturbationSceneFingerprint(bundle->scene_state);
+    return bundle->scene_state.IsValid();
+  }
+  state->failure_reason =
+      "Requested camera perturbation has no usable projection/inverse-projection grid.";
+  return false;
 }
 
 bool UnprojectPinholeEquidistantRayCurve(
@@ -397,6 +916,16 @@ struct TrialBoardRmseAccumulator {
   double squared_error_sum = 0.0;
 };
 
+struct DenseGridOutlierFilterResult {
+  CalibrationStateBundle bundle;
+  bool enabled = false;
+  double median_pixels = 0.0;
+  double robust_sigma_pixels = 0.0;
+  double threshold_pixels = 0.0;
+  int removed_point_count = 0;
+  int dropped_view_count = 0;
+};
+
 struct TrialBackendMetrics {
   bool success = false;
   double overall_rmse = 0.0;
@@ -519,7 +1048,147 @@ struct BackendDatasetStats {
   int accepted_total_point_count = 0;
 };
 
+struct EvaluationRobustSummary {
+  double frame_median_rmse = std::numeric_limits<double>::quiet_NaN();
+  double frame_p90_rmse = std::numeric_limits<double>::quiet_NaN();
+  double trimmed90_rmse = std::numeric_limits<double>::quiet_NaN();
+  double huber15_rmse = std::numeric_limits<double>::quiet_NaN();
+  double fold_median_mean_rmse = std::numeric_limits<double>::quiet_NaN();
+  double fold_median_max_rmse = std::numeric_limits<double>::quiet_NaN();
+  double fold_median_std_rmse = std::numeric_limits<double>::quiet_NaN();
+};
+
 using FrameBoardKey = std::pair<int, int>;
+
+void ReevaluateCalibrationStateBundle(CalibrationStateBundle* bundle);
+
+double Quantile(std::vector<double> values, double q) {
+  if (values.empty()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  std::sort(values.begin(), values.end());
+  const double position =
+      std::max(0.0, std::min(1.0, q)) *
+      static_cast<double>(values.size() - 1);
+  const std::size_t lower = static_cast<std::size_t>(std::floor(position));
+  const std::size_t upper = static_cast<std::size_t>(std::ceil(position));
+  const double fraction = position - static_cast<double>(lower);
+  return values[lower] * (1.0 - fraction) + values[upper] * fraction;
+}
+
+EvaluationRobustSummary SummarizeEvaluationRobustness(
+    const CameraModelRefitEvaluationResult& evaluation) {
+  EvaluationRobustSummary summary;
+  std::vector<double> frame_rmses;
+  std::array<std::vector<double>, 5> fold_frame_rmses;
+  for (const CameraModelRefitFrameDiagnostics& frame :
+       evaluation.frame_diagnostics) {
+    if (frame.point_count > 0 && std::isfinite(frame.rmse)) {
+      frame_rmses.push_back(frame.rmse);
+      std::uint32_t hash = 2166136261u;
+      for (const unsigned char ch : frame.frame_label) {
+        hash ^= static_cast<std::uint32_t>(ch);
+        hash *= 16777619u;
+      }
+      fold_frame_rmses[hash % fold_frame_rmses.size()].push_back(frame.rmse);
+    }
+  }
+  summary.frame_median_rmse = Quantile(frame_rmses, 0.5);
+  summary.frame_p90_rmse = Quantile(frame_rmses, 0.9);
+  std::vector<double> fold_medians;
+  for (const std::vector<double>& fold_values : fold_frame_rmses) {
+    if (!fold_values.empty()) {
+      fold_medians.push_back(Quantile(fold_values, 0.5));
+    }
+  }
+  if (!fold_medians.empty()) {
+    summary.fold_median_mean_rmse =
+        std::accumulate(fold_medians.begin(), fold_medians.end(), 0.0) /
+        static_cast<double>(fold_medians.size());
+    summary.fold_median_max_rmse =
+        *std::max_element(fold_medians.begin(), fold_medians.end());
+    double variance = 0.0;
+    for (const double value : fold_medians) {
+      const double delta = value - summary.fold_median_mean_rmse;
+      variance += delta * delta;
+    }
+    summary.fold_median_std_rmse = std::sqrt(
+        variance / static_cast<double>(fold_medians.size()));
+  }
+
+  std::vector<double> residuals;
+  for (const CameraModelRefitPointDiagnostics& point :
+       evaluation.point_diagnostics) {
+    if (std::isfinite(point.residual_norm)) {
+      residuals.push_back(point.residual_norm);
+    }
+  }
+  if (residuals.empty()) {
+    return summary;
+  }
+  std::sort(residuals.begin(), residuals.end());
+  const std::size_t retained = std::max<std::size_t>(
+      1, static_cast<std::size_t>(
+             std::ceil(0.9 * static_cast<double>(residuals.size()))));
+  double trimmed_squared_sum = 0.0;
+  double huber_cost_sum = 0.0;
+  constexpr double kHuberDeltaPixels = 1.5;
+  for (std::size_t index = 0; index < residuals.size(); ++index) {
+    const double residual = residuals[index];
+    if (index < retained) {
+      trimmed_squared_sum += residual * residual;
+    }
+    huber_cost_sum +=
+        residual <= kHuberDeltaPixels
+            ? 0.5 * residual * residual
+            : kHuberDeltaPixels *
+                  (residual - 0.5 * kHuberDeltaPixels);
+  }
+  summary.trimmed90_rmse = std::sqrt(
+      trimmed_squared_sum / static_cast<double>(retained));
+  summary.huber15_rmse = std::sqrt(
+      2.0 * huber_cost_sum / static_cast<double>(residuals.size()));
+  return summary;
+}
+
+bool ApplySingleBoardCameraAndPoseRefit(
+    const OuterBootstrapCameraIntrinsics& camera,
+    const CameraModelRefitEvaluationResult& evaluation,
+    CalibrationStateBundle* bundle) {
+  if (bundle == nullptr || !camera.IsValid() || !evaluation.success) {
+    return false;
+  }
+  bundle->scene_state.camera = camera;
+  int updated_frame_count = 0;
+  for (const CameraModelRefitBoardObservationDiagnostics& board_diag :
+       evaluation.board_observation_diagnostics) {
+    if (!board_diag.pose_only_refit_success) {
+      continue;
+    }
+    const JointSceneBoardState* board_state = nullptr;
+    for (const JointSceneBoardState& board : bundle->scene_state.boards) {
+      if (board.board_id == board_diag.board_id && board.initialized) {
+        board_state = &board;
+        break;
+      }
+    }
+    if (board_state == nullptr) {
+      continue;
+    }
+    const Eigen::Matrix4d T_camera_reference =
+        board_diag.T_camera_board * board_state->T_reference_board.inverse();
+    for (JointSceneFrameState& frame : bundle->scene_state.frames) {
+      if (frame.frame_index == board_diag.frame_index) {
+        frame.T_camera_reference = T_camera_reference;
+        frame.initialized = true;
+        ++updated_frame_count;
+        break;
+      }
+    }
+  }
+  ReevaluateCalibrationStateBundle(bundle);
+  return updated_frame_count > 0 && bundle->IsReadyForBackend();
+}
 
 struct BackendInputAblationWorkingResult {
   CalibrationStateBundle bundle;
@@ -963,6 +1632,13 @@ IntrinsicsJacobianInformationSummary ComputeIntrinsicsJacobianInformation(
     return summary;
   }
 
+  const DoubleSphereCameraModel base_model =
+      DoubleSphereCameraModel::FromConfig(
+          MakeIntermediateCameraConfig(bundle.scene_state.camera));
+  if (!base_model.IsValid()) {
+    return summary;
+  }
+
   std::array<DoubleSphereCameraModel, 6> plus_models;
   std::array<DoubleSphereCameraModel, 6> minus_models;
   std::array<double, 6> steps{};
@@ -988,6 +1664,14 @@ IntrinsicsJacobianInformationSummary ComputeIntrinsicsJacobianInformation(
     }
   }
 
+  Eigen::Matrix<double, 6, 6> Hcc =
+      Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 6> Hcp =
+      Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::Matrix<double, 6, 6> Hpp =
+      Eigen::Matrix<double, 6, 6>::Zero();
+  constexpr double kTranslationStep = 1e-5;
+  constexpr double kRotationStep = 1e-6;
   for (const JointPointObservation* point : points) {
     if (point == nullptr) {
       continue;
@@ -995,6 +1679,8 @@ IntrinsicsJacobianInformationSummary ComputeIntrinsicsJacobianInformation(
     const Eigen::Vector3d point_camera =
         T_camera_board * point->target_xyz_board;
     Eigen::Matrix<double, 2, 6> jacobian =
+        Eigen::Matrix<double, 2, 6>::Zero();
+    Eigen::Matrix<double, 2, 6> pose_jacobian =
         Eigen::Matrix<double, 2, 6>::Zero();
     bool valid_point = true;
     for (int param = 0; param < 6; ++param) {
@@ -1016,13 +1702,76 @@ IntrinsicsJacobianInformationSummary ComputeIntrinsicsJacobianInformation(
     if (!valid_point || !jacobian.allFinite()) {
       continue;
     }
-    summary.fisher += jacobian.transpose() * jacobian;
+
+    for (int axis = 0; axis < 3; ++axis) {
+      Eigen::Vector3d plus_point = point_camera;
+      Eigen::Vector3d minus_point = point_camera;
+      plus_point[axis] += kTranslationStep;
+      minus_point[axis] -= kTranslationStep;
+      Eigen::Vector2d plus = Eigen::Vector2d::Zero();
+      Eigen::Vector2d minus = Eigen::Vector2d::Zero();
+      if (!base_model.vsEuclideanToKeypoint(plus_point, &plus) ||
+          !base_model.vsEuclideanToKeypoint(minus_point, &minus)) {
+        valid_point = false;
+        break;
+      }
+      pose_jacobian.col(axis) =
+          (plus - minus) * (0.5 / kTranslationStep);
+    }
+    for (int axis = 0; axis < 3 && valid_point; ++axis) {
+      const Eigen::Vector3d unit_axis =
+          Eigen::Vector3d::Unit(axis);
+      const Eigen::Vector3d plus_point =
+          Eigen::AngleAxisd(kRotationStep, unit_axis) * point_camera;
+      const Eigen::Vector3d minus_point =
+          Eigen::AngleAxisd(-kRotationStep, unit_axis) * point_camera;
+      Eigen::Vector2d plus = Eigen::Vector2d::Zero();
+      Eigen::Vector2d minus = Eigen::Vector2d::Zero();
+      if (!base_model.vsEuclideanToKeypoint(plus_point, &plus) ||
+          !base_model.vsEuclideanToKeypoint(minus_point, &minus)) {
+        valid_point = false;
+        break;
+      }
+      pose_jacobian.col(3 + axis) =
+          (plus - minus) * (0.5 / kRotationStep);
+    }
+    if (!valid_point || !pose_jacobian.allFinite()) {
+      continue;
+    }
+    Hcc.noalias() += jacobian.transpose() * jacobian;
+    Hcp.noalias() += jacobian.transpose() * pose_jacobian;
+    Hpp.noalias() += pose_jacobian.transpose() * pose_jacobian;
     ++summary.point_count;
   }
 
   if (summary.point_count <= 0) {
     return summary;
   }
+  const double pose_damping =
+      1e-9 * std::max(1.0, Hpp.trace() / 6.0);
+  Hpp.diagonal().array() += pose_damping;
+  const Eigen::LDLT<Eigen::Matrix<double, 6, 6> > pose_ldlt(Hpp);
+  if (pose_ldlt.info() != Eigen::Success) {
+    return IntrinsicsJacobianInformationSummary{};
+  }
+  const Eigen::Matrix<double, 6, 6> Hpp_inv_Hpc =
+      pose_ldlt.solve(Hcp.transpose());
+  if (!Hpp_inv_Hpc.allFinite()) {
+    return IntrinsicsJacobianInformationSummary{};
+  }
+  Eigen::Matrix<double, 6, 6> marginalized_fisher =
+      Hcc - Hcp * Hpp_inv_Hpc;
+  marginalized_fisher =
+      0.5 * (marginalized_fisher + marginalized_fisher.transpose());
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6> > fisher_solver(
+      marginalized_fisher);
+  if (fisher_solver.info() != Eigen::Success) {
+    return IntrinsicsJacobianInformationSummary{};
+  }
+  summary.fisher =
+      fisher_solver.eigenvectors() *
+      fisher_solver.eigenvalues().cwiseMax(0.0).asDiagonal() *
+      fisher_solver.eigenvectors().transpose();
   summary.fisher /= static_cast<double>(summary.point_count);
   summary.trace = std::max(0.0, summary.fisher.trace());
   summary.logdet = RegularizedFisherLogDet(summary.fisher);
@@ -1290,6 +2039,27 @@ void ReevaluateCalibrationStateBundle(CalibrationStateBundle* bundle) {
   } else {
     bundle->failure_reason.clear();
   }
+}
+
+void DisableFrozenInternalObservationsForPerturbationAblation(
+    CalibrationStateBundle* bundle) {
+  if (bundle == nullptr) {
+    return;
+  }
+  for (JointMeasurementFrameResult& frame :
+       bundle->measurement_dataset.frames) {
+    for (JointBoardObservation& board : frame.board_observations) {
+      for (JointPointObservation& point : board.points) {
+        if (point.point_type != JointPointType::Internal) {
+          continue;
+        }
+        point.used_in_solver = false;
+        point.rejection_detail =
+            "frozen internal residual disabled after intrinsic perturbation";
+      }
+    }
+  }
+  ReevaluateCalibrationStateBundle(bundle);
 }
 
 CalibrationStateBundle BuildBundleForAcceptedFrameBoardKeys(
@@ -1769,6 +2539,8 @@ AslamBackendCalibrationResult RunShortTrialBackend(
   trial_input.dataset_label += label_suffix;
 
   AslamBackendCalibrationOptions runner_options;
+  runner_options.uniform_control_point_mode =
+      options.single_board_dense_grid_profile;
   runner_options.max_iterations = std::max(1, options.max_iterations);
   runner_options.convergence_delta_j = 1e-3;
   runner_options.convergence_delta_x = 1e-4;
@@ -1776,8 +2548,14 @@ AslamBackendCalibrationResult RunShortTrialBackend(
   runner_options.linear_solver = "cholmod";
   runner_options.verbose = false;
   runner_options.use_huber_loss = true;
-  runner_options.outer_huber_delta_pixels = 10.0;
-  runner_options.internal_huber_delta_pixels = 6.0;
+  const double checkerboard_huber_delta =
+      options.single_board_dense_grid_profile
+          ? std::max(0.0, options.checkerboard_huber_delta_pixels)
+          : 0.0;
+  runner_options.outer_huber_delta_pixels =
+      checkerboard_huber_delta > 0.0 ? checkerboard_huber_delta : 10.0;
+  runner_options.internal_huber_delta_pixels =
+      checkerboard_huber_delta > 0.0 ? checkerboard_huber_delta : 6.0;
   runner_options.invalid_projection_penalty_pixels =
       kInvalidProjectionPenaltyPixels;
   runner_options.export_cost_parity_diagnostics = false;
@@ -1792,6 +2570,8 @@ AslamBackendCalibrationOptions MakeTrialBackendRunnerOptions(
     const TrialBackendFrameBoardSelectionOptions& options,
     const AslamBackendCalibrationOptions& residual_options) {
   AslamBackendCalibrationOptions runner_options;
+  runner_options.uniform_control_point_mode =
+      residual_options.uniform_control_point_mode;
   runner_options.max_iterations = std::max(1, options.max_iterations);
   runner_options.convergence_delta_j = 1e-3;
   runner_options.convergence_delta_x = 1e-4;
@@ -1799,8 +2579,14 @@ AslamBackendCalibrationOptions MakeTrialBackendRunnerOptions(
   runner_options.linear_solver = "cholmod";
   runner_options.verbose = false;
   runner_options.use_huber_loss = true;
-  runner_options.outer_huber_delta_pixels = 10.0;
-  runner_options.internal_huber_delta_pixels = 6.0;
+  const double checkerboard_huber_delta =
+      options.single_board_dense_grid_profile
+          ? std::max(0.0, options.checkerboard_huber_delta_pixels)
+          : 0.0;
+  runner_options.outer_huber_delta_pixels =
+      checkerboard_huber_delta > 0.0 ? checkerboard_huber_delta : 10.0;
+  runner_options.internal_huber_delta_pixels =
+      checkerboard_huber_delta > 0.0 ? checkerboard_huber_delta : 6.0;
   runner_options.invalid_projection_penalty_pixels =
       kInvalidProjectionPenaltyPixels;
   runner_options.export_cost_parity_diagnostics = false;
@@ -1846,6 +2632,16 @@ AslamBackendCalibrationOptions MakeTrialBackendRunnerOptions(
 	      residual_options.chordal_residual_weight;
 	  runner_options.angular_use_normalize_jacobian =
 	      residual_options.angular_use_normalize_jacobian;
+  runner_options.angular_local_whitening_enabled =
+      residual_options.angular_local_whitening_enabled;
+  runner_options.angular_local_whitening_pixel_sigma_px =
+      residual_options.angular_local_whitening_pixel_sigma_px;
+  runner_options.angular_local_whitening_covariance_damping =
+      residual_options.angular_local_whitening_covariance_damping;
+  runner_options.angular_local_whitening_min_sigma_rad =
+      residual_options.angular_local_whitening_min_sigma_rad;
+  runner_options.angular_local_whitening_max_weight =
+      residual_options.angular_local_whitening_max_weight;
   runner_options.angular_observed_ray_mode =
       residual_options.angular_observed_ray_mode;
   return runner_options;
@@ -1869,6 +2665,16 @@ void CopyPersistentIncrementalSummary(
       incremental_result.information_gain_target;
   result->persistent_incremental_board_layout_in_information_group =
       incremental_result.board_layout_in_information_group;
+  result->persistent_incremental_board_layout_fixed =
+      incremental_result.board_layout_fixed;
+  result->persistent_incremental_board_layout_pose_count =
+      incremental_result.board_layout_pose_count;
+  result->persistent_incremental_board_layout_max_matrix_abs_delta =
+      incremental_result.board_layout_max_matrix_abs_delta;
+  result->persistent_incremental_board_layout_max_translation_delta =
+      incremental_result.board_layout_max_translation_delta;
+  result->persistent_incremental_board_layout_max_rotation_delta_deg =
+      incremental_result.board_layout_max_rotation_delta_deg;
   result->persistent_incremental_camera_information_group_id =
       incremental_result.camera_information_group_id;
   result->persistent_incremental_board_layout_group_id =
@@ -1877,6 +2683,22 @@ void CopyPersistentIncrementalSummary(
       incremental_result.transformation_group_id;
   result->persistent_incremental_seed_information_group_dim =
       incremental_result.seed_information_group_dim;
+  result->persistent_incremental_seed_information_rank =
+      incremental_result.seed_information_rank;
+  result->persistent_incremental_seed_information_rank_deficiency =
+      incremental_result.seed_information_rank_deficiency;
+  result->persistent_incremental_seed_information_baseline_valid =
+      incremental_result.seed_information_baseline_valid;
+  result->persistent_incremental_seed_information_scaled_min_singular_value =
+      incremental_result.seed_information_scaled_min_singular_value;
+  result->persistent_incremental_seed_information_scaled_max_singular_value =
+      incremental_result.seed_information_scaled_max_singular_value;
+  result->persistent_incremental_seed_information_scaled_condition_number =
+      incremental_result.seed_information_scaled_condition_number;
+  result->persistent_incremental_seed_information_ds_cu_stddev_px =
+      incremental_result.seed_information_ds_cu_stddev_px;
+  result->persistent_incremental_seed_information_ds_cv_stddev_px =
+      incremental_result.seed_information_ds_cv_stddev_px;
   result->persistent_incremental_seed_batch_count =
       incremental_result.seed_batch_count;
   result->persistent_incremental_seed_frame_count =
@@ -1885,6 +2707,23 @@ void CopyPersistentIncrementalSummary(
       incremental_result.seed_board_observation_count;
   result->persistent_incremental_seed_point_count =
       incremental_result.seed_point_count;
+  result->persistent_incremental_seed_intrinsics_warmup_attempted =
+      incremental_result.seed_intrinsics_warmup_attempted;
+  result->persistent_incremental_seed_intrinsics_warmup_success =
+      incremental_result.seed_intrinsics_warmup_success;
+  result
+      ->persistent_incremental_seed_intrinsics_warmup_converged_by_relative_objective =
+      incremental_result.seed_intrinsics_warmup_converged_by_relative_objective;
+  result->persistent_incremental_seed_intrinsics_warmup_iterations =
+      incremental_result.seed_intrinsics_warmup_iterations;
+  result->persistent_incremental_seed_intrinsics_warmup_objective_start =
+      incremental_result.seed_intrinsics_warmup_objective_start;
+  result->persistent_incremental_seed_intrinsics_warmup_objective_final =
+      incremental_result.seed_intrinsics_warmup_objective_final;
+  result->persistent_incremental_seed_intrinsics_warmup_last_delta_j =
+      incremental_result.seed_intrinsics_warmup_last_delta_j;
+  result->persistent_incremental_seed_intrinsics_warmup_last_delta_x =
+      incremental_result.seed_intrinsics_warmup_last_delta_x;
   result->persistent_incremental_candidate_batch_count =
       incremental_result.candidate_batch_count;
   result->persistent_incremental_attempted_batch_count =
@@ -1893,6 +2732,37 @@ void CopyPersistentIncrementalSummary(
       incremental_result.accepted_batch_count;
   result->persistent_incremental_rejected_batch_count =
       incremental_result.rejected_batch_count;
+  result->persistent_incremental_solver_profile_name =
+      incremental_result.solver_profile_name;
+  result->persistent_incremental_solver_objective_unit =
+      incremental_result.solver_objective_unit;
+  result->persistent_incremental_solver_max_iterations =
+      incremental_result.solver_max_iterations;
+  result->persistent_incremental_solver_convergence_delta_j =
+      incremental_result.solver_convergence_delta_j;
+  result->persistent_incremental_solver_convergence_delta_x =
+      incremental_result.solver_convergence_delta_x;
+  result->persistent_incremental_solver_bearing_reference_focal_px =
+      incremental_result.solver_bearing_reference_focal_px;
+  result->persistent_incremental_solver_bearing_residual_scale =
+      incremental_result.solver_bearing_residual_scale;
+  result->persistent_incremental_solver_single_iteration_batch_count =
+      incremental_result.solver_single_iteration_batch_count;
+  result->persistent_incremental_solver_max_iteration_batch_count =
+      incremental_result.solver_max_iteration_batch_count;
+  result->persistent_incremental_solver_objective_decreased_batch_count =
+      incremental_result.solver_objective_decreased_batch_count;
+  result
+      ->persistent_incremental_solver_relative_objective_converged_batch_count =
+      incremental_result.solver_relative_objective_converged_batch_count;
+  result->persistent_incremental_solver_camera_step_converged_batch_count =
+      incremental_result.solver_camera_step_converged_batch_count;
+  result->persistent_incremental_solver_continuation_batch_count =
+      incremental_result.solver_continuation_batch_count;
+  result->persistent_incremental_solver_continuation_round_count =
+      incremental_result.solver_continuation_round_count;
+  result->persistent_incremental_solver_continuation_guard_hit_count =
+      incremental_result.solver_continuation_guard_hit_count;
   result->persistent_incremental_image_plane_residual_count =
       incremental_result.image_plane_residual_count;
 	  result->persistent_incremental_angular_residual_count =
@@ -1905,6 +2775,28 @@ void CopyPersistentIncrementalSummary(
 	      incremental_result.hybrid_chordal_selected_count;
 	  result->persistent_incremental_angular_geometry_failure_count =
 	      incremental_result.angular_observation_geometry_failure_count;
+  result->persistent_incremental_angular_local_whitening_success_count =
+      incremental_result.angular_local_whitening_success_count;
+  result->persistent_incremental_angular_local_whitening_failure_count =
+      incremental_result.angular_local_whitening_failure_count;
+  result->persistent_incremental_angular_local_whitening_clamped_count =
+      incremental_result.angular_local_whitening_clamped_count;
+  if (incremental_result.angular_local_whitening_success_count > 0) {
+    const double count = static_cast<double>(
+        incremental_result.angular_local_whitening_success_count);
+    result->persistent_incremental_angular_local_whitening_sigma_mean_rad =
+        incremental_result.angular_local_whitening_sigma_sum_rad / count;
+    result->persistent_incremental_angular_local_whitening_sigma_min_rad =
+        incremental_result.angular_local_whitening_sigma_min_rad;
+    result->persistent_incremental_angular_local_whitening_sigma_max_rad =
+        incremental_result.angular_local_whitening_sigma_max_rad;
+    result->persistent_incremental_angular_local_whitening_weight_mean =
+        incremental_result.angular_local_whitening_weight_sum / count;
+    result->persistent_incremental_angular_local_whitening_weight_min =
+        incremental_result.angular_local_whitening_weight_min;
+    result->persistent_incremental_angular_local_whitening_weight_max =
+        incremental_result.angular_local_whitening_weight_max;
+  }
   result->persistent_incremental_selection_metric_name =
       incremental_result.selection_metric_name;
   result->persistent_incremental_selection_metric_unit =
@@ -1932,6 +2824,46 @@ void CopyPersistentIncrementalSummary(
       incremental_result.split_residual_health_gate_enabled;
   result->persistent_incremental_split_residual_health_rejected_count =
       incremental_result.split_residual_health_rejected_count;
+  result->persistent_incremental_bearing_pixel_safety_gate_enabled =
+      incremental_result.bearing_pixel_safety_gate_enabled;
+  result->persistent_incremental_bearing_pixel_safety_rejected_count =
+      incremental_result.bearing_pixel_safety_rejected_count;
+  result->persistent_incremental_full_training_pose_refit_health_gate_enabled =
+      incremental_result.full_training_pose_refit_health_gate_enabled;
+  result
+      ->persistent_incremental_seed_intrinsics_warmup_full_training_health_pass =
+      incremental_result.seed_intrinsics_warmup_full_training_health_pass;
+  result
+      ->persistent_incremental_full_training_pose_refit_health_rejected_count =
+      incremental_result.full_training_pose_refit_health_rejected_count;
+  result->persistent_incremental_initial_full_training_pixel_rmse =
+      incremental_result.initial_full_training_pixel_rmse;
+  result->persistent_incremental_initial_full_training_pixel_p95 =
+      incremental_result.initial_full_training_pixel_p95;
+  result->persistent_incremental_initial_full_training_pose_success_rate =
+      incremental_result.initial_full_training_pose_success_rate;
+  result->persistent_incremental_initial_full_training_pose_success_count =
+      incremental_result.initial_full_training_pose_success_count;
+  result->persistent_incremental_initial_full_training_pose_total_count =
+      incremental_result.initial_full_training_pose_total_count;
+  result->persistent_incremental_initial_full_training_invalid_projection_count =
+      incremental_result.initial_full_training_invalid_projection_count;
+  result->persistent_incremental_final_full_training_pixel_rmse =
+      incremental_result.final_full_training_pixel_rmse;
+  result->persistent_incremental_final_full_training_pixel_p95 =
+      incremental_result.final_full_training_pixel_p95;
+  result->persistent_incremental_final_full_training_pose_success_rate =
+      incremental_result.final_full_training_pose_success_rate;
+  result->persistent_incremental_final_full_training_pose_success_count =
+      incremental_result.final_full_training_pose_success_count;
+  result->persistent_incremental_final_full_training_pose_total_count =
+      incremental_result.final_full_training_pose_total_count;
+  result->persistent_incremental_final_full_training_invalid_projection_count =
+      incremental_result.final_full_training_invalid_projection_count;
+  result->persistent_incremental_kb_distortion_guard_enabled =
+      incremental_result.kb_distortion_guard_enabled;
+  result->persistent_incremental_kb_ray_curve_validity_rejected_count =
+      incremental_result.kb_ray_curve_validity_rejected_count;
   result->persistent_incremental_adaptive_saturation_stop_enabled =
       incremental_result.adaptive_saturation_stop_enabled;
   result->persistent_incremental_adaptive_saturation_stop_hit =
@@ -2446,6 +3378,120 @@ std::map<FrameBoardKey, TrialBoardRmseAccumulator> ComputeTrialBoardResiduals(
   return accumulators;
 }
 
+TrialObservationKey MakeTrialObservationKey(
+    const JointResidualPointDiagnostics& point) {
+  TrialObservationKey key;
+  key.frame_index = point.frame_index;
+  key.board_id = point.board_id;
+  key.point_id = point.point_id;
+  key.source_point_index = point.source_point_index;
+  key.source_kind = point.source_kind;
+  return key;
+}
+
+DenseGridOutlierFilterResult FilterDenseGridOutliers(
+    const CalibrationStateBundle& candidate_pool_bundle,
+    const AslamBackendCalibrationResult& trial_backend_result,
+    const std::set<FrameBoardKey>& /*protected_seed_keys*/,
+    const TrialBackendFrameBoardSelectionOptions& options) {
+  DenseGridOutlierFilterResult result;
+  result.bundle = candidate_pool_bundle;
+  result.enabled = options.single_board_dense_grid_profile &&
+                   options.checkerboard_outlier_filter_enabled;
+  if (!result.enabled) {
+    return result;
+  }
+
+  std::vector<double> residual_norms;
+  std::map<FrameBoardKey, int> total_count_by_view;
+  std::map<FrameBoardKey, int> inlier_count_by_view;
+  for (const JointResidualPointDiagnostics& point :
+       trial_backend_result.optimized_residual.point_diagnostics) {
+    if (!point.used_in_solver || !std::isfinite(point.residual_norm)) {
+      continue;
+    }
+    residual_norms.push_back(point.residual_norm);
+  }
+  if (residual_norms.empty()) {
+    result.bundle.warnings.push_back(
+        "Dense-grid outlier filtering skipped: no finite trial residuals.");
+    return result;
+  }
+
+  result.median_pixels = ComputeMedian(residual_norms);
+  const double mad = ComputeMedianAbsoluteDeviation(
+      residual_norms, result.median_pixels);
+  result.robust_sigma_pixels = 1.4826 * mad;
+  result.threshold_pixels = std::max(
+      std::max(1e-6, options.checkerboard_huber_delta_pixels),
+      result.median_pixels +
+          std::max(0.0, options.checkerboard_outlier_sigma) *
+              result.robust_sigma_pixels);
+
+  std::set<TrialObservationKey> outlier_points;
+  for (const JointResidualPointDiagnostics& point :
+       trial_backend_result.optimized_residual.point_diagnostics) {
+    if (!point.used_in_solver || !std::isfinite(point.residual_norm)) {
+      continue;
+    }
+    const FrameBoardKey view_key(point.frame_index, point.board_id);
+    ++total_count_by_view[view_key];
+    if (point.residual_norm <= result.threshold_pixels) {
+      ++inlier_count_by_view[view_key];
+    } else {
+      outlier_points.insert(MakeTrialObservationKey(point));
+    }
+  }
+
+  std::set<FrameBoardKey> dropped_views;
+  for (const auto& entry : total_count_by_view) {
+    const int total_count = entry.second;
+    const int inlier_count = inlier_count_by_view[entry.first];
+    const int minimum_count = std::max(
+        std::max(4, options.checkerboard_min_retained_points),
+        static_cast<int>(std::ceil(
+            std::max(0.0, std::min(1.0,
+                                   options.checkerboard_min_inlier_ratio)) *
+            static_cast<double>(total_count))));
+    if (inlier_count < minimum_count) {
+      dropped_views.insert(entry.first);
+    }
+  }
+
+  for (JointMeasurementFrameResult& frame :
+       result.bundle.measurement_dataset.frames) {
+    for (JointBoardObservation& board : frame.board_observations) {
+      const FrameBoardKey view_key(frame.frame_index, board.board_id);
+      const bool drop_view = dropped_views.count(view_key) > 0;
+      for (JointPointObservation& point : board.points) {
+        if (!point.used_in_solver) {
+          continue;
+        }
+        if (!drop_view &&
+            outlier_points.count(MakeTrialObservationKey(point)) == 0) {
+          continue;
+        }
+        point.used_in_solver = false;
+        point.rejection_detail = drop_view
+            ? "checkerboard_robust_filter_dropped_view"
+            : "checkerboard_robust_filter_point_outlier";
+        ++result.removed_point_count;
+      }
+    }
+  }
+  result.dropped_view_count = static_cast<int>(dropped_views.size());
+  std::ostringstream warning;
+  warning << "Dense-grid robust filtering: threshold_px="
+          << result.threshold_pixels
+          << " median_px=" << result.median_pixels
+          << " robust_sigma_px=" << result.robust_sigma_pixels
+          << " removed_points=" << result.removed_point_count
+          << " dropped_views=" << result.dropped_view_count;
+  result.bundle.warnings.push_back(warning.str());
+  ReevaluateCalibrationStateBundle(&result.bundle);
+  return result;
+}
+
 bool SelectionUsesPixelTrialResidualGate(
     const AslamBackendCalibrationOptions& selection_runner_options) {
   return selection_runner_options.residual_model == ResidualModel::ImagePlane &&
@@ -2462,6 +3508,18 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
   TrialBackendFrameBoardSelectionResult result;
   result.enabled = options.enabled;
   result.selection_mode = options.selection_mode;
+  result.selection_profile = options.single_board_dense_grid_profile
+                                 ? "single_board_dense_grid"
+                                 : "multi_board";
+  result.selection_is_kalibr_checkerboard_style =
+      options.single_board_dense_grid_profile;
+  result.checkerboard_huber_delta_pixels =
+      options.single_board_dense_grid_profile
+          ? options.checkerboard_huber_delta_pixels
+          : 0.0;
+  result.checkerboard_force_all_valid_views =
+      options.single_board_dense_grid_profile &&
+      options.acceptance_information_gain_threshold < 0.0;
   result.curated_bundle = baseline_bundle;
   result.input_frame_count =
       candidate_pool_bundle.measurement_dataset.accepted_frame_count;
@@ -2478,12 +3536,13 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
   result.baseline_seed_internal_point_count =
       baseline_bundle.measurement_dataset.accepted_internal_point_count;
   const bool use_pixel_trial_residual_gate =
-      SelectionUsesPixelTrialResidualGate(selection_runner_options);
+      SelectionUsesPixelTrialResidualGate(selection_runner_options) &&
+      !options.single_board_dense_grid_profile;
   if (!use_pixel_trial_residual_gate) {
     result.warnings.push_back(
-        "Residual-aware Stage5 selection: disabled pixel trial-RMSE "
-        "pre-rejection/strong ordering for non-pixel BA residual mode; "
-        "persistent accept/reject uses the active residual metric.");
+        options.single_board_dense_grid_profile
+            ? "Single-board dense-grid profile: trial RMSE is diagnostic only; persistent accept/reject follows Kalibr's information/rank and optimizer-validity boundary."
+            : "Residual-aware Stage5 selection: disabled pixel trial-RMSE pre-rejection/strong ordering for non-pixel BA residual mode; persistent accept/reject uses the active residual metric.");
   }
   result.baseline_seed_total_point_count =
       baseline_bundle.measurement_dataset.accepted_total_point_count;
@@ -2558,11 +3617,81 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
     result.threshold_px = std::min(result.threshold_px,
                                    options.max_threshold_px);
   }
+  const double checkerboard_view_rmse_threshold =
+      options.single_board_dense_grid_profile
+          ? std::max(0.25,
+                     result.median_board_rmse +
+                         options.outlier_sigma *
+                             std::max(1e-6,
+                                      result.robust_sigma_board_rmse))
+          : result.threshold_px;
 
   const std::set<FrameBoardKey> baseline_keys =
       CollectAcceptedFrameBoardKeys(baseline_bundle.measurement_dataset);
   const std::set<FrameBoardKey> candidate_pool_keys =
       CollectAcceptedFrameBoardKeys(candidate_pool_bundle.measurement_dataset);
+  const DenseGridOutlierFilterResult dense_grid_filter =
+      FilterDenseGridOutliers(candidate_pool_bundle,
+                              result.trial_backend_result,
+                              baseline_keys,
+                              options);
+  result.checkerboard_outlier_filter_enabled = dense_grid_filter.enabled;
+  result.checkerboard_outlier_sigma = options.checkerboard_outlier_sigma;
+  result.checkerboard_min_inlier_ratio =
+      options.checkerboard_min_inlier_ratio;
+  result.checkerboard_min_retained_points =
+      options.checkerboard_min_retained_points;
+  result.checkerboard_outlier_threshold_pixels =
+      dense_grid_filter.threshold_pixels;
+  result.checkerboard_outlier_median_pixels = dense_grid_filter.median_pixels;
+  result.checkerboard_outlier_robust_sigma_pixels =
+      dense_grid_filter.robust_sigma_pixels;
+  result.checkerboard_outlier_removed_point_count =
+      dense_grid_filter.removed_point_count;
+  result.checkerboard_outlier_dropped_view_count =
+      dense_grid_filter.dropped_view_count;
+  const CalibrationStateBundle& persistent_candidate_pool_bundle =
+      dense_grid_filter.enabled ? dense_grid_filter.bundle
+                                : candidate_pool_bundle;
+  const std::set<FrameBoardKey> persistent_candidate_pool_keys =
+      CollectAcceptedFrameBoardKeys(
+          persistent_candidate_pool_bundle.measurement_dataset);
+  CalibrationStateBundle persistent_baseline_bundle = baseline_bundle;
+  if (dense_grid_filter.enabled) {
+    std::set<FrameBoardKey> filtered_seed_keys;
+    std::set_intersection(
+        baseline_keys.begin(), baseline_keys.end(),
+        persistent_candidate_pool_keys.begin(),
+        persistent_candidate_pool_keys.end(),
+        std::inserter(filtered_seed_keys, filtered_seed_keys.end()));
+    persistent_baseline_bundle = BuildBundleForAcceptedFrameBoardKeys(
+        persistent_candidate_pool_bundle,
+        persistent_candidate_pool_bundle,
+        filtered_seed_keys,
+        baseline_bundle.measurement_dataset.source_stage_label +
+            "_dense_grid_filtered_seed");
+    if (!persistent_baseline_bundle.IsReadyForBackend()) {
+      result.failure_reason =
+          "checkerboard outlier filtering removed every bootstrap view";
+      return result;
+    }
+  }
+  if (dense_grid_filter.enabled) {
+    std::ostringstream warning;
+    warning << "Checkerboard robust filtering retained "
+            << persistent_candidate_pool_bundle.measurement_dataset
+                   .accepted_total_point_count
+            << " / "
+            << candidate_pool_bundle.measurement_dataset
+                   .accepted_total_point_count
+            << " points and "
+            << persistent_candidate_pool_bundle.measurement_dataset
+                   .accepted_frame_count
+            << " / "
+            << candidate_pool_bundle.measurement_dataset.accepted_frame_count
+            << " views.";
+    result.warnings.push_back(warning.str());
+  }
   result.candidate_board_observation_count =
       static_cast<int>(candidate_pool_keys.size() > baseline_keys.size()
                            ? candidate_pool_keys.size() - baseline_keys.size()
@@ -2863,7 +3992,72 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
       result.candidate_order_mode ==
       TrialBackendFrameBoardSelectionOptions::CandidateOrderMode
           ::RandomShuffle;
-  if (result.candidate_shuffle_seed_set) {
+  if (result.candidate_order_mode ==
+      TrialBackendFrameBoardSelectionOptions::CandidateOrderMode::
+          IntrinsicsInformationGreedy) {
+    std::vector<TrialBackendFrameBoardObservationDecision> remaining =
+        candidate_decisions;
+    std::vector<TrialBackendFrameBoardObservationDecision> ordered;
+    ordered.reserve(remaining.size());
+    Eigen::Matrix<double, 6, 6> ordering_fisher =
+        accepted_intrinsics_fisher;
+    while (!remaining.empty()) {
+      const double current_logdet =
+          RegularizedFisherLogDet(ordering_fisher);
+      std::size_t best_index = remaining.size();
+      double best_gain = -std::numeric_limits<double>::infinity();
+      double best_coverage = -std::numeric_limits<double>::infinity();
+      for (std::size_t index = 0; index < remaining.size(); ++index) {
+        const FrameBoardKey key(remaining[index].frame_index,
+                                remaining[index].board_id);
+        const auto info_it = intrinsics_jacobian_info_by_key.find(key);
+        if (info_it == intrinsics_jacobian_info_by_key.end() ||
+            !info_it->second.available) {
+          continue;
+        }
+        const double gain = std::max(
+            0.0,
+            RegularizedFisherLogDet(ordering_fisher + info_it->second.fisher) -
+                current_logdet);
+        const double coverage = remaining[index].coverage_gain;
+        if (gain > best_gain + 1e-12 ||
+            (std::abs(gain - best_gain) <= 1e-12 &&
+             coverage > best_coverage + 1e-12)) {
+          best_index = index;
+          best_gain = gain;
+          best_coverage = coverage;
+        }
+      }
+      if (best_index >= remaining.size()) {
+        std::sort(remaining.begin(), remaining.end(), ScoreSortedBefore);
+        ordered.insert(ordered.end(), remaining.begin(), remaining.end());
+        break;
+      }
+      const FrameBoardKey best_key(remaining[best_index].frame_index,
+                                   remaining[best_index].board_id);
+      ordering_fisher += intrinsics_jacobian_info_by_key[best_key].fisher;
+      ordered.push_back(remaining[best_index]);
+      remaining.erase(remaining.begin() +
+                      static_cast<std::ptrdiff_t>(best_index));
+    }
+    candidate_decisions.swap(ordered);
+  } else if (result.candidate_shuffle_seed_set) {
+    // Randomized controlled ablations must not inherit the residual-dependent
+    // score ordering that precedes this block. Canonicalize identities first
+    // so equal seeds produce an equal frame-board schedule across residual
+    // models.
+    std::sort(
+        candidate_decisions.begin(), candidate_decisions.end(),
+        [](const TrialBackendFrameBoardObservationDecision& lhs,
+           const TrialBackendFrameBoardObservationDecision& rhs) {
+          if (lhs.frame_index != rhs.frame_index) {
+            return lhs.frame_index < rhs.frame_index;
+          }
+          if (lhs.board_id != rhs.board_id) {
+            return lhs.board_id < rhs.board_id;
+          }
+          return lhs.frame_label < rhs.frame_label;
+        });
     unsigned int deterministic_seed = 2166136261u;
     for (const TrialBackendFrameBoardObservationDecision& candidate :
          candidate_decisions) {
@@ -2880,6 +4074,16 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             : deterministic_seed;
     std::mt19937 rng(result.candidate_shuffle_seed);
     std::shuffle(candidate_decisions.begin(), candidate_decisions.end(), rng);
+  }
+  if (!options.force_include_frame_board_keys.empty() ||
+      !options.force_include_frame_label_board_keys.empty()) {
+    std::stable_partition(
+        candidate_decisions.begin(), candidate_decisions.end(),
+        [&options](const TrialBackendFrameBoardObservationDecision& decision) {
+          return IsForceIncludeFrameBoardCandidate(
+              FrameBoardKey(decision.frame_index, decision.board_id),
+              decision.frame_label, options);
+        });
   }
   const auto traversal_budget_exhausted = [&]() {
     return result.valid_candidate_traversed_count >=
@@ -3246,7 +4450,8 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
           candidate_indices_by_frame[frame_index];
       Stage5IncrementalBackendBatchInput batch_input;
       batch_input.frame_index = frame_index;
-      batch_input.residual_health_threshold_px = result.threshold_px;
+      batch_input.residual_health_threshold_px =
+          checkerboard_view_rmse_threshold;
       double ordering_score_sum = 0.0;
       double coverage_gain_sum = 0.0;
       int ordering_score_count = 0;
@@ -3255,6 +4460,10 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             candidate_decisions[index];
         const FrameBoardKey key(member.frame_index, member.board_id);
         if (accepted_keys.find(key) != accepted_keys.end()) {
+          continue;
+        }
+        if (persistent_candidate_pool_keys.find(key) ==
+            persistent_candidate_pool_keys.end()) {
           continue;
         }
         if (batch_input.frame_label.empty()) {
@@ -3290,7 +4499,8 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
 
     const Stage5IncrementalBackendEstimatorResult persistent_result =
         RunStage5IncrementalBackendEstimator(
-            baseline_bundle, candidate_pool_bundle, persistent_backend_options,
+            persistent_baseline_bundle, persistent_candidate_pool_bundle,
+            persistent_backend_options,
             options, persistent_runner_options, persistent_batches);
     CopyPersistentIncrementalSummary(persistent_result, &result);
 
@@ -3360,10 +4570,14 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
 
       std::map<int, Stage5IncrementalBackendBatchResult>
           persistent_batch_result_by_frame;
+      std::map<int, int> persistent_batch_attempt_order_by_frame;
+      int persistent_batch_attempt_order = 0;
       for (const Stage5IncrementalBackendBatchResult& batch_result :
            persistent_result.batch_results) {
         persistent_batch_result_by_frame[batch_result.frame_index] =
             batch_result;
+        persistent_batch_attempt_order_by_frame[batch_result.frame_index] =
+            persistent_batch_attempt_order++;
       }
 
       for (TrialBackendFrameBoardObservationDecision candidate :
@@ -3377,6 +4591,10 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
                     .frame_board_keys.count(key) > 0;
         candidate.frame_batch_candidate = true;
         candidate.persistent_incremental_attempted = in_attempted_batch;
+        if (in_attempted_batch) {
+          candidate.persistent_incremental_attempt_order =
+              persistent_batch_attempt_order_by_frame[candidate.frame_index];
+        }
         if (!in_attempted_batch) {
           candidate.kept = false;
           if (result.safety_ceiling_hit) {
@@ -3409,6 +4627,16 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             batch_result.trust_region_backtracking_used;
         candidate.persistent_incremental_split_residual_health_pass =
             batch_result.split_residual_health_pass;
+        candidate.persistent_incremental_pixel_safety_gate_pass =
+            batch_result.pixel_safety_gate_pass;
+        candidate.persistent_incremental_full_training_pose_refit_health_pass =
+            batch_result.full_training_pose_refit_health_pass;
+        candidate.persistent_incremental_ray_curve_validity_pass =
+            batch_result.ray_curve_validity_pass;
+        candidate.persistent_incremental_kb_k3_released =
+            batch_result.kb_k3_released;
+        candidate.persistent_incremental_kb_k4_released =
+            batch_result.kb_k4_released;
         candidate.persistent_incremental_information_gain =
             batch_result.information_gain;
         candidate.persistent_incremental_normalized_information_gain =
@@ -3432,10 +4660,46 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             batch_result.qr_tolerance;
         candidate.persistent_incremental_iterations =
             batch_result.num_iterations;
+        candidate.persistent_incremental_last_solver_pass_iterations =
+            batch_result.last_solver_pass_iterations;
+        candidate.persistent_incremental_continuation_round_count =
+            batch_result.continuation_round_count;
+        candidate.persistent_incremental_continuation_guard_hit =
+            batch_result.continuation_guard_hit;
+        candidate.persistent_incremental_pose_prefit_attempted =
+            batch_result.pose_prefit_attempted;
+        candidate.persistent_incremental_pose_prefit_success =
+            batch_result.pose_prefit_success;
+        candidate.persistent_incremental_pose_prefit_iterations =
+            batch_result.pose_prefit_iterations;
+        candidate.persistent_incremental_pose_prefit_objective_start =
+            batch_result.pose_prefit_objective_start;
+        candidate.persistent_incremental_pose_prefit_objective_final =
+            batch_result.pose_prefit_objective_final;
+        candidate.persistent_incremental_pose_prefit_last_delta_j =
+            batch_result.pose_prefit_last_delta_j;
+        candidate.persistent_incremental_pose_prefit_last_delta_x =
+            batch_result.pose_prefit_last_delta_x;
         candidate.persistent_incremental_objective_start =
             batch_result.objective_start;
         candidate.persistent_incremental_objective_final =
             batch_result.objective_final;
+        candidate.persistent_incremental_objective_last_delta_j =
+            batch_result.objective_last_delta_j;
+        candidate.persistent_incremental_state_last_delta_x =
+            batch_result.state_last_delta_x;
+        candidate.persistent_incremental_linear_solver_failure =
+            batch_result.linear_solver_failure;
+        candidate.persistent_incremental_converged_by_relative_objective =
+            batch_result.converged_by_relative_objective;
+        candidate.persistent_incremental_converged_by_camera_step =
+            batch_result.converged_by_camera_step;
+        candidate.persistent_incremental_last_camera_shape_step =
+            batch_result.last_camera_shape_step;
+        candidate.persistent_incremental_last_camera_focal_relative_step =
+            batch_result.last_camera_focal_relative_step;
+        candidate.persistent_incremental_last_camera_principal_step_px =
+            batch_result.last_camera_principal_step_px;
         candidate.persistent_incremental_objective_decreased =
             batch_result.objective_decreased;
         candidate.persistent_incremental_rmse_before =
@@ -3480,6 +4744,52 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             batch_result.candidate_outer_p95_after;
         candidate.persistent_incremental_candidate_internal_p95_after =
             batch_result.candidate_internal_p95_after;
+        candidate.persistent_incremental_pixel_rmse_before =
+            batch_result.pixel_rmse_before;
+        candidate.persistent_incremental_pixel_rmse_after =
+            batch_result.pixel_rmse_after;
+        candidate.persistent_incremental_pixel_p95_before =
+            batch_result.pixel_p95_before;
+        candidate.persistent_incremental_pixel_p95_after =
+            batch_result.pixel_p95_after;
+        candidate.persistent_incremental_candidate_pixel_rmse_after =
+            batch_result.candidate_pixel_rmse_after;
+        candidate.persistent_incremental_candidate_pixel_p95_after =
+            batch_result.candidate_pixel_p95_after;
+        candidate.persistent_incremental_full_training_pixel_rmse_before =
+            batch_result.full_training_pixel_rmse_before;
+        candidate.persistent_incremental_full_training_pixel_rmse_after =
+            batch_result.full_training_pixel_rmse_after;
+        candidate.persistent_incremental_full_training_pixel_p95_before =
+            batch_result.full_training_pixel_p95_before;
+        candidate.persistent_incremental_full_training_pixel_p95_after =
+            batch_result.full_training_pixel_p95_after;
+        candidate
+            .persistent_incremental_full_training_pose_success_rate_before =
+            batch_result.full_training_pose_success_rate_before;
+        candidate
+            .persistent_incremental_full_training_pose_success_rate_after =
+            batch_result.full_training_pose_success_rate_after;
+        candidate
+            .persistent_incremental_full_training_pose_success_count_before =
+            batch_result.full_training_pose_success_count_before;
+        candidate
+            .persistent_incremental_full_training_pose_success_count_after =
+            batch_result.full_training_pose_success_count_after;
+        candidate.persistent_incremental_full_training_pose_total_count =
+            batch_result.full_training_pose_total_count;
+        candidate
+            .persistent_incremental_full_training_invalid_projection_count_before =
+            batch_result.full_training_invalid_projection_count_before;
+        candidate
+            .persistent_incremental_full_training_invalid_projection_count_after =
+            batch_result.full_training_invalid_projection_count_after;
+        candidate.persistent_incremental_ray_curve_rms_change_deg =
+            batch_result.ray_curve_rms_change_deg;
+        candidate.persistent_incremental_ray_curve_max_change_deg =
+            batch_result.ray_curve_max_change_deg;
+        candidate.persistent_incremental_ray_curve_min_radial_derivative =
+            batch_result.ray_curve_min_radial_derivative;
         candidate.persistent_incremental_image_plane_residual_count =
             batch_result.image_plane_residual_count;
 	        candidate.persistent_incremental_angular_residual_count =
@@ -3526,6 +4836,22 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             batch_result.camera_cu_after;
         candidate.persistent_incremental_camera_cv_after =
             batch_result.camera_cv_after;
+        candidate.persistent_incremental_camera_k1_before =
+            batch_result.camera_k1_before;
+        candidate.persistent_incremental_camera_k2_before =
+            batch_result.camera_k2_before;
+        candidate.persistent_incremental_camera_k3_before =
+            batch_result.camera_k3_before;
+        candidate.persistent_incremental_camera_k4_before =
+            batch_result.camera_k4_before;
+        candidate.persistent_incremental_camera_k1_after =
+            batch_result.camera_k1_after;
+        candidate.persistent_incremental_camera_k2_after =
+            batch_result.camera_k2_after;
+        candidate.persistent_incremental_camera_k3_after =
+            batch_result.camera_k3_after;
+        candidate.persistent_incremental_camera_k4_after =
+            batch_result.camera_k4_after;
         candidate.information_gain_proxy = batch_result.information_gain;
         candidate.intrinsics_jacobian_info_term =
             batch_result.information_gain;
@@ -5251,7 +6577,8 @@ Stage5Benchmark::BuildEvaluationDatasetFromMeasurementResult(
     const std::vector<InternalRegenerationFrameResult>& regeneration_results,
     const std::string& dataset_label,
     const std::string& split_label,
-    const std::string& split_signature) const {
+    const std::string& split_signature,
+    bool include_points_not_used_in_solver) const {
   CalibrationEvaluationDataset dataset;
   dataset.dataset_label = dataset_label;
   dataset.split_label = split_label;
@@ -5273,7 +6600,7 @@ Stage5Benchmark::BuildEvaluationDatasetFromMeasurementResult(
       eval_board.board_id = board_observation.board_id;
 
       for (const JointPointObservation& point : board_observation.points) {
-        if (!point.used_in_solver) {
+        if (!include_points_not_used_in_solver && !point.used_in_solver) {
           continue;
         }
         CalibrationEvaluationPointObservation eval_point;
@@ -5344,7 +6671,32 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
   dataset.split_label = "holdout";
   dataset.split_signature = split_signature;
 
-  const ApriltagInternalConfig config = NormalizeConfig(baseline_options.config);
+  ApriltagInternalConfig config = NormalizeConfig(baseline_options.config);
+  if (baseline_options.enable_camera_aware_outer_rescue &&
+      optimized_scene_state.camera.IsValid() &&
+      optimized_scene_state.camera.NormalizedFamilyString() == "ds-none") {
+    OuterRefineCameraConfig& refine_camera =
+        config.outer_detector_config.refine_camera;
+    refine_camera.camera_model =
+        optimized_scene_state.camera.NormalizedCameraModel();
+    refine_camera.distortion_model =
+        optimized_scene_state.camera.NormalizedDistortionModel();
+    refine_camera.intrinsics =
+        optimized_scene_state.camera.IntrinsicsVector();
+    refine_camera.distortion_coeffs =
+        optimized_scene_state.camera.DistortionVector();
+    refine_camera.resolution = {
+        optimized_scene_state.camera.resolution.width,
+        optimized_scene_state.camera.resolution.height};
+    config.outer_detector_config.enable_camera_aware_sphere_patch_rescue =
+        true;
+    config.outer_detector_config.camera_aware_sphere_patch_max_hamming =
+        std::max(0, baseline_options.camera_aware_outer_rescue_max_hamming);
+    config.outer_detector_config
+        .camera_aware_sphere_patch_commit_mapped_corners = true;
+  } else {
+    config.outer_detector_config.refine_camera = OuterRefineCameraConfig{};
+  }
   ApriltagInternalDetectionOptions detection_options = MakeDetectionOptions(config);
   detection_options.internal_pose_rescue_mode =
       baseline_options.internal_pose_rescue_mode;
@@ -5429,6 +6781,15 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
         if (!cache_warning.empty()) {
           dataset.warnings.push_back("Outer detection cache store warning: " + cache_warning);
         }
+      }
+    }
+    for (const OuterTagDetectionResult& detection :
+         outer_detection.detections) {
+      if (detection.attempted_local_patch_rescue) {
+        ++dataset.camera_aware_outer_rescue_attempted_board_count;
+      }
+      if (detection.used_local_patch_rescue) {
+        ++dataset.camera_aware_outer_rescue_used_board_count;
       }
     }
     InternalRegenerationFrameInput regen_input;
@@ -5590,6 +6951,9 @@ const char* ToString(
     case TrialBackendFrameBoardSelectionOptions::CandidateOrderMode
         ::RandomShuffle:
       return "random_shuffle";
+    case TrialBackendFrameBoardSelectionOptions::CandidateOrderMode
+        ::IntrinsicsInformationGreedy:
+      return "intrinsics_information_greedy";
   }
   return "score_sorted";
 }
@@ -5645,6 +7009,7 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
   result.split_label = dataset.split_label;
   result.split_signature = dataset.split_signature;
   result.camera = camera;
+  result.uniform_control_point_mode = dataset.uniform_control_point_mode;
 
   if (!dataset.success) {
     result.failure_reason =
@@ -5693,7 +7058,14 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
 
       std::vector<Eigen::Vector3d> outer_targets;
       std::vector<cv::Point2f> outer_pixels;
+      std::vector<Eigen::Vector3d> all_targets;
+      std::vector<cv::Point2f> all_pixels;
+      all_targets.reserve(board.points.size());
+      all_pixels.reserve(board.points.size());
       for (const CalibrationEvaluationPointObservation& point : board.points) {
+        all_targets.push_back(point.target_xyz_board);
+        all_pixels.emplace_back(static_cast<float>(point.image_xy.x()),
+                                static_cast<float>(point.image_xy.y()));
         if (IsOuterPoint(point)) {
           outer_targets.push_back(point.target_xyz_board);
           outer_pixels.push_back(
@@ -5701,13 +7073,19 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
                           static_cast<float>(point.image_xy.y())));
         }
       }
-      if (outer_targets.size() < 4) {
+      const std::vector<Eigen::Vector3d>& pose_targets =
+          dataset.uniform_control_point_mode ? all_targets : outer_targets;
+      const std::vector<cv::Point2f>& pose_pixels =
+          dataset.uniform_control_point_mode ? all_pixels : outer_pixels;
+      if (pose_targets.size() < 4) {
         ++result.pose_only_refit_attempt_count;
         ++frame_pose_refit_attempt_count;
-        board_diag.failure_reason = "insufficient_outer_pose_fit_points";
+        board_diag.failure_reason = dataset.uniform_control_point_mode
+                                        ? "insufficient_control_points"
+                                        : "insufficient_outer_pose_fit_points";
         result.board_observation_diagnostics.push_back(board_diag);
         result.warnings.push_back(
-            "Skipped board observation without four outer pose-fit points: frame=" +
+            "Skipped board observation without enough pose-fit points: frame=" +
             frame.frame_label + " board=" + std::to_string(board.board_id));
         continue;
       }
@@ -5716,12 +7094,12 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
       double pose_fit_outer_rmse = 0.0;
       ++result.pose_only_refit_attempt_count;
       ++frame_pose_refit_attempt_count;
-      if (!EstimatePoseForBenchmarkRefit(camera, outer_targets, outer_pixels,
+      if (!EstimatePoseForBenchmarkRefit(camera, pose_targets, pose_pixels,
                                          &T_camera_board, &pose_fit_outer_rmse)) {
         board_diag.failure_reason = "pose_only_refit_failed";
         result.board_observation_diagnostics.push_back(board_diag);
         result.warnings.push_back(
-            "Outer-only pose refit failed: frame=" + frame.frame_label + " board=" +
+            "Pose refit failed: frame=" + frame.frame_label + " board=" +
             std::to_string(board.board_id));
         continue;
       }
@@ -5732,50 +7110,48 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
       frame_pose_fit_outer_squared_rmse +=
           pose_fit_outer_rmse * pose_fit_outer_rmse;
       board_diag.pose_only_refit_success = true;
+      board_diag.T_camera_board = T_camera_board.matrix();
       board_diag.pose_fit_outer_rmse = pose_fit_outer_rmse;
 
-      std::vector<Eigen::Vector3d> all_targets;
-      std::vector<cv::Point2f> all_pixels;
-      all_targets.reserve(board.points.size());
-      all_pixels.reserve(board.points.size());
-      for (const CalibrationEvaluationPointObservation& point : board.points) {
-        all_targets.push_back(point.target_xyz_board);
-        all_pixels.push_back(
-            cv::Point2f(static_cast<float>(point.image_xy.x()),
-                        static_cast<float>(point.image_xy.y())));
-      }
       board_diag.all_point_pose_refit_point_count =
           static_cast<int>(all_targets.size());
       Eigen::Isometry3d T_camera_board_all_points =
-          Eigen::Isometry3d::Identity();
-      double all_point_pose_refit_rmse = 0.0;
-      if (all_targets.size() >= 4 &&
+          dataset.uniform_control_point_mode
+              ? T_camera_board
+              : Eigen::Isometry3d::Identity();
+      double all_point_pose_refit_rmse = dataset.uniform_control_point_mode
+                                             ? pose_fit_outer_rmse
+                                             : 0.0;
+      if (dataset.uniform_control_point_mode ||
+          (all_targets.size() >= 4 &&
           EstimatePoseForBenchmarkRefit(camera, all_targets, all_pixels,
                                         &T_camera_board_all_points,
-                                        &all_point_pose_refit_rmse)) {
+                                        &all_point_pose_refit_rmse))) {
         board_diag.all_point_pose_refit_success = true;
         board_diag.all_point_pose_refit_rmse = all_point_pose_refit_rmse;
-        double all_point_internal_squared_error = 0.0;
-        int all_point_internal_count = 0;
-        for (const CalibrationEvaluationPointObservation& point : board.points) {
-          if (point.point_type != JointPointType::Internal) {
-            continue;
+        if (!dataset.uniform_control_point_mode) {
+          double all_point_internal_squared_error = 0.0;
+          int all_point_internal_count = 0;
+          for (const CalibrationEvaluationPointObservation& point : board.points) {
+            if (point.point_type != JointPointType::Internal) {
+              continue;
+            }
+            Eigen::Vector2d predicted = Eigen::Vector2d::Zero();
+            if (!camera_model.vsEuclideanToKeypoint(
+                    T_camera_board_all_points * point.target_xyz_board,
+                    &predicted)) {
+              continue;
+            }
+            all_point_internal_squared_error +=
+                (predicted - point.image_xy).squaredNorm();
+            ++all_point_internal_count;
           }
-          Eigen::Vector2d predicted = Eigen::Vector2d::Zero();
-          if (!camera_model.vsEuclideanToKeypoint(
-                  T_camera_board_all_points * point.target_xyz_board,
-                  &predicted)) {
-            continue;
-          }
-          all_point_internal_squared_error +=
-              (predicted - point.image_xy).squaredNorm();
-          ++all_point_internal_count;
+          board_diag.all_point_pose_refit_internal_rmse =
+              all_point_internal_count > 0
+                  ? std::sqrt(all_point_internal_squared_error /
+                              static_cast<double>(all_point_internal_count))
+                  : 0.0;
         }
-        board_diag.all_point_pose_refit_internal_rmse =
-            all_point_internal_count > 0
-                ? std::sqrt(all_point_internal_squared_error /
-                            static_cast<double>(all_point_internal_count))
-                : 0.0;
       }
 
       double board_squared_error = 0.0;
@@ -5823,7 +7199,9 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
           total_squared_error_excluding_board += squared_error;
           ++total_point_count_excluding_board;
         }
-        if (point.point_type == JointPointType::Outer) {
+        if (dataset.uniform_control_point_mode) {
+          // Checkerboard control points are one homogeneous measurement set.
+        } else if (point.point_type == JointPointType::Outer) {
           outer_squared_error += squared_error;
           board_outer_squared_error += squared_error;
           frame_outer_squared_error += squared_error;
@@ -5934,6 +7312,15 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
 
   result.overall_rmse =
       std::sqrt(total_squared_error / static_cast<double>(total_point_count));
+  std::vector<double> residual_norms;
+  residual_norms.reserve(result.point_diagnostics.size());
+  for (const CameraModelRefitPointDiagnostics& point :
+       result.point_diagnostics) {
+    if (std::isfinite(point.residual_norm)) {
+      residual_norms.push_back(point.residual_norm);
+    }
+  }
+  result.p95_reprojection_error = ComputePercentile(residual_norms, 0.95);
   result.outer_only_rmse =
       outer_point_count > 0
           ? std::sqrt(outer_squared_error / static_cast<double>(outer_point_count))
@@ -5963,6 +7350,100 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
       &result.mean_residual_y,
       &result.std_residual_x,
       &result.std_residual_y);
+  result.success = true;
+  return result;
+}
+
+MultiBoardPoseOrientationEvaluationResult
+Stage5Benchmark::EvaluateMultiBoardPoseOrientation(
+    const CalibrationEvaluationDataset& dataset,
+    const CalibrationSceneState& final_scene,
+    const CalibrationSceneState& ground_truth_scene) const {
+  MultiBoardPoseOrientationEvaluationResult result;
+  if (!dataset.success || !final_scene.IsValid() ||
+      !ground_truth_scene.IsValid()) {
+    result.failure_reason =
+        "Multiboard pose orientation evaluation requires valid datasets and scenes.";
+    return result;
+  }
+
+  for (const CalibrationEvaluationFrameInput& frame : dataset.frames) {
+    // Imported holdout frames are offset by the Stage5 interchange loader to
+    // avoid collisions with training ids. Their GT scene uses source ids.
+    const int ground_truth_frame_index =
+        frame.frame_index >= 1000000 ? frame.frame_index - 1000000
+                                     : frame.frame_index;
+    const JointSceneFrameState* gt_frame = nullptr;
+    for (const JointSceneFrameState& candidate : ground_truth_scene.frames) {
+      if (candidate.frame_index == ground_truth_frame_index &&
+          candidate.initialized) {
+        gt_frame = &candidate;
+        break;
+      }
+    }
+    if (gt_frame == nullptr) {
+      continue;
+    }
+    ++result.evaluated_frame_count;
+    std::vector<Eigen::Vector3d> reference_targets;
+    std::vector<cv::Point2f> outer_pixels;
+    for (const CalibrationEvaluationBoardObservation& observation :
+         frame.board_observations) {
+      const JointSceneBoardState* board = nullptr;
+      for (const JointSceneBoardState& candidate : final_scene.boards) {
+        if (candidate.board_id == observation.board_id && candidate.initialized) {
+          board = &candidate;
+          break;
+        }
+      }
+      if (board == nullptr) {
+        continue;
+      }
+      const Eigen::Isometry3d T_reference_board(
+          board->T_reference_board);
+      for (const CalibrationEvaluationPointObservation& point :
+           observation.points) {
+        if (point.point_type != JointPointType::Outer) {
+          continue;
+        }
+        reference_targets.push_back(
+            T_reference_board * point.target_xyz_board);
+        outer_pixels.emplace_back(static_cast<float>(point.image_xy.x()),
+                                  static_cast<float>(point.image_xy.y()));
+      }
+    }
+    if (reference_targets.size() < 4u) {
+      continue;
+    }
+    Eigen::Isometry3d T_camera_reference = Eigen::Isometry3d::Identity();
+    double pose_rmse = 0.0;
+    if (!EstimatePoseForBenchmarkRefit(final_scene.camera, reference_targets,
+                                       outer_pixels, &T_camera_reference,
+                                       &pose_rmse)) {
+      continue;
+    }
+    const Eigen::Matrix3d R_delta =
+        Eigen::Isometry3d(gt_frame->T_camera_reference).rotation().transpose() *
+        T_camera_reference.rotation();
+    const double cosine = std::max(
+        -1.0, std::min(1.0, 0.5 * (R_delta.trace() - 1.0)));
+    constexpr double kDegreesPerRadian = 57.2957795130823208768;
+    result.orientation_errors_deg.push_back(
+        std::acos(cosine) * kDegreesPerRadian);
+    ++result.pose_success_count;
+  }
+  result.pose_success_rate = result.evaluated_frame_count > 0
+      ? static_cast<double>(result.pose_success_count) /
+            static_cast<double>(result.evaluated_frame_count)
+      : 0.0;
+  if (result.orientation_errors_deg.empty()) {
+    result.failure_reason = "No pose-evaluation frame could be refit.";
+    return result;
+  }
+  result.orientation_median_deg =
+      ComputePercentile(result.orientation_errors_deg, 0.50);
+  result.orientation_p95_deg =
+      ComputePercentile(result.orientation_errors_deg, 0.95);
   result.success = true;
   return result;
 }
@@ -6200,6 +7681,45 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
   report.dataset_label = input.dataset_label.empty()
                              ? input.baseline_options.dataset_label
                              : input.dataset_label;
+  if (input.use_precomputed_training_measurements) {
+    report.stage5_input_mode = "babelcalib_mat_precomputed";
+    report.precomputed_training_source =
+        input.precomputed_training_measurements.source_path;
+    report.precomputed_target_mode_requested =
+        input.precomputed_training_measurements.target_mode_requested;
+    report.precomputed_target_mode_resolved =
+        input.precomputed_training_measurements.target_mode_resolved;
+    report.precomputed_board_count =
+        input.precomputed_training_measurements.board_count;
+    report.precomputed_single_board_ba_mode =
+        input.precomputed_training_measurements.single_board_mode;
+    report.precomputed_training_frame_count =
+        input.precomputed_training_measurements.measurement_result.used_frame_count;
+    report.precomputed_training_board_observation_count =
+        input.precomputed_training_measurements.measurement_result
+            .used_board_observation_count;
+    report.precomputed_training_outer_point_count =
+        input.precomputed_training_measurements.measurement_result
+            .used_outer_point_count;
+    report.precomputed_training_internal_point_count =
+        input.precomputed_training_measurements.measurement_result
+            .used_internal_point_count;
+  }
+  if (input.use_precomputed_holdout_measurements) {
+    report.precomputed_holdout_source =
+        input.precomputed_holdout_measurements.source_path;
+    report.precomputed_holdout_frame_count =
+        input.precomputed_holdout_measurements.measurement_result.used_frame_count;
+    report.precomputed_holdout_board_observation_count =
+        input.precomputed_holdout_measurements.measurement_result
+            .used_board_observation_count;
+    report.precomputed_holdout_outer_point_count =
+        input.precomputed_holdout_measurements.measurement_result
+            .used_outer_point_count;
+    report.precomputed_holdout_internal_point_count =
+        input.precomputed_holdout_measurements.measurement_result
+            .used_internal_point_count;
+  }
 
   {
     const auto stage_start = std::chrono::steady_clock::now();
@@ -6214,13 +7734,40 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
     report.failure_reason = report.split.failure_reason;
     return report;
   }
+  const auto same_frame_sequence = [](const std::vector<FrozenRound2BaselineFrameSource>& lhs,
+                                      const std::vector<FrozenRound2BaselineFrameSource>& rhs) {
+    if (lhs.size() != rhs.size()) {
+      return false;
+    }
+    for (std::size_t index = 0; index < lhs.size(); ++index) {
+      if (lhs[index].frame_label != rhs[index].frame_label ||
+          lhs[index].image_path != rhs[index].image_path) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (input.holdout_evaluate_full_training_observations &&
+      (input.use_precomputed_training_measurements ||
+       !same_frame_sequence(report.split.training_frames,
+                            report.split.holdout_frames))) {
+    report.failure_reason =
+        "Full-training-observation holdout evaluation requires identical "
+        "image-based training and holdout frame sequences.";
+    return report;
+  }
   report.split_signature = report.split.split_signature;
   report.kalibr_reference = input.kalibr_reference;
   report.external_holdout_self_frontend_prepass_used =
+      !input.use_precomputed_holdout_measurements &&
       input.use_external_holdout_self_frontend_prepass &&
       !input.external_holdout_frames.empty();
   report.external_holdout_observation_source =
-      report.external_holdout_self_frontend_prepass_used
+      input.use_precomputed_holdout_measurements
+          ? "babelcalib_mat_frozen_precomputed_measurements"
+          : input.holdout_evaluate_full_training_observations
+          ? "same_sequence_full_frontend_observations"
+          : report.external_holdout_self_frontend_prepass_used
           ? "external_holdout_self_frontend_prepass_full_measurements"
           : "training_scene_regeneration";
 
@@ -6228,7 +7775,11 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
   baseline_options.dataset_label = report.dataset_label;
   baseline_options.training_split_signature = report.split.split_signature;
   const FrozenRound2BaselinePipeline baseline_pipeline(baseline_options);
-  report.baseline_result = baseline_pipeline.Run(report.split.training_frames);
+  report.baseline_result = input.use_precomputed_training_measurements
+                               ? baseline_pipeline.RunPrecomputed(
+                                     input.precomputed_training_measurements)
+                               : baseline_pipeline.Run(
+                                     report.split.training_frames);
   report.baseline_protocol_label = report.baseline_result.baseline_protocol_label;
   if (!report.baseline_result.success) {
     report.failure_reason = report.baseline_result.failure_reason;
@@ -6250,10 +7801,15 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
 
   {
     const auto stage_start = std::chrono::steady_clock::now();
+    InternalJointRefineOptions refine_options =
+        input.internal_joint_refine_options;
+    if (input.use_precomputed_training_measurements) {
+      refine_options.mode = InternalJointRefineMode::Off;
+    }
     report.internal_joint_refine_result = ApplyInternalJointRefinement(
         report.baseline_result.final_stage5_bundle,
         frame_image_paths,
-        input.internal_joint_refine_options);
+        refine_options);
     report.runtime_breakdown.internal_joint_refine_seconds =
         ElapsedSeconds(stage_start);
   }
@@ -6267,9 +7823,14 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
 
   {
     const auto stage_start = std::chrono::steady_clock::now();
+    PreBackendObservationFilterOptions pre_backend_filter_options =
+        input.pre_backend_filter_options;
+    if (report.precomputed_single_board_ba_mode) {
+      pre_backend_filter_options.mode = PreBackendFilterMode::Off;
+    }
     report.pre_backend_filter_result = ApplyPreBackendObservationFilter(
         report.internal_joint_refine_result.curated_bundle,
-        input.pre_backend_filter_options);
+        pre_backend_filter_options);
     report.runtime_breakdown.pre_backend_filter_seconds =
         ElapsedSeconds(stage_start);
   }
@@ -6283,10 +7844,15 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
 
   {
     const auto stage_start = std::chrono::steady_clock::now();
+    InternalBlurObservationFilterOptions blur_filter_options =
+        input.internal_blur_filter_options;
+    if (input.use_precomputed_training_measurements) {
+      blur_filter_options.mode = InternalBlurFilterMode::Off;
+    }
     report.internal_blur_filter_result = ApplyInternalBlurObservationFilter(
         report.pre_backend_filter_result.curated_bundle,
         frame_image_paths,
-        input.internal_blur_filter_options);
+        blur_filter_options);
     report.runtime_breakdown.internal_blur_filter_seconds =
         ElapsedSeconds(stage_start);
   }
@@ -6300,11 +7866,16 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
 
   {
     const auto stage_start = std::chrono::steady_clock::now();
+    InternalBlurBoardWeightOptions blur_weight_options =
+        input.internal_blur_board_weight_options;
+    if (input.use_precomputed_training_measurements) {
+      blur_weight_options.mode = InternalBlurBoardWeightMode::Off;
+    }
     report.internal_blur_board_weight_result =
         ApplyInternalBlurBoardWeights(
             report.internal_blur_filter_result.curated_bundle,
             frame_image_paths,
-            input.internal_blur_board_weight_options);
+            blur_weight_options);
     report.runtime_breakdown.internal_blur_board_weight_seconds =
         ElapsedSeconds(stage_start);
   }
@@ -6318,10 +7889,15 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
 
   {
     const auto stage_start = std::chrono::steady_clock::now();
+    InternalObservationWeightOptions observation_weight_options =
+        input.internal_observation_weight_options;
+    if (report.precomputed_single_board_ba_mode) {
+      observation_weight_options.mode = InternalObservationWeightMode::Off;
+    }
     report.internal_observation_weight_result =
         ApplyInternalObservationWeights(
             report.internal_blur_board_weight_result.curated_bundle,
-            input.internal_observation_weight_options);
+            observation_weight_options);
     report.runtime_breakdown.internal_observation_weight_seconds =
         ElapsedSeconds(stage_start);
   }
@@ -6333,30 +7909,244 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
     return report;
   }
 
-  const CalibrationStateBundle& curated_backend_seed_bundle =
+  CalibrationStateBundle curated_backend_seed_bundle =
       report.internal_observation_weight_result.curated_bundle;
+  if (input.enable_large_intrinsic_perturbation) {
+    report.large_intrinsic_perturbation.outer_only_after_application =
+        input.large_intrinsic_perturbation_outer_only_after_application;
+    report.large_intrinsic_perturbation
+        .frozen_internal_point_count_before_ablation =
+        curated_backend_seed_bundle.measurement_dataset
+            .accepted_internal_point_count;
+    report.large_intrinsic_perturbation.frozen_observation_fingerprint =
+        LargePerturbationObservationFingerprint(
+            curated_backend_seed_bundle.measurement_dataset);
+    if (!ApplyLargeDsIntrinsicPerturbation(
+            input, &curated_backend_seed_bundle,
+            &report.large_intrinsic_perturbation)) {
+      report.failure_reason =
+          report.large_intrinsic_perturbation.failure_reason.empty()
+              ? "Failed to apply large intrinsic perturbation before selection."
+              : report.large_intrinsic_perturbation.failure_reason;
+      return report;
+    }
+    if (input.large_intrinsic_perturbation_outer_only_after_application) {
+      DisableFrozenInternalObservationsForPerturbationAblation(
+          &curated_backend_seed_bundle);
+      if (!curated_backend_seed_bundle.IsReadyForBackend() ||
+          curated_backend_seed_bundle.measurement_dataset
+                  .accepted_internal_point_count != 0) {
+        report.failure_reason =
+            "Failed to remove frozen internal residuals after perturbation.";
+        return report;
+      }
+    }
+    report.large_intrinsic_perturbation
+        .seed_internal_point_count_after_ablation =
+        curated_backend_seed_bundle.measurement_dataset
+            .accepted_internal_point_count;
+  }
   const FrozenRoundArtifacts& trial_source_artifacts =
       report.baseline_result.round2_available
           ? report.baseline_result.round2
           : report.baseline_result.round1;
-  const CalibrationStateBundle trial_candidate_bundle =
+  const bool single_board_dense_grid_profile =
+      input.use_precomputed_training_measurements &&
+      input.precomputed_training_measurements.single_board_mode &&
+      input.trial_backend_selection_options.enabled;
+  CalibrationStateBundle trial_candidate_bundle =
       input.trial_backend_selection_options.enabled
           ? BuildCandidateBackendPoolBundle(
                 curated_backend_seed_bundle,
                 trial_source_artifacts)
           : curated_backend_seed_bundle;
+  if (input.enable_large_intrinsic_perturbation &&
+      input.large_intrinsic_perturbation_outer_only_after_application) {
+    DisableFrozenInternalObservationsForPerturbationAblation(
+        &trial_candidate_bundle);
+    if (!trial_candidate_bundle.IsReadyForBackend() ||
+        trial_candidate_bundle.measurement_dataset
+                .accepted_internal_point_count != 0) {
+      report.failure_reason =
+          "Failed to remove frozen internal residuals from the perturbation candidate pool.";
+      return report;
+    }
+  }
+  if (input.enable_large_intrinsic_perturbation) {
+    report.large_intrinsic_perturbation
+        .candidate_pool_internal_point_count_after_ablation =
+        trial_candidate_bundle.measurement_dataset
+            .accepted_internal_point_count;
+  }
+  if (input.enable_large_intrinsic_perturbation) {
+    report.large_intrinsic_perturbation.selection_seed_camera =
+        curated_backend_seed_bundle.scene_state.camera;
+    report.large_intrinsic_perturbation.selection_candidate_camera =
+        trial_candidate_bundle.scene_state.camera;
+    report.large_intrinsic_perturbation.selection_seed_matches_perturbed_camera =
+        SameLargePerturbationCamera(
+            report.large_intrinsic_perturbation.selection_seed_camera,
+            report.large_intrinsic_perturbation.perturbed_camera);
+    report.large_intrinsic_perturbation
+        .selection_candidate_matches_perturbed_camera =
+        SameLargePerturbationCamera(
+            report.large_intrinsic_perturbation.selection_candidate_camera,
+            report.large_intrinsic_perturbation.perturbed_camera);
+    if (!report.large_intrinsic_perturbation
+             .selection_seed_matches_perturbed_camera ||
+        !report.large_intrinsic_perturbation
+             .selection_candidate_matches_perturbed_camera) {
+      report.failure_reason =
+          "Large DS perturbation was not preserved at the selection boundary.";
+      return report;
+    }
+  }
+  if (single_board_dense_grid_profile) {
+    // A checkerboard target view is atomic: every valid imported grid point
+    // belongs to the same incremental batch. Do not inherit point-level
+    // filtering from the generic multi-board round-1 selection.
+    trial_candidate_bundle.measurement_dataset.frames =
+        trial_source_artifacts.measurement_result.frames;
+    trial_candidate_bundle.measurement_dataset.solver_observations =
+        trial_source_artifacts.measurement_result.solver_observations;
+    trial_candidate_bundle.measurement_dataset.source_stage_label =
+        trial_source_artifacts.measurement_result.frames.empty()
+            ? trial_candidate_bundle.measurement_dataset.source_stage_label
+            : trial_candidate_bundle.measurement_dataset.source_stage_label +
+                  "_single_board_dense_grid_atomic_views";
+    ReevaluateCalibrationStateBundle(&trial_candidate_bundle);
+  }
+
+  TrialBackendFrameBoardSelectionOptions effective_selection_options =
+      input.trial_backend_selection_options;
+  if (single_board_dense_grid_profile) {
+    effective_selection_options.single_board_dense_grid_profile = true;
+    effective_selection_options.selection_mode =
+        TrialBackendFrameBoardSelectionOptions::SelectionMode::KalibrStyleBatch;
+    effective_selection_options.budget_mode =
+        TrialBackendFrameBoardSelectionOptions::BudgetMode::KalibrStyle;
+    if (!effective_selection_options.candidate_order_mode_explicit) {
+      effective_selection_options.candidate_order_mode =
+          TrialBackendFrameBoardSelectionOptions::CandidateOrderMode::
+              RandomShuffle;
+    }
+    effective_selection_options.candidate_batch_granularity =
+        TrialBackendFrameBoardSelectionOptions::CandidateBatchGranularity::Frame;
+    effective_selection_options.acceptance_policy =
+        KalibrStyleBatchAcceptancePolicy::KalibrInformationGain;
+    // Kalibr's command-line default is miTol=0.2; miTol=-1 is the explicit
+    // all-view override. Keep the same default boundary here.
+    if (!effective_selection_options
+             .acceptance_information_gain_threshold_explicit) {
+      effective_selection_options.acceptance_information_gain_threshold = 0.2;
+    }
+    effective_selection_options.optimize_intrinsics_in_trial = true;
+    effective_selection_options.delayed_intrinsics_release_in_trial = false;
+    effective_selection_options.persistent_intrinsics_anchor_prior_enabled = false;
+    effective_selection_options.persistent_max_focal_relative_step = 0.0;
+    effective_selection_options.persistent_max_principal_step_px = 0.0;
+    effective_selection_options.persistent_max_xi_alpha_step = 0.0;
+    effective_selection_options.frame_cohesion_enabled = false;
+    effective_selection_options.use_consistency_score = false;
+    effective_selection_options.max_accepted_per_board = 0;
+    effective_selection_options.max_accepted_per_frame = 0;
+    effective_selection_options.max_iterations = 50;
+    if (!effective_selection_options.candidate_shuffle_seed_set) {
+      effective_selection_options.candidate_shuffle_seed_set = true;
+      effective_selection_options.candidate_shuffle_seed = 1337u;
+    }
+  }
 
   CalibrationStateBundle exact_trial_candidate_bundle;
+  CalibrationStateBundle single_board_seed_bundle;
+  CalibrationStateBundle controlled_seed_override_bundle;
+  std::string checkerboard_seed_strategy = "not_applicable";
+  int checkerboard_seed_target_frame_count = 0;
+  double checkerboard_seed_fisher_logdet = 0.0;
+  double checkerboard_seed_fisher_rank_proxy = 0.0;
   const CalibrationStateBundle* selection_seed_bundle =
       &curated_backend_seed_bundle;
   const CalibrationStateBundle* selection_candidate_bundle =
       &trial_candidate_bundle;
   const bool force_list_exact_input =
-      input.trial_backend_selection_options.force_include_list_is_exact_input &&
-      (!input.trial_backend_selection_options.force_include_frame_board_keys
+      effective_selection_options.force_include_list_is_exact_input &&
+      (!effective_selection_options.force_include_frame_board_keys
             .empty() ||
-       !input.trial_backend_selection_options.force_include_frame_label_board_keys
+       !effective_selection_options.force_include_frame_label_board_keys
             .empty());
+  const bool controlled_seed_override =
+      !effective_selection_options.seed_override_frame_board_keys.empty() ||
+      !effective_selection_options.seed_override_frame_label_board_keys.empty();
+  if (controlled_seed_override) {
+    std::set<FrameBoardKey> seed_override_keys;
+    for (const JointMeasurementFrameResult& frame :
+         trial_candidate_bundle.measurement_dataset.frames) {
+      for (const JointBoardObservation& board : frame.board_observations) {
+        const FrameBoardKey key(frame.frame_index, board.board_id);
+        if (effective_selection_options.seed_override_frame_board_keys.count(key) > 0 ||
+            effective_selection_options.seed_override_frame_label_board_keys.count(
+                std::make_pair(frame.frame_label, board.board_id)) > 0) {
+          seed_override_keys.insert(key);
+        }
+      }
+    }
+    controlled_seed_override_bundle = BuildBundleForAcceptedFrameBoardKeys(
+        trial_candidate_bundle, trial_candidate_bundle, seed_override_keys,
+        trial_candidate_bundle.measurement_dataset.source_stage_label +
+            "_controlled_seed_override");
+    if (!controlled_seed_override_bundle.IsReadyForBackend()) {
+      report.failure_reason =
+          "Controlled persistent seed override produced no valid backend input.";
+      return report;
+    }
+    controlled_seed_override_bundle.warnings.push_back(
+        "Stage5 used a controlled frame-board seed override for a paired perturbation experiment.");
+    selection_seed_bundle = &controlled_seed_override_bundle;
+  }
+  if (single_board_dense_grid_profile && !force_list_exact_input) {
+    const std::set<FrameBoardKey> candidate_keys =
+        CollectAcceptedFrameBoardKeys(
+            trial_candidate_bundle.measurement_dataset);
+    std::set<FrameBoardKey> selected_seed_keys =
+        CollectAcceptedFrameBoardKeys(
+            curated_backend_seed_bundle.measurement_dataset);
+    if (selected_seed_keys.size() < 3 && candidate_keys.size() >= 3) {
+      for (const FrameBoardKey& key : candidate_keys) {
+        selected_seed_keys.insert(key);
+        if (selected_seed_keys.size() >= 3) {
+          break;
+        }
+      }
+    }
+    if (!selected_seed_keys.empty()) {
+      checkerboard_seed_target_frame_count =
+          static_cast<int>(selected_seed_keys.size());
+      Eigen::Matrix<double, 6, 6> cumulative_fisher =
+          Eigen::Matrix<double, 6, 6>::Zero();
+      for (const FrameBoardKey& key : selected_seed_keys) {
+        const IntrinsicsJacobianInformationSummary info =
+            ComputeIntrinsicsJacobianInformation(trial_candidate_bundle, key);
+        if (info.available) {
+          cumulative_fisher += info.fisher;
+        }
+      }
+      checkerboard_seed_strategy =
+          "existing_stage5_coverage_observability_selection_with_pose_marginalized_fisher_audit";
+      checkerboard_seed_fisher_logdet =
+          RegularizedFisherLogDet(cumulative_fisher);
+      checkerboard_seed_fisher_rank_proxy =
+          FisherRankProxy(cumulative_fisher);
+      single_board_seed_bundle = BuildBundleForAcceptedFrameBoardKeys(
+          trial_candidate_bundle,
+          trial_candidate_bundle,
+          selected_seed_keys,
+          trial_candidate_bundle.measurement_dataset.source_stage_label +
+              "_single_board_dense_grid_existing_selection_seed");
+      if (single_board_seed_bundle.IsReadyForBackend()) {
+        selection_seed_bundle = &single_board_seed_bundle;
+      }
+    }
+  }
   if (force_list_exact_input) {
     std::set<FrameBoardKey> exact_keys;
     for (const JointMeasurementFrameResult& frame :
@@ -6365,7 +8155,7 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
         const FrameBoardKey key(frame.frame_index, board.board_id);
         if (IsForceIncludeFrameBoardCandidate(
                 key, frame.frame_label,
-                input.trial_backend_selection_options)) {
+                effective_selection_options)) {
           exact_keys.insert(key);
         }
       }
@@ -6381,13 +8171,39 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
     selection_seed_bundle = &exact_trial_candidate_bundle;
     selection_candidate_bundle = &exact_trial_candidate_bundle;
   }
+  AslamBackendCalibrationOptions effective_selection_runner_options =
+      input.selection_backend_runner_options;
+  effective_selection_runner_options.uniform_control_point_mode =
+      single_board_dense_grid_profile;
+  if (single_board_dense_grid_profile &&
+      effective_selection_options.checkerboard_huber_delta_pixels > 0.0) {
+    effective_selection_runner_options.outer_huber_delta_pixels =
+        effective_selection_options.checkerboard_huber_delta_pixels;
+    effective_selection_runner_options.internal_huber_delta_pixels =
+        effective_selection_options.checkerboard_huber_delta_pixels;
+  }
+  effective_selection_runner_options.use_point_type_residual_split =
+      single_board_dense_grid_profile
+          ? false
+          : effective_selection_runner_options.use_point_type_residual_split;
   report.trial_backend_selection_result =
       ApplyTrialBackendFrameBoardSelection(
           *selection_seed_bundle,
           *selection_candidate_bundle,
           input.backend_options,
-          input.trial_backend_selection_options,
-          input.selection_backend_runner_options);
+          effective_selection_options,
+          effective_selection_runner_options);
+  report.trial_backend_selection_result
+      .checkerboard_pose_marginalized_fisher =
+      single_board_dense_grid_profile;
+  report.trial_backend_selection_result.checkerboard_seed_strategy =
+      checkerboard_seed_strategy;
+  report.trial_backend_selection_result.checkerboard_seed_target_frame_count =
+      checkerboard_seed_target_frame_count;
+  report.trial_backend_selection_result.checkerboard_seed_fisher_logdet =
+      checkerboard_seed_fisher_logdet;
+  report.trial_backend_selection_result.checkerboard_seed_fisher_rank_proxy =
+      checkerboard_seed_fisher_rank_proxy;
   report.trial_backend_selection_result.source_joint_input_frame_count =
       static_cast<int>(trial_source_artifacts.joint_inputs.size());
   const HierarchicalMeasurementCounts source_hierarchical_counts =
@@ -6477,19 +8293,27 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
       report.warnings.end(),
       report.backend_input_ablation_result.warnings.begin(),
       report.backend_input_ablation_result.warnings.end());
-  const CalibrationStateBundle& final_backend_bundle =
+  CalibrationStateBundle final_backend_bundle =
       backend_input_ablation.bundle;
   report.backend_problem_input = BuildBackendProblemInput(
       final_backend_bundle,
       input.committed_backend_evaluation_options);
   {
     const auto stage_start = std::chrono::steady_clock::now();
-    report.training_dataset =
-        BuildTrainingEvaluationDataset(report.baseline_result.final_stage5_bundle);
-    report.training_dataset.internal_regeneration_results =
-        report.baseline_result.round2_available
-            ? report.baseline_result.round2.regeneration_results
-            : report.baseline_result.round1.regeneration_results;
+    if (input.use_precomputed_training_measurements) {
+      report.training_dataset = BuildEvaluationDatasetFromMeasurementResult(
+          input.precomputed_training_measurements.measurement_result,
+          std::vector<InternalRegenerationFrameResult>{},
+          report.dataset_label + "_precomputed_training", "training",
+          report.split.split_signature + "_frozen_precomputed_training");
+    } else {
+      report.training_dataset = BuildTrainingEvaluationDataset(
+          report.baseline_result.final_stage5_bundle);
+      report.training_dataset.internal_regeneration_results =
+          report.baseline_result.round2_available
+              ? report.baseline_result.round2.regeneration_results
+              : report.baseline_result.round1.regeneration_results;
+    }
     report.runtime_breakdown.training_dataset_build_seconds =
         ElapsedSeconds(stage_start);
   }
@@ -6498,7 +8322,34 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
     return report;
   }
 
-  if (report.external_holdout_self_frontend_prepass_used) {
+  if (input.use_precomputed_holdout_measurements) {
+    const auto stage_start = std::chrono::steady_clock::now();
+    report.holdout_dataset = BuildEvaluationDatasetFromMeasurementResult(
+        input.precomputed_holdout_measurements.measurement_result,
+        std::vector<InternalRegenerationFrameResult>{},
+        input.external_holdout_label.empty()
+            ? report.dataset_label + "_precomputed_holdout"
+            : input.external_holdout_label,
+        "holdout", report.split.split_signature + "_frozen_precomputed");
+    report.runtime_breakdown.holdout_dataset_build_seconds =
+        ElapsedSeconds(stage_start);
+  } else if (input.holdout_evaluate_full_training_observations) {
+    const auto stage_start = std::chrono::steady_clock::now();
+    const FrozenRoundArtifacts& training_frontend_artifacts =
+        report.baseline_result.round2_available
+            ? report.baseline_result.round2
+            : report.baseline_result.round1;
+    report.holdout_dataset = BuildEvaluationDatasetFromMeasurementResult(
+        training_frontend_artifacts.measurement_result,
+        training_frontend_artifacts.regeneration_results,
+        report.dataset_label + "_same_sequence_full_frontend",
+        "holdout",
+        report.split.split_signature +
+            "_same_sequence_full_frontend_observations",
+        true);
+    report.runtime_breakdown.holdout_dataset_build_seconds =
+        ElapsedSeconds(stage_start);
+  } else if (report.external_holdout_self_frontend_prepass_used) {
     const auto stage_start = std::chrono::steady_clock::now();
     FrozenRound2BaselineOptions holdout_prepass_options = baseline_options;
     holdout_prepass_options.outer_only_ablation_mode = false;
@@ -6561,6 +8412,10 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
     report.failure_reason = report.holdout_dataset.failure_reason;
     return report;
   }
+  if (report.precomputed_single_board_ba_mode) {
+    report.training_dataset.uniform_control_point_mode = true;
+    report.holdout_dataset.uniform_control_point_mode = true;
+  }
 
   OuterBootstrapCameraIntrinsics kalibr_intrinsics;
   std::string intrinsics_error;
@@ -6600,6 +8455,22 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
       report.training_dataset,
       final_backend_camera,
       "ours");
+  const OuterBootstrapCameraIntrinsics& initialization_camera =
+      report.baseline_result.auto_camera_initialization.selected_camera;
+  report.initialization_training_evaluation = EvaluateCameraModel(
+      report.training_dataset, initialization_camera, "initialization_only");
+  report.initialization_holdout_evaluation = EvaluateCameraModel(
+      report.holdout_dataset, initialization_camera, "initialization_only");
+  if (report.large_intrinsic_perturbation.enabled) {
+    report.perturbation_boundary_training_evaluation = EvaluateCameraModel(
+        report.training_dataset,
+        report.large_intrinsic_perturbation.perturbed_camera,
+        "perturbation_boundary");
+    report.perturbation_boundary_holdout_evaluation = EvaluateCameraModel(
+        report.holdout_dataset,
+        report.large_intrinsic_perturbation.perturbed_camera,
+        "perturbation_boundary");
+  }
   report.kalibr_training_evaluation =
       EvaluateCameraModel(report.training_dataset, kalibr_intrinsics, "kalibr");
   report.our_holdout_evaluation = EvaluateCameraModel(
@@ -6608,6 +8479,253 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
       "ours");
   report.kalibr_holdout_evaluation =
       EvaluateCameraModel(report.holdout_dataset, kalibr_intrinsics, "kalibr");
+
+  const std::string checkpoint_camera_family =
+      final_backend_camera.NormalizedFamilyString();
+  if ((checkpoint_camera_family == "ds-none" ||
+       checkpoint_camera_family == "pinhole-equi" ||
+       checkpoint_camera_family == "omni-none")) {
+    std::vector<const TrialBackendFrameBoardObservationDecision*>
+        accepted_checkpoints;
+    for (const TrialBackendFrameBoardObservationDecision& decision :
+         report.trial_backend_selection_result.decisions) {
+      if (decision.persistent_incremental_attempt_order >= 0 &&
+          decision.persistent_incremental_batch_accepted) {
+        accepted_checkpoints.push_back(&decision);
+      }
+    }
+    std::sort(
+        accepted_checkpoints.begin(), accepted_checkpoints.end(),
+        [](const TrialBackendFrameBoardObservationDecision* lhs,
+           const TrialBackendFrameBoardObservationDecision* rhs) {
+          return lhs->persistent_incremental_attempt_order <
+                 rhs->persistent_incremental_attempt_order;
+        });
+    for (const TrialBackendFrameBoardObservationDecision* decision :
+         accepted_checkpoints) {
+      PersistentCameraCheckpointEvaluation checkpoint;
+      checkpoint.attempt_order =
+          decision->persistent_incremental_attempt_order;
+      checkpoint.frame_index = decision->frame_index;
+      checkpoint.frame_label = decision->frame_label;
+      checkpoint.information_gain =
+          decision->persistent_incremental_information_gain;
+      checkpoint.camera = final_backend_camera;
+      checkpoint.camera.xi =
+          decision->persistent_incremental_camera_xi_after;
+      checkpoint.camera.alpha =
+          decision->persistent_incremental_camera_alpha_after;
+      checkpoint.camera.fu =
+          decision->persistent_incremental_camera_fu_after;
+      checkpoint.camera.fv =
+          decision->persistent_incremental_camera_fv_after;
+      checkpoint.camera.cu =
+          decision->persistent_incremental_camera_cu_after;
+      checkpoint.camera.cv =
+          decision->persistent_incremental_camera_cv_after;
+      if (checkpoint_camera_family == "pinhole-equi") {
+        checkpoint.camera.distortion_coeffs = {
+            decision->persistent_incremental_camera_k1_after,
+            decision->persistent_incremental_camera_k2_after,
+            decision->persistent_incremental_camera_k3_after,
+            decision->persistent_incremental_camera_k4_after};
+      }
+      checkpoint.training_evaluation = EvaluateCameraModel(
+          report.training_dataset, checkpoint.camera,
+          "persistent_checkpoint_training");
+      checkpoint.holdout_evaluation = EvaluateCameraModel(
+          report.holdout_dataset, checkpoint.camera,
+          "persistent_checkpoint_holdout");
+      report.persistent_camera_checkpoint_evaluations.push_back(
+          std::move(checkpoint));
+    }
+
+    // Multi-board runs expose checkpoints strictly as diagnostics. The robust
+    // checkpoint selector below was designed for one board with independent
+    // per-view poses and must never replace a committed multi-board scene.
+    if (report.precomputed_single_board_ba_mode) {
+    const EvaluationRobustSummary initialization_robust =
+        SummarizeEvaluationRobustness(
+            report.initialization_training_evaluation);
+    OuterBootstrapCameraIntrinsics selected_camera = initialization_camera;
+    CameraModelRefitEvaluationResult selected_training_evaluation =
+        report.initialization_training_evaluation;
+    EvaluationRobustSummary selected_robust = initialization_robust;
+    std::string selected_label = "initialization_only";
+    int selected_attempt_order = -1;
+    bool selected_by_early_cross_fold_consensus = false;
+    std::size_t first_consensus_checkpoint_index =
+        report.persistent_camera_checkpoint_evaluations.size();
+    constexpr std::size_t kConsensusRefinementWindow = 4;
+    for (std::size_t checkpoint_index = 0;
+         checkpoint_index <
+         report.persistent_camera_checkpoint_evaluations.size();
+         ++checkpoint_index) {
+      const PersistentCameraCheckpointEvaluation& checkpoint =
+          report.persistent_camera_checkpoint_evaluations[checkpoint_index];
+      if (selected_by_early_cross_fold_consensus &&
+          checkpoint_index > first_consensus_checkpoint_index +
+                                 kConsensusRefinementWindow) {
+        break;
+      }
+      const EvaluationRobustSummary candidate_robust =
+          SummarizeEvaluationRobustness(checkpoint.training_evaluation);
+      const bool finite_candidate =
+          std::isfinite(candidate_robust.frame_median_rmse) &&
+          std::isfinite(candidate_robust.frame_p90_rmse) &&
+          std::isfinite(candidate_robust.huber15_rmse) &&
+          std::isfinite(candidate_robust.fold_median_mean_rmse) &&
+          std::isfinite(candidate_robust.fold_median_max_rmse);
+      const bool cross_fold_consensus =
+          finite_candidate &&
+          candidate_robust.fold_median_mean_rmse <=
+              0.95 * initialization_robust.fold_median_mean_rmse &&
+          candidate_robust.fold_median_max_rmse <=
+              initialization_robust.fold_median_max_rmse;
+      const bool center_healthy =
+          candidate_robust.frame_median_rmse <=
+          initialization_robust.frame_median_rmse;
+      const bool bounded_tail =
+          candidate_robust.frame_p90_rmse <=
+              1.10 * initialization_robust.frame_p90_rmse &&
+          candidate_robust.huber15_rmse <=
+              1.03 * initialization_robust.huber15_rmse;
+      if (!cross_fold_consensus || !center_healthy || !bounded_tail) {
+        continue;
+      }
+      if (selected_by_early_cross_fold_consensus) {
+        const std::array<std::pair<double, double>, 5> metric_pairs{{
+            {candidate_robust.fold_median_mean_rmse,
+             selected_robust.fold_median_mean_rmse},
+            {candidate_robust.fold_median_max_rmse,
+             selected_robust.fold_median_max_rmse},
+            {candidate_robust.frame_median_rmse,
+             selected_robust.frame_median_rmse},
+            {candidate_robust.frame_p90_rmse,
+             selected_robust.frame_p90_rmse},
+            {candidate_robust.huber15_rmse,
+             selected_robust.huber15_rmse},
+        }};
+        int improved_metric_count = 0;
+        bool bounded_relative_regression = true;
+        for (const std::pair<double, double>& metric_pair : metric_pairs) {
+          if (metric_pair.first < metric_pair.second) {
+            ++improved_metric_count;
+          }
+          if (metric_pair.first > 1.03 * metric_pair.second) {
+            bounded_relative_regression = false;
+          }
+        }
+        const bool central_metric_improved =
+            candidate_robust.fold_median_mean_rmse <
+                selected_robust.fold_median_mean_rmse ||
+            candidate_robust.frame_median_rmse <
+                selected_robust.frame_median_rmse;
+        if (improved_metric_count < 3 || !bounded_relative_regression ||
+            !central_metric_improved) {
+          continue;
+        }
+      } else {
+        first_consensus_checkpoint_index = checkpoint_index;
+      }
+      selected_camera = checkpoint.camera;
+      selected_training_evaluation = checkpoint.training_evaluation;
+      selected_robust = candidate_robust;
+      selected_label = "accepted_batch";
+      selected_attempt_order = checkpoint.attempt_order;
+      selected_by_early_cross_fold_consensus = true;
+    }
+
+    if (!selected_by_early_cross_fold_consensus) {
+      for (const PersistentCameraCheckpointEvaluation& checkpoint :
+           report.persistent_camera_checkpoint_evaluations) {
+        const EvaluationRobustSummary candidate_robust =
+            SummarizeEvaluationRobustness(checkpoint.training_evaluation);
+        const bool finite_candidate =
+            std::isfinite(candidate_robust.frame_median_rmse) &&
+            std::isfinite(candidate_robust.frame_p90_rmse) &&
+            std::isfinite(candidate_robust.huber15_rmse);
+        const bool worst_fold_improved =
+            finite_candidate &&
+            std::isfinite(candidate_robust.fold_median_max_rmse) &&
+            candidate_robust.fold_median_max_rmse <
+                0.995 * selected_robust.fold_median_max_rmse;
+        const bool fold_mean_healthy =
+            candidate_robust.fold_median_mean_rmse <=
+                1.005 * initialization_robust.fold_median_mean_rmse;
+        const bool tail_healthy =
+            candidate_robust.frame_p90_rmse <=
+                1.02 * initialization_robust.frame_p90_rmse;
+        const bool robust_cost_healthy =
+            candidate_robust.huber15_rmse <=
+                1.01 * initialization_robust.huber15_rmse;
+        if (!worst_fold_improved || !fold_mean_healthy || !tail_healthy ||
+            !robust_cost_healthy) {
+          continue;
+        }
+        selected_camera = checkpoint.camera;
+        selected_training_evaluation = checkpoint.training_evaluation;
+        selected_robust = candidate_robust;
+        selected_label = "accepted_batch";
+        selected_attempt_order = checkpoint.attempt_order;
+      }
+    }
+
+    if (ApplySingleBoardCameraAndPoseRefit(
+            selected_camera, selected_training_evaluation,
+            &final_backend_bundle)) {
+      report.checkerboard_robust_checkpoint_selection_used = true;
+      report.checkerboard_robust_checkpoint_criterion =
+          selected_by_early_cross_fold_consensus
+              ? "training_early_cross_fold_consensus_with_center_guarded_pareto_refinement"
+              : "training_worst_fold_median_with_fold_mean_frame_p90_and_huber_guards";
+      report.checkerboard_robust_checkpoint_label = selected_label;
+      report.checkerboard_robust_checkpoint_attempt_order =
+          selected_attempt_order;
+      report.checkerboard_robust_checkpoint_frame_median_rmse =
+          selected_robust.frame_median_rmse;
+      report.checkerboard_robust_checkpoint_frame_p90_rmse =
+          selected_robust.frame_p90_rmse;
+      report.checkerboard_robust_checkpoint_huber_rmse =
+          selected_robust.huber15_rmse;
+      report.checkerboard_robust_checkpoint_fold_median_mean_rmse =
+          selected_robust.fold_median_mean_rmse;
+      report.checkerboard_robust_checkpoint_fold_median_max_rmse =
+          selected_robust.fold_median_max_rmse;
+      report.checkerboard_robust_checkpoint_fold_median_std_rmse =
+          selected_robust.fold_median_std_rmse;
+      report.backend_problem_input = BuildBackendProblemInput(
+          final_backend_bundle,
+          input.committed_backend_evaluation_options);
+      report.our_training_evaluation = EvaluateCameraModel(
+          report.training_dataset, final_backend_bundle.scene_state.camera,
+          "ours");
+      report.our_holdout_evaluation = EvaluateCameraModel(
+          report.holdout_dataset, final_backend_bundle.scene_state.camera,
+          "ours");
+      std::ostringstream warning;
+      warning << "Checkerboard training-only robust checkpoint selected "
+              << selected_label
+              << " attempt_order=" << selected_attempt_order
+              << " frame_median_rmse="
+              << selected_robust.frame_median_rmse
+              << " frame_p90_rmse=" << selected_robust.frame_p90_rmse
+              << " huber15_rmse=" << selected_robust.huber15_rmse
+              << " fold_median_mean_rmse="
+              << selected_robust.fold_median_mean_rmse
+              << " fold_median_max_rmse="
+              << selected_robust.fold_median_max_rmse
+              << " fold_median_std_rmse="
+              << selected_robust.fold_median_std_rmse
+              << "; frozen holdout was not used for checkpoint selection.";
+      report.warnings.push_back(warning.str());
+    } else {
+      report.warnings.push_back(
+          "Checkerboard robust checkpoint selection could not refit the "
+          "committed single-board poses; retained the persistent final state.");
+    }
+    }
+  }
 
   report.additional_camera_references = input.additional_camera_references;
   std::vector<CameraRayCurveReference> ray_curve_references;
@@ -6698,6 +8816,16 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
     report.diagnostic_compare.failure_reason = "Skipped by runtime mode.";
   }
 
+  report.final_backend_scene = final_backend_bundle.scene_state;
+  report.final_backend_scene_available = report.final_backend_scene.IsValid();
+  if (report.large_intrinsic_perturbation.enabled &&
+      report.final_backend_scene_available) {
+    report.large_perturbation_pose_orientation_evaluation =
+        EvaluateMultiBoardPoseOrientation(
+            report.holdout_dataset, report.final_backend_scene,
+            report.large_intrinsic_perturbation.reference_scene);
+  }
+
   report.success = true;
   report.warnings.insert(report.warnings.end(),
                          report.baseline_result.warnings.begin(),
@@ -6775,14 +8903,22 @@ cv::Mat Stage5Benchmark::RenderEvaluationFrameOverlay(
                              static_cast<int>(std::lround(point.observed_image_xy.y())));
     const cv::Point predicted(static_cast<int>(std::lround(point.predicted_image_xy.x())),
                               static_cast<int>(std::lround(point.predicted_image_xy.y())));
-    const cv::Scalar observed_color =
+    const cv::Scalar projected_color =
         point.point_type == JointPointType::Outer ? cv::Scalar(60, 220, 80)
                                                   : cv::Scalar(40, 180, 255);
-    cv::circle(output, observed, point.point_type == JointPointType::Outer ? 5 : 3,
-               observed_color, 2, cv::LINE_AA);
-    cv::drawMarker(output, predicted, cv::Scalar(0, 0, 255), cv::MARKER_CROSS, 10, 1,
-                   cv::LINE_AA);
     cv::line(output, observed, predicted, cv::Scalar(210, 210, 210), 1, cv::LINE_AA);
+    // Outer points use cross/circle markers. Dense internal observations use
+    // compact filled dots, with the prediction remaining in the foreground.
+    if (point.point_type == JointPointType::Outer) {
+      cv::drawMarker(output, observed, cv::Scalar(0, 0, 255),
+                     cv::MARKER_CROSS, 13, 1, cv::LINE_AA);
+      cv::circle(output, predicted, 8, projected_color, 2, cv::LINE_AA);
+    } else {
+      cv::circle(output, observed, 2, cv::Scalar(0, 0, 255), cv::FILLED,
+                 cv::LINE_AA);
+      cv::circle(output, predicted, 3, projected_color, cv::FILLED,
+                 cv::LINE_AA);
+    }
   }
 
   double frame_rmse = 0.0;
@@ -6879,7 +9015,7 @@ cv::Mat Stage5Benchmark::RenderEvaluationBoardObservationOverlay(
          << " points=" << point_count;
   cv::putText(cropped, banner.str(), cv::Point(12, 24), cv::FONT_HERSHEY_PLAIN, 1.2,
               cv::Scalar(235, 235, 235), 1, cv::LINE_AA);
-  cv::putText(cropped, "green/orange: observed, red cross: predicted",
+  cv::putText(cropped, "outer: red cross/green circle; internal: red/orange dots",
               cv::Point(12, 44), cv::FONT_HERSHEY_PLAIN, 1.0,
               cv::Scalar(190, 190, 190), 1, cv::LINE_AA);
   return cropped;
@@ -7037,6 +9173,78 @@ void WriteStage5BenchmarkProtocolSummary(const std::string& path,
   output << "split_random_seed: " << report.split.random_seed << "\n";
   output << "training_frame_count: " << report.split.training_frames.size() << "\n";
   output << "holdout_frame_count: " << report.split.holdout_frames.size() << "\n";
+  output << "stage5_input_mode: " << report.stage5_input_mode << "\n";
+  output << "precomputed_training_source: "
+         << report.precomputed_training_source << "\n";
+  output << "precomputed_holdout_source: "
+         << report.precomputed_holdout_source << "\n";
+  output << "precomputed_target_mode_requested: "
+         << report.precomputed_target_mode_requested << "\n";
+  output << "precomputed_target_mode_resolved: "
+         << report.precomputed_target_mode_resolved << "\n";
+  output << "precomputed_board_count: "
+         << report.precomputed_board_count << "\n";
+  output << "precomputed_single_board_ba_mode: "
+         << (report.precomputed_single_board_ba_mode ? 1 : 0) << "\n";
+  output << "checkerboard_robust_checkpoint_selection_used: "
+         << (report.checkerboard_robust_checkpoint_selection_used ? 1 : 0)
+         << "\n";
+  output << "checkerboard_robust_checkpoint_criterion: "
+         << report.checkerboard_robust_checkpoint_criterion << "\n";
+  output << "checkerboard_robust_checkpoint_label: "
+         << report.checkerboard_robust_checkpoint_label << "\n";
+  output << "checkerboard_robust_checkpoint_attempt_order: "
+         << report.checkerboard_robust_checkpoint_attempt_order << "\n";
+  output << "checkerboard_robust_checkpoint_frame_median_rmse: "
+         << report.checkerboard_robust_checkpoint_frame_median_rmse << "\n";
+  output << "checkerboard_robust_checkpoint_frame_p90_rmse: "
+         << report.checkerboard_robust_checkpoint_frame_p90_rmse << "\n";
+  output << "checkerboard_robust_checkpoint_huber_rmse: "
+         << report.checkerboard_robust_checkpoint_huber_rmse << "\n";
+  output << "checkerboard_robust_checkpoint_fold_median_mean_rmse: "
+         << report.checkerboard_robust_checkpoint_fold_median_mean_rmse
+         << "\n";
+  output << "checkerboard_robust_checkpoint_fold_median_max_rmse: "
+         << report.checkerboard_robust_checkpoint_fold_median_max_rmse
+         << "\n";
+  output << "checkerboard_robust_checkpoint_fold_median_std_rmse: "
+         << report.checkerboard_robust_checkpoint_fold_median_std_rmse
+         << "\n";
+  output << "precomputed_uniform_control_point_mode: "
+         << (report.precomputed_single_board_ba_mode ? 1 : 0) << "\n";
+  output << "precomputed_training_frame_count: "
+         << report.precomputed_training_frame_count << "\n";
+  output << "precomputed_training_board_observation_count: "
+         << report.precomputed_training_board_observation_count << "\n";
+  if (report.precomputed_single_board_ba_mode) {
+    output << "precomputed_training_control_point_count: "
+           << report.precomputed_training_outer_point_count +
+                  report.precomputed_training_internal_point_count
+           << "\n";
+  } else {
+    output << "precomputed_training_outer_point_count: "
+           << report.precomputed_training_outer_point_count << "\n";
+    output << "precomputed_training_internal_point_count: "
+           << report.precomputed_training_internal_point_count << "\n";
+  }
+  output << "precomputed_holdout_frame_count: "
+         << report.precomputed_holdout_frame_count << "\n";
+  output << "precomputed_holdout_board_observation_count: "
+         << report.precomputed_holdout_board_observation_count << "\n";
+  if (report.precomputed_single_board_ba_mode) {
+    output << "precomputed_holdout_control_point_count: "
+           << report.precomputed_holdout_outer_point_count +
+                  report.precomputed_holdout_internal_point_count
+           << "\n";
+  } else {
+    output << "precomputed_holdout_outer_point_count: "
+           << report.precomputed_holdout_outer_point_count << "\n";
+    output << "precomputed_holdout_internal_point_count: "
+           << report.precomputed_holdout_internal_point_count << "\n";
+  }
+  output << "precomputed_boards_rt_used_to_initialize_layout: "
+         << (report.precomputed_boards_rt_used_to_initialize_layout ? 1 : 0)
+         << "\n";
   output << "external_holdout_observation_source: "
          << report.external_holdout_observation_source << "\n";
   output << "external_holdout_self_frontend_prepass_used: "
@@ -7142,7 +9350,18 @@ void WriteStage5BenchmarkProtocolSummary(const std::string& path,
   output << "internal_observation_weight_mean_weight: "
          << report.internal_observation_weight_result.mean_weight << "\n";
   output << "comparison_scope: output_level_and_evaluator_level_only\n";
-  output << "evaluation_protocol: camera_only_outer_refit_pose_plus_outer_internal_reprojection\n";
+  output << "evaluation_protocol: "
+         << (report.precomputed_single_board_ba_mode
+                 ? "checkerboard_all_control_points_pose_refit_and_reprojection"
+                 : "camera_only_outer_refit_pose_plus_outer_internal_reprojection")
+         << "\n";
+  output << "camera_aware_outer_rescue_attempted_board_count: "
+         << report.holdout_dataset
+                .camera_aware_outer_rescue_attempted_board_count
+         << "\n";
+  output << "camera_aware_outer_rescue_used_board_count: "
+         << report.holdout_dataset.camera_aware_outer_rescue_used_board_count
+         << "\n";
   for (const std::string& warning : report.warnings) {
     output << "warning: " << warning << "\n";
   }
@@ -7189,38 +9408,58 @@ void WriteStage5BenchmarkTrainingSummary(const std::string& path,
   WriteEvaluationCameraSummary(output, "our_", report.our_training_evaluation);
   WriteEvaluationCameraSummary(output, "kalibr_", report.kalibr_training_evaluation);
   output << "our_overall_rmse: " << report.our_training_evaluation.overall_rmse << "\n";
-  output << "our_outer_only_rmse: " << report.our_training_evaluation.outer_only_rmse << "\n";
-  output << "our_internal_only_rmse: " << report.our_training_evaluation.internal_only_rmse
+  output << "our_p95_reprojection_error: "
+         << report.our_training_evaluation.p95_reprojection_error << "\n";
+  WriteEvaluationCameraSummary(
+      output, "initialization_only_",
+      report.initialization_training_evaluation);
+  output << "initialization_only_overall_rmse: "
+         << report.initialization_training_evaluation.overall_rmse << "\n";
+  output << "initialization_only_p95_reprojection_error: "
+         << report.initialization_training_evaluation.p95_reprojection_error
          << "\n";
-  output << "our_overall_rmse_excluding_board"
-         << report.our_training_evaluation.excluded_board_id_for_rmse << ": "
-         << report.our_training_evaluation.overall_rmse_excluding_board << "\n";
-  output << "our_internal_only_rmse_excluding_board"
-         << report.our_training_evaluation.excluded_board_id_for_rmse << ": "
-         << report.our_training_evaluation.internal_only_rmse_excluding_board
-         << "\n";
+  if (!report.precomputed_single_board_ba_mode) {
+    output << "our_outer_only_rmse: " << report.our_training_evaluation.outer_only_rmse << "\n";
+    output << "our_internal_only_rmse: " << report.our_training_evaluation.internal_only_rmse
+           << "\n";
+    output << "our_overall_rmse_excluding_board"
+           << report.our_training_evaluation.excluded_board_id_for_rmse << ": "
+           << report.our_training_evaluation.overall_rmse_excluding_board << "\n";
+    output << "our_internal_only_rmse_excluding_board"
+           << report.our_training_evaluation.excluded_board_id_for_rmse << ": "
+           << report.our_training_evaluation.internal_only_rmse_excluding_board
+           << "\n";
+  }
   output << "kalibr_overall_rmse: " << report.kalibr_training_evaluation.overall_rmse << "\n";
-  output << "kalibr_outer_only_rmse: " << report.kalibr_training_evaluation.outer_only_rmse
-         << "\n";
-  output << "kalibr_internal_only_rmse: "
-         << report.kalibr_training_evaluation.internal_only_rmse << "\n";
-  output << "kalibr_overall_rmse_excluding_board"
-         << report.kalibr_training_evaluation.excluded_board_id_for_rmse << ": "
-         << report.kalibr_training_evaluation.overall_rmse_excluding_board << "\n";
-  output << "kalibr_internal_only_rmse_excluding_board"
-         << report.kalibr_training_evaluation.excluded_board_id_for_rmse << ": "
-         << report.kalibr_training_evaluation.internal_only_rmse_excluding_board
-         << "\n";
+  output << "kalibr_p95_reprojection_error: "
+         << report.kalibr_training_evaluation.p95_reprojection_error << "\n";
+  if (!report.precomputed_single_board_ba_mode) {
+    output << "kalibr_outer_only_rmse: " << report.kalibr_training_evaluation.outer_only_rmse
+           << "\n";
+    output << "kalibr_internal_only_rmse: "
+           << report.kalibr_training_evaluation.internal_only_rmse << "\n";
+    output << "kalibr_overall_rmse_excluding_board"
+           << report.kalibr_training_evaluation.excluded_board_id_for_rmse << ": "
+           << report.kalibr_training_evaluation.overall_rmse_excluding_board << "\n";
+    output << "kalibr_internal_only_rmse_excluding_board"
+           << report.kalibr_training_evaluation.excluded_board_id_for_rmse << ": "
+           << report.kalibr_training_evaluation.internal_only_rmse_excluding_board
+           << "\n";
+  }
   WriteKalibrStyleResidualStatistics(output, "our", report.our_training_evaluation);
   WriteKalibrStyleResidualStatistics(output, "kalibr", report.kalibr_training_evaluation);
   output << "our_point_count: " << report.our_training_evaluation.point_count << "\n";
-  output << "our_point_count_excluding_board"
-         << report.our_training_evaluation.excluded_board_id_for_rmse << ": "
-         << report.our_training_evaluation.point_count_excluding_board << "\n";
+  if (!report.precomputed_single_board_ba_mode) {
+    output << "our_point_count_excluding_board"
+           << report.our_training_evaluation.excluded_board_id_for_rmse << ": "
+           << report.our_training_evaluation.point_count_excluding_board << "\n";
+  }
   output << "kalibr_point_count: " << report.kalibr_training_evaluation.point_count << "\n";
-  output << "kalibr_point_count_excluding_board"
-         << report.kalibr_training_evaluation.excluded_board_id_for_rmse << ": "
-         << report.kalibr_training_evaluation.point_count_excluding_board << "\n";
+  if (!report.precomputed_single_board_ba_mode) {
+    output << "kalibr_point_count_excluding_board"
+           << report.kalibr_training_evaluation.excluded_board_id_for_rmse << ": "
+           << report.kalibr_training_evaluation.point_count_excluding_board << "\n";
+  }
   output << "additional_reference_camera_count: "
          << report.additional_training_evaluations.size() << "\n";
   for (std::size_t index = 0;
@@ -7232,6 +9471,8 @@ void WriteStage5BenchmarkTrainingSummary(const std::string& path,
         "reference_" + SanitizeMetricKey(evaluation.method_label) + "_";
     WriteEvaluationCameraSummary(output, prefix, evaluation);
     output << prefix << "overall_rmse: " << evaluation.overall_rmse << "\n";
+    output << prefix << "p95_reprojection_error: "
+           << evaluation.p95_reprojection_error << "\n";
     output << prefix << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
     output << prefix << "internal_only_rmse: "
            << evaluation.internal_only_rmse << "\n";
@@ -7256,50 +9497,89 @@ void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
   std::ofstream output(path.c_str());
   output << "split_label: holdout\n";
   output << "split_signature: " << report.split_signature << "\n";
+  output << "evaluation_protocol: "
+         << (report.precomputed_single_board_ba_mode
+                 ? "checkerboard_all_control_points_pose_refit_and_reprojection"
+                 : "outer_pose_refit_plus_all_point_reprojection")
+         << "\n";
+  output << "camera_aware_outer_rescue_attempted_board_count: "
+         << report.holdout_dataset
+                .camera_aware_outer_rescue_attempted_board_count
+         << "\n";
+  output << "camera_aware_outer_rescue_used_board_count: "
+         << report.holdout_dataset.camera_aware_outer_rescue_used_board_count
+         << "\n";
   WriteEvaluationCameraSummary(output, "our_", report.our_holdout_evaluation);
   WriteEvaluationCameraSummary(output, "kalibr_", report.kalibr_holdout_evaluation);
   output << "our_overall_rmse: " << report.our_holdout_evaluation.overall_rmse << "\n";
-  output << "our_pose_only_refit_rmse: "
+  output << "our_p95_reprojection_error: "
+         << report.our_holdout_evaluation.p95_reprojection_error << "\n";
+  WriteEvaluationCameraSummary(
+      output, "initialization_only_",
+      report.initialization_holdout_evaluation);
+  output << "initialization_only_overall_rmse: "
+         << report.initialization_holdout_evaluation.overall_rmse << "\n";
+  output << "initialization_only_p95_reprojection_error: "
+         << report.initialization_holdout_evaluation.p95_reprojection_error
+         << "\n";
+  if (report.precomputed_single_board_ba_mode) {
+    output << "our_test_rmse_all_control_points: "
+           << report.our_holdout_evaluation.overall_rmse << "\n";
+  }
+  const std::string pose_prefix = report.precomputed_single_board_ba_mode
+                                      ? "test_pose_refit_"
+                                      : "pose_only_refit_";
+  output << "our_" << pose_prefix << "rmse: "
          << report.our_holdout_evaluation.pose_only_refit_rmse << "\n";
-  output << "our_pose_only_refit_success_rate: "
+  output << "our_" << pose_prefix << "success_rate: "
          << report.our_holdout_evaluation.pose_only_refit_success_rate << "\n";
-  output << "our_pose_only_refit_attempt_count: "
+  output << "our_" << pose_prefix << "attempt_count: "
          << report.our_holdout_evaluation.pose_only_refit_attempt_count << "\n";
-  output << "our_pose_only_refit_success_count: "
+  output << "our_" << pose_prefix << "success_count: "
          << report.our_holdout_evaluation.pose_only_refit_success_count << "\n";
-  output << "our_outer_only_rmse: " << report.our_holdout_evaluation.outer_only_rmse << "\n";
-  output << "our_internal_only_rmse: " << report.our_holdout_evaluation.internal_only_rmse
-         << "\n";
-  output << "our_overall_rmse_excluding_board"
-         << report.our_holdout_evaluation.excluded_board_id_for_rmse << ": "
-         << report.our_holdout_evaluation.overall_rmse_excluding_board << "\n";
-  output << "our_internal_only_rmse_excluding_board"
-         << report.our_holdout_evaluation.excluded_board_id_for_rmse << ": "
-         << report.our_holdout_evaluation.internal_only_rmse_excluding_board
-         << "\n";
+  if (!report.precomputed_single_board_ba_mode) {
+    output << "our_outer_only_rmse: " << report.our_holdout_evaluation.outer_only_rmse << "\n";
+    output << "our_internal_only_rmse: " << report.our_holdout_evaluation.internal_only_rmse
+           << "\n";
+    output << "our_overall_rmse_excluding_board"
+           << report.our_holdout_evaluation.excluded_board_id_for_rmse << ": "
+           << report.our_holdout_evaluation.overall_rmse_excluding_board << "\n";
+    output << "our_internal_only_rmse_excluding_board"
+           << report.our_holdout_evaluation.excluded_board_id_for_rmse << ": "
+           << report.our_holdout_evaluation.internal_only_rmse_excluding_board
+           << "\n";
+  }
   output << "kalibr_overall_rmse: " << report.kalibr_holdout_evaluation.overall_rmse << "\n";
-  output << "kalibr_pose_only_refit_rmse: "
+  output << "kalibr_p95_reprojection_error: "
+         << report.kalibr_holdout_evaluation.p95_reprojection_error << "\n";
+  if (report.precomputed_single_board_ba_mode) {
+    output << "kalibr_test_rmse_all_control_points: "
+           << report.kalibr_holdout_evaluation.overall_rmse << "\n";
+  }
+  output << "kalibr_" << pose_prefix << "rmse: "
          << report.kalibr_holdout_evaluation.pose_only_refit_rmse << "\n";
-  output << "kalibr_pose_only_refit_success_rate: "
+  output << "kalibr_" << pose_prefix << "success_rate: "
          << report.kalibr_holdout_evaluation.pose_only_refit_success_rate
          << "\n";
-  output << "kalibr_pose_only_refit_attempt_count: "
+  output << "kalibr_" << pose_prefix << "attempt_count: "
          << report.kalibr_holdout_evaluation.pose_only_refit_attempt_count
          << "\n";
-  output << "kalibr_pose_only_refit_success_count: "
+  output << "kalibr_" << pose_prefix << "success_count: "
          << report.kalibr_holdout_evaluation.pose_only_refit_success_count
          << "\n";
-  output << "kalibr_outer_only_rmse: " << report.kalibr_holdout_evaluation.outer_only_rmse
-         << "\n";
-  output << "kalibr_internal_only_rmse: "
-         << report.kalibr_holdout_evaluation.internal_only_rmse << "\n";
-  output << "kalibr_overall_rmse_excluding_board"
-         << report.kalibr_holdout_evaluation.excluded_board_id_for_rmse << ": "
-         << report.kalibr_holdout_evaluation.overall_rmse_excluding_board << "\n";
-  output << "kalibr_internal_only_rmse_excluding_board"
-         << report.kalibr_holdout_evaluation.excluded_board_id_for_rmse << ": "
-         << report.kalibr_holdout_evaluation.internal_only_rmse_excluding_board
-         << "\n";
+  if (!report.precomputed_single_board_ba_mode) {
+    output << "kalibr_outer_only_rmse: " << report.kalibr_holdout_evaluation.outer_only_rmse
+           << "\n";
+    output << "kalibr_internal_only_rmse: "
+           << report.kalibr_holdout_evaluation.internal_only_rmse << "\n";
+    output << "kalibr_overall_rmse_excluding_board"
+           << report.kalibr_holdout_evaluation.excluded_board_id_for_rmse << ": "
+           << report.kalibr_holdout_evaluation.overall_rmse_excluding_board << "\n";
+    output << "kalibr_internal_only_rmse_excluding_board"
+           << report.kalibr_holdout_evaluation.excluded_board_id_for_rmse << ": "
+           << report.kalibr_holdout_evaluation.internal_only_rmse_excluding_board
+           << "\n";
+  }
   WriteKalibrStyleResidualStatistics(output, "our", report.our_holdout_evaluation);
   WriteKalibrStyleResidualStatistics(output, "kalibr", report.kalibr_holdout_evaluation);
   output << "our_point_count: " << report.our_holdout_evaluation.point_count << "\n";
@@ -7350,29 +9630,98 @@ void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
         "reference_" + SanitizeMetricKey(evaluation.method_label) + "_";
     WriteEvaluationCameraSummary(output, prefix, evaluation);
     output << prefix << "overall_rmse: " << evaluation.overall_rmse << "\n";
-    output << prefix << "pose_only_refit_rmse: "
+    output << prefix << "p95_reprojection_error: "
+           << evaluation.p95_reprojection_error << "\n";
+    if (report.precomputed_single_board_ba_mode) {
+      output << prefix << "test_rmse_all_control_points: "
+             << evaluation.overall_rmse << "\n";
+    }
+    output << prefix << pose_prefix << "rmse: "
            << evaluation.pose_only_refit_rmse << "\n";
-    output << prefix << "pose_only_refit_success_rate: "
+    output << prefix << pose_prefix << "success_rate: "
            << evaluation.pose_only_refit_success_rate << "\n";
-    output << prefix << "pose_only_refit_attempt_count: "
+    output << prefix << pose_prefix << "attempt_count: "
            << evaluation.pose_only_refit_attempt_count << "\n";
-    output << prefix << "pose_only_refit_success_count: "
+    output << prefix << pose_prefix << "success_count: "
            << evaluation.pose_only_refit_success_count << "\n";
-    output << prefix << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
-    output << prefix << "internal_only_rmse: "
-           << evaluation.internal_only_rmse << "\n";
-    output << prefix << "overall_rmse_excluding_board"
-           << evaluation.excluded_board_id_for_rmse << ": "
-           << evaluation.overall_rmse_excluding_board << "\n";
-    output << prefix << "internal_only_rmse_excluding_board"
-           << evaluation.excluded_board_id_for_rmse << ": "
-           << evaluation.internal_only_rmse_excluding_board << "\n";
+    if (!report.precomputed_single_board_ba_mode) {
+      output << prefix << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
+      output << prefix << "internal_only_rmse: "
+             << evaluation.internal_only_rmse << "\n";
+      output << prefix << "overall_rmse_excluding_board"
+             << evaluation.excluded_board_id_for_rmse << ": "
+             << evaluation.overall_rmse_excluding_board << "\n";
+      output << prefix << "internal_only_rmse_excluding_board"
+             << evaluation.excluded_board_id_for_rmse << ": "
+             << evaluation.internal_only_rmse_excluding_board << "\n";
+    }
     WriteKalibrStyleResidualStatistics(output, prefix.substr(0, prefix.size() - 1),
                                        evaluation);
     output << prefix << "point_count: " << evaluation.point_count << "\n";
     output << prefix << "point_count_excluding_board"
            << evaluation.excluded_board_id_for_rmse << ": "
            << evaluation.point_count_excluding_board << "\n";
+  }
+}
+
+void WritePersistentCameraCheckpointEvaluationsCsv(
+    const std::string& path,
+    const Stage5BenchmarkReport& report) {
+  std::ofstream output(path.c_str());
+  output << "checkpoint,attempt_order,frame_index,frame_label,information_gain,"
+         << "xi,alpha,fu,fv,cu,cv,train_rmse,train_p95,"
+         << "train_frame_median_rmse,train_frame_p90_rmse,"
+         << "train_trimmed90_rmse,train_huber15_rmse,"
+         << "train_fold_median_mean_rmse,train_fold_median_max_rmse,"
+         << "train_fold_median_std_rmse,test_rmse,test_p95,"
+         << "train_pose_success_rate,test_pose_success_rate\n";
+  const auto write_row = [&output](
+      const std::string& checkpoint_label,
+      int attempt_order,
+      int frame_index,
+      const std::string& frame_label,
+      double information_gain,
+      const OuterBootstrapCameraIntrinsics& camera,
+      const CameraModelRefitEvaluationResult& training,
+      const CameraModelRefitEvaluationResult& holdout) {
+    const EvaluationRobustSummary training_robust =
+        SummarizeEvaluationRobustness(training);
+    output << checkpoint_label << "," << attempt_order << ","
+           << frame_index << "," << frame_label << ","
+           << information_gain << "," << camera.xi << ","
+           << camera.alpha << "," << camera.fu << "," << camera.fv
+           << "," << camera.cu << "," << camera.cv << ","
+           << training.overall_rmse << ","
+           << training.p95_reprojection_error << ","
+           << training_robust.frame_median_rmse << ","
+           << training_robust.frame_p90_rmse << ","
+           << training_robust.trimmed90_rmse << ","
+           << training_robust.huber15_rmse << ","
+           << training_robust.fold_median_mean_rmse << ","
+           << training_robust.fold_median_max_rmse << ","
+           << training_robust.fold_median_std_rmse << ","
+           << holdout.overall_rmse << ","
+           << holdout.p95_reprojection_error << ","
+           << training.pose_only_refit_success_rate << ","
+           << holdout.pose_only_refit_success_rate << "\n";
+  };
+  write_row("initialization_only", -1, -1, "", 0.0,
+            report.initialization_holdout_evaluation.camera,
+            report.initialization_training_evaluation,
+            report.initialization_holdout_evaluation);
+  if (report.large_intrinsic_perturbation.enabled) {
+    write_row("perturbation_boundary", -2, -1, "", 0.0,
+              report.large_intrinsic_perturbation.perturbed_camera,
+              report.perturbation_boundary_training_evaluation,
+              report.perturbation_boundary_holdout_evaluation);
+  }
+  for (const PersistentCameraCheckpointEvaluation& checkpoint :
+       report.persistent_camera_checkpoint_evaluations) {
+    write_row("accepted_batch", checkpoint.attempt_order,
+              checkpoint.frame_index, checkpoint.frame_label,
+              checkpoint.information_gain, checkpoint.camera,
+              checkpoint.training_evaluation,
+              checkpoint.holdout_evaluation);
   }
 }
 

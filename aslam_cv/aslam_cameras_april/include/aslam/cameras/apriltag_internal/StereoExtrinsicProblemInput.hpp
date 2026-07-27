@@ -6,6 +6,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>
@@ -45,6 +46,11 @@ enum class StereoSingleCameraOnlyWeightMode {
 enum class StereoMeasurementSourceMode {
   BackendSelectedOnly = 0,
   AllValid = 1,
+};
+
+enum class StereoFramePairingMode {
+  ExactTimestamp = 0,
+  FrameIndex = 1,
 };
 
 enum class StereoSingleBoardPairPolicy {
@@ -92,6 +98,18 @@ enum class StereoSelectionOptimizationMode {
 enum class StereoRigParamMode {
   Cam0Reference = 0,
   RigCentricSymmetric = 1,
+};
+
+enum class StereoIntrinsicsMode {
+  FixedStage5 = 0,
+  KalibrJointProjection = 1,
+  RegularizedJointProjection = 2,
+  AdaptiveRegularizedJointProjection = 3,
+};
+
+enum class StereoPersistentPoseStructure {
+  IndependentPairBoard = 0,
+  SharedFrameLayout = 1,
 };
 
 struct StereoFramePair {
@@ -176,6 +194,20 @@ struct StereoMeasurementDataset {
   std::string failure_reason;
 };
 
+struct StereoFrontendImagePairSelection {
+  bool success = false;
+  std::vector<std::string> left_image_paths;
+  std::vector<std::string> right_image_paths;
+  int original_left_frame_count = 0;
+  int original_right_frame_count = 0;
+  int paired_frame_count = 0;
+  int unmatched_left_count = 0;
+  int unmatched_right_count = 0;
+  std::string pairing_mode;
+  std::vector<std::string> warnings;
+  std::string failure_reason;
+};
+
 struct StereoSceneState {
   bool success = false;
   bool cam0_is_reference = true;
@@ -185,6 +217,8 @@ struct StereoSceneState {
   Eigen::Matrix4d T_cam1_cam0 = Eigen::Matrix4d::Identity();
   std::map<int, Eigen::Matrix4d> T_cam0_world_by_pair;
   std::map<int, Eigen::Matrix4d> T_world_board_by_id;
+  std::map<std::pair<int, int>, Eigen::Matrix4d>
+      T_cam0_board_by_pair_board;
   std::set<int> excluded_training_pair_indices;
   std::vector<std::string> warnings;
   std::string failure_reason;
@@ -207,6 +241,13 @@ struct Stage6RuntimeSummary {
   int cam1_training_detection_cache_misses = 0;
   int cam1_training_detection_cache_load_failures = 0;
   int cam1_training_detection_cache_store_failures = 0;
+  bool frontend_pairing_prefilter_enabled = false;
+  int frontend_original_left_frame_count = 0;
+  int frontend_original_right_frame_count = 0;
+  int frontend_processed_left_frame_count = 0;
+  int frontend_processed_right_frame_count = 0;
+  int frontend_skipped_unpaired_left_frame_count = 0;
+  int frontend_skipped_unpaired_right_frame_count = 0;
   int symmetric_refit_call_count = 0;
   int symmetric_refit_improved_count = 0;
   int symmetric_refit_fallback_count = 0;
@@ -226,6 +267,8 @@ struct StereoExtrinsicSolverOptions {
   StereoViewSelectionMode view_selection_mode = StereoViewSelectionMode::Off;
   int selected_pair_count = 0;
   StereoSolverMode solver_mode = StereoSolverMode::GlobalSparseBa;
+  StereoIntrinsicsMode intrinsics_mode =
+      StereoIntrinsicsMode::AdaptiveRegularizedJointProjection;
   std::string ba_mode_label = "pixel";
   StereoFinalBaResidualMode final_ba_residual_mode =
       StereoFinalBaResidualMode::Pixel;
@@ -339,6 +382,8 @@ struct StereoExtrinsicSolverOptions {
   bool enable_kalibr_style_pair_selection = true;
   bool enable_committing_pair_batch_selection = false;
   bool enable_persistent_incremental_stereo_ba = true;
+  StereoPersistentPoseStructure persistent_pose_structure =
+      StereoPersistentPoseStructure::IndependentPairBoard;
   bool allow_legacy_selection_fallback_after_persistent_failure = false;
   bool enable_stage6_incremental_estimator = false;
   bool enable_incremental_pair_diversity_rescue = false;
@@ -350,6 +395,13 @@ struct StereoExtrinsicSolverOptions {
   double persistent_incremental_convergence_delta_x = 1e-4;
   double persistent_incremental_baseline_prior_translation_weight = 1e-6;
   double persistent_incremental_baseline_prior_rotation_weight = 1e-6;
+  double persistent_incremental_projection_prior_shape_sigma = 0.01;
+  double persistent_incremental_projection_prior_focal_relative_sigma = 0.01;
+  double persistent_incremental_projection_prior_principal_sigma_px = 5.0;
+  int adaptive_joint_projection_min_training_pairs = 8;
+  int adaptive_joint_projection_min_shared_pair_boards = 20;
+  int adaptive_joint_projection_min_distinct_boards = 3;
+  int adaptive_joint_projection_min_observation_points = 1000;
   double persistent_incremental_invalid_projection_penalty_px = 100.0;
   int persistent_incremental_seed_pair_count = 1;
   Stage6IncrementalInfoBlock incremental_info_block =
@@ -554,6 +606,7 @@ struct StereoExtrinsicProblemInput {
   std::string left_intrinsics_path;
   std::string right_intrinsics_path;
   std::string split_signature;
+  std::string measurement_source_mode;
   StereoMeasurementDataset measurement_dataset;
   StereoSceneState initial_scene;
   StereoExtrinsicSolverOptions solver_options;
@@ -750,6 +803,14 @@ struct StereoPairOnlyBaInitSummary {
   double baseline_rotation_delta_deg = 0.0;
   double baseline_translation_delta_m = 0.0;
   bool used_refined_baseline = false;
+  bool robust_loss_enabled = false;
+  bool objective_finite = false;
+  bool objective_decreased = false;
+  bool linear_solver_failure = false;
+  bool reached_max_iterations = false;
+  int optimization_iterations = 0;
+  double objective_start = std::numeric_limits<double>::infinity();
+  double objective_final = std::numeric_limits<double>::infinity();
   std::vector<StereoPairInitCandidateRow> candidates;
   std::vector<StereoPairInitResidualRow> residual_rows;
   std::vector<std::string> warnings;
@@ -952,6 +1013,19 @@ struct StereoPairBoardTrialSelectionSummary {
   bool incremental_estimator_enabled = false;
   bool persistent_incremental_estimator_used = false;
   std::string persistent_incremental_information_group;
+  std::string persistent_pose_structure;
+  std::string requested_intrinsics_mode;
+  std::string effective_intrinsics_mode;
+  bool projection_intrinsics_active = false;
+  bool projection_prior_enabled = false;
+  std::string projection_release_reason;
+  int projection_policy_training_pair_count = 0;
+  int projection_policy_shared_pair_board_count = 0;
+  int projection_policy_distinct_board_count = 0;
+  int projection_policy_observation_point_count = 0;
+  double projection_prior_shape_sigma = 0.0;
+  double projection_prior_focal_relative_sigma = 0.0;
+  double projection_prior_principal_sigma_px = 0.0;
   int persistent_incremental_seed_batch_count = 0;
   int persistent_incremental_seed_pair_count = 0;
   int persistent_incremental_seed_pair_board_count = 0;
@@ -1119,7 +1193,17 @@ StereoMeasurementDataset BuildStereoMeasurementDataset(
     const CalibrationStateBundle& left_bundle,
     const CalibrationStateBundle& right_bundle,
     StereoMeasurementSourceMode source_mode =
-        StereoMeasurementSourceMode::BackendSelectedOnly);
+        StereoMeasurementSourceMode::BackendSelectedOnly,
+    StereoFramePairingMode pairing_mode =
+        StereoFramePairingMode::ExactTimestamp,
+    double pairing_max_delta_ms = 250.0);
+
+StereoFrontendImagePairSelection SelectStereoFrontendImagePairs(
+    const std::vector<std::string>& left_image_paths,
+    const std::vector<std::string>& right_image_paths,
+    StereoFramePairingMode pairing_mode =
+        StereoFramePairingMode::ExactTimestamp,
+    double pairing_max_delta_ms = 250.0);
 
 void WriteStereoExtrinsicYaml(const std::string& path,
                               const StereoExtrinsicCalibrationResult& result);

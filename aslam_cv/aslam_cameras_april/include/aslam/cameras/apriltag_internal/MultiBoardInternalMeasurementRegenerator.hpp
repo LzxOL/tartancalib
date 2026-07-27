@@ -43,6 +43,15 @@ struct GeometryPriorOuterSeedCandidate {
   std::array<cv::Point2f, 4> predicted_corners{};
   std::array<cv::Point2f, 4> refined_corners{};
   double predicted_area_px = 0.0;
+  double predicted_signed_area_px = 0.0;
+  double refined_area_px = 0.0;
+  double refined_signed_area_px = 0.0;
+  double refined_to_predicted_area_ratio =
+      std::numeric_limits<double>::quiet_NaN();
+  bool predicted_quad_topology_valid = false;
+  bool refined_quad_topology_valid = false;
+  bool quad_topology_preserved = false;
+  std::string quad_topology_summary;
   double local_corner_scale_px = 0.0;
   int subpix_window_radius = 0;
   bool spherical_refine_attempted = false;
@@ -54,6 +63,8 @@ struct GeometryPriorOuterSeedCandidate {
   double spherical_refine_max_residual = 0.0;
   std::string spherical_refine_failure_summary;
   double max_corner_displacement_px = 0.0;
+  double adaptive_max_corner_displacement_px =
+      std::numeric_limits<double>::quiet_NaN();
   double min_corner_response_ratio = 0.0;
   double edge_support_ratio = 0.0;
   double mean_edge_gradient_ratio = 0.0;
@@ -70,6 +81,7 @@ struct GeometryPriorOuterSeedCandidate {
   std::string roi_redetect_summary;
   bool roi_valid = false;
   bool image_evidence_checked = false;
+  bool tag_id_validated = false;
   bool image_evidence_success = false;
   bool local_redetect_success = false;
   bool local_corner_refine_success = false;

@@ -17,6 +17,7 @@ struct StereoResidualEvaluationOptions {
   int symmetric_refit_max_iterations = 8;
   double symmetric_refit_step = 1e-3;
   bool extrinsic_only_local_board_pose = false;
+  bool use_committed_pair_board_pose = false;
 };
 
 class StereoResidualEvaluator {

@@ -820,7 +820,9 @@ std::map<int, std::string> BuildTrainingFrameImagePathMap(
   std::map<int, std::string> image_paths;
   for (const ati::FrozenRound2BaselineFrameSource& source :
        report.baseline_result.frame_sources) {
-    image_paths[source.frame_index] = source.image_path;
+    if (!source.image_path.empty()) {
+      image_paths[source.frame_index] = source.image_path;
+    }
   }
   return image_paths;
 }
@@ -1075,8 +1077,11 @@ void DrawGeometryPriorSeedCandidate(
         << " | outer_rmse=" << std::fixed << std::setprecision(2)
         << candidate.outer_reprojection_rmse
         << " | disp=" << candidate.max_corner_displacement_px
+        << "/" << candidate.adaptive_max_corner_displacement_px
         << " | subpix=" << candidate.subpix_window_radius
         << " | scale=" << candidate.local_corner_scale_px
+        << " | topology=" << (candidate.quad_topology_preserved ? 1 : 0)
+        << " | id=" << (candidate.tag_id_validated ? 1 : 0)
         << " | resp=" << candidate.min_corner_response_ratio
         << " | edge=" << candidate.edge_support_ratio
         << "/" << candidate.mean_edge_gradient_ratio;
@@ -1186,7 +1191,12 @@ void WriteGeometryPriorOuterSeedDiagnostics(
       << "refined_corner_u1,refined_corner_v1,"
       << "refined_corner_u2,refined_corner_v2,"
       << "refined_corner_u3,refined_corner_v3,"
-      << "predicted_area_px,local_corner_scale_px,subpix_window_radius,"
+      << "predicted_area_px,predicted_signed_area_px,"
+      << "refined_area_px,refined_signed_area_px,"
+      << "refined_to_predicted_area_ratio,"
+      << "predicted_quad_topology_valid,refined_quad_topology_valid,"
+      << "quad_topology_preserved,quad_topology_summary,"
+      << "local_corner_scale_px,subpix_window_radius,"
       << "spherical_refine_attempted,spherical_refine_success,"
       << "spherical_refine_successful_corner_count,"
       << "spherical_refine_max_displacement_px,"
@@ -1194,7 +1204,7 @@ void WriteGeometryPriorOuterSeedDiagnostics(
       << "spherical_refine_min_support_count,"
       << "spherical_refine_max_residual,"
       << "spherical_refine_failure_summary,"
-      << "max_corner_displacement_px,"
+      << "max_corner_displacement_px,adaptive_max_corner_displacement_px,"
       << "min_corner_response_ratio,edge_support_ratio,"
       << "mean_edge_gradient_ratio,rectified_patch_checked,"
       << "rectified_patch_decode_success,rectified_patch_detected_tag_id,"
@@ -1204,7 +1214,7 @@ void WriteGeometryPriorOuterSeedDiagnostics(
       << "roi_redetect_bbox_x,roi_redetect_bbox_y,"
       << "roi_redetect_bbox_width,roi_redetect_bbox_height,"
       << "roi_redetect_summary,"
-      << "roi_valid,image_evidence_checked,"
+      << "roi_valid,image_evidence_checked,tag_id_validated,"
       << "image_evidence_success,local_redetect_success,"
       << "local_corner_refine_success,pose_refit_success,"
       << "local_vs_global_rotation_error_deg,"
@@ -1287,6 +1297,14 @@ void WriteGeometryPriorOuterSeedDiagnostics(
                   << ",";
             }
             csv << candidate.predicted_area_px << ","
+                << candidate.predicted_signed_area_px << ","
+                << candidate.refined_area_px << ","
+                << candidate.refined_signed_area_px << ","
+                << candidate.refined_to_predicted_area_ratio << ","
+                << (candidate.predicted_quad_topology_valid ? 1 : 0) << ","
+                << (candidate.refined_quad_topology_valid ? 1 : 0) << ","
+                << (candidate.quad_topology_preserved ? 1 : 0) << ","
+                << CsvEscape(candidate.quad_topology_summary) << ","
                 << candidate.local_corner_scale_px << ","
                 << candidate.subpix_window_radius << ","
                 << (candidate.spherical_refine_attempted ? 1 : 0) << ","
@@ -1298,6 +1316,7 @@ void WriteGeometryPriorOuterSeedDiagnostics(
                 << candidate.spherical_refine_max_residual << ","
                 << CsvEscape(candidate.spherical_refine_failure_summary) << ","
                 << candidate.max_corner_displacement_px << ","
+                << candidate.adaptive_max_corner_displacement_px << ","
                 << candidate.min_corner_response_ratio << ","
                 << candidate.edge_support_ratio << ","
                 << candidate.mean_edge_gradient_ratio << ","
@@ -1317,6 +1336,7 @@ void WriteGeometryPriorOuterSeedDiagnostics(
                 << CsvEscape(candidate.roi_redetect_summary) << ","
                 << (candidate.roi_valid ? 1 : 0) << ","
                 << (candidate.image_evidence_checked ? 1 : 0) << ","
+                << (candidate.tag_id_validated ? 1 : 0) << ","
                 << (candidate.image_evidence_success ? 1 : 0) << ","
                 << (candidate.local_redetect_success ? 1 : 0) << ","
                 << (candidate.local_corner_refine_success ? 1 : 0) << ","
@@ -1372,6 +1392,29 @@ void WriteGeometryPriorOuterSeedDiagnostics(
                       .geometry_prior_rescue_allow_geometry_only_pose_refit
                   ? 1
                   : 0)
+          << "\n";
+  summary << "geometry_only_updates_observations_by_default: "
+          << (report.baseline_result.effective_options
+                      .geometry_prior_rescue_allow_geometry_only_pose_refit &&
+                  report.baseline_result.effective_options
+                      .geometry_prior_rescue_use_as_observation &&
+                  !report.baseline_result.effective_options
+                       .geometry_prior_rescue_diagnostic_only
+              ? 1
+              : 0)
+          << "\n";
+  summary << "quad_topology_guard_enabled: 1\n";
+  summary << "visible_frame_refit_mode: robust_multi_board_consensus\n";
+  summary << "visible_frame_refit_outlier_policy: local_outer_rmse_lt_3px_then_board_median_mad_consensus\n";
+  summary << "corner_displacement_guard_mode: "
+          << (report.baseline_result.effective_options
+                          .geometry_prior_rescue_max_corner_displacement_px < 0.0
+                  ? "disabled_debug"
+                  : (report.baseline_result.effective_options
+                                 .geometry_prior_rescue_max_corner_displacement_px ==
+                             0.0
+                         ? "scale_adaptive"
+                         : "fixed_px"))
           << "\n";
   summary << "normal_detected_outer_observation_count: "
           << normal_detected_outer_count << "\n";
@@ -4959,7 +5002,9 @@ void WriteFrameBoardObservationFlowDiagnostics(
   std::map<int, std::string> image_paths;
   for (const ati::FrozenRound2BaselineFrameSource& frame :
        all_frames_for_lookup) {
-    image_paths[frame.frame_index] = frame.image_path;
+    if (!frame.image_path.empty()) {
+      image_paths[frame.frame_index] = frame.image_path;
+    }
   }
   std::map<int, std::vector<FrameBoardObservationFlowRow> > rows_by_frame;
   for (const FrameBoardObservationFlowRow& row : rows) {
@@ -6222,6 +6267,43 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.baseline_seed_total_point_count << "\n";
   summary << "candidate_board_observation_count: "
           << result.candidate_board_observation_count << "\n";
+  summary << "stage5_selection_profile: "
+          << result.selection_profile << "\n";
+  summary << "stage5_selection_is_kalibr_checkerboard_style: "
+          << (result.selection_is_kalibr_checkerboard_style ? 1 : 0)
+          << "\n";
+  summary << "stage5_checkerboard_huber_delta_pixels: "
+          << result.checkerboard_huber_delta_pixels << "\n";
+  summary << "stage5_checkerboard_force_all_valid_views: "
+          << (result.checkerboard_force_all_valid_views ? 1 : 0) << "\n";
+  summary << "stage5_checkerboard_pose_marginalized_fisher: "
+          << (result.checkerboard_pose_marginalized_fisher ? 1 : 0) << "\n";
+  summary << "stage5_checkerboard_seed_strategy: "
+          << result.checkerboard_seed_strategy << "\n";
+  summary << "stage5_checkerboard_seed_target_frame_count: "
+          << result.checkerboard_seed_target_frame_count << "\n";
+  summary << "stage5_checkerboard_seed_fisher_logdet: "
+          << result.checkerboard_seed_fisher_logdet << "\n";
+  summary << "stage5_checkerboard_seed_fisher_rank_proxy: "
+          << result.checkerboard_seed_fisher_rank_proxy << "\n";
+  summary << "stage5_checkerboard_outlier_filter_enabled: "
+          << (result.checkerboard_outlier_filter_enabled ? 1 : 0) << "\n";
+  summary << "stage5_checkerboard_outlier_sigma: "
+          << result.checkerboard_outlier_sigma << "\n";
+  summary << "stage5_checkerboard_min_inlier_ratio: "
+          << result.checkerboard_min_inlier_ratio << "\n";
+  summary << "stage5_checkerboard_min_retained_points: "
+          << result.checkerboard_min_retained_points << "\n";
+  summary << "stage5_checkerboard_outlier_threshold_pixels: "
+          << result.checkerboard_outlier_threshold_pixels << "\n";
+  summary << "stage5_checkerboard_outlier_median_pixels: "
+          << result.checkerboard_outlier_median_pixels << "\n";
+  summary << "stage5_checkerboard_outlier_robust_sigma_pixels: "
+          << result.checkerboard_outlier_robust_sigma_pixels << "\n";
+  summary << "stage5_checkerboard_outlier_removed_point_count: "
+          << result.checkerboard_outlier_removed_point_count << "\n";
+  summary << "stage5_checkerboard_outlier_dropped_view_count: "
+          << result.checkerboard_outlier_dropped_view_count << "\n";
   summary << "attempted_candidate_count: "
           << result.attempted_candidate_count << "\n";
   summary << "accepted_candidate_count: "
@@ -6274,6 +6356,20 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
                   ? 1
                   : 0)
           << "\n";
+  summary << "persistent_incremental_board_layout_fixed: "
+          << (result.persistent_incremental_board_layout_fixed ? 1 : 0)
+          << "\n";
+  summary << "persistent_incremental_board_layout_pose_count: "
+          << result.persistent_incremental_board_layout_pose_count << "\n";
+  summary << "persistent_incremental_board_layout_max_matrix_abs_delta: "
+          << result.persistent_incremental_board_layout_max_matrix_abs_delta
+          << "\n";
+  summary << "persistent_incremental_board_layout_max_translation_delta: "
+          << result.persistent_incremental_board_layout_max_translation_delta
+          << "\n";
+  summary << "persistent_incremental_board_layout_max_rotation_delta_deg: "
+          << result.persistent_incremental_board_layout_max_rotation_delta_deg
+          << "\n";
   summary << "persistent_incremental_camera_information_group_id: "
           << result.persistent_incremental_camera_information_group_id << "\n";
   summary << "persistent_incremental_board_layout_group_id: "
@@ -6282,6 +6378,33 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.persistent_incremental_transformation_group_id << "\n";
   summary << "persistent_incremental_seed_information_group_dim: "
           << result.persistent_incremental_seed_information_group_dim << "\n";
+  summary << "persistent_incremental_seed_information_rank: "
+          << result.persistent_incremental_seed_information_rank << "\n";
+  summary << "persistent_incremental_seed_information_rank_deficiency: "
+          << result.persistent_incremental_seed_information_rank_deficiency
+          << "\n";
+  summary << "persistent_incremental_seed_information_baseline_valid: "
+          << (result.persistent_incremental_seed_information_baseline_valid ? 1
+                                                                            : 0)
+          << "\n";
+  summary << "persistent_incremental_seed_information_scaled_min_singular_value: "
+          << result
+                 .persistent_incremental_seed_information_scaled_min_singular_value
+          << "\n";
+  summary << "persistent_incremental_seed_information_scaled_max_singular_value: "
+          << result
+                 .persistent_incremental_seed_information_scaled_max_singular_value
+          << "\n";
+  summary << "persistent_incremental_seed_information_scaled_condition_number: "
+          << result
+                 .persistent_incremental_seed_information_scaled_condition_number
+          << "\n";
+  summary << "persistent_incremental_seed_information_ds_cu_stddev_px: "
+          << result.persistent_incremental_seed_information_ds_cu_stddev_px
+          << "\n";
+  summary << "persistent_incremental_seed_information_ds_cv_stddev_px: "
+          << result.persistent_incremental_seed_information_ds_cv_stddev_px
+          << "\n";
   summary << "persistent_incremental_seed_batch_count: "
           << result.persistent_incremental_seed_batch_count << "\n";
   summary << "persistent_incremental_seed_frame_count: "
@@ -6290,6 +6413,38 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.persistent_incremental_seed_board_observation_count << "\n";
   summary << "persistent_incremental_seed_point_count: "
           << result.persistent_incremental_seed_point_count << "\n";
+  summary << "persistent_incremental_seed_intrinsics_warmup_attempted: "
+          << (result.persistent_incremental_seed_intrinsics_warmup_attempted
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_incremental_seed_intrinsics_warmup_success: "
+          << (result.persistent_incremental_seed_intrinsics_warmup_success ? 1
+                                                                           : 0)
+          << "\n";
+  summary << "persistent_incremental_seed_intrinsics_warmup_converged_by_relative_objective: "
+          << (result
+                      .persistent_incremental_seed_intrinsics_warmup_converged_by_relative_objective
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_incremental_seed_intrinsics_warmup_iterations: "
+          << result.persistent_incremental_seed_intrinsics_warmup_iterations
+          << "\n";
+  summary << "persistent_incremental_seed_intrinsics_warmup_objective_start: "
+          << result
+                 .persistent_incremental_seed_intrinsics_warmup_objective_start
+          << "\n";
+  summary << "persistent_incremental_seed_intrinsics_warmup_objective_final: "
+          << result
+                 .persistent_incremental_seed_intrinsics_warmup_objective_final
+          << "\n";
+  summary << "persistent_incremental_seed_intrinsics_warmup_last_delta_j: "
+          << result.persistent_incremental_seed_intrinsics_warmup_last_delta_j
+          << "\n";
+  summary << "persistent_incremental_seed_intrinsics_warmup_last_delta_x: "
+          << result.persistent_incremental_seed_intrinsics_warmup_last_delta_x
+          << "\n";
   summary << "persistent_incremental_candidate_batch_count: "
           << result.persistent_incremental_candidate_batch_count << "\n";
   summary << "persistent_incremental_attempted_batch_count: "
@@ -6298,6 +6453,49 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.persistent_incremental_accepted_batch_count << "\n";
   summary << "persistent_incremental_rejected_batch_count: "
           << result.persistent_incremental_rejected_batch_count << "\n";
+  summary << "persistent_incremental_solver_profile_name: "
+          << result.persistent_incremental_solver_profile_name << "\n";
+  summary << "persistent_incremental_solver_objective_unit: "
+          << result.persistent_incremental_solver_objective_unit << "\n";
+  summary << "persistent_incremental_solver_max_iterations: "
+          << result.persistent_incremental_solver_max_iterations << "\n";
+  summary << "persistent_incremental_solver_convergence_delta_j: "
+          << result.persistent_incremental_solver_convergence_delta_j << "\n";
+  summary << "persistent_incremental_solver_convergence_delta_x: "
+          << result.persistent_incremental_solver_convergence_delta_x << "\n";
+  summary << "persistent_incremental_solver_bearing_reference_focal_px: "
+          << result.persistent_incremental_solver_bearing_reference_focal_px
+          << "\n";
+  summary << "persistent_incremental_solver_bearing_residual_scale: "
+          << result.persistent_incremental_solver_bearing_residual_scale
+          << "\n";
+  summary << "persistent_incremental_solver_single_iteration_batch_count: "
+          << result.persistent_incremental_solver_single_iteration_batch_count
+          << "\n";
+  summary << "persistent_incremental_solver_max_iteration_batch_count: "
+          << result.persistent_incremental_solver_max_iteration_batch_count
+          << "\n";
+  summary << "persistent_incremental_solver_objective_decreased_batch_count: "
+          << result
+                 .persistent_incremental_solver_objective_decreased_batch_count
+          << "\n";
+  summary << "persistent_incremental_solver_relative_objective_converged_batch_count: "
+          << result
+                 .persistent_incremental_solver_relative_objective_converged_batch_count
+          << "\n";
+  summary << "persistent_incremental_solver_camera_step_converged_batch_count: "
+          << result
+                 .persistent_incremental_solver_camera_step_converged_batch_count
+          << "\n";
+  summary << "persistent_incremental_solver_continuation_batch_count: "
+          << result.persistent_incremental_solver_continuation_batch_count
+          << "\n";
+  summary << "persistent_incremental_solver_continuation_round_count: "
+          << result.persistent_incremental_solver_continuation_round_count
+          << "\n";
+  summary << "persistent_incremental_solver_continuation_guard_hit_count: "
+          << result.persistent_incremental_solver_continuation_guard_hit_count
+          << "\n";
   summary << "persistent_incremental_total_elapsed_time_seconds: "
           << result.persistent_incremental_total_elapsed_time_seconds << "\n";
   summary << "persistent_incremental_trust_region_backtracking_batch_count: "
@@ -6327,6 +6525,86 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
   summary << "persistent_incremental_split_residual_health_rejected_count: "
           << result
                  .persistent_incremental_split_residual_health_rejected_count
+          << "\n";
+  summary << "persistent_incremental_bearing_pixel_safety_gate_enabled: "
+          << (result.persistent_incremental_bearing_pixel_safety_gate_enabled
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_incremental_bearing_pixel_safety_rejected_count: "
+          << result.persistent_incremental_bearing_pixel_safety_rejected_count
+          << "\n";
+  summary
+      << "persistent_incremental_full_training_pose_refit_health_gate_enabled: "
+      << (result
+                  .persistent_incremental_full_training_pose_refit_health_gate_enabled
+              ? 1
+              : 0)
+      << "\n";
+  summary
+      << "persistent_incremental_seed_intrinsics_warmup_full_training_health_pass: "
+      << (result
+                  .persistent_incremental_seed_intrinsics_warmup_full_training_health_pass
+              ? 1
+              : 0)
+      << "\n";
+  summary
+      << "persistent_incremental_full_training_pose_refit_health_rejected_count: "
+      << result
+             .persistent_incremental_full_training_pose_refit_health_rejected_count
+      << "\n";
+  summary << "persistent_incremental_initial_full_training_pixel_rmse: "
+          << result.persistent_incremental_initial_full_training_pixel_rmse
+          << "\n";
+  summary << "persistent_incremental_initial_full_training_pixel_p95: "
+          << result.persistent_incremental_initial_full_training_pixel_p95
+          << "\n";
+  summary
+      << "persistent_incremental_initial_full_training_pose_success_rate: "
+      << result
+             .persistent_incremental_initial_full_training_pose_success_rate
+      << "\n";
+  summary
+      << "persistent_incremental_initial_full_training_pose_success_count: "
+      << result
+             .persistent_incremental_initial_full_training_pose_success_count
+      << "\n";
+  summary << "persistent_incremental_initial_full_training_pose_total_count: "
+          << result
+                 .persistent_incremental_initial_full_training_pose_total_count
+          << "\n";
+  summary
+      << "persistent_incremental_initial_full_training_invalid_projection_count: "
+      << result
+             .persistent_incremental_initial_full_training_invalid_projection_count
+      << "\n";
+  summary << "persistent_incremental_final_full_training_pixel_rmse: "
+          << result.persistent_incremental_final_full_training_pixel_rmse
+          << "\n";
+  summary << "persistent_incremental_final_full_training_pixel_p95: "
+          << result.persistent_incremental_final_full_training_pixel_p95
+          << "\n";
+  summary << "persistent_incremental_final_full_training_pose_success_rate: "
+          << result.persistent_incremental_final_full_training_pose_success_rate
+          << "\n";
+  summary << "persistent_incremental_final_full_training_pose_success_count: "
+          << result
+                 .persistent_incremental_final_full_training_pose_success_count
+          << "\n";
+  summary << "persistent_incremental_final_full_training_pose_total_count: "
+          << result.persistent_incremental_final_full_training_pose_total_count
+          << "\n";
+  summary
+      << "persistent_incremental_final_full_training_invalid_projection_count: "
+      << result
+             .persistent_incremental_final_full_training_invalid_projection_count
+      << "\n";
+  summary << "persistent_incremental_kb_distortion_guard_enabled: "
+          << (result.persistent_incremental_kb_distortion_guard_enabled ? 1
+                                                                        : 0)
+          << "\n";
+  summary << "persistent_incremental_kb_ray_curve_validity_rejected_count: "
+          << result.persistent_incremental_kb_ray_curve_validity_rejected_count
           << "\n";
   summary << "persistent_incremental_adaptive_saturation_stop_enabled: "
           << (result.persistent_incremental_adaptive_saturation_stop_enabled
@@ -6361,7 +6639,7 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.persistent_incremental_adaptive_saturation_stop_reason
           << "\n";
   summary << "persistent_incremental_objective_decrease_gate_enabled: "
-          << 0
+          << (result.selection_is_kalibr_checkerboard_style ? 1 : 0)
           << "\n";
   summary << "persistent_incremental_residual_model_aware_acceptance: "
           << (result.persistent_incremental_backend_estimator_used ? 1 : 0)
@@ -6445,6 +6723,33 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
 	  summary << "persistent_incremental_angular_geometry_failure_count: "
 	          << result.persistent_incremental_angular_geometry_failure_count
 	          << "\n";
+  summary << "persistent_incremental_angular_local_whitening_success_count: "
+          << result.persistent_incremental_angular_local_whitening_success_count
+          << "\n";
+  summary << "persistent_incremental_angular_local_whitening_failure_count: "
+          << result.persistent_incremental_angular_local_whitening_failure_count
+          << "\n";
+  summary << "persistent_incremental_angular_local_whitening_clamped_count: "
+          << result.persistent_incremental_angular_local_whitening_clamped_count
+          << "\n";
+  summary << "persistent_incremental_angular_local_whitening_sigma_mean_rad: "
+          << result.persistent_incremental_angular_local_whitening_sigma_mean_rad
+          << "\n";
+  summary << "persistent_incremental_angular_local_whitening_sigma_min_rad: "
+          << result.persistent_incremental_angular_local_whitening_sigma_min_rad
+          << "\n";
+  summary << "persistent_incremental_angular_local_whitening_sigma_max_rad: "
+          << result.persistent_incremental_angular_local_whitening_sigma_max_rad
+          << "\n";
+  summary << "persistent_incremental_angular_local_whitening_weight_mean: "
+          << result.persistent_incremental_angular_local_whitening_weight_mean
+          << "\n";
+  summary << "persistent_incremental_angular_local_whitening_weight_min: "
+          << result.persistent_incremental_angular_local_whitening_weight_min
+          << "\n";
+  summary << "persistent_incremental_angular_local_whitening_weight_max: "
+          << result.persistent_incremental_angular_local_whitening_weight_max
+          << "\n";
   summary << "persistent_incremental_selection_metric_name: "
           << result.persistent_incremental_selection_metric_name << "\n";
   summary << "persistent_incremental_bearing_geometry_source: "
@@ -6571,11 +6876,17 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
       << "information_gain_proxy,residual_overage_penalty,"
       << "batch_acceptance_score,accepted_by_batch_acceptance,"
       << "persistent_incremental_attempted,"
+      << "persistent_incremental_attempt_order,"
       << "persistent_incremental_batch_accepted,"
       << "persistent_incremental_force,"
       << "persistent_incremental_trust_region_pass,"
       << "persistent_incremental_trust_region_backtracking_used,"
       << "persistent_incremental_split_residual_health_pass,"
+      << "persistent_incremental_pixel_safety_gate_pass,"
+      << "persistent_incremental_full_training_pose_refit_health_pass,"
+      << "persistent_incremental_ray_curve_validity_pass,"
+      << "persistent_incremental_kb_k3_released,"
+      << "persistent_incremental_kb_k4_released,"
       << "persistent_incremental_information_gain,"
       << "persistent_incremental_normalized_information_gain,"
       << "persistent_incremental_information_gain_normalization_count,"
@@ -6587,8 +6898,26 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
       << "persistent_incremental_svd_tolerance,"
       << "persistent_incremental_qr_tolerance,"
       << "persistent_incremental_iterations,"
+      << "persistent_incremental_last_solver_pass_iterations,"
+      << "persistent_incremental_continuation_round_count,"
+      << "persistent_incremental_continuation_guard_hit,"
+      << "persistent_incremental_pose_prefit_attempted,"
+      << "persistent_incremental_pose_prefit_success,"
+      << "persistent_incremental_pose_prefit_iterations,"
+      << "persistent_incremental_pose_prefit_objective_start,"
+      << "persistent_incremental_pose_prefit_objective_final,"
+      << "persistent_incremental_pose_prefit_last_delta_j,"
+      << "persistent_incremental_pose_prefit_last_delta_x,"
       << "persistent_incremental_objective_start,"
       << "persistent_incremental_objective_final,"
+      << "persistent_incremental_objective_last_delta_j,"
+      << "persistent_incremental_state_last_delta_x,"
+      << "persistent_incremental_linear_solver_failure,"
+      << "persistent_incremental_converged_by_relative_objective,"
+      << "persistent_incremental_converged_by_camera_step,"
+      << "persistent_incremental_last_camera_shape_step,"
+      << "persistent_incremental_last_camera_focal_relative_step,"
+      << "persistent_incremental_last_camera_principal_step_px,"
       << "persistent_incremental_objective_decreased,"
       << "persistent_incremental_rmse_before,"
       << "persistent_incremental_outer_rmse_before,"
@@ -6611,6 +6940,26 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
       << "persistent_incremental_candidate_total_p95_after,"
       << "persistent_incremental_candidate_outer_p95_after,"
       << "persistent_incremental_candidate_internal_p95_after,"
+      << "persistent_incremental_pixel_rmse_before,"
+      << "persistent_incremental_pixel_rmse_after,"
+      << "persistent_incremental_pixel_p95_before,"
+      << "persistent_incremental_pixel_p95_after,"
+      << "persistent_incremental_candidate_pixel_rmse_after,"
+      << "persistent_incremental_candidate_pixel_p95_after,"
+      << "persistent_incremental_full_training_pixel_rmse_before,"
+      << "persistent_incremental_full_training_pixel_rmse_after,"
+      << "persistent_incremental_full_training_pixel_p95_before,"
+      << "persistent_incremental_full_training_pixel_p95_after,"
+      << "persistent_incremental_full_training_pose_success_rate_before,"
+      << "persistent_incremental_full_training_pose_success_rate_after,"
+      << "persistent_incremental_full_training_pose_success_count_before,"
+      << "persistent_incremental_full_training_pose_success_count_after,"
+      << "persistent_incremental_full_training_pose_total_count,"
+      << "persistent_incremental_full_training_invalid_projection_count_before,"
+      << "persistent_incremental_full_training_invalid_projection_count_after,"
+      << "persistent_incremental_ray_curve_rms_change_deg,"
+      << "persistent_incremental_ray_curve_max_change_deg,"
+      << "persistent_incremental_ray_curve_min_radial_derivative,"
 	      << "persistent_incremental_image_plane_residual_count,"
 	      << "persistent_incremental_angular_residual_count,"
 	      << "persistent_incremental_chordal_residual_count,"
@@ -6634,6 +6983,14 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
       << "persistent_incremental_camera_fv_after,"
       << "persistent_incremental_camera_cu_after,"
       << "persistent_incremental_camera_cv_after,"
+      << "persistent_incremental_camera_k1_before,"
+      << "persistent_incremental_camera_k2_before,"
+      << "persistent_incremental_camera_k3_before,"
+      << "persistent_incremental_camera_k4_before,"
+      << "persistent_incremental_camera_k1_after,"
+      << "persistent_incremental_camera_k2_after,"
+      << "persistent_incremental_camera_k3_after,"
+      << "persistent_incremental_camera_k4_after,"
       << "point_count,outer_point_count,internal_point_count\n";
   for (const ati::TrialBackendFrameBoardObservationDecision& decision :
        result.decisions) {
@@ -6717,6 +7074,7 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
         << decision.batch_acceptance_score << ","
         << (decision.accepted_by_batch_acceptance ? 1 : 0) << ","
         << (decision.persistent_incremental_attempted ? 1 : 0) << ","
+        << decision.persistent_incremental_attempt_order << ","
         << (decision.persistent_incremental_batch_accepted ? 1 : 0) << ","
         << (decision.persistent_incremental_force ? 1 : 0) << ","
         << (decision.persistent_incremental_trust_region_pass ? 1 : 0)
@@ -6727,6 +7085,17 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
         << (decision.persistent_incremental_split_residual_health_pass ? 1
                                                                        : 0)
         << ","
+        << (decision.persistent_incremental_pixel_safety_gate_pass ? 1 : 0)
+        << ","
+        << (decision
+                    .persistent_incremental_full_training_pose_refit_health_pass
+                ? 1
+                : 0)
+        << ","
+        << (decision.persistent_incremental_ray_curve_validity_pass ? 1 : 0)
+        << ","
+        << (decision.persistent_incremental_kb_k3_released ? 1 : 0) << ","
+        << (decision.persistent_incremental_kb_k4_released ? 1 : 0) << ","
         << decision.persistent_incremental_information_gain << ","
         << decision.persistent_incremental_normalized_information_gain << ","
         << decision
@@ -6740,8 +7109,36 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
         << decision.persistent_incremental_svd_tolerance << ","
         << decision.persistent_incremental_qr_tolerance << ","
         << decision.persistent_incremental_iterations << ","
+        << decision.persistent_incremental_last_solver_pass_iterations << ","
+        << decision.persistent_incremental_continuation_round_count << ","
+        << (decision.persistent_incremental_continuation_guard_hit ? 1 : 0)
+        << ","
+        << (decision.persistent_incremental_pose_prefit_attempted ? 1 : 0)
+        << ","
+        << (decision.persistent_incremental_pose_prefit_success ? 1 : 0)
+        << ","
+        << decision.persistent_incremental_pose_prefit_iterations << ","
+        << decision.persistent_incremental_pose_prefit_objective_start << ","
+        << decision.persistent_incremental_pose_prefit_objective_final << ","
+        << decision.persistent_incremental_pose_prefit_last_delta_j << ","
+        << decision.persistent_incremental_pose_prefit_last_delta_x << ","
         << decision.persistent_incremental_objective_start << ","
         << decision.persistent_incremental_objective_final << ","
+        << decision.persistent_incremental_objective_last_delta_j << ","
+        << decision.persistent_incremental_state_last_delta_x << ","
+        << (decision.persistent_incremental_linear_solver_failure ? 1 : 0)
+        << ","
+        << (decision.persistent_incremental_converged_by_relative_objective
+                ? 1
+                : 0)
+        << ","
+        << (decision.persistent_incremental_converged_by_camera_step ? 1 : 0)
+        << ","
+        << decision.persistent_incremental_last_camera_shape_step << ","
+        << decision.persistent_incremental_last_camera_focal_relative_step
+        << ","
+        << decision.persistent_incremental_last_camera_principal_step_px
+        << ","
         << (decision.persistent_incremental_objective_decreased ? 1 : 0)
         << ","
         << decision.persistent_incremental_rmse_before << ","
@@ -6771,6 +7168,44 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
         << decision.persistent_incremental_candidate_total_p95_after << ","
         << decision.persistent_incremental_candidate_outer_p95_after << ","
         << decision.persistent_incremental_candidate_internal_p95_after << ","
+        << decision.persistent_incremental_pixel_rmse_before << ","
+        << decision.persistent_incremental_pixel_rmse_after << ","
+        << decision.persistent_incremental_pixel_p95_before << ","
+        << decision.persistent_incremental_pixel_p95_after << ","
+        << decision.persistent_incremental_candidate_pixel_rmse_after << ","
+        << decision.persistent_incremental_candidate_pixel_p95_after << ","
+        << decision.persistent_incremental_full_training_pixel_rmse_before
+        << ","
+        << decision.persistent_incremental_full_training_pixel_rmse_after
+        << ","
+        << decision.persistent_incremental_full_training_pixel_p95_before
+        << ","
+        << decision.persistent_incremental_full_training_pixel_p95_after
+        << ","
+        << decision
+               .persistent_incremental_full_training_pose_success_rate_before
+        << ","
+        << decision
+               .persistent_incremental_full_training_pose_success_rate_after
+        << ","
+        << decision
+               .persistent_incremental_full_training_pose_success_count_before
+        << ","
+        << decision
+               .persistent_incremental_full_training_pose_success_count_after
+        << ","
+        << decision.persistent_incremental_full_training_pose_total_count
+        << ","
+        << decision
+               .persistent_incremental_full_training_invalid_projection_count_before
+        << ","
+        << decision
+               .persistent_incremental_full_training_invalid_projection_count_after
+        << ","
+        << decision.persistent_incremental_ray_curve_rms_change_deg << ","
+        << decision.persistent_incremental_ray_curve_max_change_deg << ","
+        << decision.persistent_incremental_ray_curve_min_radial_derivative
+        << ","
 	        << decision.persistent_incremental_image_plane_residual_count << ","
 	        << decision.persistent_incremental_angular_residual_count << ","
 	        << decision.persistent_incremental_chordal_residual_count << ","
@@ -6798,6 +7233,14 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
         << decision.persistent_incremental_camera_fv_after << ","
         << decision.persistent_incremental_camera_cu_after << ","
         << decision.persistent_incremental_camera_cv_after << ","
+        << decision.persistent_incremental_camera_k1_before << ","
+        << decision.persistent_incremental_camera_k2_before << ","
+        << decision.persistent_incremental_camera_k3_before << ","
+        << decision.persistent_incremental_camera_k4_before << ","
+        << decision.persistent_incremental_camera_k1_after << ","
+        << decision.persistent_incremental_camera_k2_after << ","
+        << decision.persistent_incremental_camera_k3_after << ","
+        << decision.persistent_incremental_camera_k4_after << ","
         << decision.point_count << ","
         << decision.outer_point_count << ","
         << decision.internal_point_count << "\n";

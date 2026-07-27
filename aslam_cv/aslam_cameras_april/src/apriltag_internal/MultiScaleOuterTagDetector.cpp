@@ -64,6 +64,8 @@ struct ScaleCandidate {
   double shape_quality = 0.0;
   bool from_local_patch_rescue = false;
   std::string local_patch_label;
+  double local_patch_center_distance =
+      std::numeric_limits<double>::infinity();
 };
 
 struct RefinedCandidate {
@@ -159,7 +161,7 @@ struct ScalePlanEntry {
 };
 
 struct LocalSpherePatchPlan {
-  const char* label = "";
+  std::string label;
   double normalized_x = 0.5;
   double normalized_y = 0.5;
   double fov_deg = 44.0;
@@ -211,6 +213,7 @@ struct MultiScaleCornerFusionOutcome {
 };
 
 double ComputeQuadArea(const std::array<cv::Point2f, 4>& corners);
+cv::Point2f ComputeQuadCenter(const std::array<cv::Point2f, 4>& corners);
 std::pair<double, double> ComputeEdgeRange(const std::array<cv::Point2f, 4>& corners);
 bool IntersectLines(const FittedLine& first, const FittedLine& second, cv::Point2f* intersection);
 std::vector<cv::Point2f> CollectCornerMarkerEdgeSupportPoints(
@@ -467,59 +470,31 @@ bool BuildLocalSpherePatchFrame(const DoubleSphereCameraModel& camera,
 }
 
 std::vector<LocalSpherePatchPlan> BuildOuterLocalSpherePatchPlans() {
-  struct PlanSeed {
-    const char* label = "";
-    cv::Point2f center{};
-    double fov_deg = 44.0;
-  };
-  const std::array<PlanSeed, 32> seeds{{
-      {"top_inner", cv::Point2f(0.50f, 0.28f), 44.0},
-      {"bottom_inner", cv::Point2f(0.50f, 0.72f), 44.0},
-      {"left_inner", cv::Point2f(0.28f, 0.50f), 44.0},
-      {"right_inner", cv::Point2f(0.72f, 0.50f), 44.0},
-      {"top_left_inner", cv::Point2f(0.30f, 0.30f), 44.0},
-      {"top_right_inner", cv::Point2f(0.70f, 0.30f), 44.0},
-      {"bottom_left_inner", cv::Point2f(0.30f, 0.70f), 44.0},
-      {"bottom_right_inner", cv::Point2f(0.70f, 0.70f), 44.0},
-      {"top_outer", cv::Point2f(0.50f, 0.18f), 44.0},
-      {"bottom_outer", cv::Point2f(0.50f, 0.82f), 44.0},
-      {"left_outer", cv::Point2f(0.18f, 0.50f), 44.0},
-      {"right_outer", cv::Point2f(0.82f, 0.50f), 44.0},
-      {"top_left_outer", cv::Point2f(0.26f, 0.26f), 44.0},
-      {"top_right_outer", cv::Point2f(0.74f, 0.26f), 44.0},
-      {"bottom_left_outer", cv::Point2f(0.26f, 0.74f), 44.0},
-      {"bottom_right_outer", cv::Point2f(0.74f, 0.74f), 44.0},
-      // Extra stress-case patches for close boards near the fisheye boundary.
-      // They are only used after ordinary multiscale detection sees tags but
-      // fails to decode the requested board id, so they do not change normal
-      // detections or relax the AprilTag id/hamming checks.
-      {"left_edge_mid", cv::Point2f(0.10f, 0.50f), 58.0},
-      {"left_edge_upper", cv::Point2f(0.10f, 0.38f), 58.0},
-      {"left_edge_lower", cv::Point2f(0.10f, 0.62f), 58.0},
-      {"left_edge_mid_wide", cv::Point2f(0.14f, 0.50f), 68.0},
-      {"left_edge_upper_wide", cv::Point2f(0.14f, 0.36f), 68.0},
-      {"left_edge_lower_wide", cv::Point2f(0.14f, 0.64f), 68.0},
-      {"bottom_edge_mid", cv::Point2f(0.50f, 0.90f), 58.0},
-      {"bottom_edge_left", cv::Point2f(0.38f, 0.90f), 58.0},
-      {"bottom_edge_right", cv::Point2f(0.62f, 0.90f), 58.0},
-      {"bottom_edge_mid_wide", cv::Point2f(0.50f, 0.86f), 68.0},
-      {"bottom_edge_left_wide", cv::Point2f(0.36f, 0.86f), 68.0},
-      {"bottom_edge_right_wide", cv::Point2f(0.64f, 0.86f), 68.0},
-      {"bottom_left_edge", cv::Point2f(0.18f, 0.86f), 62.0},
-      {"bottom_right_edge", cv::Point2f(0.82f, 0.86f), 62.0},
-      {"top_left_edge", cv::Point2f(0.18f, 0.14f), 62.0},
-      {"top_right_edge", cv::Point2f(0.82f, 0.14f), 62.0},
-  }};
-
   std::vector<LocalSpherePatchPlan> plans;
-  plans.reserve(seeds.size());
-  for (const PlanSeed& seed : seeds) {
-    LocalSpherePatchPlan plan;
-    plan.label = seed.label;
-    plan.normalized_x = seed.center.x;
-    plan.normalized_y = seed.center.y;
-    plan.fov_deg = seed.fov_deg;
-    plans.push_back(plan);
+  plans.reserve(34);
+  const std::array<double, 5> dense_centers{{0.10, 0.30, 0.50, 0.70, 0.90}};
+  for (std::size_t row = 0; row < dense_centers.size(); ++row) {
+    for (std::size_t column = 0; column < dense_centers.size(); ++column) {
+      LocalSpherePatchPlan plan;
+      plan.label = "dense_r" + std::to_string(row) + "_c" +
+                   std::to_string(column);
+      plan.normalized_x = dense_centers[column];
+      plan.normalized_y = dense_centers[row];
+      plan.fov_deg = 56.0;
+      plans.push_back(plan);
+    }
+  }
+  const std::array<double, 3> wide_centers{{0.18, 0.50, 0.82}};
+  for (std::size_t row = 0; row < wide_centers.size(); ++row) {
+    for (std::size_t column = 0; column < wide_centers.size(); ++column) {
+      LocalSpherePatchPlan plan;
+      plan.label = "wide_r" + std::to_string(row) + "_c" +
+                   std::to_string(column);
+      plan.normalized_x = wide_centers[column];
+      plan.normalized_y = wide_centers[row];
+      plan.fov_deg = 72.0;
+      plans.push_back(plan);
+    }
   }
   return plans;
 }
@@ -627,6 +602,10 @@ bool BuildScaleCandidateFromPatchDetection(const AprilTags::TagDetection& detect
   candidate->max_edge = edge_range.second;
   candidate->shape_quality =
       candidate->max_edge > 1e-6 ? ClampUnit(candidate->min_edge / candidate->max_edge) : 0.0;
+  candidate->local_patch_center_distance = cv::norm(
+      ComputeQuadCenter(candidate->scaled_corners) -
+      cv::Point2f(static_cast<float>(context.cx),
+                  static_cast<float>(context.cy)));
   return true;
 }
 
@@ -797,6 +776,16 @@ MultiScaleOuterTagDetectorConfig ParseConfig(const std::string& yaml_path) {
     } else if (key == "anonymousTagLikeRescueMaxAreaRatio" ||
                key == "anonymous_tag_like_rescue_max_area_ratio") {
       config.anonymous_tag_like_rescue_max_area_ratio = ParseDouble(key, value);
+    } else if (key == "enableCameraAwareSpherePatchRescue" ||
+               key == "enable_camera_aware_sphere_patch_rescue") {
+      config.enable_camera_aware_sphere_patch_rescue = ParseBool(key, value);
+    } else if (key == "cameraAwareSpherePatchMaxHamming" ||
+               key == "camera_aware_sphere_patch_max_hamming") {
+      config.camera_aware_sphere_patch_max_hamming = ParseInt(key, value);
+    } else if (key == "cameraAwareSpherePatchCommitMappedCorners" ||
+               key == "camera_aware_sphere_patch_commit_mapped_corners") {
+      config.camera_aware_sphere_patch_commit_mapped_corners =
+          ParseBool(key, value);
     } else if (key == "camera_model") {
       config.refine_camera.camera_model = value;
     } else if (key == "distortion_model") {
@@ -2808,20 +2797,23 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
         debug.close_edge_subpix_boost_applied &&
         debug.subpix_applied) {
       std::string support_failure_reason;
-      if (!PassesRefinedCornerEdgeSupportCheck(
+      const bool edge_support_ok = PassesRefinedCornerEdgeSupportCheck(
               gray_original, refined_candidate.refined_original, index, debug,
-              &support_failure_reason)) {
-        std::string response_diagnostic;
-        const bool response_ok = PassesRefinedCornerResponseCheck(
-            gray_original,
-            refined_candidate.refined_original[static_cast<std::size_t>(index)],
-            debug.subpix_window_radius,
-            &response_diagnostic);
-        if (!response_ok) {
-          refined_valid = false;
-          debug.failure_reason =
-              support_failure_reason + ";" + response_diagnostic;
-        }
+              &support_failure_reason);
+      std::string response_diagnostic;
+      const bool response_ok = PassesRefinedCornerResponseCheck(
+          gray_original,
+          refined_candidate.refined_original[static_cast<std::size_t>(index)],
+          debug.subpix_window_radius,
+          &response_diagnostic);
+      // A strong corner response alone is insufficient: a large adaptive
+      // window can converge to a different image corner. The refined point
+      // must also be supported by the two marker edges of this decoded tag.
+      if (!edge_support_ok || !response_ok) {
+        refined_valid = false;
+        debug.failure_reason = edge_support_ok
+                                   ? response_diagnostic
+                                   : support_failure_reason + ";" + response_diagnostic;
       }
     }
     debug.refined_valid = refined_valid;
@@ -2991,6 +2983,10 @@ MultiScaleOuterTagDetector::MultiScaleOuterTagDetector(MultiScaleOuterTagDetecto
           config_.anonymous_tag_like_rescue_min_area_ratio) {
     throw std::runtime_error(
         "anonymous_tag_like_rescue area ratio bounds must be non-negative and ordered.");
+  }
+  if (config_.camera_aware_sphere_patch_max_hamming < 0) {
+    throw std::runtime_error(
+        "camera_aware_sphere_patch_max_hamming must be non-negative.");
   }
 
   detector_ = std::make_unique<AprilTags::TagDetector>(AprilTags::tagCodes36h11, 2);
@@ -3312,7 +3308,8 @@ void TryLocalSpherePatchRescue(
     const std::map<int, std::size_t>& requested_index_by_id,
     AprilTags::TagDetector* detector,
     std::vector<PerTagOuterAggregationState>* states) {
-  if (states == nullptr || detector == nullptr || sphere_camera == nullptr ||
+  if (!config.enable_camera_aware_sphere_patch_rescue || states == nullptr ||
+      detector == nullptr || sphere_camera == nullptr ||
       !sphere_camera->IsValid()) {
     return;
   }
@@ -3336,11 +3333,8 @@ void TryLocalSpherePatchRescue(
   }
 
   const std::vector<LocalSpherePatchPlan> patch_plans = BuildOuterLocalSpherePatchPlans();
+  std::map<std::size_t, ScaleCandidate> best_candidate_by_index;
   for (const LocalSpherePatchPlan& patch_plan : patch_plans) {
-    if (unresolved_indices.empty()) {
-      break;
-    }
-
     LocalSpherePatchContext patch_context;
     if (!BuildLocalSpherePatch(gray_original, *sphere_camera, patch_plan, &patch_context)) {
       continue;
@@ -3358,7 +3352,9 @@ void TryLocalSpherePatchRescue(
       }
 
       PerTagOuterAggregationState& state = (*states)[requested_it->second];
-      if (state.saw_matching_tag_id || !state.attempted_local_patch_rescue || !detection.good) {
+      if (!state.attempted_local_patch_rescue || !detection.good ||
+          detection.hammingDistance >
+              config.camera_aware_sphere_patch_max_hamming) {
         continue;
       }
 
@@ -3372,20 +3368,38 @@ void TryLocalSpherePatchRescue(
         continue;
       }
 
-      state.saw_matching_tag_id = true;
-      state.coarse_candidates.push_back(candidate);
-
-      std::ostringstream rescue_summary;
-      rescue_summary << "local_sphere_patch label=" << patch_context.label
-                     << " id=" << detection.id
-                     << " ham=" << detection.hammingDistance
-                     << " area=" << std::lround(candidate.scaled_area);
-      state.local_patch_rescue_summaries.push_back(rescue_summary.str());
-
-      unresolved_indices.erase(
-          std::remove(unresolved_indices.begin(), unresolved_indices.end(), requested_it->second),
-          unresolved_indices.end());
+      const auto current_it = best_candidate_by_index.find(requested_it->second);
+      const bool better = current_it == best_candidate_by_index.end() ||
+                          candidate.detection.hammingDistance <
+                              current_it->second.detection.hammingDistance ||
+                          (candidate.detection.hammingDistance ==
+                               current_it->second.detection.hammingDistance &&
+                           (candidate.local_patch_center_distance <
+                                current_it->second.local_patch_center_distance - 1e-6 ||
+                            (std::abs(candidate.local_patch_center_distance -
+                                      current_it->second.local_patch_center_distance) <= 1e-6 &&
+                             candidate.scaled_area >
+                                 current_it->second.scaled_area)));
+      if (better) {
+        best_candidate_by_index[requested_it->second] = candidate;
+      }
     }
+  }
+
+  for (const auto& entry : best_candidate_by_index) {
+    PerTagOuterAggregationState& state = (*states)[entry.first];
+    const ScaleCandidate& candidate = entry.second;
+    state.saw_matching_tag_id = true;
+    state.coarse_candidates.push_back(candidate);
+    std::ostringstream rescue_summary;
+    rescue_summary << "camera_aware_sphere_patch label="
+                   << candidate.local_patch_label
+                   << " id=" << candidate.detection.id
+                   << " ham=" << candidate.detection.hammingDistance
+                   << " center_distance=" << std::fixed << std::setprecision(2)
+                   << candidate.local_patch_center_distance
+                   << " area=" << std::lround(candidate.scaled_area);
+    state.local_patch_rescue_summaries.push_back(rescue_summary.str());
   }
 }
 
@@ -3428,6 +3442,39 @@ OuterTagDetectionResult FinalizeOuterTagDetection(
       });
   if (reference_it == state->coarse_candidates.end()) {
     result.failure_reason = OuterTagFailureReason::MatchingTagIdButAllScalesUnstable;
+    result.failure_reason_text = ToString(result.failure_reason);
+    return result;
+  }
+
+  if (reference_it->from_local_patch_rescue &&
+      config.camera_aware_sphere_patch_commit_mapped_corners) {
+    result.used_local_patch_rescue = true;
+    result.detected_tag_id = reference_it->detection.id;
+    result.chosen_scale_longest_side = reference_it->target_longest_side;
+    result.chosen_scale_factor = reference_it->scale_factor;
+    result.hamming = reference_it->detection.hammingDistance;
+    result.good = reference_it->detection.good;
+    result.quality = 1.0;
+    for (int index = 0; index < 4; ++index) {
+      const std::size_t corner_index = static_cast<std::size_t>(index);
+      result.coarse_corners_scaled_image[corner_index] =
+          ToEigen(reference_it->scaled_corners[corner_index]);
+      result.coarse_corners_original_image[corner_index] =
+          ToEigen(reference_it->original_corners[corner_index]);
+      result.refined_corners_original_image[corner_index] =
+          ToEigen(reference_it->original_corners[corner_index]);
+      result.refined_valid[corner_index] = true;
+      result.corner_verification_debug[corner_index].coarse_corner =
+          reference_it->original_corners[corner_index];
+      result.corner_verification_debug[corner_index].verified_corner =
+          reference_it->original_corners[corner_index];
+      result.corner_verification_debug[corner_index].subpix_corner =
+          reference_it->original_corners[corner_index];
+      result.corner_verification_debug[corner_index].refined_valid = true;
+      result.corner_verification_debug[corner_index].verification_passed = true;
+    }
+    result.success = true;
+    result.failure_reason = OuterTagFailureReason::None;
     result.failure_reason_text = ToString(result.failure_reason);
     return result;
   }

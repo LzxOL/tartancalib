@@ -4,13 +4,16 @@
 #include <aslam/cameras/apriltag_internal/JointMeasurementCuration.hpp>
 #include <aslam/cameras/apriltag_internal/KalibrBenchmark.hpp>
 #include <aslam/cameras/apriltag_internal/MultiBoardConsistencyDiagnostics.hpp>
+#include <aslam/cameras/apriltag_internal/DoubleSphereCameraModel.hpp>
 #include <aslam/cameras/apriltag_internal/OuterOnlyCameraInitializer.hpp>
 #include <aslam/cameras/apriltag_internal/PolarAngleResidualDiagnostics.hpp>
+#include <aslam/cameras/apriltag_internal/PrecomputedObservationImporter.hpp>
 #include <aslam/cameras/apriltag_internal/Stage5Benchmark.hpp>
 #include <aslam/cameras/apriltag_internal/Stage5BackendDiagnosticWriters.hpp>
 #include <aslam/cameras/apriltag_internal/Stage5Runtime.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -38,7 +41,8 @@ namespace fs = boost::filesystem;
 
 std::string MatrixToCsv(const Eigen::Matrix4d& matrix);
 
-constexpr const char kFrozenBaselineLabel[] = "stage5_backend_auto_v1";
+constexpr const char kFrozenBaselineLabel[] =
+    "stage5_backend_auto_v2_camera_aware_outer";
 
 enum class IntrinsicsReleaseMode {
   Delayed,
@@ -50,7 +54,16 @@ struct CmdArgs {
   std::string config_path;
   std::string image_path;
   std::string test_image_path;
+  std::string precomputed_observations_dir;
+  std::string precomputed_holdout_observations_dir;
+  std::vector<std::string>
+      precomputed_initialization_auxiliary_observation_dirs;
+  std::string precomputed_target_mode = "auto";
+  bool allow_image_training_with_precomputed_holdout = false;
+  bool precomputed_init_use_all_points = false;
+  std::string precomputed_initialization_point_scope = "all";
   bool external_holdout_self_frontend_prepass = false;
+  bool stage5_holdout_evaluate_full_training_observations = false;
   std::string output_path;
   std::string kalibr_camchain_yaml;
   std::vector<std::string> reference_intrinsics_specs;
@@ -58,6 +71,16 @@ struct CmdArgs {
   std::string camera_init_mode_override;
   std::string stage5_models = "ds-none";
   std::string stage5_init_refine_mode = "kalibr_outer_lm";
+  std::string stage5_init_selection_scorer =
+      "pose_marginalized_principal";
+  bool stage5_enable_init_principal_profile = false;
+  double stage5_init_principal_profile_radius_px = 10.0;
+  bool stage5_enable_init_fixed_layout_diagnostic = false;
+  bool stage5_enable_init_board_jackknife_diagnostic = false;
+  bool stage5_enable_init_coverage_weighted_diagnostic = false;
+  bool stage5_init_near_tie_prefer_lower_focal = false;
+  double stage5_init_near_tie_relative_objective_tolerance = 0.0;
+  bool stage5_camera_aware_outer_rescue = true;
   std::string experiment_tag;
   std::string cache_dir;
   bool all = false;
@@ -93,7 +116,13 @@ struct CmdArgs {
   std::string stage5_trial_backend_selection_acceptance_policy =
       "kalibr_information_gain";
   double stage5_trial_backend_selection_mi_tol = 0.2;
+  bool stage5_trial_backend_selection_mi_tol_set = false;
   double stage5_trial_backend_selection_rank_threshold = 1e-6;
+  double stage5_checkerboard_huber_delta_pixels = 1.5;
+  bool stage5_checkerboard_outlier_filter_enabled = true;
+  double stage5_checkerboard_outlier_sigma = 4.0;
+  double stage5_checkerboard_min_inlier_ratio = 0.5;
+  int stage5_checkerboard_min_retained_points = 8;
   unsigned int stage5_trial_backend_selection_candidate_shuffle_seed = 0;
   bool stage5_trial_backend_selection_candidate_shuffle_seed_set = false;
   bool stage5_trial_backend_selection_incremental = true;
@@ -102,6 +131,7 @@ struct CmdArgs {
   bool stage5_trial_backend_selection_delayed_intrinsics_release = true;
   int stage5_trial_backend_selection_intrinsics_release_iteration = 1;
   bool stage5_trial_backend_selection_persistent_intrinsics_anchor_prior = false;
+  bool stage5_trial_backend_selection_persistent_fix_board_layout = false;
   double stage5_trial_backend_selection_persistent_intrinsics_anchor_weight_xi_alpha = 0.0;
   double stage5_trial_backend_selection_persistent_intrinsics_anchor_weight_focal = 0.0;
   double stage5_trial_backend_selection_persistent_intrinsics_anchor_weight_principal = 0.0;
@@ -136,6 +166,7 @@ struct CmdArgs {
   double stage5_trial_backend_selection_frame_cohesion_min_candidate_score = 3.2;
   int stage5_trial_backend_selection_min_keep_per_board = 5;
   std::string stage5_trial_backend_selection_force_include_frame_board_list;
+  std::string stage5_trial_backend_selection_seed_frame_board_list;
   bool stage5_trial_backend_selection_force_include_list_is_exact_input = false;
   bool strict_board_observation_acceptance = false;
   bool preserve_frame_board_cohesion = false;
@@ -170,7 +201,23 @@ struct CmdArgs {
   double backend_normalized_angular_max_weight_scale = 1.0e8;
   double backend_pixel_residual_weight = 1.0;
   double backend_chordal_residual_weight = 1.0;
+  bool enable_hybrid_pixel_ray_final_refinement = false;
+  bool enable_large_intrinsic_perturbation = false;
+  std::string large_intrinsic_perturbation_profile;
+  double large_intrinsic_perturbation_scale = 1.0;
+  bool large_intrinsic_perturbation_strict_scale = false;
+  std::string large_intrinsic_perturbation_reference_scene_path;
+  bool large_intrinsic_perturbation_outer_only_after_application = false;
+  double hybrid_pixel_ray_lambda = 0.5;
+  int hybrid_pixel_ray_max_iterations = 12;
+  double hybrid_pixel_ray_pixel_scale_floor = 1e-3;
+  double hybrid_pixel_ray_ray_scale_floor = 1e-6;
   bool backend_angular_use_normalize_jacobian = false;
+  bool backend_angular_local_whitening = false;
+  double backend_angular_local_whitening_pixel_sigma_px = 1.0;
+  double backend_angular_local_whitening_covariance_damping = 1e-12;
+  double backend_angular_local_whitening_min_sigma_rad = 1e-6;
+  double backend_angular_local_whitening_max_weight = 1e5;
   std::string backend_angular_observed_ray_mode = "dynamic_current_camera";
   std::string backend_board_pose_parameterization = "reference_chain";
   bool backend_optimize_board_poses = true;
@@ -213,7 +260,7 @@ struct CmdArgs {
   bool geometry_prior_rescue_diagnostic_only = false;
   bool geometry_prior_rescue_use_as_observation = true;
   bool geometry_prior_rescue_keep_outer_on_internal_failure = false;
-  bool geometry_prior_rescue_allow_geometry_only_pose_refit = true;
+  bool geometry_prior_rescue_allow_geometry_only_pose_refit = false;
   int geometry_prior_rescue_subpix_window_radius = 0;
   double geometry_prior_rescue_max_corner_displacement_px = 0.0;
   double geometry_prior_rescue_min_corner_response_ratio = 0.03;
@@ -408,14 +455,17 @@ std::string NormalizeStage5ModelFamily(std::string model) {
   if (model == "eucm" || model == "eucm-none") {
     return "eucm-none";
   }
-  if (model == "mei" || model == "omni" || model == "omni-radtan" ||
-      model == "omni_radtan" || model == "mei-radtan" ||
-      model == "radial-tangential-omni") {
+  if (model == "mei" || model == "ucm" || model == "omni" ||
+      model == "omni-none" || model == "omni_none") {
+    return "omni-none";
+  }
+  if (model == "omni-radtan" || model == "omni_radtan" ||
+      model == "mei-radtan" || model == "radial-tangential-omni") {
     return "omni-radtan";
   }
   throw std::runtime_error(
       "Unsupported --models value: " + model +
-      " (supported: ds-none, pinhole-equi/kb, eucm-none, mei/omni-radtan)");
+      " (supported: ds-none, pinhole-equi/kb, eucm-none, mei/ucm/omni-none, omni-radtan)");
 }
 
 void ApplyStage5ModelFamily(const std::string& model_family,
@@ -441,6 +491,9 @@ void ApplyStage5ModelFamily(const std::string& model_family,
   } else if (family == "omni-radtan") {
     camera.camera_model = "omni";
     camera.distortion_model = "radtan";
+  } else if (family == "omni-none") {
+    camera.camera_model = "omni";
+    camera.distortion_model = "none";
   }
   config->intermediate_camera = camera;
 }
@@ -472,8 +525,12 @@ struct RequestedExperimentConfig {
   std::string models = "ds-none";
   ati::AutoCameraInitializationRefineMode init_refine_mode =
       ati::AutoCameraInitializationRefineMode::KalibrOuterLm;
+  ati::AutoCameraInitializationSelectionScorer init_selection_scorer =
+      ati::AutoCameraInitializationSelectionScorer::
+          PoseMarginalizedPrincipal;
   ati::CameraInitializationMode camera_init_mode =
       ati::CameraInitializationMode::Auto;
+  bool camera_aware_outer_rescue = true;
   bool outer_only_ablation_mode = false;
   bool include_internal_points = true;
   bool run_second_pass = true;
@@ -517,7 +574,13 @@ struct RequestedExperimentConfig {
   std::string trial_backend_selection_acceptance_policy =
       "kalibr_information_gain";
   double trial_backend_selection_mi_tol = 0.2;
+  bool trial_backend_selection_mi_tol_set = false;
   double trial_backend_selection_rank_threshold = 1e-6;
+  double checkerboard_huber_delta_pixels = 1.5;
+  bool checkerboard_outlier_filter_enabled = true;
+  double checkerboard_outlier_sigma = 4.0;
+  double checkerboard_min_inlier_ratio = 0.5;
+  int checkerboard_min_retained_points = 8;
   unsigned int trial_backend_selection_candidate_shuffle_seed = 0;
   bool trial_backend_selection_candidate_shuffle_seed_set = false;
   bool trial_backend_selection_incremental = true;
@@ -526,6 +589,7 @@ struct RequestedExperimentConfig {
   bool trial_backend_selection_delayed_intrinsics_release = true;
   int trial_backend_selection_intrinsics_release_iteration = 1;
   bool trial_backend_selection_persistent_intrinsics_anchor_prior = false;
+  bool trial_backend_selection_persistent_fix_board_layout = false;
   double trial_backend_selection_persistent_intrinsics_anchor_weight_xi_alpha = 0.0;
   double trial_backend_selection_persistent_intrinsics_anchor_weight_focal = 0.0;
   double trial_backend_selection_persistent_intrinsics_anchor_weight_principal = 0.0;
@@ -560,6 +624,7 @@ struct RequestedExperimentConfig {
   double trial_backend_selection_frame_cohesion_min_candidate_score = 3.2;
   int trial_backend_selection_min_keep_per_board = 5;
   std::string trial_backend_selection_force_include_frame_board_list;
+  std::string trial_backend_selection_seed_frame_board_list;
   bool trial_backend_selection_force_include_list_is_exact_input = false;
   bool strict_board_observation_acceptance = false;
   bool preserve_frame_board_cohesion = false;
@@ -594,7 +659,17 @@ struct RequestedExperimentConfig {
   double backend_normalized_angular_max_weight_scale = 1.0e8;
   double backend_pixel_residual_weight = 1.0;
   double backend_chordal_residual_weight = 1.0;
+  bool enable_hybrid_pixel_ray_final_refinement = false;
+  double hybrid_pixel_ray_lambda = 0.5;
+  int hybrid_pixel_ray_max_iterations = 12;
+  double hybrid_pixel_ray_pixel_scale_floor = 1e-3;
+  double hybrid_pixel_ray_ray_scale_floor = 1e-6;
   bool backend_angular_use_normalize_jacobian = false;
+  bool backend_angular_local_whitening = false;
+  double backend_angular_local_whitening_pixel_sigma_px = 1.0;
+  double backend_angular_local_whitening_covariance_damping = 1e-12;
+  double backend_angular_local_whitening_min_sigma_rad = 1e-6;
+  double backend_angular_local_whitening_max_weight = 1e5;
   std::string backend_angular_observed_ray_mode = "dynamic_current_camera";
   bool backend_fixed_intrinsics = false;
   bool enable_angular_residual_diagnostics = false;
@@ -628,7 +703,7 @@ struct RequestedExperimentConfig {
   bool geometry_prior_rescue_diagnostic_only = false;
   bool geometry_prior_rescue_use_as_observation = true;
   bool geometry_prior_rescue_keep_outer_on_internal_failure = false;
-  bool geometry_prior_rescue_allow_geometry_only_pose_refit = true;
+  bool geometry_prior_rescue_allow_geometry_only_pose_refit = false;
   int geometry_prior_rescue_subpix_window_radius = 0;
   double geometry_prior_rescue_max_corner_displacement_px = 0.0;
   double geometry_prior_rescue_min_corner_response_ratio = 0.03;
@@ -804,6 +879,12 @@ ParseTrialBackendFrameBoardCandidateOrderMode(const std::string& value) {
     return ati::TrialBackendFrameBoardSelectionOptions::CandidateOrderMode
         ::RandomShuffle;
   }
+  if (lowered == "intrinsics_information_greedy" ||
+      lowered == "intrinsics-information-greedy" ||
+      lowered == "information_greedy") {
+    return ati::TrialBackendFrameBoardSelectionOptions::CandidateOrderMode
+        ::IntrinsicsInformationGreedy;
+  }
   throw std::runtime_error(
       "Unsupported --stage5-trial-backend-selection-candidate-order: " +
       value);
@@ -948,6 +1029,7 @@ bool HasAblationOverrides(const RequestedExperimentConfig& config) {
          std::fabs(config.internal_corner_filter_quality_relaxation_px - 1.0) > 1e-12 ||
          std::fabs(config.internal_corner_filter_adaptive_min_threshold_px - 1.0) > 1e-12 ||
 	         config.backend_residual_model != "image_plane" ||
+	         config.enable_hybrid_pixel_ray_final_refinement ||
 	         config.backend_angular_observed_ray_mode != "dynamic_current_camera" ||
 	         !config.backend_optimize_board_poses ||
 	         config.backend_point_budget_control ||
@@ -1281,6 +1363,13 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
     }
     parts.push_back(residual_tag.str());
   }
+  if (config.enable_hybrid_pixel_ray_final_refinement) {
+    std::ostringstream hybrid_tag;
+    hybrid_tag << "pixel_ray_refine_l"
+               << static_cast<int>(
+                      std::lround(100.0 * config.hybrid_pixel_ray_lambda));
+    parts.push_back(hybrid_tag.str());
+  }
 	  if (!config.backend_optimize_board_poses) {
 	    parts.push_back("backend_fixed_board_poses");
 	  }
@@ -1332,6 +1421,11 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
   config.init_refine_mode =
       ati::ParseAutoCameraInitializationRefineMode(
           args.stage5_init_refine_mode);
+  config.init_selection_scorer =
+      ati::ParseAutoCameraInitializationSelectionScorer(
+          args.stage5_init_selection_scorer);
+  config.camera_aware_outer_rescue =
+      args.stage5_camera_aware_outer_rescue;
   config.outer_only_ablation_mode = !args.include_internal_points;
   config.include_internal_points = args.include_internal_points;
   config.run_second_pass = !args.disable_second_pass;
@@ -1372,8 +1466,20 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.stage5_trial_backend_selection_acceptance_policy;
   config.trial_backend_selection_mi_tol =
       args.stage5_trial_backend_selection_mi_tol;
+  config.trial_backend_selection_mi_tol_set =
+      args.stage5_trial_backend_selection_mi_tol_set;
   config.trial_backend_selection_rank_threshold =
       args.stage5_trial_backend_selection_rank_threshold;
+  config.checkerboard_huber_delta_pixels =
+      args.stage5_checkerboard_huber_delta_pixels;
+  config.checkerboard_outlier_filter_enabled =
+      args.stage5_checkerboard_outlier_filter_enabled;
+  config.checkerboard_outlier_sigma =
+      args.stage5_checkerboard_outlier_sigma;
+  config.checkerboard_min_inlier_ratio =
+      args.stage5_checkerboard_min_inlier_ratio;
+  config.checkerboard_min_retained_points =
+      args.stage5_checkerboard_min_retained_points;
   config.trial_backend_selection_candidate_shuffle_seed =
       args.stage5_trial_backend_selection_candidate_shuffle_seed;
   config.trial_backend_selection_candidate_shuffle_seed_set =
@@ -1390,6 +1496,8 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.stage5_trial_backend_selection_intrinsics_release_iteration;
   config.trial_backend_selection_persistent_intrinsics_anchor_prior =
       args.stage5_trial_backend_selection_persistent_intrinsics_anchor_prior;
+  config.trial_backend_selection_persistent_fix_board_layout =
+      args.stage5_trial_backend_selection_persistent_fix_board_layout;
   config.trial_backend_selection_persistent_intrinsics_anchor_weight_xi_alpha =
       args.stage5_trial_backend_selection_persistent_intrinsics_anchor_weight_xi_alpha;
   config.trial_backend_selection_persistent_intrinsics_anchor_weight_focal =
@@ -1460,6 +1568,8 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.stage5_trial_backend_selection_min_keep_per_board;
   config.trial_backend_selection_force_include_frame_board_list =
       args.stage5_trial_backend_selection_force_include_frame_board_list;
+  config.trial_backend_selection_seed_frame_board_list =
+      args.stage5_trial_backend_selection_seed_frame_board_list;
   config.trial_backend_selection_force_include_list_is_exact_input =
       args.stage5_trial_backend_selection_force_include_list_is_exact_input;
   config.strict_board_observation_acceptance =
@@ -1648,8 +1758,27 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.backend_pixel_residual_weight;
   config.backend_chordal_residual_weight =
       args.backend_chordal_residual_weight;
+  config.enable_hybrid_pixel_ray_final_refinement =
+      args.enable_hybrid_pixel_ray_final_refinement;
+  config.hybrid_pixel_ray_lambda = args.hybrid_pixel_ray_lambda;
+  config.hybrid_pixel_ray_max_iterations =
+      args.hybrid_pixel_ray_max_iterations;
+  config.hybrid_pixel_ray_pixel_scale_floor =
+      args.hybrid_pixel_ray_pixel_scale_floor;
+  config.hybrid_pixel_ray_ray_scale_floor =
+      args.hybrid_pixel_ray_ray_scale_floor;
   config.backend_angular_use_normalize_jacobian =
       args.backend_angular_use_normalize_jacobian;
+	config.backend_angular_local_whitening =
+	    args.backend_angular_local_whitening;
+	config.backend_angular_local_whitening_pixel_sigma_px =
+	    args.backend_angular_local_whitening_pixel_sigma_px;
+	config.backend_angular_local_whitening_covariance_damping =
+	    args.backend_angular_local_whitening_covariance_damping;
+	config.backend_angular_local_whitening_min_sigma_rad =
+	    args.backend_angular_local_whitening_min_sigma_rad;
+	config.backend_angular_local_whitening_max_weight =
+	    args.backend_angular_local_whitening_max_weight;
 	  config.backend_angular_observed_ray_mode =
 	      args.backend_angular_observed_ray_mode;
 	  config.backend_board_pose_parameterization =
@@ -1803,12 +1932,31 @@ void PrintUsage(const char* program) {
   std::cout
       << "Usage:\n"
       << "  " << program
-      << " --image IMAGE_OR_DIR --config APRILTAG_INTERNAL_YAML --output OUTPUT_DIR"
+      << " (--image IMAGE_OR_DIR|--stage5-precomputed-observations-dir DIR)"
+      << " --config APRILTAG_INTERNAL_YAML --output OUTPUT_DIR"
       << " --kalibr-camchain CAMCHAIN_YAML [--all]"
       << " [--test-image IMAGE_OR_DIR|--holdout-image IMAGE_OR_DIR]\n\n"
       << "Core options:\n"
       << "  --image PATH                         Training image or directory.\n"
       << "  --test-image PATH                    Optional holdout image or directory.\n"
+      << "  --stage5-precomputed-observations-dir PATH\n"
+      << "                                      Imported BabelCalib MAT training observations.\n"
+      << "  --stage5-precomputed-holdout-observations-dir PATH\n"
+      << "                                      Frozen imported MAT holdout observations.\n"
+      << "  --stage5-allow-image-training-with-precomputed-holdout\n"
+      << "                                      Explicit paper mode: image frontend training\n"
+      << "                                      plus frozen precomputed holdout.\n"
+      << "  --stage5-init-auxiliary-precomputed-observations-dir PATH\n"
+      << "                                      Additional calibration session used only for\n"
+      << "                                      shared-intrinsics initialization; repeatable.\n"
+      << "  --stage5-precomputed-target-mode auto|single_board|multi_board\n"
+      << "                                      Target topology mode; default auto.\n"
+      << "  --stage5-precomputed-init-use-all-points 0|1\n"
+      << "                                      Experimental: use imported outer and internal\n"
+      << "                                      points in camera initialization LM; default 0.\n"
+      << "  --stage5-precomputed-init-point-scope all|outer_only|internal_only\n"
+      << "                                      Diagnostic control-point scope for the\n"
+      << "                                      imported initialization LM; default all.\n"
       << "  --stage5-external-holdout-self-frontend-prepass\n"
       << "                                      For external --test-image evaluation,\n"
       << "                                      build test observations from a frozen\n"
@@ -1819,13 +1967,40 @@ void PrintUsage(const char* program) {
       << "                                      Extra reference camera YAML/camchain for\n"
       << "                                      evaluation only; repeatable. LABEL is\n"
       << "                                      optional when using just PATH.\n"
-      << "  --models ds-none|pinhole-equi|kb|eucm-none|mei\n"
+      << "  --models ds-none|pinhole-equi|kb|eucm-none|mei|ucm|omni-none|omni-radtan\n"
       << "                                      Stage5 calibration camera model family;\n"
       << "                                      default ds-none. This follows Kalibr-style\n"
       << "                                      explicit model selection instead of target YAML.\n"
       << "  --stage5-init-refine-mode kalibr_outer_lm|coordinate_search|none\n"
       << "                                      Camera initialization refinement mode;\n"
       << "                                      default kalibr_outer_lm.\n"
+      << "  --stage5-init-selection-scorer pose_marginalized_principal|legacy_fixed_pose\n"
+      << "                                      Outer-only initialization view scorer;\n"
+      << "                                      default pose_marginalized_principal.\n"
+      << "  --stage5-enable-init-principal-profile\n"
+      << "                                      Diagnostic-only 3x3 fixed-cu/cv profile;\n"
+      << "                                      does not update selected intrinsics.\n"
+      << "  --stage5-init-principal-profile-radius-px PX\n"
+      << "                                      Profile offset radius; default 10 px.\n"
+      << "  --stage5-enable-init-fixed-layout-diagnostic\n"
+      << "                                      Diagnostic-only frozen-layout/shared-frame\n"
+      << "                                      pose LM; never commits intrinsics.\n"
+      << "  --stage5-enable-init-board-jackknife-diagnostic\n"
+      << "                                      Diagnostic-only leave-one-board-out\n"
+      << "                                      camera refinement; never commits.\n"
+      << "  --stage5-enable-init-coverage-weighted-diagnostic\n"
+      << "                                      Diagnostic-only 4x4 inverse-density\n"
+      << "                                      view weighting; never commits.\n"
+      << "  --stage5-init-near-tie-prefer-lower-focal\n"
+      << "                                      Explicit DS basin-selection ablation;\n"
+      << "                                      default disabled.\n"
+      << "  --stage5-init-near-tie-relative-objective-tolerance R\n"
+      << "                                      Relative near-tie tolerance; default 0.\n"
+      << "  --stage5-enable-camera-aware-outer-rescue\n"
+      << "                                      Enable provisional-camera sphere-tile\n"
+      << "                                      outer-tag rescue; enabled by default.\n"
+      << "  --stage5-disable-camera-aware-outer-rescue\n"
+      << "                                      Disable it for detector ablation.\n"
       << "  --output PATH                        Output directory.\n"
       << "  --runtime-mode research|fast         Runtime preset.\n"
       << "  --cache-dir PATH                     Optional frontend cache directory.\n"
@@ -1849,12 +2024,22 @@ void PrintUsage(const char* program) {
       << "  --stage5-trial-backend-selection-mode strict_rmse|kalibr_style_batch"
       << " (default kalibr_style_batch; strict_rmse for ablation)\n"
       << "  --stage5-trial-backend-selection-budget-mode fixed|adaptive|kalibr_style\n"
-      << "  --stage5-trial-backend-selection-candidate-order score_sorted|random_shuffle\n"
+      << "  --stage5-trial-backend-selection-candidate-order score_sorted|random_shuffle|intrinsics_information_greedy\n"
       << "  --stage5-trial-backend-selection-info-gain-proxy-mode legacy|intrinsics_jacobian\n"
       << "  --stage5-trial-backend-selection-batch-granularity frame_board|frame|frame_board_then_frame\n"
       << "  --stage5-trial-backend-selection-acceptance-policy residual_score|kalibr_information_gain\n"
       << "  --stage5-trial-backend-selection-mi-tol X\n"
       << "  --stage5-trial-backend-selection-rank-threshold X\n"
+      << "  --stage5-checkerboard-huber-delta-px X"
+      << " (dense single-board robust scale; default 1.5)\n"
+      << "  --stage5-checkerboard-outlier-filter 0|1"
+      << " (hard training-outlier filter after initial trial; default 1)\n"
+      << "  --stage5-checkerboard-outlier-sigma X"
+      << " (median/MAD threshold multiplier; default 4.0)\n"
+      << "  --stage5-checkerboard-min-inlier-ratio X"
+      << " (minimum retained fraction per view; default 0.5)\n"
+      << "  --stage5-checkerboard-min-retained-points N"
+      << " (minimum retained controls per view; default 8)\n"
       << "  --stage5-trial-backend-selection-candidate-shuffle-seed N"
       << " (optional reproducibility; default non-fixed seed in kalibr_style_batch)\n"
       << "  --stage5-trial-backend-selection-carry-accepted-trial-state 0|1"
@@ -1867,6 +2052,8 @@ void PrintUsage(const char* program) {
       << " (default 1)\n"
       << "  --stage5-trial-backend-selection-persistent-intrinsics-anchor-prior 0|1"
       << " (default 1; trust-region anchor for candidate intrinsics)\n"
+      << "  --stage5-trial-backend-selection-persistent-fix-board-layout 0|1"
+      << " (default 0; freeze the estimated rigid board layout during persistent BA)\n"
       << "  --stage5-trial-backend-selection-persistent-intrinsics-anchor-weight-xi-alpha W\n"
       << "  --stage5-trial-backend-selection-persistent-intrinsics-anchor-weight-focal W\n"
       << "  --stage5-trial-backend-selection-persistent-intrinsics-anchor-weight-principal W\n"
@@ -1885,6 +2072,8 @@ void PrintUsage(const char* program) {
       << "  --stage5-trial-backend-selection-frame-cohesion\n"
       << "  --stage5-trial-backend-selection-force-include-list-is-exact-input 0|1"
       << " (paper ablation: use force-list as the only backend input)\n"
+      << "  --stage5-trial-backend-selection-seed-frame-board-list CSV"
+      << " (paper ablation: exact common persistent seed input)\n"
       << "  --stage5-trial-backend-selection-frame-cohesion-max-companions N"
       << " (<=0 auto from observed boards)\n"
 	      << "  --stage5-trial-backend-selection-close-distance-boost\n"
@@ -1899,6 +2088,25 @@ void PrintUsage(const char* program) {
 	      << "  --stage5-backend-point-budget-control-total-points N\n"
 	      << "  --stage5-backend-point-budget-control-seed N\n"
 	      << "  --stage5-backend-max-boards-per-frame-for-ablation N\n\n"
+	      << "Optional post-selection refinement:\n"
+	      << "  --stage5-enable-hybrid-pixel-ray-final-refinement\n"
+	      << "  --stage5-hybrid-pixel-ray-lambda L (default 0.5)\n"
+	      << "  --stage5-hybrid-pixel-ray-max-iterations N (default 12)\n"
+	      << "  --stage5-hybrid-pixel-ray-pixel-scale-floor S (default 1e-3)\n"
+      << "  --stage5-hybrid-pixel-ray-ray-scale-floor S (default 1e-6)\n\n"
+      << "  --stage5-large-intrinsic-perturbation PROFILE\n"
+      << "                                      Apply DS P1/P2/P3/P4 after\n"
+      << "                                      internal recovery and before\n"
+      << "                                      selection/incremental BA.\n\n"
+      << "  --stage5-large-intrinsic-perturbation-scale S\n"
+      << "                                      Unit-interval amount along the\n"
+      << "                                      selected direction (default 1).\n\n"
+      << "  --stage5-large-intrinsic-perturbation-reference-scene PATH\n"
+      << "                                      Reuse a saved unperturbed scene\n"
+      << "                                      for paired ablation runs.\n\n"
+      << "  --stage5-large-intrinsic-perturbation-outer-only-after-application\n"
+      << "                                      Drop frozen internal residuals only\n"
+      << "                                      after perturbation, before selection.\n\n"
 	      << "Diagnostics and visualizations:\n"
       << "  --internal-regeneration-diagnostics\n"
       << "  --stage5-enable-selection-diagnostics\n"
@@ -1922,8 +2130,36 @@ CmdArgs ParseArgs(int argc, char** argv) {
     } else if ((token == "--test-image" || token == "--holdout-image") &&
                i + 1 < argc) {
       args.test_image_path = argv[++i];
+    } else if (token == "--stage5-precomputed-observations-dir" &&
+               i + 1 < argc) {
+      args.precomputed_observations_dir = argv[++i];
+    } else if (token ==
+                   "--stage5-precomputed-holdout-observations-dir" &&
+               i + 1 < argc) {
+      args.precomputed_holdout_observations_dir = argv[++i];
+    } else if (
+        token == "--stage5-allow-image-training-with-precomputed-holdout") {
+      args.allow_image_training_with_precomputed_holdout = true;
+    } else if (token ==
+                   "--stage5-init-auxiliary-precomputed-observations-dir" &&
+               i + 1 < argc) {
+      args.precomputed_initialization_auxiliary_observation_dirs.push_back(
+          argv[++i]);
+    } else if (token == "--stage5-precomputed-target-mode" &&
+               i + 1 < argc) {
+      args.precomputed_target_mode = argv[++i];
+    } else if (token == "--stage5-precomputed-init-use-all-points" &&
+               i + 1 < argc) {
+      args.precomputed_init_use_all_points =
+          ParseBooleanFlagValue(argv[++i]);
+    } else if (token == "--stage5-precomputed-init-point-scope" &&
+               i + 1 < argc) {
+      args.precomputed_initialization_point_scope = argv[++i];
     } else if (token == "--stage5-external-holdout-self-frontend-prepass") {
       args.external_holdout_self_frontend_prepass = true;
+    } else if (token ==
+               "--stage5-holdout-evaluate-full-training-observations") {
+      args.stage5_holdout_evaluate_full_training_observations = true;
     } else if (token == "--config" && i + 1 < argc) {
       args.config_path = argv[++i];
     } else if (token == "--output" && i + 1 < argc) {
@@ -1939,6 +2175,30 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.stage5_models = NormalizeStage5ModelFamily(argv[++i]);
     } else if (token == "--stage5-init-refine-mode" && i + 1 < argc) {
       args.stage5_init_refine_mode = argv[++i];
+    } else if (token == "--stage5-init-selection-scorer" && i + 1 < argc) {
+      args.stage5_init_selection_scorer = argv[++i];
+    } else if (token == "--stage5-enable-init-principal-profile") {
+      args.stage5_enable_init_principal_profile = true;
+    } else if (token == "--stage5-init-principal-profile-radius-px" &&
+               i + 1 < argc) {
+      args.stage5_init_principal_profile_radius_px = std::stod(argv[++i]);
+    } else if (token == "--stage5-enable-init-fixed-layout-diagnostic") {
+      args.stage5_enable_init_fixed_layout_diagnostic = true;
+    } else if (token == "--stage5-enable-init-board-jackknife-diagnostic") {
+      args.stage5_enable_init_board_jackknife_diagnostic = true;
+    } else if (token == "--stage5-enable-init-coverage-weighted-diagnostic") {
+      args.stage5_enable_init_coverage_weighted_diagnostic = true;
+    } else if (token == "--stage5-init-near-tie-prefer-lower-focal") {
+      args.stage5_init_near_tie_prefer_lower_focal = true;
+    } else if (token ==
+                   "--stage5-init-near-tie-relative-objective-tolerance" &&
+               i + 1 < argc) {
+      args.stage5_init_near_tie_relative_objective_tolerance =
+          std::stod(argv[++i]);
+    } else if (token == "--stage5-enable-camera-aware-outer-rescue") {
+      args.stage5_camera_aware_outer_rescue = true;
+    } else if (token == "--stage5-disable-camera-aware-outer-rescue") {
+      args.stage5_camera_aware_outer_rescue = false;
     } else if (token == "--kalibr-training-split-signature" && i + 1 < argc) {
       args.kalibr_training_split_signature = argv[++i];
     } else if (token == "--camera-init-mode" && i + 1 < argc) {
@@ -2019,11 +2279,28 @@ CmdArgs ParseArgs(int argc, char** argv) {
         token == "--stage5-trial-backend-selection-mi-tol" &&
         i + 1 < argc) {
       args.stage5_trial_backend_selection_mi_tol = std::stod(argv[++i]);
+      args.stage5_trial_backend_selection_mi_tol_set = true;
     } else if (
         token == "--stage5-trial-backend-selection-rank-threshold" &&
         i + 1 < argc) {
       args.stage5_trial_backend_selection_rank_threshold =
           std::stod(argv[++i]);
+    } else if (token == "--stage5-checkerboard-huber-delta-px" &&
+               i + 1 < argc) {
+      args.stage5_checkerboard_huber_delta_pixels = std::stod(argv[++i]);
+    } else if (token == "--stage5-checkerboard-outlier-filter" &&
+               i + 1 < argc) {
+      args.stage5_checkerboard_outlier_filter_enabled =
+          ParseBooleanFlagValue(argv[++i]);
+    } else if (token == "--stage5-checkerboard-outlier-sigma" &&
+               i + 1 < argc) {
+      args.stage5_checkerboard_outlier_sigma = std::stod(argv[++i]);
+    } else if (token == "--stage5-checkerboard-min-inlier-ratio" &&
+               i + 1 < argc) {
+      args.stage5_checkerboard_min_inlier_ratio = std::stod(argv[++i]);
+    } else if (token == "--stage5-checkerboard-min-retained-points" &&
+               i + 1 < argc) {
+      args.stage5_checkerboard_min_retained_points = std::stoi(argv[++i]);
     } else if (
         token == "--stage5-trial-backend-selection-candidate-shuffle-seed" &&
         i + 1 < argc) {
@@ -2064,6 +2341,12 @@ CmdArgs ParseArgs(int argc, char** argv) {
             "--stage5-trial-backend-selection-persistent-intrinsics-anchor-prior" &&
         i + 1 < argc) {
       args.stage5_trial_backend_selection_persistent_intrinsics_anchor_prior =
+          std::stoi(argv[++i]) != 0;
+    } else if (
+        token ==
+            "--stage5-trial-backend-selection-persistent-fix-board-layout" &&
+        i + 1 < argc) {
+      args.stage5_trial_backend_selection_persistent_fix_board_layout =
           std::stoi(argv[++i]) != 0;
     } else if (
         token ==
@@ -2249,6 +2532,11 @@ CmdArgs ParseArgs(int argc, char** argv) {
           argv[++i];
     } else if (
         token ==
+            "--stage5-trial-backend-selection-seed-frame-board-list" &&
+        i + 1 < argc) {
+      args.stage5_trial_backend_selection_seed_frame_board_list = argv[++i];
+    } else if (
+        token ==
             "--stage5-trial-backend-selection-force-include-list-is-exact-input" &&
         i + 1 < argc) {
       args.stage5_trial_backend_selection_force_include_list_is_exact_input =
@@ -2333,10 +2621,61 @@ CmdArgs ParseArgs(int argc, char** argv) {
     } else if (token == "--backend-chordal-residual-weight" &&
                i + 1 < argc) {
       args.backend_chordal_residual_weight = std::stod(argv[++i]);
+    } else if (token ==
+               "--stage5-enable-hybrid-pixel-ray-final-refinement") {
+      args.enable_hybrid_pixel_ray_final_refinement = true;
+    } else if (token == "--stage5-large-intrinsic-perturbation" &&
+               i + 1 < argc) {
+      args.enable_large_intrinsic_perturbation = true;
+      args.large_intrinsic_perturbation_profile = argv[++i];
+    } else if (token == "--stage5-large-intrinsic-perturbation-scale" &&
+               i + 1 < argc) {
+      args.large_intrinsic_perturbation_scale = std::stod(argv[++i]);
+    } else if (token == "--stage5-large-intrinsic-perturbation-strict-scale") {
+      args.large_intrinsic_perturbation_strict_scale = true;
+    } else if (token ==
+                   "--stage5-large-intrinsic-perturbation-reference-scene" &&
+               i + 1 < argc) {
+      args.large_intrinsic_perturbation_reference_scene_path = argv[++i];
+    } else if (token ==
+               "--stage5-large-intrinsic-perturbation-outer-only-after-application") {
+      args.large_intrinsic_perturbation_outer_only_after_application = true;
+    } else if (token == "--stage5-hybrid-pixel-ray-lambda" &&
+               i + 1 < argc) {
+      args.hybrid_pixel_ray_lambda = std::stod(argv[++i]);
+    } else if (token == "--stage5-hybrid-pixel-ray-max-iterations" &&
+               i + 1 < argc) {
+      args.hybrid_pixel_ray_max_iterations = std::stoi(argv[++i]);
+    } else if (token == "--stage5-hybrid-pixel-ray-pixel-scale-floor" &&
+               i + 1 < argc) {
+      args.hybrid_pixel_ray_pixel_scale_floor = std::stod(argv[++i]);
+    } else if (token == "--stage5-hybrid-pixel-ray-ray-scale-floor" &&
+               i + 1 < argc) {
+      args.hybrid_pixel_ray_ray_scale_floor = std::stod(argv[++i]);
     } else if (token == "--backend-angular-use-normalize-jacobian" &&
                i + 1 < argc) {
       args.backend_angular_use_normalize_jacobian =
           ParseBooleanFlagValue(argv[++i]);
+	} else if (token == "--backend-angular-local-whitening") {
+	  args.backend_angular_local_whitening = true;
+	} else if (token == "--backend-angular-local-whitening-pixel-sigma-px" &&
+	           i + 1 < argc) {
+	  args.backend_angular_local_whitening_pixel_sigma_px =
+	      std::stod(argv[++i]);
+	} else if (token ==
+	               "--backend-angular-local-whitening-covariance-damping" &&
+	           i + 1 < argc) {
+	  args.backend_angular_local_whitening_covariance_damping =
+	      std::stod(argv[++i]);
+	} else if (token ==
+	               "--backend-angular-local-whitening-min-sigma-rad" &&
+	           i + 1 < argc) {
+	  args.backend_angular_local_whitening_min_sigma_rad =
+	      std::stod(argv[++i]);
+	} else if (token == "--backend-angular-local-whitening-max-weight" &&
+	           i + 1 < argc) {
+	  args.backend_angular_local_whitening_max_weight =
+	      std::stod(argv[++i]);
     } else if (token == "--backend-angular-observed-ray-mode" &&
                i + 1 < argc) {
       args.backend_angular_observed_ray_mode = argv[++i];
@@ -2791,10 +3130,83 @@ CmdArgs ParseArgs(int argc, char** argv) {
     }
   }
 
-  if (args.image_path.empty() || args.config_path.empty() || args.output_path.empty() ||
+  const bool has_image_input = !args.image_path.empty();
+  const bool has_precomputed_input = !args.precomputed_observations_dir.empty();
+  if (has_image_input == has_precomputed_input) {
+    throw std::runtime_error(
+        "Specify exactly one of --image or --stage5-precomputed-observations-dir.");
+  }
+  if (args.config_path.empty() || args.output_path.empty() ||
       args.kalibr_camchain_yaml.empty()) {
     throw std::runtime_error(
-        "--image, --config, --output and --kalibr-camchain are required.");
+        "--config, --output and --kalibr-camchain are required.");
+  }
+  if (has_precomputed_input && !args.test_image_path.empty()) {
+    throw std::runtime_error(
+        "Use --stage5-precomputed-holdout-observations-dir instead of --test-image with precomputed input.");
+  }
+  if (has_precomputed_input &&
+      args.precomputed_holdout_observations_dir.empty()) {
+    throw std::runtime_error(
+        "Stage5 benchmark precomputed mode requires --stage5-precomputed-holdout-observations-dir to prevent train/holdout leakage.");
+  }
+  if (!has_precomputed_input &&
+      !args.precomputed_holdout_observations_dir.empty() &&
+      !args.allow_image_training_with_precomputed_holdout) {
+    throw std::runtime_error(
+        "Precomputed holdout observations require precomputed training observations.");
+  }
+  if (args.allow_image_training_with_precomputed_holdout &&
+      has_precomputed_input) {
+    throw std::runtime_error(
+        "--stage5-allow-image-training-with-precomputed-holdout is only for image training input.");
+  }
+  if (args.allow_image_training_with_precomputed_holdout &&
+      args.precomputed_holdout_observations_dir.empty()) {
+    throw std::runtime_error(
+        "--stage5-allow-image-training-with-precomputed-holdout requires frozen holdout observations.");
+  }
+  if (args.allow_image_training_with_precomputed_holdout &&
+      !args.test_image_path.empty()) {
+    throw std::runtime_error(
+        "Use only precomputed holdout observations with image training in mixed frozen-test mode.");
+  }
+  if (!has_precomputed_input && args.precomputed_init_use_all_points) {
+    throw std::runtime_error(
+        "--stage5-precomputed-init-use-all-points requires precomputed observations.");
+  }
+  if (args.precomputed_initialization_point_scope != "all" &&
+      args.precomputed_initialization_point_scope != "outer_only" &&
+      args.precomputed_initialization_point_scope != "internal_only") {
+    throw std::runtime_error(
+        "--stage5-precomputed-init-point-scope must be all, outer_only, or "
+        "internal_only.");
+  }
+  if (!args.precomputed_init_use_all_points &&
+      args.precomputed_initialization_point_scope != "all") {
+    throw std::runtime_error(
+        "A non-default precomputed initialization point scope requires "
+        "--stage5-precomputed-init-use-all-points 1.");
+  }
+  if (!std::isfinite(args.stage5_checkerboard_huber_delta_pixels) ||
+      args.stage5_checkerboard_huber_delta_pixels < 0.0) {
+    throw std::runtime_error(
+        "--stage5-checkerboard-huber-delta-px must be finite and non-negative.");
+  }
+  if (!std::isfinite(args.stage5_checkerboard_outlier_sigma) ||
+      args.stage5_checkerboard_outlier_sigma < 0.0) {
+    throw std::runtime_error(
+        "--stage5-checkerboard-outlier-sigma must be finite and non-negative.");
+  }
+  if (!std::isfinite(args.stage5_checkerboard_min_inlier_ratio) ||
+      args.stage5_checkerboard_min_inlier_ratio < 0.0 ||
+      args.stage5_checkerboard_min_inlier_ratio > 1.0) {
+    throw std::runtime_error(
+        "--stage5-checkerboard-min-inlier-ratio must be in [0, 1].");
+  }
+  if (args.stage5_checkerboard_min_retained_points < 4) {
+    throw std::runtime_error(
+        "--stage5-checkerboard-min-retained-points must be >= 4.");
   }
   if (args.backend_polar_angle_weight_mode != "none" &&
       args.backend_polar_angle_weight_mode != "diagnostic_only" &&
@@ -3667,37 +4079,60 @@ void WriteEvaluationSummary(const std::string& path,
   output << "method_label: " << evaluation.method_label << "\n";
   output << "split_label: " << evaluation.split_label << "\n";
   output << "split_signature: " << evaluation.split_signature << "\n";
-  output << "pose_only_refit_rmse: " << evaluation.pose_only_refit_rmse << "\n";
-  output << "pose_only_refit_success_rate: "
+  output << "evaluation_metric_name: pixel_reprojection\n";
+  output << "evaluation_metric_unit: px\n";
+  output << "evaluation_protocol: "
+         << (evaluation.uniform_control_point_mode
+                 ? "checkerboard_all_control_points_pose_refit_and_reprojection"
+                 : "outer_pose_refit_plus_all_point_reprojection")
+         << "\n";
+  output << (evaluation.uniform_control_point_mode ? "test_pose_refit_rmse: "
+                                                   : "pose_only_refit_rmse: ")
+         << evaluation.pose_only_refit_rmse << "\n";
+  output << (evaluation.uniform_control_point_mode
+                 ? "test_pose_refit_success_rate: "
+                 : "pose_only_refit_success_rate: ")
          << evaluation.pose_only_refit_success_rate << "\n";
-  output << "pose_only_refit_attempt_count: "
+  output << (evaluation.uniform_control_point_mode
+                 ? "test_pose_refit_attempt_count: "
+                 : "pose_only_refit_attempt_count: ")
          << evaluation.pose_only_refit_attempt_count << "\n";
-  output << "pose_only_refit_success_count: "
+  output << (evaluation.uniform_control_point_mode
+                 ? "test_pose_refit_success_count: "
+                 : "pose_only_refit_success_count: ")
          << evaluation.pose_only_refit_success_count << "\n";
   output << "overall_rmse: " << evaluation.overall_rmse << "\n";
-  output << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
-  output << "internal_only_rmse: " << evaluation.internal_only_rmse << "\n";
-  output << "excluded_board_id_for_rmse: "
-         << evaluation.excluded_board_id_for_rmse << "\n";
-  output << "overall_rmse_excluding_board: "
-         << evaluation.overall_rmse_excluding_board << "\n";
-  output << "outer_only_rmse_excluding_board: "
-         << evaluation.outer_only_rmse_excluding_board << "\n";
-  output << "internal_only_rmse_excluding_board: "
-         << evaluation.internal_only_rmse_excluding_board << "\n";
+  output << "p95_reprojection_error: "
+         << evaluation.p95_reprojection_error << "\n";
+  if (evaluation.uniform_control_point_mode) {
+    output << "test_rmse_all_control_points: " << evaluation.overall_rmse << "\n";
+  } else {
+    output << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
+    output << "internal_only_rmse: " << evaluation.internal_only_rmse << "\n";
+    output << "excluded_board_id_for_rmse: "
+           << evaluation.excluded_board_id_for_rmse << "\n";
+    output << "overall_rmse_excluding_board: "
+           << evaluation.overall_rmse_excluding_board << "\n";
+    output << "outer_only_rmse_excluding_board: "
+           << evaluation.outer_only_rmse_excluding_board << "\n";
+    output << "internal_only_rmse_excluding_board: "
+           << evaluation.internal_only_rmse_excluding_board << "\n";
+  }
   output << "mean_residual_x: " << evaluation.mean_residual_x << "\n";
   output << "mean_residual_y: " << evaluation.mean_residual_y << "\n";
   output << "std_residual_x: " << evaluation.std_residual_x << "\n";
   output << "std_residual_y: " << evaluation.std_residual_y << "\n";
   output << "point_count: " << evaluation.point_count << "\n";
-  output << "outer_point_count: " << evaluation.outer_point_count << "\n";
-  output << "internal_point_count: " << evaluation.internal_point_count << "\n";
-  output << "point_count_excluding_board: "
-         << evaluation.point_count_excluding_board << "\n";
-  output << "outer_point_count_excluding_board: "
-         << evaluation.outer_point_count_excluding_board << "\n";
-  output << "internal_point_count_excluding_board: "
-         << evaluation.internal_point_count_excluding_board << "\n";
+  if (!evaluation.uniform_control_point_mode) {
+    output << "outer_point_count: " << evaluation.outer_point_count << "\n";
+    output << "internal_point_count: " << evaluation.internal_point_count << "\n";
+    output << "point_count_excluding_board: "
+           << evaluation.point_count_excluding_board << "\n";
+    output << "outer_point_count_excluding_board: "
+           << evaluation.outer_point_count_excluding_board << "\n";
+    output << "internal_point_count_excluding_board: "
+           << evaluation.internal_point_count_excluding_board << "\n";
+  }
   output << "camera_xi: " << evaluation.camera.xi << "\n";
   output << "camera_alpha: " << evaluation.camera.alpha << "\n";
   output << "camera_fu: " << evaluation.camera.fu << "\n";
@@ -3742,18 +4177,40 @@ void WriteCommittedBackendTrainingSummary(
          << backend_result.training_split_signature
          << "_backend_committed_state\n";
   output << "evaluation_pose_mode: committed_backend_scene_state\n";
+  output << "evaluation_metric_name: "
+         << ati::ToString(backend_result.options.residual_model) << "\n";
+  const ati::ResidualModel training_residual_model =
+      backend_result.options.residual_model;
+  output << "evaluation_metric_unit: "
+         << (training_residual_model == ati::ResidualModel::ImagePlane
+                 ? "px"
+                 : (training_residual_model == ati::ResidualModel::SphereAngular ||
+                            training_residual_model ==
+                                ati::ResidualModel::NormalizedSphereAngular
+                        ? "rad"
+                        : (training_residual_model == ati::ResidualModel::Chordal
+                               ? "unit_bearing_chord"
+                               : "px_equivalent")))
+         << "\n";
+  output << "uniform_control_point_mode: "
+         << (backend_result.options.uniform_control_point_mode ? 1 : 0) << "\n";
   output << "pose_only_refit_rmse: nan\n";
   output << "pose_only_refit_success_rate: nan\n";
   output << "pose_only_refit_attempt_count: 0\n";
   output << "pose_only_refit_success_count: 0\n";
   output << "overall_rmse: " << evaluation.overall_rmse << "\n";
-  output << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
-  output << "internal_only_rmse: " << evaluation.internal_only_rmse << "\n";
-  output << "excluded_board_id_for_rmse: "
-         << backend_result.optimized_scene_state.reference_board_id << "\n";
-  output << "overall_rmse_excluding_board: nan\n";
-  output << "outer_only_rmse_excluding_board: nan\n";
-  output << "internal_only_rmse_excluding_board: nan\n";
+  if (backend_result.options.uniform_control_point_mode) {
+    output << "training_rmse_all_control_points: "
+           << evaluation.overall_rmse << "\n";
+  } else {
+    output << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
+    output << "internal_only_rmse: " << evaluation.internal_only_rmse << "\n";
+    output << "excluded_board_id_for_rmse: "
+           << backend_result.optimized_scene_state.reference_board_id << "\n";
+    output << "overall_rmse_excluding_board: nan\n";
+    output << "outer_only_rmse_excluding_board: nan\n";
+    output << "internal_only_rmse_excluding_board: nan\n";
+  }
   output << "mean_residual_x: nan\n";
   output << "mean_residual_y: nan\n";
   output << "std_residual_x: nan\n";
@@ -3769,11 +4226,13 @@ void WriteCommittedBackendTrainingSummary(
       ++internal_count;
     }
   }
-  output << "outer_point_count: " << outer_count << "\n";
-  output << "internal_point_count: " << internal_count << "\n";
-  output << "point_count_excluding_board: 0\n";
-  output << "outer_point_count_excluding_board: 0\n";
-  output << "internal_point_count_excluding_board: 0\n";
+  if (!backend_result.options.uniform_control_point_mode) {
+    output << "outer_point_count: " << outer_count << "\n";
+    output << "internal_point_count: " << internal_count << "\n";
+    output << "point_count_excluding_board: 0\n";
+    output << "outer_point_count_excluding_board: 0\n";
+    output << "internal_point_count_excluding_board: 0\n";
+  }
   output << "camera_xi: "
          << backend_result.optimized_scene_state.camera.xi << "\n";
   output << "camera_alpha: "
@@ -3896,6 +4355,8 @@ ati::CameraModelRefitEvaluationResult MakeCommittedBackendTrainingEvaluation(
       backend_result.training_split_signature +
       "_backend_committed_state";
   result.camera = backend_result.optimized_scene_state.camera;
+  result.uniform_control_point_mode =
+      backend_result.options.uniform_control_point_mode;
   result.pose_only_refit_attempt_count = 0;
   result.pose_only_refit_success_count = 0;
   result.pose_only_refit_success_rate = 0.0;
@@ -4382,6 +4843,44 @@ void WriteIntermediateCameraYaml(
   output << "cv: " << camera.cv << "\n";
 }
 
+void WriteLargePerturbationSceneSnapshot(
+    const fs::path& path,
+    const ati::CalibrationSceneState& scene) {
+  std::ofstream output(path.string().c_str());
+  output << std::setprecision(17);
+  output << "camera " << scene.camera.xi << " " << scene.camera.alpha << " "
+         << scene.camera.fu << " " << scene.camera.fv << " "
+         << scene.camera.cu << " " << scene.camera.cv << "\n";
+  const std::vector<double> distortion = scene.camera.DistortionVector();
+  output << "distortion " << distortion.size();
+  for (double coefficient : distortion) {
+    output << " " << coefficient;
+  }
+  output << "\n";
+  for (const ati::JointSceneFrameState& frame : scene.frames) {
+    output << "frame " << frame.frame_index << " "
+           << (frame.initialized ? 1 : 0) << " " << frame.observation_count
+           << " " << frame.rmse;
+    for (int row = 0; row < 4; ++row) {
+      for (int col = 0; col < 4; ++col) {
+        output << " " << frame.T_camera_reference(row, col);
+      }
+    }
+    output << "\n";
+  }
+  for (const ati::JointSceneBoardState& board : scene.boards) {
+    output << "board " << board.board_id << " "
+           << (board.initialized ? 1 : 0) << " " << board.observation_count
+           << " " << board.rmse;
+    for (int row = 0; row < 4; ++row) {
+      for (int col = 0; col < 4; ++col) {
+        output << " " << board.T_reference_board(row, col);
+      }
+    }
+    output << "\n";
+  }
+}
+
 void WriteIntermediateResidualPointsCsv(
     const fs::path& path,
     const ati::OuterOnlyIntermediateCalibrationResult& intermediate) {
@@ -4626,6 +5125,147 @@ void WriteOuterOnlyIntermediateArtifacts(
       intermediate);
 }
 
+void WriteCameraAwareOuterRescueArtifacts(
+    const fs::path& output_dir,
+    const ati::FrozenRound2BaselineResult& baseline_result) {
+  const ati::CameraAwareOuterRescueSummary& rescue =
+      baseline_result.camera_aware_outer_rescue;
+  if (!rescue.requested) {
+    return;
+  }
+
+  {
+    std::ofstream output(
+        (output_dir / "camera_aware_outer_rescue_summary.txt").string().c_str());
+    output << std::setprecision(12);
+    output << "stage5_camera_aware_outer_rescue_requested: "
+           << (rescue.requested ? 1 : 0) << "\n";
+    output << "stage5_camera_aware_outer_rescue_enabled: "
+           << (rescue.enabled ? 1 : 0) << "\n";
+    output << "stage5_camera_aware_outer_rescue_camera_family_supported: "
+           << (rescue.camera_family_supported ? 1 : 0) << "\n";
+    output << "stage5_camera_aware_outer_rescue_camera_source: "
+           << rescue.camera_source << "\n";
+    output << "stage5_camera_aware_outer_rescue_uses_yaml_intrinsics: "
+           << rescue.uses_yaml_intrinsics << "\n";
+    output << "stage5_camera_aware_outer_rescue_uses_kalibr_camchain_intrinsics: "
+           << rescue.uses_kalibr_camchain_intrinsics << "\n";
+    output << "stage5_camera_aware_outer_rescue_patch_plan: "
+           << rescue.patch_plan << "\n";
+    output << "stage5_camera_aware_outer_rescue_patch_size: "
+           << rescue.patch_size << "\n";
+    output << "stage5_camera_aware_outer_rescue_max_hamming: "
+           << rescue.max_hamming << "\n";
+    output << "stage5_camera_aware_outer_rescue_frame_count: "
+           << rescue.frame_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_requested_board_observation_count: "
+           << rescue.requested_board_observation_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_baseline_success_count: "
+           << rescue.baseline_success_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_baseline_all_boards_frame_count: "
+           << rescue.baseline_all_boards_frame_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_attempted_frame_count: "
+           << rescue.attempted_frame_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_attempted_board_observation_count: "
+           << rescue.attempted_board_observation_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_rescued_board_observation_count: "
+           << rescue.rescued_board_observation_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_final_success_count: "
+           << rescue.final_success_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_final_all_boards_frame_count: "
+           << rescue.final_all_boards_frame_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_initialization_rerun: "
+           << (rescue.camera_initialization_rerun ? 1 : 0) << "\n";
+    output << "stage5_camera_aware_outer_rescue_initialization_rerun_success: "
+           << (rescue.camera_initialization_rerun_success ? 1 : 0) << "\n";
+    output << "stage5_camera_aware_outer_rescue_runtime_seconds: "
+           << rescue.runtime_seconds << "\n";
+    output << "stage5_camera_aware_outer_rescue_skip_reason: "
+           << rescue.skip_reason << "\n";
+    output << "provisional_camera_xi: " << rescue.provisional_camera.xi << "\n";
+    output << "provisional_camera_alpha: " << rescue.provisional_camera.alpha << "\n";
+    output << "provisional_camera_fu: " << rescue.provisional_camera.fu << "\n";
+    output << "provisional_camera_fv: " << rescue.provisional_camera.fv << "\n";
+    output << "provisional_camera_cu: " << rescue.provisional_camera.cu << "\n";
+    output << "provisional_camera_cv: " << rescue.provisional_camera.cv << "\n";
+    output << "final_initialization_camera_xi: "
+           << rescue.final_initialization_camera.xi << "\n";
+    output << "final_initialization_camera_alpha: "
+           << rescue.final_initialization_camera.alpha << "\n";
+    output << "final_initialization_camera_fu: "
+           << rescue.final_initialization_camera.fu << "\n";
+    output << "final_initialization_camera_fv: "
+           << rescue.final_initialization_camera.fv << "\n";
+    output << "final_initialization_camera_cu: "
+           << rescue.final_initialization_camera.cu << "\n";
+    output << "final_initialization_camera_cv: "
+           << rescue.final_initialization_camera.cv << "\n";
+  }
+
+  {
+    std::ofstream output(
+        (output_dir / "camera_aware_outer_rescue_records.csv").string().c_str());
+    output << "frame_index,frame_label,board_id,baseline_failure_reason,"
+              "hamming,rescue_summary,corner0_x,corner0_y,corner1_x,corner1_y,"
+              "corner2_x,corner2_y,corner3_x,corner3_y\n";
+    for (const ati::CameraAwareOuterRescueRecord& record : rescue.records) {
+      output << record.frame_index << "," << CsvEscape(record.frame_label)
+             << "," << record.board_id << ","
+             << CsvEscape(record.baseline_failure_reason) << ","
+             << record.hamming << "," << CsvEscape(record.rescue_summary);
+      for (const Eigen::Vector2d& corner : record.committed_corners) {
+        output << "," << corner.x() << "," << corner.y();
+      }
+      output << "\n";
+    }
+  }
+
+  if (rescue.records.empty()) {
+    return;
+  }
+  const fs::path visualization_dir =
+      output_dir / "camera_aware_outer_rescue_visualizations";
+  EnsureDirectoryExists(visualization_dir);
+  std::map<int, std::string> image_path_by_frame;
+  for (const ati::FrozenRound2BaselineFrameSource& frame :
+       baseline_result.frame_sources) {
+    image_path_by_frame[frame.frame_index] = frame.image_path;
+  }
+  for (const ati::CameraAwareOuterRescueRecord& record : rescue.records) {
+    const auto path_it = image_path_by_frame.find(record.frame_index);
+    if (path_it == image_path_by_frame.end()) {
+      continue;
+    }
+    cv::Mat image = cv::imread(path_it->second, cv::IMREAD_COLOR);
+    if (image.empty()) {
+      continue;
+    }
+    for (int corner_index = 0; corner_index < 4; ++corner_index) {
+      const Eigen::Vector2d& first =
+          record.committed_corners[static_cast<std::size_t>(corner_index)];
+      const Eigen::Vector2d& second = record.committed_corners[
+          static_cast<std::size_t>((corner_index + 1) % 4)];
+      cv::line(image, cv::Point2d(first.x(), first.y()),
+               cv::Point2d(second.x(), second.y()),
+               cv::Scalar(255, 220, 70), 5, cv::LINE_AA);
+      cv::circle(image, cv::Point2d(first.x(), first.y()), 8,
+                 cv::Scalar(255, 220, 70), -1, cv::LINE_AA);
+    }
+    const std::string title =
+        "camera-aware rescue: frame=" + record.frame_label +
+        " board=" + std::to_string(record.board_id) +
+        " hamming=" + std::to_string(record.hamming);
+    cv::putText(image, title, cv::Point(24, 48), cv::FONT_HERSHEY_SIMPLEX,
+                0.9, cv::Scalar(0, 0, 0), 5, cv::LINE_AA);
+    cv::putText(image, title, cv::Point(24, 48), cv::FONT_HERSHEY_SIMPLEX,
+                0.9, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+    const std::string filename = record.frame_label + "_board" +
+                                 std::to_string(record.board_id) + ".jpg";
+    cv::imwrite((visualization_dir / filename).string(), image,
+                std::vector<int>{cv::IMWRITE_JPEG_QUALITY, 92});
+  }
+}
+
 void WriteExperimentConfigSummary(
     const std::string& path,
     const RequestedExperimentConfig& requested,
@@ -4639,8 +5279,12 @@ void WriteExperimentConfigSummary(
   output << "requested_models: " << requested.models << "\n";
   output << "requested_stage5_init_refine_mode: "
          << ati::ToString(requested.init_refine_mode) << "\n";
+  output << "requested_stage5_init_selection_scorer: "
+         << ati::ToString(requested.init_selection_scorer) << "\n";
   output << "requested_camera_init_mode: "
          << ati::ToString(requested.camera_init_mode) << "\n";
+  output << "requested_stage5_camera_aware_outer_rescue: "
+         << (requested.camera_aware_outer_rescue ? 1 : 0) << "\n";
   output << "requested_outer_only_ablation_mode: "
          << (requested.outer_only_ablation_mode ? 1 : 0) << "\n";
   output << "requested_strict_outer_only_ablation: "
@@ -4764,8 +5408,20 @@ void WriteExperimentConfigSummary(
          << requested.trial_backend_selection_acceptance_policy << "\n";
   output << "requested_stage5_trial_backend_selection_mi_tol: "
          << requested.trial_backend_selection_mi_tol << "\n";
+  output << "requested_stage5_trial_backend_selection_mi_tol_explicit: "
+         << (requested.trial_backend_selection_mi_tol_set ? 1 : 0) << "\n";
   output << "requested_stage5_trial_backend_selection_rank_threshold: "
          << requested.trial_backend_selection_rank_threshold << "\n";
+  output << "requested_stage5_checkerboard_huber_delta_pixels: "
+         << requested.checkerboard_huber_delta_pixels << "\n";
+  output << "requested_stage5_checkerboard_outlier_filter_enabled: "
+         << (requested.checkerboard_outlier_filter_enabled ? 1 : 0) << "\n";
+  output << "requested_stage5_checkerboard_outlier_sigma: "
+         << requested.checkerboard_outlier_sigma << "\n";
+  output << "requested_stage5_checkerboard_min_inlier_ratio: "
+         << requested.checkerboard_min_inlier_ratio << "\n";
+  output << "requested_stage5_checkerboard_min_retained_points: "
+         << requested.checkerboard_min_retained_points << "\n";
   output << "requested_stage5_trial_backend_selection_candidate_shuffle_seed_set: "
          << (requested.trial_backend_selection_candidate_shuffle_seed_set ? 1
                                                                           : 0)
@@ -4792,6 +5448,10 @@ void WriteExperimentConfigSummary(
          << (requested.trial_backend_selection_persistent_intrinsics_anchor_prior
                  ? 1
                  : 0)
+         << "\n";
+  output << "requested_stage5_trial_backend_selection_persistent_fix_board_layout: "
+         << (requested.trial_backend_selection_persistent_fix_board_layout ? 1
+                                                                           : 0)
          << "\n";
   output << "requested_stage5_trial_backend_selection_persistent_intrinsics_anchor_weight_xi_alpha: "
          << requested
@@ -4850,6 +5510,8 @@ void WriteExperimentConfigSummary(
   output << "requested_stage5_trial_backend_selection_force_include_frame_board_list: "
          << requested.trial_backend_selection_force_include_frame_board_list
          << "\n";
+  output << "requested_stage5_trial_backend_selection_seed_frame_board_list: "
+         << requested.trial_backend_selection_seed_frame_board_list << "\n";
   output << "requested_stage5_trial_backend_selection_force_include_list_is_exact_input: "
          << (requested.trial_backend_selection_force_include_list_is_exact_input
                  ? 1
@@ -4968,9 +5630,31 @@ void WriteExperimentConfigSummary(
          << requested.backend_pixel_residual_weight << "\n";
   output << "requested_backend_chordal_residual_weight: "
          << requested.backend_chordal_residual_weight << "\n";
+  output << "requested_stage5_hybrid_pixel_ray_final_refinement_enabled: "
+         << (requested.enable_hybrid_pixel_ray_final_refinement ? 1 : 0)
+         << "\n";
+  output << "requested_stage5_hybrid_pixel_ray_lambda: "
+         << requested.hybrid_pixel_ray_lambda << "\n";
+  output << "requested_stage5_hybrid_pixel_ray_max_iterations: "
+         << requested.hybrid_pixel_ray_max_iterations << "\n";
+  output << "requested_stage5_hybrid_pixel_ray_pixel_scale_floor: "
+         << requested.hybrid_pixel_ray_pixel_scale_floor << "\n";
+  output << "requested_stage5_hybrid_pixel_ray_ray_scale_floor: "
+         << requested.hybrid_pixel_ray_ray_scale_floor << "\n";
   output << "requested_backend_angular_use_normalize_jacobian: "
          << (requested.backend_angular_use_normalize_jacobian ? 1 : 0)
          << "\n";
+  output << "requested_backend_angular_local_whitening: "
+         << (requested.backend_angular_local_whitening ? 1 : 0) << "\n";
+  output << "requested_backend_angular_local_whitening_pixel_sigma_px: "
+         << requested.backend_angular_local_whitening_pixel_sigma_px << "\n";
+  output << "requested_backend_angular_local_whitening_covariance_damping: "
+         << requested.backend_angular_local_whitening_covariance_damping
+         << "\n";
+  output << "requested_backend_angular_local_whitening_min_sigma_rad: "
+         << requested.backend_angular_local_whitening_min_sigma_rad << "\n";
+  output << "requested_backend_angular_local_whitening_max_weight: "
+         << requested.backend_angular_local_whitening_max_weight << "\n";
   output << "requested_backend_angular_observed_ray_mode: "
          << requested.backend_angular_observed_ray_mode << "\n";
   output << "requested_backend_fixed_intrinsics: "
@@ -5216,6 +5900,23 @@ void WriteExperimentConfigSummary(
 
   output << "stage5_success: " << (report.success ? 1 : 0) << "\n";
   output << "stage5_failure_reason: " << report.failure_reason << "\n";
+  output << "effective_stage5_camera_aware_outer_rescue: "
+         << (report.baseline_result.camera_aware_outer_rescue.enabled ? 1 : 0)
+         << "\n";
+  output << "stage5_camera_aware_outer_rescue_camera_source: "
+         << report.baseline_result.camera_aware_outer_rescue.camera_source
+         << "\n";
+  output << "stage5_camera_aware_outer_rescue_uses_yaml_intrinsics: "
+         << report.baseline_result.camera_aware_outer_rescue.uses_yaml_intrinsics
+         << "\n";
+  output << "stage5_camera_aware_outer_rescue_uses_kalibr_camchain_intrinsics: "
+         << report.baseline_result.camera_aware_outer_rescue
+                .uses_kalibr_camchain_intrinsics
+         << "\n";
+  output << "stage5_camera_aware_outer_rescue_rescued_board_observation_count: "
+         << report.baseline_result.camera_aware_outer_rescue
+                .rescued_board_observation_count
+         << "\n";
   output << "effective_stage5_baseline_protocol_label: "
          << report.baseline_protocol_label << "\n";
   output << "effective_camera_init_mode: "
@@ -5287,6 +5988,78 @@ void WriteExperimentConfigSummary(
          << report.baseline_result.auto_camera_initialization
                 .stage5_init_selection_is_exact_kalibr_information_theoretic
          << "\n";
+  output << "stage5_init_selection_pose_marginalized: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_pose_marginalized
+         << "\n";
+  output << "stage5_init_selection_principal_subspace_aware: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_principal_subspace_aware
+         << "\n";
+  output << "stage5_init_selection_camera_information_dimension: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_camera_information_dimension
+         << "\n";
+  output << "stage5_init_selection_camera_information_rank: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_camera_information_rank
+         << "\n";
+  output << "stage5_init_selection_principal_information_rank: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_principal_information_rank
+         << "\n";
+  output << "stage5_init_selection_pose_rank_min: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_pose_rank_min
+         << "\n";
+  output << "stage5_init_selection_pose_rank_max: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_pose_rank_max
+         << "\n";
+  output << "stage5_init_selection_pose_rank_deficient_count: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_pose_rank_deficient_count
+         << "\n";
+  output << "stage5_init_selection_principal_min_eigenvalue: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_principal_min_eigenvalue
+         << "\n";
+  output << "stage5_init_selection_principal_max_eigenvalue: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_principal_max_eigenvalue
+         << "\n";
+  output << "stage5_init_selection_cu_stddev_px: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_cu_stddev_px
+         << "\n";
+  output << "stage5_init_selection_cv_stddev_px: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_cv_stddev_px
+         << "\n";
+  output << "stage5_init_selection_weakest_eigenvalue: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_weakest_eigenvalue
+         << "\n";
+  output << "stage5_init_selection_weakest_direction: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_weakest_direction
+         << "\n";
+  output << "stage5_init_selection_weakest_principal_fraction: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_weakest_principal_fraction
+         << "\n";
+  output << "stage5_init_selection_weakest_focal_fraction: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_weakest_focal_fraction
+         << "\n";
+  output << "stage5_init_selection_information_linearization: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_information_linearization
+         << "\n";
+  output << "stage5_init_selection_all_pose_valid_observations_used: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_selection_all_pose_valid_observations_used
+         << "\n";
   output << "stage5_init_runtime_seconds: "
          << report.baseline_result.auto_camera_initialization
                 .stage5_init_runtime_seconds
@@ -5310,6 +6083,32 @@ void WriteExperimentConfigSummary(
   output << "effective_stage5_camera_model_family: "
          << BuildConfiguredCameraFamily(
                 report.baseline_result.effective_options.config)
+         << "\n";
+  const ati::OuterBootstrapCameraIntrinsics& effective_camera =
+      report.baseline_result.auto_camera_initialization.selected_camera;
+  const std::string effective_family = effective_camera.NormalizedFamilyString();
+  std::string native_geometry = "unknown";
+  if (effective_family == "ds-none") {
+    native_geometry = "DoubleSphereCameraGeometry";
+  } else if (effective_family == "eucm-none") {
+    native_geometry = "ExtendedUnifiedCameraGeometry";
+  } else if (effective_family == "pinhole-equi") {
+    native_geometry = "EquidistantDistortedPinholeCameraGeometry";
+  } else if (effective_family == "omni-none") {
+    native_geometry = "OmniCameraGeometry";
+  } else if (effective_family == "omni-radtan") {
+    native_geometry = "DistortedOmniCameraGeometry";
+  }
+  output << "effective_stage5_native_camera_geometry: " << native_geometry << "\n";
+  output << "effective_stage5_projection_parameter_count: "
+         << effective_camera.IntrinsicsLabels().size() << "\n";
+  output << "effective_stage5_distortion_parameter_count: "
+         << effective_camera.DistortionLabels().size() << "\n";
+  output << "effective_stage5_uses_native_no_distortion_geometry: "
+         << ((effective_family == "ds-none" || effective_family == "eucm-none" ||
+              effective_family == "omni-none")
+                 ? 1
+                 : 0)
          << "\n";
   output << "camera_intrinsics_labels: ";
   for (const std::string& label :
@@ -5455,6 +6254,27 @@ void WriteExperimentConfigSummary(
          << report.trial_backend_selection_result
                 .acceptance_rank_gain_threshold
          << "\n";
+  output << "effective_stage5_checkerboard_huber_delta_pixels: "
+         << report.trial_backend_selection_result
+                .checkerboard_huber_delta_pixels
+         << "\n";
+  output << "effective_stage5_checkerboard_outlier_filter_enabled: "
+         << (report.trial_backend_selection_result
+                     .checkerboard_outlier_filter_enabled
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_stage5_checkerboard_outlier_sigma: "
+         << report.trial_backend_selection_result.checkerboard_outlier_sigma
+         << "\n";
+  output << "effective_stage5_checkerboard_min_inlier_ratio: "
+         << report.trial_backend_selection_result
+                .checkerboard_min_inlier_ratio
+         << "\n";
+  output << "effective_stage5_checkerboard_min_retained_points: "
+         << report.trial_backend_selection_result
+                .checkerboard_min_retained_points
+         << "\n";
   output << "effective_stage5_trial_backend_selection_candidate_shuffle_seed_set: "
          << (report.trial_backend_selection_result.candidate_shuffle_seed_set
                  ? 1
@@ -5485,6 +6305,12 @@ void WriteExperimentConfigSummary(
   output << "effective_stage5_trial_backend_selection_persistent_intrinsics_anchor_prior: "
          << (report.trial_backend_selection_result
                      .persistent_intrinsics_anchor_prior_enabled
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_stage5_trial_backend_selection_persistent_fix_board_layout: "
+         << (report.trial_backend_selection_result
+                     .persistent_incremental_board_layout_fixed
                  ? 1
                  : 0)
          << "\n";
@@ -5618,6 +6444,38 @@ void WriteExperimentConfigSummary(
   output << "effective_stage5_persistent_incremental_rejected_batch_count: "
          << report.trial_backend_selection_result
                 .persistent_incremental_rejected_batch_count
+         << "\n";
+  output << "effective_stage5_persistent_incremental_solver_profile_name: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_solver_profile_name
+         << "\n";
+  output << "effective_stage5_persistent_incremental_solver_objective_unit: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_solver_objective_unit
+         << "\n";
+  output << "effective_stage5_persistent_incremental_solver_max_iterations: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_solver_max_iterations
+         << "\n";
+  output << "effective_stage5_persistent_incremental_solver_convergence_delta_j: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_solver_convergence_delta_j
+         << "\n";
+  output << "effective_stage5_persistent_incremental_solver_bearing_reference_focal_px: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_solver_bearing_reference_focal_px
+         << "\n";
+  output << "effective_stage5_persistent_incremental_solver_single_iteration_batch_count: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_solver_single_iteration_batch_count
+         << "\n";
+  output << "effective_stage5_persistent_incremental_solver_max_iteration_batch_count: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_solver_max_iteration_batch_count
+         << "\n";
+  output << "effective_stage5_persistent_incremental_solver_relative_objective_converged_batch_count: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_solver_relative_objective_converged_batch_count
          << "\n";
   output << "effective_stage5_persistent_incremental_total_elapsed_time_seconds: "
          << report.trial_backend_selection_result
@@ -5928,6 +6786,19 @@ void WriteExperimentConfigSummary(
                  ? 1
                  : 0)
          << "\n";
+  output << "effective_geometry_only_updates_observations: "
+         << (report.baseline_result.effective_options
+                     .geometry_prior_rescue_allow_geometry_only_pose_refit &&
+                 report.baseline_result.effective_options
+                     .geometry_prior_rescue_use_as_observation &&
+                 !report.baseline_result.effective_options
+                      .geometry_prior_rescue_diagnostic_only
+             ? 1
+             : 0)
+         << "\n";
+  output << "effective_geometry_prior_quad_topology_guard: 1\n";
+  output << "effective_geometry_prior_visible_frame_refit_mode: "
+            "robust_multi_board_consensus\n";
   output << "effective_geometry_prior_rescue_subpix_window_radius: "
          << report.baseline_result.effective_options
                 .geometry_prior_rescue_subpix_window_radius
@@ -5935,6 +6806,16 @@ void WriteExperimentConfigSummary(
   output << "effective_geometry_prior_rescue_max_corner_displacement_px: "
          << report.baseline_result.effective_options
                 .geometry_prior_rescue_max_corner_displacement_px
+         << "\n";
+  output << "effective_geometry_prior_corner_displacement_guard_mode: "
+         << (report.baseline_result.effective_options
+                         .geometry_prior_rescue_max_corner_displacement_px < 0.0
+                 ? "disabled_debug"
+                 : (report.baseline_result.effective_options
+                                .geometry_prior_rescue_max_corner_displacement_px ==
+                            0.0
+                        ? "scale_adaptive"
+                        : "fixed_px"))
          << "\n";
   output << "effective_geometry_prior_rescue_min_corner_response_ratio: "
          << report.baseline_result.effective_options
@@ -6440,7 +7321,9 @@ std::map<int, std::string> BuildFrameImagePathMap(
     const std::vector<ati::FrozenRound2BaselineFrameSource>& frames) {
   std::map<int, std::string> paths;
   for (const ati::FrozenRound2BaselineFrameSource& frame : frames) {
-    paths[frame.frame_index] = frame.image_path;
+    if (!frame.image_path.empty()) {
+      paths[frame.frame_index] = frame.image_path;
+    }
   }
   return paths;
 }
@@ -7194,16 +8077,87 @@ void ValidateBackendResidualConfiguration(
     throw std::runtime_error(
         "pixel_chordal_hybrid requires a positive pixel or chordal weight.");
   }
+  if (config.enable_hybrid_pixel_ray_final_refinement) {
+    if (model != ati::ResidualModel::ImagePlane ||
+        config.backend_use_point_type_residual_split ||
+        config.backend_enable_angular_auxiliary_residual) {
+      throw std::runtime_error(
+          "Hybrid Pixel-Ray final refinement requires a standard pixel-only "
+          "persistent selection BA (image_plane, no residual split or "
+          "angular auxiliary block).");
+    }
+    if (config.backend_angular_observed_ray_mode !=
+        "dynamic_current_camera") {
+      throw std::runtime_error(
+          "Hybrid Pixel-Ray final refinement requires "
+          "dynamic_current_camera observed rays.");
+    }
+    if (!std::isfinite(config.hybrid_pixel_ray_lambda) ||
+        config.hybrid_pixel_ray_lambda < 0.0 ||
+        config.hybrid_pixel_ray_lambda > 1.0) {
+      throw std::runtime_error(
+          "--stage5-hybrid-pixel-ray-lambda must be in [0, 1].");
+    }
+    if (config.hybrid_pixel_ray_max_iterations <= 0) {
+      throw std::runtime_error(
+          "--stage5-hybrid-pixel-ray-max-iterations must be positive.");
+    }
+    if (!std::isfinite(config.hybrid_pixel_ray_pixel_scale_floor) ||
+        config.hybrid_pixel_ray_pixel_scale_floor <= 0.0 ||
+        !std::isfinite(config.hybrid_pixel_ray_ray_scale_floor) ||
+        config.hybrid_pixel_ray_ray_scale_floor <= 0.0) {
+      throw std::runtime_error(
+          "Hybrid Pixel-Ray scale floors must be finite and positive.");
+    }
+  }
+  if (config.backend_angular_local_whitening &&
+      model != ati::ResidualModel::SphereAngular) {
+    throw std::runtime_error(
+        "--backend-angular-local-whitening requires sphere_angular.");
+  }
+  if (config.backend_angular_local_whitening &&
+      (!std::isfinite(
+           config.backend_angular_local_whitening_pixel_sigma_px) ||
+       config.backend_angular_local_whitening_pixel_sigma_px <= 0.0 ||
+       !std::isfinite(
+           config.backend_angular_local_whitening_covariance_damping) ||
+       config.backend_angular_local_whitening_covariance_damping < 0.0 ||
+       !std::isfinite(
+           config.backend_angular_local_whitening_min_sigma_rad) ||
+       config.backend_angular_local_whitening_min_sigma_rad <= 0.0 ||
+       !std::isfinite(config.backend_angular_local_whitening_max_weight) ||
+       config.backend_angular_local_whitening_max_weight < 1.0)) {
+    throw std::runtime_error(
+        "invalid angular local-whitening configuration.");
+  }
 }
 
 void PrintEvaluationProgress(
     const std::string& label,
-    const ati::CameraModelRefitEvaluationResult& evaluation) {
+    const ati::CameraModelRefitEvaluationResult& evaluation,
+    const std::string& metric_unit = "px") {
   std::cout << "[stage5_backend] " << label
-            << " overall=" << evaluation.overall_rmse
-            << " outer=" << evaluation.outer_only_rmse
-            << " internal=" << evaluation.internal_only_rmse
+            << " overall=" << evaluation.overall_rmse;
+  if (!evaluation.uniform_control_point_mode) {
+    std::cout << " outer=" << evaluation.outer_only_rmse
+              << " internal=" << evaluation.internal_only_rmse;
+  }
+  std::cout << " unit=" << metric_unit
             << " points=" << evaluation.point_count << std::endl;
+}
+
+std::string BackendResidualMetricUnit(ati::ResidualModel model) {
+  if (model == ati::ResidualModel::ImagePlane) {
+    return "px";
+  }
+  if (model == ati::ResidualModel::SphereAngular ||
+      model == ati::ResidualModel::NormalizedSphereAngular) {
+    return "rad";
+  }
+  if (model == ati::ResidualModel::Chordal) {
+    return "unit_bearing_chord";
+  }
+  return "px_equivalent";
 }
 
 void PrintBackendResultProgress(
@@ -7280,6 +8234,7 @@ int main(int argc, char** argv) {
   try {
     const auto total_start = std::chrono::steady_clock::now();
     const CmdArgs args = ParseArgs(argc, argv);
+    const bool use_precomputed = !args.precomputed_observations_dir.empty();
     const RequestedExperimentConfig requested_config =
         BuildRequestedExperimentConfig(args);
     ValidateBackendResidualConfiguration(requested_config);
@@ -7287,23 +8242,202 @@ int main(int argc, char** argv) {
     runtime_summary.runtime_mode = args.runtime_mode;
     runtime_summary.cache_dir =
         args.cache_dir.empty() ? "result/.stage5_backend_cache" : args.cache_dir;
-    runtime_summary.cache_enabled = true;
+    runtime_summary.cache_enabled = !use_precomputed;
     const std::string dataset_label = InferDatasetLabel(args);
     std::vector<std::string> image_paths;
     std::vector<std::string> test_image_paths;
+    ati::FrozenPrecomputedMeasurementInput precomputed_training;
+    ati::FrozenPrecomputedMeasurementInput precomputed_holdout;
+    std::vector<ati::FrozenPrecomputedMeasurementInput>
+        precomputed_initialization_auxiliary_sessions;
     {
       const auto stage_start = std::chrono::steady_clock::now();
-      image_paths = CollectImagePaths(args.image_path, args.all);
-      if (!args.test_image_path.empty()) {
-        test_image_paths = CollectImagePaths(args.test_image_path, args.all);
+      if (use_precomputed) {
+        const ati::PrecomputedObservationImporter importer;
+        precomputed_training =
+            importer.Load(args.precomputed_observations_dir, 0,
+                          args.precomputed_target_mode);
+        if (!precomputed_training.success) {
+          throw std::runtime_error(
+              "Failed to import precomputed training observations: " +
+              precomputed_training.failure_reason);
+        }
+        if (!args.precomputed_holdout_observations_dir.empty()) {
+          precomputed_holdout = importer.Load(
+              args.precomputed_holdout_observations_dir, 1000000,
+              args.precomputed_target_mode);
+          if (!precomputed_holdout.success) {
+            throw std::runtime_error(
+                "Failed to import precomputed holdout observations: " +
+                precomputed_holdout.failure_reason);
+          }
+          if (precomputed_holdout.target_mode_resolved !=
+                  precomputed_training.target_mode_resolved ||
+              precomputed_holdout.board_count !=
+                  precomputed_training.board_count) {
+            throw std::runtime_error(
+                "Precomputed training and holdout target topology do not match.");
+          }
+        }
+        precomputed_initialization_auxiliary_sessions.reserve(
+            args.precomputed_initialization_auxiliary_observation_dirs.size());
+        for (std::size_t auxiliary_index = 0;
+             auxiliary_index <
+             args.precomputed_initialization_auxiliary_observation_dirs.size();
+             ++auxiliary_index) {
+          const std::string& auxiliary_dir =
+              args.precomputed_initialization_auxiliary_observation_dirs[
+                  auxiliary_index];
+          if (fs::equivalent(fs::path(auxiliary_dir),
+                             fs::path(args.precomputed_observations_dir)) ||
+              (!args.precomputed_holdout_observations_dir.empty() &&
+               fs::equivalent(
+                   fs::path(auxiliary_dir),
+                   fs::path(args.precomputed_holdout_observations_dir)))) {
+            throw std::runtime_error(
+                "Auxiliary initialization observations must be disjoint from "
+                "primary training and frozen holdout inputs: " +
+                auxiliary_dir);
+          }
+          for (std::size_t previous_index = 0;
+               previous_index < auxiliary_index; ++previous_index) {
+            if (fs::equivalent(
+                    fs::path(auxiliary_dir),
+                    fs::path(args
+                                 .precomputed_initialization_auxiliary_observation_dirs[
+                                     previous_index]))) {
+              throw std::runtime_error(
+                  "Duplicate auxiliary initialization observation session: " +
+                  auxiliary_dir);
+            }
+          }
+          ati::FrozenPrecomputedMeasurementInput auxiliary = importer.Load(
+              auxiliary_dir,
+              2000000 + static_cast<int>(auxiliary_index) * 1000000,
+              args.precomputed_target_mode);
+          if (!auxiliary.success) {
+            throw std::runtime_error(
+                "Failed to import auxiliary initialization observations: " +
+                auxiliary.failure_reason);
+          }
+          if (auxiliary.image_size != precomputed_training.image_size ||
+              auxiliary.reference_board_id !=
+                  precomputed_training.reference_board_id ||
+              auxiliary.target_mode_resolved !=
+                  precomputed_training.target_mode_resolved ||
+              auxiliary.board_count != precomputed_training.board_count) {
+            throw std::runtime_error(
+                "Auxiliary initialization session topology/resolution does not "
+                "match the primary training observations: " +
+                auxiliary_dir);
+          }
+          precomputed_initialization_auxiliary_sessions.push_back(
+              std::move(auxiliary));
+        }
+      } else {
+        image_paths = CollectImagePaths(args.image_path, args.all);
+        if (!args.test_image_path.empty()) {
+          test_image_paths = CollectImagePaths(args.test_image_path, args.all);
+        }
+        const ati::PrecomputedObservationImporter importer;
+        precomputed_initialization_auxiliary_sessions.reserve(
+            args.precomputed_initialization_auxiliary_observation_dirs.size());
+        for (std::size_t auxiliary_index = 0;
+             auxiliary_index <
+             args.precomputed_initialization_auxiliary_observation_dirs.size();
+             ++auxiliary_index) {
+          const std::string& auxiliary_dir =
+              args.precomputed_initialization_auxiliary_observation_dirs[
+                  auxiliary_index];
+          for (std::size_t previous_index = 0;
+               previous_index < auxiliary_index; ++previous_index) {
+            if (fs::equivalent(
+                    fs::path(auxiliary_dir),
+                    fs::path(args
+                                 .precomputed_initialization_auxiliary_observation_dirs[
+                                     previous_index]))) {
+              throw std::runtime_error(
+                  "Duplicate auxiliary initialization observation session: " +
+                  auxiliary_dir);
+            }
+          }
+          ati::FrozenPrecomputedMeasurementInput auxiliary = importer.Load(
+              auxiliary_dir,
+              2000000 + static_cast<int>(auxiliary_index) * 1000000,
+              args.precomputed_target_mode);
+          if (!auxiliary.success) {
+            throw std::runtime_error(
+                "Failed to import auxiliary initialization observations: " +
+                auxiliary.failure_reason);
+          }
+          precomputed_initialization_auxiliary_sessions.push_back(
+              std::move(auxiliary));
+        }
+      }
+      if (!use_precomputed &&
+          args.allow_image_training_with_precomputed_holdout &&
+          !args.precomputed_holdout_observations_dir.empty()) {
+        const ati::PrecomputedObservationImporter importer;
+        precomputed_holdout = importer.Load(
+            args.precomputed_holdout_observations_dir, 1000000,
+            args.precomputed_target_mode);
+        if (!precomputed_holdout.success) {
+          throw std::runtime_error(
+              "Failed to import precomputed holdout observations: " +
+              precomputed_holdout.failure_reason);
+        }
+      }
+      std::set<std::string> occupied_frame_labels;
+      if (use_precomputed) {
+        for (const ati::FrozenRound2BaselineFrameSource& frame :
+             precomputed_training.frame_sources) {
+          occupied_frame_labels.insert(frame.frame_label);
+        }
+        for (const ati::FrozenRound2BaselineFrameSource& frame :
+             precomputed_holdout.frame_sources) {
+          occupied_frame_labels.insert(frame.frame_label);
+        }
+      } else {
+        for (const std::string& image_path : image_paths) {
+          occupied_frame_labels.insert(
+              fs::path(image_path).stem().string());
+        }
+        // An explicit raw holdout is allowed to point at the training set for
+        // diagnostics, so only auxiliary overlap is prohibited here.
+      }
+      for (std::size_t auxiliary_index = 0;
+           auxiliary_index <
+           precomputed_initialization_auxiliary_sessions.size();
+           ++auxiliary_index) {
+        for (const ati::FrozenRound2BaselineFrameSource& frame :
+             precomputed_initialization_auxiliary_sessions[auxiliary_index]
+                 .frame_sources) {
+          if (!frame.frame_label.empty() &&
+              !occupied_frame_labels.insert(frame.frame_label).second) {
+            throw std::runtime_error(
+                "Auxiliary initialization frame overlaps a primary, holdout, "
+                "or earlier auxiliary frame: " +
+                frame.frame_label + " auxiliary_index=" +
+                std::to_string(auxiliary_index));
+          }
+        }
       }
       AddRuntimeStage(&runtime_summary, "image_collection", ElapsedSeconds(stage_start),
                       false);
     }
     PrintProgress("dataset=" + dataset_label);
-    PrintProgress("training_input=" + args.image_path);
-    if (!args.test_image_path.empty()) {
+    PrintProgress("training_input=" +
+                  (use_precomputed ? args.precomputed_observations_dir
+                                   : args.image_path));
+    if (!args.precomputed_holdout_observations_dir.empty()) {
+      PrintProgress("holdout_input=" +
+                    args.precomputed_holdout_observations_dir);
+    } else if (!args.test_image_path.empty()) {
       PrintProgress("holdout_input=" + args.test_image_path);
+    }
+    for (const std::string& auxiliary_dir :
+         args.precomputed_initialization_auxiliary_observation_dirs) {
+      PrintProgress("initialization_auxiliary_input=" + auxiliary_dir);
     }
     PrintProgress("output=" + args.output_path);
     PrintProgress("collected_training_images=" + std::to_string(image_paths.size()));
@@ -7318,9 +8452,12 @@ int main(int argc, char** argv) {
         BuildKalibrSourceLabel(args.kalibr_camchain_yaml);
 
     std::vector<ati::FrozenRound2BaselineFrameSource> all_frames =
-        BuildFrameSources(image_paths, 0);
+        use_precomputed ? precomputed_training.frame_sources
+                        : BuildFrameSources(image_paths, 0);
     std::vector<ati::FrozenRound2BaselineFrameSource> external_holdout_frames;
-    if (!test_image_paths.empty()) {
+    if (precomputed_holdout.success) {
+      external_holdout_frames = precomputed_holdout.frame_sources;
+    } else if (!test_image_paths.empty()) {
       external_holdout_frames =
           BuildFrameSources(test_image_paths, static_cast<int>(all_frames.size()));
     }
@@ -7334,10 +8471,76 @@ int main(int argc, char** argv) {
     baseline_options.config = ati::ApriltagInternalDetector::LoadConfig(args.config_path);
     ApplyStage5ModelFamily(requested_config.models,
                            &baseline_options.config);
+    if (!use_precomputed &&
+        !precomputed_initialization_auxiliary_sessions.empty()) {
+      const std::vector<int>& resolution =
+          baseline_options.config.intermediate_camera.resolution;
+      const cv::Size configured_size =
+          resolution.size() == 2
+              ? cv::Size(resolution[0], resolution[1])
+              : cv::Size();
+      const int configured_board_count =
+          !baseline_options.config.tag_ids.empty()
+              ? static_cast<int>(baseline_options.config.tag_ids.size())
+              : 1;
+      for (std::size_t auxiliary_index = 0;
+           auxiliary_index <
+           precomputed_initialization_auxiliary_sessions.size();
+           ++auxiliary_index) {
+        const ati::FrozenPrecomputedMeasurementInput& auxiliary =
+            precomputed_initialization_auxiliary_sessions[auxiliary_index];
+        if (configured_size.width <= 0 || configured_size.height <= 0 ||
+            auxiliary.image_size != configured_size ||
+            auxiliary.reference_board_id != args.reference_board_id ||
+            auxiliary.board_count != configured_board_count) {
+          throw std::runtime_error(
+              "Auxiliary initialization session topology/resolution does not "
+              "match the raw-image primary configuration: " +
+              args.precomputed_initialization_auxiliary_observation_dirs[
+                  auxiliary_index]);
+        }
+      }
+    }
     baseline_options.config.camera_initialization_mode =
         requested_config.camera_init_mode;
     baseline_options.camera_initialization_refine_mode =
         requested_config.init_refine_mode;
+    baseline_options.camera_initialization_selection_scorer =
+        requested_config.init_selection_scorer;
+    baseline_options.enable_camera_initialization_principal_profile =
+        args.stage5_enable_init_principal_profile;
+    baseline_options.camera_initialization_principal_profile_radius_px =
+        std::max(0.0, args.stage5_init_principal_profile_radius_px);
+    baseline_options.enable_camera_initialization_fixed_layout_diagnostic =
+        args.stage5_enable_init_fixed_layout_diagnostic;
+    baseline_options.enable_camera_initialization_board_jackknife_diagnostic =
+        args.stage5_enable_init_board_jackknife_diagnostic;
+    baseline_options.enable_camera_initialization_coverage_weighted_diagnostic =
+        args.stage5_enable_init_coverage_weighted_diagnostic;
+    baseline_options.camera_initialization_prefer_lower_focal_in_near_tie =
+        args.stage5_init_near_tie_prefer_lower_focal;
+    baseline_options.camera_initialization_near_tie_relative_objective_tolerance =
+        std::max(0.0,
+                 args.stage5_init_near_tie_relative_objective_tolerance);
+    baseline_options.checkerboard_initialization_huber_delta_pixels =
+        requested_config.checkerboard_huber_delta_pixels;
+    baseline_options.precomputed_initialization_use_all_points =
+        use_precomputed && args.precomputed_init_use_all_points;
+    baseline_options.precomputed_initialization_point_scope =
+        args.precomputed_initialization_point_scope;
+    baseline_options.enable_camera_aware_outer_rescue =
+        requested_config.camera_aware_outer_rescue && !use_precomputed;
+    baseline_options.rerun_camera_initialization_after_outer_rescue = true;
+    baseline_options.camera_aware_outer_rescue_max_hamming = 0;
+    baseline_options.camera_initialization_auxiliary_session_count =
+        static_cast<int>(
+            precomputed_initialization_auxiliary_sessions.size());
+    for (const ati::FrozenPrecomputedMeasurementInput& auxiliary :
+         precomputed_initialization_auxiliary_sessions) {
+      baseline_options.camera_initialization_auxiliary_bootstrap_frames.insert(
+          baseline_options.camera_initialization_auxiliary_bootstrap_frames.end(),
+          auxiliary.bootstrap_frames.begin(), auxiliary.bootstrap_frames.end());
+    }
     baseline_options.reference_board_id = args.reference_board_id;
     baseline_options.outer_only_ablation_mode =
         requested_config.outer_only_ablation_mode;
@@ -7370,7 +8573,10 @@ int main(int argc, char** argv) {
   baseline_options.strict_board_observation_acceptance =
       requested_config.strict_board_observation_acceptance;
     baseline_options.preserve_frame_board_cohesion =
-        requested_config.preserve_frame_board_cohesion;
+      requested_config.preserve_frame_board_cohesion;
+    if (use_precomputed && precomputed_training.single_board_mode) {
+      baseline_options.preserve_frame_board_cohesion = false;
+    }
     baseline_options.ignore_image_evidence_min_quality =
         requested_config.ignore_image_evidence_min_quality;
     baseline_options.force_internal_seed_from_prediction =
@@ -7492,7 +8698,11 @@ int main(int argc, char** argv) {
                           : benchmark.BuildExternalHoldoutSplit(
                                 all_frames,
                                 external_holdout_frames,
-                                fs::path(args.test_image_path).stem().string());
+                                use_precomputed
+                                    ? fs::path(args.precomputed_holdout_observations_dir)
+                                          .filename()
+                                          .string()
+                                    : fs::path(args.test_image_path).stem().string());
       AddRuntimeStage(&runtime_summary, "split_preview", ElapsedSeconds(stage_start),
                       false);
     }
@@ -7529,12 +8739,23 @@ int main(int argc, char** argv) {
     ati::Stage5BenchmarkInput benchmark_input;
     benchmark_input.all_frames = all_frames;
     benchmark_input.external_holdout_frames = external_holdout_frames;
+    benchmark_input.use_precomputed_training_measurements = use_precomputed;
+    benchmark_input.precomputed_training_measurements = precomputed_training;
+    benchmark_input.use_precomputed_holdout_measurements =
+        precomputed_holdout.success;
+    benchmark_input.precomputed_holdout_measurements = precomputed_holdout;
     benchmark_input.external_holdout_label =
-        args.test_image_path.empty()
-            ? std::string()
-            : fs::path(args.test_image_path).stem().string();
+        use_precomputed
+            ? fs::path(args.precomputed_holdout_observations_dir)
+                  .filename()
+                  .string()
+            : (args.test_image_path.empty()
+                   ? std::string()
+                   : fs::path(args.test_image_path).stem().string());
     benchmark_input.use_external_holdout_self_frontend_prepass =
         args.external_holdout_self_frontend_prepass;
+    benchmark_input.holdout_evaluate_full_training_observations =
+        args.stage5_holdout_evaluate_full_training_observations;
     benchmark_input.baseline_options = baseline_options;
     benchmark_input.backend_options = backend_options;
     benchmark_input.committed_backend_evaluation_options =
@@ -7584,6 +8805,21 @@ int main(int argc, char** argv) {
     benchmark_input.selection_backend_runner_options
         .angular_use_normalize_jacobian =
         requested_config.backend_angular_use_normalize_jacobian;
+    benchmark_input.selection_backend_runner_options
+        .angular_local_whitening_enabled =
+        requested_config.backend_angular_local_whitening;
+    benchmark_input.selection_backend_runner_options
+        .angular_local_whitening_pixel_sigma_px =
+        requested_config.backend_angular_local_whitening_pixel_sigma_px;
+    benchmark_input.selection_backend_runner_options
+        .angular_local_whitening_covariance_damping =
+        requested_config.backend_angular_local_whitening_covariance_damping;
+    benchmark_input.selection_backend_runner_options
+        .angular_local_whitening_min_sigma_rad =
+        requested_config.backend_angular_local_whitening_min_sigma_rad;
+    benchmark_input.selection_backend_runner_options
+        .angular_local_whitening_max_weight =
+        requested_config.backend_angular_local_whitening_max_weight;
     benchmark_input.selection_backend_runner_options.angular_observed_ray_mode =
         ati::ParseAngularObservedRayMode(
             requested_config.backend_angular_observed_ray_mode);
@@ -7679,6 +8915,19 @@ int main(int argc, char** argv) {
     benchmark_input.kalibr_reference = kalibr_reference;
     benchmark_input.additional_camera_references = additional_camera_references;
     benchmark_input.dataset_label = dataset_label;
+    benchmark_input.enable_large_intrinsic_perturbation =
+        args.enable_large_intrinsic_perturbation;
+    benchmark_input.large_intrinsic_perturbation_profile =
+        args.large_intrinsic_perturbation_profile;
+    benchmark_input.large_intrinsic_perturbation_scale =
+        args.large_intrinsic_perturbation_scale;
+    benchmark_input.large_intrinsic_perturbation_strict_scale =
+        args.large_intrinsic_perturbation_strict_scale;
+    benchmark_input.large_intrinsic_perturbation_reference_scene_path =
+        args.large_intrinsic_perturbation_reference_scene_path;
+    benchmark_input
+        .large_intrinsic_perturbation_outer_only_after_application =
+        args.large_intrinsic_perturbation_outer_only_after_application;
     benchmark_input.enable_diagnostic_compare =
         args.runtime_mode == ati::Stage5RuntimeMode::Research;
     benchmark_input.multi_board_consistency_diagnostics_options.enabled =
@@ -7713,10 +8962,14 @@ int main(int argc, char** argv) {
       benchmark_input.trial_backend_selection_options.candidate_order_mode =
           ParseTrialBackendFrameBoardCandidateOrderMode(
               requested_config.trial_backend_selection_candidate_order);
+      benchmark_input.trial_backend_selection_options
+          .candidate_order_mode_explicit = true;
     } else {
       benchmark_input.trial_backend_selection_options.candidate_order_mode =
           ati::TrialBackendFrameBoardSelectionOptions::CandidateOrderMode::
               ScoreSorted;
+      benchmark_input.trial_backend_selection_options
+          .candidate_order_mode_explicit = false;
     }
     benchmark_input.trial_backend_selection_options.candidate_shuffle_seed_set =
         requested_config.trial_backend_selection_candidate_shuffle_seed_set;
@@ -7735,8 +8988,25 @@ int main(int argc, char** argv) {
     benchmark_input.trial_backend_selection_options
         .acceptance_information_gain_threshold =
         requested_config.trial_backend_selection_mi_tol;
+    benchmark_input.trial_backend_selection_options
+        .acceptance_information_gain_threshold_explicit =
+        requested_config.trial_backend_selection_mi_tol_set;
     benchmark_input.trial_backend_selection_options.acceptance_rank_gain_threshold =
         requested_config.trial_backend_selection_rank_threshold;
+    benchmark_input.trial_backend_selection_options
+        .checkerboard_huber_delta_pixels =
+        requested_config.checkerboard_huber_delta_pixels;
+    benchmark_input.trial_backend_selection_options
+        .checkerboard_outlier_filter_enabled =
+        requested_config.checkerboard_outlier_filter_enabled;
+    benchmark_input.trial_backend_selection_options.checkerboard_outlier_sigma =
+        requested_config.checkerboard_outlier_sigma;
+    benchmark_input.trial_backend_selection_options
+        .checkerboard_min_inlier_ratio =
+        requested_config.checkerboard_min_inlier_ratio;
+    benchmark_input.trial_backend_selection_options
+        .checkerboard_min_retained_points =
+        requested_config.checkerboard_min_retained_points;
     benchmark_input.trial_backend_selection_options.incremental_acceptance =
         requested_config.trial_backend_selection_incremental;
     benchmark_input.trial_backend_selection_options.carry_accepted_trial_state =
@@ -7752,6 +9022,9 @@ int main(int argc, char** argv) {
         .persistent_intrinsics_anchor_prior_enabled =
         requested_config
             .trial_backend_selection_persistent_intrinsics_anchor_prior;
+    benchmark_input.trial_backend_selection_options
+        .persistent_fix_board_layout =
+        requested_config.trial_backend_selection_persistent_fix_board_layout;
     benchmark_input.trial_backend_selection_options
         .persistent_intrinsics_anchor_weight_xi_alpha =
         requested_config
@@ -7869,6 +9142,30 @@ int main(int argc, char** argv) {
         requested_config
             .trial_backend_selection_force_include_frame_board_list,
         &benchmark_input.trial_backend_selection_options);
+    if (!requested_config.trial_backend_selection_seed_frame_board_list.empty()) {
+      ati::TrialBackendFrameBoardSelectionOptions parsed_seed_options;
+      LoadForceIncludeFrameBoardList(
+          requested_config.trial_backend_selection_seed_frame_board_list,
+          &parsed_seed_options);
+      benchmark_input.trial_backend_selection_options
+          .seed_override_frame_board_keys =
+          parsed_seed_options.force_include_frame_board_keys;
+      benchmark_input.trial_backend_selection_options
+          .seed_override_frame_label_board_keys =
+          parsed_seed_options.force_include_frame_label_board_keys;
+    }
+    if (use_precomputed && precomputed_training.single_board_mode) {
+      benchmark_input.trial_backend_selection_options
+          .candidate_batch_granularity =
+          ati::TrialBackendFrameBoardSelectionOptions::CandidateBatchGranularity
+              ::Frame;
+      benchmark_input.trial_backend_selection_options.frame_cohesion_enabled =
+          false;
+      benchmark_input.trial_backend_selection_options.use_consistency_score =
+          false;
+      benchmark_input.multi_board_consistency_diagnostics_options.enabled =
+          false;
+    }
 
     const fs::path output_dir(args.output_path);
     EnsureDirectoryExists(output_dir);
@@ -7915,6 +9212,10 @@ int main(int argc, char** argv) {
     AddRuntimeStage(&runtime_summary, "training_outer_detection_load_build",
                     report.baseline_result.runtime_breakdown.training_outer_detection_seconds,
                     false);
+    AddRuntimeStage(
+        &runtime_summary, "camera_aware_outer_rescue",
+        report.baseline_result.runtime_breakdown.camera_aware_outer_rescue_seconds,
+        !report.baseline_result.effective_options.enable_camera_aware_outer_rescue);
     AddRuntimeStage(&runtime_summary, "auto_camera_initialization",
                     report.baseline_result.runtime_breakdown
                         .auto_camera_initialization_seconds,
@@ -8102,6 +9403,11 @@ int main(int argc, char** argv) {
           (output_dir / "stage5_backend_problem_summary.txt").string(),
           report.backend_problem_input);
     }
+    if (report.final_backend_scene_available) {
+      WriteLargePerturbationSceneSnapshot(
+          output_dir / "final_persistent_backend_scene.txt",
+          report.final_backend_scene);
+    }
     ati::WriteBackendInputAblationSummary(
         (output_dir / "backend_input_ablation_summary.txt").string(),
         report.backend_input_ablation_result);
@@ -8111,17 +9417,172 @@ int main(int argc, char** argv) {
     ati::WriteAutoCameraInitializationCandidatesCsv(
         (output_dir / "auto_camera_initialization_candidates.csv").string(),
         report.baseline_result.auto_camera_initialization);
+    ati::WriteAutoCameraInitializationRefinedBasinsCsv(
+        (output_dir / "auto_camera_initialization_refined_basins.csv").string(),
+        report.baseline_result.auto_camera_initialization);
     ati::WriteAutoCameraInitializationOuterResidualsCsv(
         (output_dir / "auto_camera_initialization_outer_residuals.csv").string(),
         report.baseline_result.auto_camera_initialization);
     ati::WriteAutoCameraInitializationBootstrapViewsCsv(
         (output_dir / "auto_camera_initialization_bootstrap_views.csv").string(),
         report.baseline_result.auto_camera_initialization);
+    if (report.large_intrinsic_perturbation.enabled) {
+      const ati::Stage5LargeIntrinsicPerturbationState& perturbation =
+          report.large_intrinsic_perturbation;
+      std::ofstream summary(
+          (output_dir / "large_intrinsic_perturbation_summary.txt")
+              .string()
+              .c_str());
+      summary << std::setprecision(12);
+      summary << "enabled: 1\n";
+      summary << "requested_profile: " << perturbation.requested_profile << "\n";
+      summary << "effective_profile: " << perturbation.effective_profile << "\n";
+      summary << "application_stage: after_internal_recovery_before_selection_incremental_ba\n";
+      summary << "internal_observations_regenerated_after_perturbation: 0\n";
+      summary << "internal_observations_refiltered_after_perturbation: 0\n";
+      summary << "outer_only_after_application: "
+              << (perturbation.outer_only_after_application ? 1 : 0) << "\n";
+      summary << "frozen_internal_point_count_before_ablation: "
+              << perturbation.frozen_internal_point_count_before_ablation
+              << "\n";
+      summary << "seed_internal_point_count_after_ablation: "
+              << perturbation.seed_internal_point_count_after_ablation
+              << "\n";
+      summary << "candidate_pool_internal_point_count_after_ablation: "
+              << perturbation.candidate_pool_internal_point_count_after_ablation
+              << "\n";
+      summary << "reference_scene_fingerprint: "
+              << perturbation.reference_scene_fingerprint << "\n";
+      summary << "perturbed_scene_fingerprint: "
+              << perturbation.perturbed_scene_fingerprint << "\n";
+      summary << "frozen_observation_fingerprint: "
+              << perturbation.frozen_observation_fingerprint << "\n";
+      summary << "requested_focal_scale: "
+              << perturbation.requested_focal_scale << "\n";
+      summary << "requested_xi_delta: " << perturbation.requested_xi_delta << "\n";
+      summary << "requested_alpha_delta: "
+              << perturbation.requested_alpha_delta << "\n";
+      summary << "requested_scale: " << perturbation.requested_scale << "\n";
+      summary << "effective_scale: " << perturbation.effective_scale << "\n";
+      summary << "actual_focal_scale: " << perturbation.actual_focal_scale << "\n";
+      summary << "actual_xi_delta: " << perturbation.actual_xi_delta << "\n";
+      summary << "actual_alpha_delta: " << perturbation.actual_alpha_delta << "\n";
+      summary << "projection_grid_width: "
+              << perturbation.projection_grid_width << "\n";
+      summary << "projection_grid_height: "
+              << perturbation.projection_grid_height << "\n";
+      summary << "valid_projection_grid_count: "
+              << perturbation.valid_projection_grid_count << "\n";
+      summary << "invalid_projection_grid_count: "
+              << perturbation.invalid_projection_grid_count << "\n";
+      summary << "valid_projection_grid: "
+              << (perturbation.valid_projection_grid ? 1 : 0) << "\n";
+      summary << "failure_reason: " << perturbation.failure_reason << "\n";
+      summary << "reference_camera_intrinsics: "
+              << JoinDoubleVector(perturbation.reference_camera.IntrinsicsVector(), ",")
+              << "\n";
+      summary << "reference_camera_distortion: "
+              << JoinDoubleVector(perturbation.reference_camera.DistortionVector(), ",")
+              << "\n";
+      summary << "perturbed_camera_intrinsics: "
+              << JoinDoubleVector(perturbation.perturbed_camera.IntrinsicsVector(), ",")
+              << "\n";
+      summary << "perturbed_camera_distortion: "
+              << JoinDoubleVector(perturbation.perturbed_camera.DistortionVector(), ",")
+              << "\n";
+      summary << "selection_seed_camera_intrinsics: "
+              << JoinDoubleVector(
+                     perturbation.selection_seed_camera.IntrinsicsVector(), ",")
+              << "\n";
+      summary << "selection_seed_camera_distortion: "
+              << JoinDoubleVector(
+                     perturbation.selection_seed_camera.DistortionVector(), ",")
+              << "\n";
+      summary << "selection_candidate_camera_intrinsics: "
+              << JoinDoubleVector(
+                     perturbation.selection_candidate_camera.IntrinsicsVector(),
+                     ",")
+              << "\n";
+      summary << "selection_candidate_camera_distortion: "
+              << JoinDoubleVector(
+                     perturbation.selection_candidate_camera.DistortionVector(),
+                     ",")
+              << "\n";
+      summary << "selection_seed_matches_perturbed_camera: "
+              << (perturbation.selection_seed_matches_perturbed_camera ? 1 : 0)
+              << "\n";
+      summary << "selection_candidate_matches_perturbed_camera: "
+              << (perturbation.selection_candidate_matches_perturbed_camera ? 1
+                                                                            : 0)
+              << "\n";
+      WriteIntermediateCameraYaml(output_dir / "large_perturbation_reference_camera.yaml",
+                                  perturbation.reference_camera);
+      WriteIntermediateCameraYaml(output_dir / "large_perturbation_initial_camera.yaml",
+                                  perturbation.perturbed_camera);
+      WriteLargePerturbationSceneSnapshot(
+          output_dir / "large_intrinsic_perturbation_reference_scene.txt",
+          perturbation.reference_scene);
+      const ati::MultiBoardPoseOrientationEvaluationResult& pose_eval =
+          report.large_perturbation_pose_orientation_evaluation;
+      std::ofstream pose_summary(
+          (output_dir / "large_perturbation_pose_orientation_summary.txt")
+              .string().c_str());
+      pose_summary << std::setprecision(12);
+      pose_summary << "success: " << (pose_eval.success ? 1 : 0) << "\n";
+      pose_summary << "evaluated_frame_count: " << pose_eval.evaluated_frame_count
+                   << "\n";
+      pose_summary << "pose_success_count: " << pose_eval.pose_success_count
+                   << "\n";
+      pose_summary << "pose_success_rate: " << pose_eval.pose_success_rate
+                   << "\n";
+      pose_summary << "orientation_median_deg: "
+                   << pose_eval.orientation_median_deg << "\n";
+      pose_summary << "orientation_p95_deg: "
+                   << pose_eval.orientation_p95_deg << "\n";
+      pose_summary << "failure_reason: " << pose_eval.failure_reason << "\n";
+    }
+    ati::WriteAutoCameraInitializationPoseExcitationCsv(
+        (output_dir / "auto_camera_initialization_pose_excitation.csv").string(),
+        report.baseline_result.auto_camera_initialization);
+    ati::WriteAutoCameraInitializationPoseExcitationSamplesCsv(
+        (output_dir /
+         "auto_camera_initialization_pose_excitation_samples.csv").string(),
+        report.baseline_result.auto_camera_initialization);
+    if (report.baseline_result.auto_camera_initialization
+            .stage5_init_principal_profile_enabled != 0) {
+      ati::WriteAutoCameraInitializationPrincipalProfileCsv(
+          (output_dir / "auto_camera_initialization_principal_profile.csv")
+              .string(),
+          report.baseline_result.auto_camera_initialization);
+    }
+    if (report.baseline_result.auto_camera_initialization
+            .stage5_init_fixed_layout_principal_profile_enabled != 0) {
+      ati::WriteAutoCameraInitializationFixedLayoutPrincipalProfileCsv(
+          (output_dir /
+           "auto_camera_initialization_fixed_layout_principal_profile.csv")
+              .string(),
+          report.baseline_result.auto_camera_initialization);
+    }
+    if (report.baseline_result.auto_camera_initialization
+            .stage5_init_board_jackknife_diagnostic_enabled != 0) {
+      ati::WriteAutoCameraInitializationBoardJackknifeCsv(
+          (output_dir / "auto_camera_initialization_board_jackknife.csv")
+              .string(),
+          report.baseline_result.auto_camera_initialization);
+    }
+    if (report.baseline_result.auto_camera_initialization
+            .stage5_init_coverage_weighted_diagnostic_enabled != 0) {
+      ati::WriteAutoCameraInitializationCoverageWeightsCsv(
+          (output_dir / "auto_camera_initialization_coverage_weights.csv")
+              .string(),
+          report.baseline_result.auto_camera_initialization);
+    }
     WriteAutoCameraInitializationBootstrapCornerOverlays(
         output_dir / "auto_camera_initialization_bootstrap_corner_overlays",
         report.baseline_result.auto_camera_initialization,
         report.baseline_result.frame_sources);
     WriteOuterOnlyIntermediateArtifacts(output_dir, report.baseline_result);
+    WriteCameraAwareOuterRescueArtifacts(output_dir, report.baseline_result);
     WriteExperimentConfigSummary(
         (output_dir / "experiment_config_summary.txt").string(),
         requested_config,
@@ -8242,6 +9703,9 @@ int main(int argc, char** argv) {
         (output_dir / "benchmark_training_summary.txt").string(), report);
     ati::WriteStage5BenchmarkHoldoutSummary(
         (output_dir / "benchmark_holdout_summary.txt").string(), report);
+    ati::WritePersistentCameraCheckpointEvaluationsCsv(
+        (output_dir / "persistent_camera_checkpoint_evaluations.csv").string(),
+        report);
     {
       std::vector<ati::CameraModelRefitEvaluationResult> training_evaluations{
           report.our_training_evaluation,
@@ -8285,8 +9749,9 @@ int main(int argc, char** argv) {
         ati::WriteGeometryPriorOuterSeedDiagnostics(output_dir, report);
       }
     }
-    if (requested_config.internal_regeneration_diagnostics ||
-        write_selection_diagnostics) {
+    if (!use_precomputed &&
+        (requested_config.internal_regeneration_diagnostics ||
+         write_selection_diagnostics)) {
       ati::WriteFrameBoardObservationFlowDiagnostics(
           output_dir, report, all_frames_for_lookup, nullptr,
           nullptr);
@@ -8305,7 +9770,8 @@ int main(int argc, char** argv) {
           report.diagnostic_compare);
     }
 
-    if (args.runtime_mode == ati::Stage5RuntimeMode::Research) {
+    if (!use_precomputed &&
+        args.runtime_mode == ati::Stage5RuntimeMode::Research) {
       const cv::Mat projection_compare = benchmark.RenderProjectionComparison(report);
       if (!projection_compare.empty()) {
         cv::imwrite((output_dir / "benchmark_projection_compare.png").string(),
@@ -8336,6 +9802,8 @@ int main(int argc, char** argv) {
     PrintEvaluationProgress("kalibr holdout", report.kalibr_holdout_evaluation);
 
     ati::AslamBackendCalibrationOptions runner_options;
+    runner_options.uniform_control_point_mode =
+        report.precomputed_single_board_ba_mode;
     runner_options.max_iterations = 12;
     runner_options.convergence_delta_j = 1e-3;
     runner_options.convergence_delta_x = 1e-4;
@@ -8395,6 +9863,16 @@ int main(int argc, char** argv) {
         requested_config.backend_chordal_residual_weight;
     runner_options.angular_use_normalize_jacobian =
         requested_config.backend_angular_use_normalize_jacobian;
+    runner_options.angular_local_whitening_enabled =
+        requested_config.backend_angular_local_whitening;
+    runner_options.angular_local_whitening_pixel_sigma_px =
+        requested_config.backend_angular_local_whitening_pixel_sigma_px;
+    runner_options.angular_local_whitening_covariance_damping =
+        requested_config.backend_angular_local_whitening_covariance_damping;
+    runner_options.angular_local_whitening_min_sigma_rad =
+        requested_config.backend_angular_local_whitening_min_sigma_rad;
+    runner_options.angular_local_whitening_max_weight =
+        requested_config.backend_angular_local_whitening_max_weight;
     runner_options.angular_observed_ray_mode =
         ati::ParseAngularObservedRayMode(
             requested_config.backend_angular_observed_ray_mode);
@@ -8451,7 +9929,7 @@ int main(int argc, char** argv) {
     PrintProgress(
         "final backend BA removed; evaluating incremental-selection committed state...");
     const auto backend_stage_start = std::chrono::steady_clock::now();
-    const ati::AslamBackendCalibrationResult backend_result =
+    ati::AslamBackendCalibrationResult backend_result =
         backend_runner.Run(report.backend_problem_input);
     AddRuntimeStage(&runtime_summary,
                     "backend_committed_state_evaluation",
@@ -8475,6 +9953,200 @@ int main(int argc, char** argv) {
                 << (output_dir / "backend_optimization_summary.txt").string() << "\n";
       return 1;
     }
+
+    {
+      const bool enabled =
+          requested_config.enable_hybrid_pixel_ray_final_refinement;
+      bool attempted = false;
+      bool succeeded = false;
+      bool committed = false;
+      std::string failure_reason = enabled ? "not_attempted" : "disabled";
+      double runtime_seconds = 0.0;
+      ati::AslamBackendCalibrationResult hybrid_result;
+
+      if (enabled) {
+        attempted = true;
+        WriteBackendDiagnosticArtifacts(
+            output_dir, "pixel_committed_state", backend_result);
+        ati::CalibrationBackendProblemInput hybrid_input =
+            backend_result.effective_problem_input;
+        hybrid_input.scene_state.camera =
+            backend_result.optimized_scene_state.camera;
+        hybrid_input.scene_state.frames =
+            backend_result.optimized_scene_state.frames;
+        hybrid_input.scene_state.boards =
+            backend_result.optimized_scene_state.boards;
+        hybrid_input.scene_state.coarse_or_optimized_level =
+            "pixel_committed_before_pixel_ray_hybrid_refinement";
+        hybrid_input.optimization_masks.delayed_intrinsics_release = false;
+
+        ati::AslamBackendCalibrationOptions hybrid_options = runner_options;
+        hybrid_options.skip_optimization = false;
+        hybrid_options.max_iterations =
+            requested_config.hybrid_pixel_ray_max_iterations;
+        hybrid_options.residual_model = ati::ResidualModel::ImagePlane;
+        hybrid_options.use_point_type_residual_split = false;
+        hybrid_options.angular_auxiliary_enabled = false;
+        hybrid_options.angular_observed_ray_mode =
+            ati::AslamBackendCalibrationOptions::AngularObservedRayMode::
+                DynamicCurrentCamera;
+        hybrid_options.pixel_ray_hybrid_refinement_mode = true;
+        hybrid_options.pixel_ray_hybrid_lambda =
+            requested_config.hybrid_pixel_ray_lambda;
+        hybrid_options.pixel_ray_hybrid_pixel_scale_floor =
+            requested_config.hybrid_pixel_ray_pixel_scale_floor;
+        hybrid_options.pixel_ray_hybrid_ray_scale_floor =
+            requested_config.hybrid_pixel_ray_ray_scale_floor;
+        hybrid_options.export_cost_parity_diagnostics = false;
+        hybrid_options.export_variable_block_influence_diagnostics =
+            args.runtime_mode == ati::Stage5RuntimeMode::Research;
+        hybrid_options.run_jacobian_consistency_check =
+            args.runtime_mode == ati::Stage5RuntimeMode::Research;
+
+        PrintProgress(
+            "running optional Hybrid Pixel-Ray post-selection refinement...");
+        const auto hybrid_start = std::chrono::steady_clock::now();
+        const ati::AslamBackendCalibrationRunner hybrid_runner(hybrid_options);
+        hybrid_result = hybrid_runner.Run(hybrid_input);
+        runtime_seconds = ElapsedSeconds(hybrid_start);
+        AddRuntimeStage(&runtime_summary,
+                        "hybrid_pixel_ray_final_refinement",
+                        runtime_seconds, false);
+        WriteBackendDiagnosticArtifacts(
+            output_dir, "hybrid_pixel_ray_refinement_backend", hybrid_result);
+        bool objective_nonincreasing = !hybrid_result.stages.empty();
+        for (const auto& stage : hybrid_result.stages) {
+          objective_nonincreasing =
+              objective_nonincreasing &&
+              std::isfinite(stage.objective_start) &&
+              std::isfinite(stage.objective_final) &&
+              stage.objective_final <=
+                  stage.objective_start +
+                      1e-10 * std::max(1.0, std::abs(stage.objective_start));
+        }
+        succeeded = hybrid_result.success && objective_nonincreasing &&
+                    hybrid_result.optimized_residual.success &&
+                    hybrid_result.optimized_scene_state.camera.IsValid() &&
+                    std::isfinite(
+                        hybrid_result.optimized_residual.overall_rmse);
+        if (succeeded) {
+          backend_result = hybrid_result;
+          committed = true;
+          failure_reason.clear();
+          WriteBackendDiagnosticArtifacts(
+              output_dir, "backend_optimization", backend_result);
+          ati::WriteBoardLayoutPoseDeltaCsv(
+              (output_dir / "board_layout_pose_delta.csv").string(),
+              backend_result);
+          PrintProgress(
+              "Hybrid Pixel-Ray refinement committed from training-only "
+              "numerical health.");
+        } else {
+          failure_reason = hybrid_result.failure_reason.empty()
+                               ? "hybrid_result_failed_numerical_health"
+                               : hybrid_result.failure_reason;
+          PrintProgress(
+              "Hybrid Pixel-Ray refinement rolled back; keeping Pixel "
+              "committed state: " + failure_reason);
+        }
+      }
+
+      std::ofstream hybrid_summary(
+          (output_dir /
+           "hybrid_pixel_ray_final_refinement_summary.txt").string().c_str());
+      hybrid_summary << std::setprecision(12);
+      hybrid_summary << "stage5_hybrid_pixel_ray_final_refinement_enabled: "
+                     << (enabled ? 1 : 0) << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_final_refinement_attempted: "
+                     << (attempted ? 1 : 0) << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_final_refinement_success: "
+                     << (succeeded ? 1 : 0) << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_final_refinement_committed: "
+                     << (committed ? 1 : 0) << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_lambda: "
+                     << requested_config.hybrid_pixel_ray_lambda << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_residual_dimension: 4\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_scale_source: "
+                     << (enabled ? "pixel_committed_training_state"
+                                 : "disabled")
+                     << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_scales_computed_once: "
+                     << (hybrid_result.pixel_ray_hybrid_scales_computed_once
+                             ? 1
+                             : 0)
+                     << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_valid_observation_count: "
+                     << hybrid_result.pixel_ray_hybrid_valid_observation_count
+                     << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_invalid_observation_count: "
+                     << hybrid_result.pixel_ray_hybrid_invalid_observation_count
+                     << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_s_px: "
+                     << hybrid_result.pixel_ray_hybrid_pixel_scale << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_s_ray: "
+                     << hybrid_result.pixel_ray_hybrid_ray_scale << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_initial_pixel_rmse: "
+                     << hybrid_result.initial_residual.overall_image_plane_rmse
+                     << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_final_pixel_rmse: "
+                     << hybrid_result.optimized_residual.overall_image_plane_rmse
+                     << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_initial_ray_rmse: "
+                     << hybrid_result.initial_residual.overall_angular_rmse
+                     << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_final_ray_rmse: "
+                     << hybrid_result.optimized_residual.overall_angular_rmse
+                     << "\n";
+      int hybrid_iterations = 0;
+      int hybrid_failed_iterations = 0;
+      double hybrid_objective_start =
+          std::numeric_limits<double>::quiet_NaN();
+      double hybrid_objective_final =
+          std::numeric_limits<double>::quiet_NaN();
+      for (const auto& stage : hybrid_result.stages) {
+        hybrid_iterations += stage.iterations;
+        hybrid_failed_iterations += stage.failed_iterations;
+        if (!std::isfinite(hybrid_objective_start)) {
+          hybrid_objective_start = stage.objective_start;
+        }
+        hybrid_objective_final = stage.objective_final;
+      }
+      hybrid_summary << "stage5_hybrid_pixel_ray_iterations: "
+                     << hybrid_iterations << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_runtime_seconds: "
+                     << runtime_seconds << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_objective_start: "
+                     << hybrid_objective_start << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_objective_final: "
+                     << hybrid_objective_final << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_failed_iterations: "
+                     << hybrid_failed_iterations << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_failure_reason: "
+                     << failure_reason << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_holdout_used_for_scale: 0\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_holdout_used_for_commit: 0\n";
+      if (committed) {
+        hybrid_summary << "stage5_hybrid_pixel_ray_final_camera_family: "
+                       << backend_result.optimized_scene_state.camera
+                              .NormalizedFamilyString()
+                       << "\n";
+        hybrid_summary << "stage5_hybrid_pixel_ray_final_intrinsics_csv: ";
+        const std::vector<double> intrinsics =
+            backend_result.optimized_scene_state.camera.IntrinsicsVector();
+        for (std::size_t index = 0; index < intrinsics.size(); ++index) {
+          if (index > 0) {
+            hybrid_summary << ",";
+          }
+          hybrid_summary << intrinsics[index];
+        }
+        hybrid_summary << "\n";
+      }
+    }
+    WriteExperimentConfigSummary(
+        (output_dir / "experiment_config_summary.txt").string(),
+        requested_config,
+        report,
+        &backend_result);
 
     ati::CameraModelRefitEvaluationResult backend_training_evaluation;
     ati::CameraModelRefitEvaluationResult backend_holdout_evaluation;
@@ -8502,7 +10174,9 @@ int main(int argc, char** argv) {
       write_runtime_summary();
       return 1;
     }
-    PrintEvaluationProgress("backend training", backend_training_evaluation);
+    PrintEvaluationProgress(
+        "backend training objective", backend_training_evaluation,
+        BackendResidualMetricUnit(runner_options.residual_model));
     PrintEvaluationProgress("backend holdout", backend_holdout_evaluation);
 
     WriteCommittedBackendTrainingSummary(
@@ -8747,7 +10421,7 @@ int main(int argc, char** argv) {
         report.our_holdout_evaluation,
         backend_holdout_evaluation,
         report.kalibr_holdout_evaluation);
-    {
+    if (!use_precomputed) {
       const auto worst_overlay_stage_start = std::chrono::steady_clock::now();
       ExportWorstReprojectionOverlays(
           output_dir,

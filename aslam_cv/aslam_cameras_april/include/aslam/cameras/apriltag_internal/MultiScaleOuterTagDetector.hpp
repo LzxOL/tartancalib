@@ -72,6 +72,12 @@ struct MultiScaleOuterTagDetectorConfig {
   double anonymous_tag_like_rescue_max_center_error_scale = 0.90;
   double anonymous_tag_like_rescue_min_area_ratio = 0.30;
   double anonymous_tag_like_rescue_max_area_ratio = 3.50;
+  // Camera-aware re-detection is active only when refine_camera is populated.
+  // The production baseline accepts only exact-ID, zero-Hamming decodes and
+  // keeps the distortion-aware patch-to-image mapping as the committed corner.
+  bool enable_camera_aware_sphere_patch_rescue = true;
+  int camera_aware_sphere_patch_max_hamming = 0;
+  bool camera_aware_sphere_patch_commit_mapped_corners = true;
   OuterRefineCameraConfig refine_camera;
 
   // Legacy compatibility fields. Old YAML keys may still populate these,
@@ -275,6 +281,12 @@ struct OuterBoardMeasurement {
   int valid_refined_corner_count = 0;
   std::array<Eigen::Vector2d, 4> refined_outer_corners_original_image{};
   std::array<bool, 4> refined_corner_valid{{false, false, false, false}};
+  bool has_target_outer_corners = false;
+  std::array<Eigen::Vector3d, 4> target_outer_corners_board{};
+  bool has_direct_dense_control_points = false;
+  std::vector<Eigen::Vector3d> direct_dense_target_points_board;
+  std::vector<Eigen::Vector2d> direct_dense_image_points;
+  std::vector<unsigned char> direct_dense_point_is_outer;
   std::array<OuterCornerVerificationDebugInfo, 4> corner_verification_debug{};
   OuterTagFailureReason failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
   std::string failure_reason_text;

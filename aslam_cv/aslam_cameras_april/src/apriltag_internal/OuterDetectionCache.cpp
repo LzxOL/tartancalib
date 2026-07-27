@@ -15,7 +15,8 @@ namespace {
 
 namespace fs = boost::filesystem;
 
-constexpr const char kCacheFormatVersion[] = "outer_detection_cache_v3_subpix_debug";
+constexpr const char kCacheFormatVersion[] =
+    "outer_detection_cache_v4_subpix_edge_support_contract";
 
 std::uint64_t HashBytes(const std::string& text) {
   std::uint64_t hash = 1469598103934665603ull;
@@ -64,6 +65,12 @@ std::string MakeConfigSignature(const MultiScaleOuterTagDetectorConfig& config) 
          << "|blur_before_detect=" << (config.blur_before_detect ? 1 : 0)
          << "|blur_kernel=" << config.blur_kernel
          << "|blur_sigma=" << config.blur_sigma
+         << "|enable_camera_aware_sphere_patch_rescue="
+         << (config.enable_camera_aware_sphere_patch_rescue ? 1 : 0)
+         << "|camera_aware_sphere_patch_max_hamming="
+         << config.camera_aware_sphere_patch_max_hamming
+         << "|camera_aware_sphere_patch_commit_mapped_corners="
+         << (config.camera_aware_sphere_patch_commit_mapped_corners ? 1 : 0)
          << "|outer_subpix_window_radius=" << config.outer_subpix_window_radius
          << "|outer_subpix_window_scale=" << config.outer_subpix_window_scale
          << "|outer_subpix_window_min=" << config.outer_subpix_window_min

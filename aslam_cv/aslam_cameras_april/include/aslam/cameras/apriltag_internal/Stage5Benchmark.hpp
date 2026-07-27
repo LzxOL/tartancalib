@@ -88,6 +88,9 @@ struct CalibrationEvaluationDataset {
   int outer_point_count = 0;
   int internal_point_count = 0;
   int total_point_count = 0;
+  int camera_aware_outer_rescue_attempted_board_count = 0;
+  int camera_aware_outer_rescue_used_board_count = 0;
+  bool uniform_control_point_mode = false;
   std::vector<InternalRegenerationFrameResult> internal_regeneration_results;
   std::vector<std::string> warnings;
   std::string failure_reason;
@@ -120,6 +123,7 @@ struct CameraModelRefitBoardObservationDiagnostics {
   std::string frame_label;
   int board_id = -1;
   bool pose_only_refit_success = false;
+  Eigen::Matrix4d T_camera_board = Eigen::Matrix4d::Identity();
   int point_count = 0;
   int outer_point_count = 0;
   int internal_point_count = 0;
@@ -157,6 +161,7 @@ struct CameraModelRefitEvaluationResult {
   std::string split_label;
   std::string split_signature;
   OuterBootstrapCameraIntrinsics camera;
+  bool uniform_control_point_mode = false;
   int evaluated_frame_count = 0;
   int evaluated_board_observation_count = 0;
   int pose_only_refit_attempt_count = 0;
@@ -167,6 +172,7 @@ struct CameraModelRefitEvaluationResult {
   int outer_point_count = 0;
   int internal_point_count = 0;
   double overall_rmse = 0.0;
+  double p95_reprojection_error = 0.0;
   double outer_only_rmse = 0.0;
   double internal_only_rmse = 0.0;
   int excluded_board_id_for_rmse = 1;
@@ -184,6 +190,19 @@ struct CameraModelRefitEvaluationResult {
   std::vector<CameraModelRefitBoardObservationDiagnostics> board_observation_diagnostics;
   std::vector<CameraModelRefitFrameDiagnostics> frame_diagnostics;
   std::vector<std::string> warnings;
+  std::string failure_reason;
+};
+
+// Experimental-only held-out multiboard pose evaluation. Calibration never
+// consumes this result.
+struct MultiBoardPoseOrientationEvaluationResult {
+  bool success = false;
+  int evaluated_frame_count = 0;
+  int pose_success_count = 0;
+  double pose_success_rate = 0.0;
+  double orientation_median_deg = 0.0;
+  double orientation_p95_deg = 0.0;
+  std::vector<double> orientation_errors_deg;
   std::string failure_reason;
 };
 
@@ -300,6 +319,7 @@ struct TrialBackendFrameBoardSelectionOptions {
   enum class CandidateOrderMode {
     ScoreSorted = 0,
     RandomShuffle = 1,
+    IntrinsicsInformationGreedy = 2,
   };
   enum class InfoGainProxyMode {
     Legacy = 0,
@@ -312,15 +332,28 @@ struct TrialBackendFrameBoardSelectionOptions {
   };
 
   bool enabled = false;
+  // Single planar target profile: one dense target view per candidate batch.
+  // The forced bootstrap batch contains an adaptive set of informative views
+  // with intrinsics fixed; candidate batches then release intrinsics.
+  bool single_board_dense_grid_profile = false;
+  // One robust scale is shared by all dense-grid control points. The default
+  // matches BabelCalib's pixel-domain Huber IRLS threshold.
+  double checkerboard_huber_delta_pixels = 1.5;
+  bool checkerboard_outlier_filter_enabled = true;
+  double checkerboard_outlier_sigma = 4.0;
+  double checkerboard_min_inlier_ratio = 0.5;
+  int checkerboard_min_retained_points = 8;
   SelectionMode selection_mode = SelectionMode::KalibrStyleBatch;
   BudgetMode budget_mode = BudgetMode::KalibrStyle;
   CandidateOrderMode candidate_order_mode = CandidateOrderMode::ScoreSorted;
+  bool candidate_order_mode_explicit = false;
   InfoGainProxyMode info_gain_proxy_mode = InfoGainProxyMode::IntrinsicsJacobian;
   CandidateBatchGranularity candidate_batch_granularity =
       CandidateBatchGranularity::Frame;
   KalibrStyleBatchAcceptancePolicy acceptance_policy =
       KalibrStyleBatchAcceptancePolicy::KalibrInformationGain;
   double acceptance_information_gain_threshold = 0.2;
+  bool acceptance_information_gain_threshold_explicit = false;
   double acceptance_rank_gain_threshold = 1e-6;
   bool candidate_shuffle_seed_set = false;
   unsigned int candidate_shuffle_seed = 0;
@@ -330,6 +363,7 @@ struct TrialBackendFrameBoardSelectionOptions {
   bool delayed_intrinsics_release_in_trial = true;
   int intrinsics_release_iteration = 1;
   bool persistent_intrinsics_anchor_prior_enabled = false;
+  bool persistent_fix_board_layout = false;
   double persistent_intrinsics_anchor_weight_xi_alpha = 0.0;
   double persistent_intrinsics_anchor_weight_focal = 0.0;
   double persistent_intrinsics_anchor_weight_principal = 0.0;
@@ -367,6 +401,8 @@ struct TrialBackendFrameBoardSelectionOptions {
   bool force_include_list_is_exact_input = false;
   std::set<std::pair<int, int> > force_include_frame_board_keys;
   std::set<std::pair<std::string, int> > force_include_frame_label_board_keys;
+  std::set<std::pair<int, int> > seed_override_frame_board_keys;
+  std::set<std::pair<std::string, int> > seed_override_frame_label_board_keys;
 };
 
 struct TrialBackendFrameBoardObservationDecision {
@@ -445,11 +481,17 @@ struct TrialBackendFrameBoardObservationDecision {
   double batch_acceptance_score = 0.0;
   bool accepted_by_batch_acceptance = false;
   bool persistent_incremental_attempted = false;
+  int persistent_incremental_attempt_order = -1;
   bool persistent_incremental_batch_accepted = false;
   bool persistent_incremental_force = false;
   bool persistent_incremental_trust_region_pass = true;
   bool persistent_incremental_trust_region_backtracking_used = false;
   bool persistent_incremental_split_residual_health_pass = true;
+  bool persistent_incremental_pixel_safety_gate_pass = true;
+  bool persistent_incremental_full_training_pose_refit_health_pass = true;
+  bool persistent_incremental_ray_curve_validity_pass = true;
+  bool persistent_incremental_kb_k3_released = true;
+  bool persistent_incremental_kb_k4_released = true;
   double persistent_incremental_information_gain = 0.0;
   double persistent_incremental_normalized_information_gain = 0.0;
   int persistent_incremental_information_gain_normalization_count = 1;
@@ -461,8 +503,26 @@ struct TrialBackendFrameBoardObservationDecision {
   double persistent_incremental_svd_tolerance = 0.0;
   double persistent_incremental_qr_tolerance = 0.0;
   int persistent_incremental_iterations = 0;
+  int persistent_incremental_last_solver_pass_iterations = 0;
+  int persistent_incremental_continuation_round_count = 0;
+  bool persistent_incremental_continuation_guard_hit = false;
+  bool persistent_incremental_pose_prefit_attempted = false;
+  bool persistent_incremental_pose_prefit_success = false;
+  int persistent_incremental_pose_prefit_iterations = 0;
+  double persistent_incremental_pose_prefit_objective_start = 0.0;
+  double persistent_incremental_pose_prefit_objective_final = 0.0;
+  double persistent_incremental_pose_prefit_last_delta_j = 0.0;
+  double persistent_incremental_pose_prefit_last_delta_x = 0.0;
   double persistent_incremental_objective_start = 0.0;
   double persistent_incremental_objective_final = 0.0;
+  double persistent_incremental_objective_last_delta_j = 0.0;
+  double persistent_incremental_state_last_delta_x = 0.0;
+  bool persistent_incremental_linear_solver_failure = false;
+  bool persistent_incremental_converged_by_relative_objective = false;
+  bool persistent_incremental_converged_by_camera_step = false;
+  double persistent_incremental_last_camera_shape_step = 0.0;
+  double persistent_incremental_last_camera_focal_relative_step = 0.0;
+  double persistent_incremental_last_camera_principal_step_px = 0.0;
   bool persistent_incremental_objective_decreased = false;
   double persistent_incremental_rmse_before = 0.0;
   double persistent_incremental_outer_rmse_before = 0.0;
@@ -485,6 +545,26 @@ struct TrialBackendFrameBoardObservationDecision {
   double persistent_incremental_candidate_total_p95_after = 0.0;
   double persistent_incremental_candidate_outer_p95_after = 0.0;
   double persistent_incremental_candidate_internal_p95_after = 0.0;
+  double persistent_incremental_pixel_rmse_before = 0.0;
+  double persistent_incremental_pixel_rmse_after = 0.0;
+  double persistent_incremental_pixel_p95_before = 0.0;
+  double persistent_incremental_pixel_p95_after = 0.0;
+  double persistent_incremental_candidate_pixel_rmse_after = 0.0;
+  double persistent_incremental_candidate_pixel_p95_after = 0.0;
+  double persistent_incremental_full_training_pixel_rmse_before = 0.0;
+  double persistent_incremental_full_training_pixel_rmse_after = 0.0;
+  double persistent_incremental_full_training_pixel_p95_before = 0.0;
+  double persistent_incremental_full_training_pixel_p95_after = 0.0;
+  double persistent_incremental_full_training_pose_success_rate_before = 0.0;
+  double persistent_incremental_full_training_pose_success_rate_after = 0.0;
+  int persistent_incremental_full_training_pose_success_count_before = 0;
+  int persistent_incremental_full_training_pose_success_count_after = 0;
+  int persistent_incremental_full_training_pose_total_count = 0;
+  int persistent_incremental_full_training_invalid_projection_count_before = 0;
+  int persistent_incremental_full_training_invalid_projection_count_after = 0;
+  double persistent_incremental_ray_curve_rms_change_deg = 0.0;
+  double persistent_incremental_ray_curve_max_change_deg = 0.0;
+  double persistent_incremental_ray_curve_min_radial_derivative = 0.0;
   int persistent_incremental_image_plane_residual_count = 0;
   int persistent_incremental_angular_residual_count = 0;
   int persistent_incremental_chordal_residual_count = 0;
@@ -508,6 +588,14 @@ struct TrialBackendFrameBoardObservationDecision {
   double persistent_incremental_camera_fv_after = 0.0;
   double persistent_incremental_camera_cu_after = 0.0;
   double persistent_incremental_camera_cv_after = 0.0;
+  double persistent_incremental_camera_k1_before = 0.0;
+  double persistent_incremental_camera_k2_before = 0.0;
+  double persistent_incremental_camera_k3_before = 0.0;
+  double persistent_incremental_camera_k4_before = 0.0;
+  double persistent_incremental_camera_k1_after = 0.0;
+  double persistent_incremental_camera_k2_after = 0.0;
+  double persistent_incremental_camera_k3_after = 0.0;
+  double persistent_incremental_camera_k4_after = 0.0;
   double left_rmse = 0.0;
   double right_rmse = 0.0;
   double center_side_rmse = 0.0;
@@ -586,6 +674,24 @@ struct TrialBackendFrameBoardSelectionResult {
   int baseline_seed_outer_point_count = 0;
   int baseline_seed_internal_point_count = 0;
   int candidate_board_observation_count = 0;
+  std::string selection_profile = "multi_board";
+  bool selection_is_kalibr_checkerboard_style = false;
+  double checkerboard_huber_delta_pixels = 0.0;
+  bool checkerboard_force_all_valid_views = false;
+  bool checkerboard_pose_marginalized_fisher = false;
+  std::string checkerboard_seed_strategy;
+  int checkerboard_seed_target_frame_count = 0;
+  double checkerboard_seed_fisher_logdet = 0.0;
+  double checkerboard_seed_fisher_rank_proxy = 0.0;
+  bool checkerboard_outlier_filter_enabled = false;
+  double checkerboard_outlier_sigma = 0.0;
+  double checkerboard_min_inlier_ratio = 0.0;
+  int checkerboard_min_retained_points = 0;
+  double checkerboard_outlier_threshold_pixels = 0.0;
+  double checkerboard_outlier_median_pixels = 0.0;
+  double checkerboard_outlier_robust_sigma_pixels = 0.0;
+  int checkerboard_outlier_removed_point_count = 0;
+  int checkerboard_outlier_dropped_view_count = 0;
   TrialBackendFrameBoardSelectionOptions::BudgetMode budget_mode =
       TrialBackendFrameBoardSelectionOptions::BudgetMode::KalibrStyle;
   TrialBackendFrameBoardSelectionOptions::CandidateOrderMode
@@ -638,24 +744,69 @@ struct TrialBackendFrameBoardSelectionResult {
   std::string persistent_incremental_backend_estimator_failure_reason;
   std::string persistent_incremental_information_gain_target;
   bool persistent_incremental_board_layout_in_information_group = false;
+  bool persistent_incremental_board_layout_fixed = false;
+  int persistent_incremental_board_layout_pose_count = 0;
+  double persistent_incremental_board_layout_max_matrix_abs_delta = 0.0;
+  double persistent_incremental_board_layout_max_translation_delta = 0.0;
+  double persistent_incremental_board_layout_max_rotation_delta_deg = 0.0;
   int persistent_incremental_camera_information_group_id = -1;
   int persistent_incremental_board_layout_group_id = -1;
   int persistent_incremental_transformation_group_id = -1;
   int persistent_incremental_seed_information_group_dim = -1;
+  int persistent_incremental_seed_information_rank = -1;
+  int persistent_incremental_seed_information_rank_deficiency = -1;
+  bool persistent_incremental_seed_information_baseline_valid = false;
+  double persistent_incremental_seed_information_scaled_min_singular_value = -1.0;
+  double persistent_incremental_seed_information_scaled_max_singular_value = -1.0;
+  double persistent_incremental_seed_information_scaled_condition_number = -1.0;
+  double persistent_incremental_seed_information_ds_cu_stddev_px = -1.0;
+  double persistent_incremental_seed_information_ds_cv_stddev_px = -1.0;
   int persistent_incremental_seed_batch_count = 0;
   int persistent_incremental_seed_frame_count = 0;
   int persistent_incremental_seed_board_observation_count = 0;
   int persistent_incremental_seed_point_count = 0;
+  bool persistent_incremental_seed_intrinsics_warmup_attempted = false;
+  bool persistent_incremental_seed_intrinsics_warmup_success = false;
+  bool persistent_incremental_seed_intrinsics_warmup_converged_by_relative_objective = false;
+  int persistent_incremental_seed_intrinsics_warmup_iterations = 0;
+  double persistent_incremental_seed_intrinsics_warmup_objective_start = 0.0;
+  double persistent_incremental_seed_intrinsics_warmup_objective_final = 0.0;
+  double persistent_incremental_seed_intrinsics_warmup_last_delta_j = 0.0;
+  double persistent_incremental_seed_intrinsics_warmup_last_delta_x = 0.0;
   int persistent_incremental_candidate_batch_count = 0;
   int persistent_incremental_attempted_batch_count = 0;
   int persistent_incremental_accepted_batch_count = 0;
   int persistent_incremental_rejected_batch_count = 0;
+  std::string persistent_incremental_solver_profile_name;
+  std::string persistent_incremental_solver_objective_unit;
+  int persistent_incremental_solver_max_iterations = 0;
+  double persistent_incremental_solver_convergence_delta_j = 0.0;
+  double persistent_incremental_solver_convergence_delta_x = 0.0;
+  double persistent_incremental_solver_bearing_reference_focal_px = 1.0;
+  double persistent_incremental_solver_bearing_residual_scale = 1.0;
+  int persistent_incremental_solver_single_iteration_batch_count = 0;
+  int persistent_incremental_solver_max_iteration_batch_count = 0;
+  int persistent_incremental_solver_objective_decreased_batch_count = 0;
+  int persistent_incremental_solver_relative_objective_converged_batch_count = 0;
+  int persistent_incremental_solver_camera_step_converged_batch_count = 0;
+  int persistent_incremental_solver_continuation_batch_count = 0;
+  int persistent_incremental_solver_continuation_round_count = 0;
+  int persistent_incremental_solver_continuation_guard_hit_count = 0;
   int persistent_incremental_image_plane_residual_count = 0;
   int persistent_incremental_angular_residual_count = 0;
   int persistent_incremental_chordal_residual_count = 0;
   int persistent_incremental_hybrid_angular_selected_count = 0;
   int persistent_incremental_hybrid_chordal_selected_count = 0;
   int persistent_incremental_angular_geometry_failure_count = 0;
+  int persistent_incremental_angular_local_whitening_success_count = 0;
+  int persistent_incremental_angular_local_whitening_failure_count = 0;
+  int persistent_incremental_angular_local_whitening_clamped_count = 0;
+  double persistent_incremental_angular_local_whitening_sigma_mean_rad = 0.0;
+  double persistent_incremental_angular_local_whitening_sigma_min_rad = 0.0;
+  double persistent_incremental_angular_local_whitening_sigma_max_rad = 0.0;
+  double persistent_incremental_angular_local_whitening_weight_mean = 0.0;
+  double persistent_incremental_angular_local_whitening_weight_min = 0.0;
+  double persistent_incremental_angular_local_whitening_weight_max = 0.0;
   std::string persistent_incremental_selection_metric_name;
   std::string persistent_incremental_selection_metric_unit;
   std::string persistent_incremental_residual_health_threshold_source;
@@ -670,6 +821,27 @@ struct TrialBackendFrameBoardSelectionResult {
       false;
   bool persistent_incremental_split_residual_health_gate_enabled = false;
   int persistent_incremental_split_residual_health_rejected_count = 0;
+  bool persistent_incremental_bearing_pixel_safety_gate_enabled = false;
+  int persistent_incremental_bearing_pixel_safety_rejected_count = 0;
+  bool persistent_incremental_full_training_pose_refit_health_gate_enabled =
+      false;
+  bool persistent_incremental_seed_intrinsics_warmup_full_training_health_pass =
+      true;
+  int persistent_incremental_full_training_pose_refit_health_rejected_count = 0;
+  double persistent_incremental_initial_full_training_pixel_rmse = 0.0;
+  double persistent_incremental_initial_full_training_pixel_p95 = 0.0;
+  double persistent_incremental_initial_full_training_pose_success_rate = 0.0;
+  int persistent_incremental_initial_full_training_pose_success_count = 0;
+  int persistent_incremental_initial_full_training_pose_total_count = 0;
+  int persistent_incremental_initial_full_training_invalid_projection_count = 0;
+  double persistent_incremental_final_full_training_pixel_rmse = 0.0;
+  double persistent_incremental_final_full_training_pixel_p95 = 0.0;
+  double persistent_incremental_final_full_training_pose_success_rate = 0.0;
+  int persistent_incremental_final_full_training_pose_success_count = 0;
+  int persistent_incremental_final_full_training_pose_total_count = 0;
+  int persistent_incremental_final_full_training_invalid_projection_count = 0;
+  bool persistent_incremental_kb_distortion_guard_enabled = false;
+  int persistent_incremental_kb_ray_curve_validity_rejected_count = 0;
   bool persistent_incremental_adaptive_saturation_stop_enabled = false;
   bool persistent_incremental_adaptive_saturation_stop_hit = false;
   int persistent_incremental_adaptive_saturation_min_accepted_batches = 0;
@@ -802,11 +974,53 @@ struct CameraRayCurveDiagnostics {
   std::string failure_reason;
 };
 
+struct Stage5LargeIntrinsicPerturbationState {
+  bool enabled = false;
+  std::string requested_profile;
+  std::string effective_profile;
+  bool valid_projection_grid = false;
+  int projection_grid_width = 0;
+  int projection_grid_height = 0;
+  int valid_projection_grid_count = 0;
+  int invalid_projection_grid_count = 0;
+  double requested_focal_scale = 1.0;
+  double requested_xi_delta = 0.0;
+  double requested_alpha_delta = 0.0;
+  double requested_scale = 1.0;
+  double effective_scale = 1.0;
+  double actual_focal_scale = 1.0;
+  double actual_xi_delta = 0.0;
+  double actual_alpha_delta = 0.0;
+  std::string reference_scene_fingerprint;
+  std::string perturbed_scene_fingerprint;
+  std::string frozen_observation_fingerprint;
+  CalibrationSceneState reference_scene;
+  OuterBootstrapCameraIntrinsics reference_camera;
+  OuterBootstrapCameraIntrinsics perturbed_camera;
+  OuterBootstrapCameraIntrinsics selection_seed_camera;
+  OuterBootstrapCameraIntrinsics selection_candidate_camera;
+  bool selection_seed_matches_perturbed_camera = false;
+  bool selection_candidate_matches_perturbed_camera = false;
+  bool outer_only_after_application = false;
+  int frozen_internal_point_count_before_ablation = 0;
+  int seed_internal_point_count_after_ablation = 0;
+  int candidate_pool_internal_point_count_after_ablation = 0;
+  std::string failure_reason;
+};
+
 struct Stage5BenchmarkInput {
   std::vector<FrozenRound2BaselineFrameSource> all_frames;
   std::vector<FrozenRound2BaselineFrameSource> external_holdout_frames;
+  bool use_precomputed_training_measurements = false;
+  FrozenPrecomputedMeasurementInput precomputed_training_measurements;
+  bool use_precomputed_holdout_measurements = false;
+  FrozenPrecomputedMeasurementInput precomputed_holdout_measurements;
   std::string external_holdout_label;
   bool use_external_holdout_self_frontend_prepass = false;
+  // Valid only when holdout frames exactly match the training frames. Reuse
+  // the full frontend observations for a same-sequence evaluation, rather
+  // than changing the observed board set through a second detector pass.
+  bool holdout_evaluate_full_training_observations = false;
   FrozenRound2BaselineOptions baseline_options;
   BackendProblemOptions backend_options;
   BackendProblemOptions committed_backend_evaluation_options;
@@ -824,6 +1038,29 @@ struct Stage5BenchmarkInput {
       multi_board_consistency_diagnostics_options;
   TrialBackendFrameBoardSelectionOptions trial_backend_selection_options;
   BackendInputAblationOptions backend_input_ablation_options;
+  bool enable_large_intrinsic_perturbation = false;
+  std::string large_intrinsic_perturbation_profile;
+  // Unit interval amount along the selected P1--P4 direction. A value of one
+  // is the full perturbation and zero is the paired clean baseline.
+  double large_intrinsic_perturbation_scale = 1.0;
+  // Semi-synthetic experiments preserve the requested scale exactly,
+  // including values above one, instead of backing it off.
+  bool large_intrinsic_perturbation_strict_scale = false;
+  std::string large_intrinsic_perturbation_reference_scene_path;
+  // Perturbation-ablation only: retain the already recovered/frozen internal
+  // measurements through bootstrap, then remove them immediately after the
+  // perturbation and before selection/incremental BA.
+  bool large_intrinsic_perturbation_outer_only_after_application = false;
+};
+
+struct PersistentCameraCheckpointEvaluation {
+  int attempt_order = -1;
+  int frame_index = -1;
+  std::string frame_label;
+  double information_gain = 0.0;
+  OuterBootstrapCameraIntrinsics camera;
+  CameraModelRefitEvaluationResult training_evaluation;
+  CameraModelRefitEvaluationResult holdout_evaluation;
 };
 
 struct Stage5BenchmarkReport {
@@ -833,6 +1070,22 @@ struct Stage5BenchmarkReport {
   bool external_holdout_self_frontend_prepass_used = false;
   bool external_holdout_self_frontend_prepass_success = false;
   std::string external_holdout_observation_source = "training_scene_regeneration";
+  std::string stage5_input_mode = "images";
+  std::string precomputed_training_source;
+  std::string precomputed_holdout_source;
+  std::string precomputed_target_mode_requested = "auto";
+  std::string precomputed_target_mode_resolved;
+  int precomputed_board_count = 0;
+  bool precomputed_single_board_ba_mode = false;
+  int precomputed_training_frame_count = 0;
+  int precomputed_training_board_observation_count = 0;
+  int precomputed_training_outer_point_count = 0;
+  int precomputed_training_internal_point_count = 0;
+  int precomputed_holdout_frame_count = 0;
+  int precomputed_holdout_board_observation_count = 0;
+  int precomputed_holdout_outer_point_count = 0;
+  int precomputed_holdout_internal_point_count = 0;
+  bool precomputed_boards_rt_used_to_initialize_layout = false;
   std::string external_holdout_self_frontend_prepass_failure_reason;
   std::string dataset_label;
   std::string baseline_protocol_label;
@@ -846,6 +1099,11 @@ struct Stage5BenchmarkReport {
   InternalBlurObservationFilterResult internal_blur_filter_result;
   TrialBackendFrameBoardSelectionResult trial_backend_selection_result;
   BackendInputAblationResult backend_input_ablation_result;
+  Stage5LargeIntrinsicPerturbationState large_intrinsic_perturbation;
+  bool final_backend_scene_available = false;
+  CalibrationSceneState final_backend_scene;
+  MultiBoardPoseOrientationEvaluationResult
+      large_perturbation_pose_orientation_evaluation;
   CalibrationBackendProblemInput backend_problem_input;
   CalibrationEvaluationDataset training_dataset;
   CalibrationEvaluationDataset holdout_dataset;
@@ -853,6 +1111,22 @@ struct Stage5BenchmarkReport {
   CameraModelRefitEvaluationResult kalibr_training_evaluation;
   CameraModelRefitEvaluationResult our_holdout_evaluation;
   CameraModelRefitEvaluationResult kalibr_holdout_evaluation;
+  CameraModelRefitEvaluationResult initialization_training_evaluation;
+  CameraModelRefitEvaluationResult initialization_holdout_evaluation;
+  CameraModelRefitEvaluationResult perturbation_boundary_training_evaluation;
+  CameraModelRefitEvaluationResult perturbation_boundary_holdout_evaluation;
+  std::vector<PersistentCameraCheckpointEvaluation>
+      persistent_camera_checkpoint_evaluations;
+  bool checkerboard_robust_checkpoint_selection_used = false;
+  std::string checkerboard_robust_checkpoint_criterion;
+  std::string checkerboard_robust_checkpoint_label;
+  int checkerboard_robust_checkpoint_attempt_order = -1;
+  double checkerboard_robust_checkpoint_frame_median_rmse = 0.0;
+  double checkerboard_robust_checkpoint_frame_p90_rmse = 0.0;
+  double checkerboard_robust_checkpoint_huber_rmse = 0.0;
+  double checkerboard_robust_checkpoint_fold_median_mean_rmse = 0.0;
+  double checkerboard_robust_checkpoint_fold_median_max_rmse = 0.0;
+  double checkerboard_robust_checkpoint_fold_median_std_rmse = 0.0;
   std::vector<KalibrBenchmarkReference> additional_camera_references;
   std::vector<CameraModelRefitEvaluationResult> additional_training_evaluations;
   std::vector<CameraModelRefitEvaluationResult> additional_holdout_evaluations;
@@ -884,6 +1158,11 @@ class Stage5Benchmark {
       const CalibrationEvaluationDataset& dataset,
       const OuterBootstrapCameraIntrinsics& camera,
       const std::string& method_label) const;
+  MultiBoardPoseOrientationEvaluationResult
+  EvaluateMultiBoardPoseOrientation(
+      const CalibrationEvaluationDataset& dataset,
+      const CalibrationSceneState& final_scene,
+      const CalibrationSceneState& ground_truth_scene) const;
   MultiBoardConsistencyDiagnosticsResult EvaluateMultiBoardConsistency(
       const CalibrationEvaluationDataset& dataset,
       const CameraModelRefitEvaluationResult& evaluation,
@@ -932,7 +1211,8 @@ class Stage5Benchmark {
       const std::vector<InternalRegenerationFrameResult>& regeneration_results,
       const std::string& dataset_label,
       const std::string& split_label,
-      const std::string& split_signature) const;
+      const std::string& split_signature,
+      bool include_points_not_used_in_solver = false) const;
   std::string FindFrameImagePath(const Stage5BenchmarkReport& report,
                                  int frame_index) const;
 
@@ -945,6 +1225,9 @@ void WriteStage5BenchmarkTrainingSummary(const std::string& path,
                                          const Stage5BenchmarkReport& report);
 void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
                                         const Stage5BenchmarkReport& report);
+void WritePersistentCameraCheckpointEvaluationsCsv(
+    const std::string& path,
+    const Stage5BenchmarkReport& report);
 void WriteStage5BenchmarkHoldoutPointsCsv(const std::string& path,
                                           const Stage5BenchmarkReport& report);
 void WriteCameraModelRefitPointsCsv(

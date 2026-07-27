@@ -44,6 +44,7 @@ struct JointReprojectionSceneState {
 };
 
 struct JointReprojectionCostOptions {
+  bool uniform_control_point_mode = false;
   ResidualModel residual_model = ResidualModel::ImagePlane;
   double hybrid_angular_threshold_deg = 50.0;
   double polar_continuous_hybrid_threshold_deg = 50.0;

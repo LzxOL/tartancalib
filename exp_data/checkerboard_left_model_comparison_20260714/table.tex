@@ -1,0 +1,42 @@
+\begin{table}[t]
+  \centering
+  \caption{Left-camera cross-sequence diagnostic on 32 frozen holdout views
+  (2,816 control points). Ours is calibrated on the checkerboard-3-25-left
+  training split, while external methods use the available stereo-4-2-3-left
+  canonical parameters. Inl. denotes the percentage of points with
+  reprojection error below 1 px. Best results for each camera model are
+  highlighted in bold. $\dagger$ indicates an omni model with radial--tangential
+  distortion; the other UCM/Mei entries use omni-none.}
+  \label{tab:checkerboard_left_models}
+  \setlength{\tabcolsep}{4.0pt}
+  \renewcommand{\arraystretch}{1.03}
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{llccc}
+    \toprule
+    Model & Method & \multicolumn{3}{c}{Left Checkerboard} \\
+    \cmidrule(lr){3-5}
+          &        & RMSE $\downarrow$ & P95 $\downarrow$ & Inl.@1px [\%] $\uparrow$ \\
+    \midrule
+    \multirow{4}{*}{DS}
+      & \textbf{Ours} & \textbf{0.370} & \textbf{0.539} & \textbf{99.40} \\
+      & BabelCalib    & 0.967          & 2.047          & 78.66 \\
+      & Kalibr        & 0.922          & 1.904          & 79.47 \\
+      & TartanCalib   & 0.925          & 1.953          & 80.18 \\
+    \midrule
+    \multirow{5}{*}{KB}
+      & \textbf{Ours} & \textbf{0.390} & \textbf{0.582} & \textbf{98.93} \\
+      & BabelCalib    & 1.103          & 2.306          & 76.70 \\
+      & Kalibr        & 1.269          & 2.569          & 74.43 \\
+      & CamOdoCal     & 1.104          & 2.319          & 76.74 \\
+      & OpenCV fisheye& 1.019          & 2.134          & 78.16 \\
+    \midrule
+    \multirow{5}{*}{\shortstack[l]{UCM /\\Mei}}
+      & \textbf{Ours}          & \textbf{0.783} & \textbf{1.472} & \textbf{87.96} \\
+      & Kalibr                 & 1.520          & 3.287          & 66.76 \\
+      & TartanCalib            & 1.646          & 3.547          & 65.20 \\
+      & CamOdoCal$^\dagger$    & 1.079          & 2.264          & 77.13 \\
+      & OpenCV omnidir$^\dagger$ & 1.031       & 2.122          & 78.62 \\
+    \bottomrule
+  \end{tabular}%
+  }
+\end{table}

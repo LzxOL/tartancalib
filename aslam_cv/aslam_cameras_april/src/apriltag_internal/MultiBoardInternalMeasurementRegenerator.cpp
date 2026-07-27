@@ -34,6 +34,23 @@ void AppendUniqueBoardId(int board_id, std::vector<int>* board_ids) {
   }
 }
 
+void CollectVisibleBoardIds(
+    const InternalRegenerationFrameInput& frame_input,
+    std::vector<int>* board_ids) {
+  if (board_ids == nullptr) {
+    return;
+  }
+  for (std::size_t index = 0;
+       index < frame_input.outer_detections.requested_board_ids.size();
+       ++index) {
+    if (index < frame_input.outer_detections.detections.size() &&
+        frame_input.outer_detections.detections[index].success) {
+      AppendUniqueBoardId(
+          frame_input.outer_detections.requested_board_ids[index], board_ids);
+    }
+  }
+}
+
 void AppendUniqueWarning(const std::string& warning,
                          std::vector<std::string>* warnings) {
   if (warnings == nullptr || warning.empty()) {
@@ -110,7 +127,7 @@ bool ProjectGeometryPriorOuterCorners(
   return inside_count == 4;
 }
 
-double PolygonArea(const std::array<cv::Point2f, 4>& corners) {
+double SignedPolygonArea(const std::array<cv::Point2f, 4>& corners) {
   double area = 0.0;
   for (int index = 0; index < 4; ++index) {
     const cv::Point2f& a = corners[static_cast<std::size_t>(index)];
@@ -118,7 +135,92 @@ double PolygonArea(const std::array<cv::Point2f, 4>& corners) {
     area += static_cast<double>(a.x) * static_cast<double>(b.y) -
             static_cast<double>(b.x) * static_cast<double>(a.y);
   }
-  return std::fabs(area) * 0.5;
+  return area * 0.5;
+}
+
+double PolygonArea(const std::array<cv::Point2f, 4>& corners) {
+  return std::fabs(SignedPolygonArea(corners));
+}
+
+double Cross2d(const cv::Point2f& a,
+               const cv::Point2f& b,
+               const cv::Point2f& c) {
+  return static_cast<double>(b.x - a.x) * static_cast<double>(c.y - a.y) -
+         static_cast<double>(b.y - a.y) * static_cast<double>(c.x - a.x);
+}
+
+struct QuadTopologyCheck {
+  bool valid = false;
+  bool finite = false;
+  bool convex = false;
+  bool self_intersecting = false;
+  double signed_area_px = 0.0;
+  double area_px = 0.0;
+  double min_edge_length_px = 0.0;
+  std::string summary;
+};
+
+bool ProperSegmentsIntersect(const cv::Point2f& a,
+                             const cv::Point2f& b,
+                             const cv::Point2f& c,
+                             const cv::Point2f& d) {
+  constexpr double kCrossEpsilon = 1e-6;
+  const double ab_c = Cross2d(a, b, c);
+  const double ab_d = Cross2d(a, b, d);
+  const double cd_a = Cross2d(c, d, a);
+  const double cd_b = Cross2d(c, d, b);
+  return ((ab_c > kCrossEpsilon && ab_d < -kCrossEpsilon) ||
+          (ab_c < -kCrossEpsilon && ab_d > kCrossEpsilon)) &&
+         ((cd_a > kCrossEpsilon && cd_b < -kCrossEpsilon) ||
+          (cd_a < -kCrossEpsilon && cd_b > kCrossEpsilon));
+}
+
+QuadTopologyCheck CheckQuadTopology(
+    const std::array<cv::Point2f, 4>& corners) {
+  QuadTopologyCheck check;
+  check.finite = std::all_of(
+      corners.begin(), corners.end(), [](const cv::Point2f& point) {
+        return std::isfinite(point.x) && std::isfinite(point.y);
+      });
+  if (!check.finite) {
+    check.summary = "nonfinite_corner";
+    return check;
+  }
+
+  check.signed_area_px = SignedPolygonArea(corners);
+  check.area_px = std::fabs(check.signed_area_px);
+  check.min_edge_length_px = std::numeric_limits<double>::infinity();
+  int positive_turn_count = 0;
+  int negative_turn_count = 0;
+  for (int index = 0; index < 4; ++index) {
+    const cv::Point2f edge =
+        corners[static_cast<std::size_t>((index + 1) % 4)] -
+        corners[static_cast<std::size_t>(index)];
+    check.min_edge_length_px = std::min(
+        check.min_edge_length_px,
+        std::hypot(static_cast<double>(edge.x), static_cast<double>(edge.y)));
+    const double turn = Cross2d(
+        corners[static_cast<std::size_t>(index)],
+        corners[static_cast<std::size_t>((index + 1) % 4)],
+        corners[static_cast<std::size_t>((index + 2) % 4)]);
+    positive_turn_count += turn > 1e-6 ? 1 : 0;
+    negative_turn_count += turn < -1e-6 ? 1 : 0;
+  }
+  check.convex = positive_turn_count == 4 || negative_turn_count == 4;
+  check.self_intersecting =
+      ProperSegmentsIntersect(corners[0], corners[1], corners[2], corners[3]) ||
+      ProperSegmentsIntersect(corners[1], corners[2], corners[3], corners[0]);
+  check.valid = check.area_px >= 4.0 &&
+                check.min_edge_length_px >= 2.0 && check.convex &&
+                !check.self_intersecting;
+  std::ostringstream summary;
+  summary << "finite=" << (check.finite ? 1 : 0)
+          << " convex=" << (check.convex ? 1 : 0)
+          << " self_intersecting=" << (check.self_intersecting ? 1 : 0)
+          << " signed_area=" << check.signed_area_px
+          << " min_edge=" << check.min_edge_length_px;
+  check.summary = summary.str();
+  return check;
 }
 
 GeometryPriorOuterSeedCandidate BuildGeometryPriorOuterSeedCandidate(
@@ -134,6 +236,7 @@ GeometryPriorOuterSeedCandidate BuildGeometryPriorOuterSeedCandidate(
 struct LocalFramePoseRefit {
   bool success = false;
   int source_board_id = -1;
+  std::vector<int> support_board_ids;
   double outer_rmse = 0.0;
   Eigen::Matrix4d T_camera_reference = Eigen::Matrix4d::Identity();
 };
@@ -1543,10 +1646,20 @@ LocalFramePoseRefit EstimateLocalFramePoseFromVisibleBoards(
     const OuterBootstrapCameraIntrinsics& intrinsics,
     const InternalRegenerationFrameInput& frame_input,
     const std::function<bool(int, Eigen::Matrix4d*)>& lookup_reference_board) {
+  struct BoardPoseSupport {
+    int board_id = -1;
+    double local_outer_rmse = std::numeric_limits<double>::infinity();
+    Eigen::Isometry3d T_camera_reference = Eigen::Isometry3d::Identity();
+    std::vector<Eigen::Vector3d> object_points_reference;
+    std::vector<cv::Point2f> image_points;
+  };
+
   LocalFramePoseRefit best;
+  std::vector<BoardPoseSupport> supports;
   for (const OuterBoardMeasurement& measurement :
        frame_input.outer_detections.frame_measurements.board_measurements) {
-    if (!measurement.success || measurement.valid_refined_corner_count < 4) {
+    if (!measurement.success || measurement.used_local_patch_rescue ||
+        measurement.valid_refined_corner_count < 4) {
       continue;
     }
     bool all_corners_valid = true;
@@ -1578,12 +1691,188 @@ LocalFramePoseRefit EstimateLocalFramePoseFromVisibleBoards(
         ToIsometry3d(T_reference_board_matrix);
     const Eigen::Isometry3d T_camera_reference =
         T_camera_board * T_reference_board.inverse();
+    BoardPoseSupport support;
+    support.board_id = measurement.board_id;
+    support.local_outer_rmse = outer_rmse;
+    support.T_camera_reference = T_camera_reference;
+    support.image_points =
+        ToImagePoints(measurement.refined_outer_corners_original_image);
+    support.object_points_reference.reserve(object_points_array.size());
+    for (const Eigen::Vector3d& object_point : object_points_array) {
+      support.object_points_reference.push_back(
+          T_reference_board * object_point);
+    }
+    supports.push_back(std::move(support));
     if (!best.success || outer_rmse < best.outer_rmse) {
       best.success = true;
       best.source_board_id = measurement.board_id;
+      best.support_board_ids = {measurement.board_id};
       best.outer_rmse = outer_rmse;
       best.T_camera_reference = T_camera_reference.matrix();
     }
+  }
+
+  std::vector<const BoardPoseSupport*> locally_valid_supports;
+  for (const BoardPoseSupport& support : supports) {
+    if (std::isfinite(support.local_outer_rmse) &&
+        support.local_outer_rmse < 3.0) {
+      locally_valid_supports.push_back(&support);
+    }
+  }
+  if (locally_valid_supports.size() < 2) {
+    return best;
+  }
+
+  const auto fit_supports =
+      [&](const std::vector<const BoardPoseSupport*>& fit_set,
+          Eigen::Isometry3d* pose, double* rmse) {
+        std::vector<Eigen::Vector3d> object_points;
+        std::vector<cv::Point2f> image_points;
+        object_points.reserve(fit_set.size() * 4);
+        image_points.reserve(fit_set.size() * 4);
+        for (const BoardPoseSupport* support : fit_set) {
+          object_points.insert(object_points.end(),
+                               support->object_points_reference.begin(),
+                               support->object_points_reference.end());
+          image_points.insert(image_points.end(), support->image_points.begin(),
+                              support->image_points.end());
+        }
+        return EstimatePoseFromObjectPoints(intrinsics, object_points,
+                                            image_points, pose, rmse);
+      };
+
+  IntermediateCameraConfig camera_config;
+  camera_config.camera_model = intrinsics.camera_model;
+  camera_config.distortion_model = intrinsics.distortion_model;
+  camera_config.intrinsics = intrinsics.IntrinsicsVector();
+  camera_config.distortion_coeffs = intrinsics.DistortionVector();
+  camera_config.resolution = {intrinsics.resolution.width,
+                              intrinsics.resolution.height};
+  const DoubleSphereCameraModel camera =
+      DoubleSphereCameraModel::FromConfig(camera_config);
+  if (!camera.IsValid()) {
+    return best;
+  }
+
+  const auto board_rmse =
+      [&](const Eigen::Isometry3d& pose, const BoardPoseSupport& support) {
+        double squared_error_sum = 0.0;
+        int valid_count = 0;
+        for (std::size_t index = 0;
+             index < support.object_points_reference.size(); ++index) {
+          Eigen::Vector2d projected;
+          if (!camera.vsEuclideanToKeypoint(
+                  pose * support.object_points_reference[index], &projected)) {
+            continue;
+          }
+          const cv::Point2f& observed = support.image_points[index];
+          squared_error_sum +=
+              (projected - Eigen::Vector2d(observed.x, observed.y)).squaredNorm();
+          ++valid_count;
+        }
+        return valid_count > 0
+                   ? std::sqrt(squared_error_sum /
+                               static_cast<double>(valid_count))
+                   : std::numeric_limits<double>::infinity();
+      };
+
+  struct PoseConsensusCandidate {
+    Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+    double fit_rmse = std::numeric_limits<double>::infinity();
+    double median_board_rmse = std::numeric_limits<double>::infinity();
+  };
+  std::vector<PoseConsensusCandidate> pose_candidates;
+  const auto append_pose_candidate =
+      [&](const Eigen::Isometry3d& pose, double fit_rmse) {
+        std::vector<double> board_rmses;
+        board_rmses.reserve(locally_valid_supports.size());
+        for (const BoardPoseSupport* support : locally_valid_supports) {
+          board_rmses.push_back(board_rmse(pose, *support));
+        }
+        PoseConsensusCandidate candidate;
+        candidate.pose = pose;
+        candidate.fit_rmse = fit_rmse;
+        candidate.median_board_rmse = MedianFinite(board_rmses);
+        if (std::isfinite(candidate.median_board_rmse)) {
+          pose_candidates.push_back(candidate);
+        }
+      };
+
+  for (const BoardPoseSupport* support : locally_valid_supports) {
+    append_pose_candidate(support->T_camera_reference,
+                          support->local_outer_rmse);
+  }
+  Eigen::Isometry3d all_pose = Eigen::Isometry3d::Identity();
+  double all_rmse = 0.0;
+  if (fit_supports(locally_valid_supports, &all_pose, &all_rmse)) {
+    append_pose_candidate(all_pose, all_rmse);
+  }
+  if (locally_valid_supports.size() >= 3) {
+    for (std::size_t excluded = 0; excluded < locally_valid_supports.size();
+         ++excluded) {
+      std::vector<const BoardPoseSupport*> subset;
+      subset.reserve(locally_valid_supports.size() - 1);
+      for (std::size_t index = 0; index < locally_valid_supports.size();
+           ++index) {
+        if (index != excluded) {
+          subset.push_back(locally_valid_supports[index]);
+        }
+      }
+      Eigen::Isometry3d subset_pose = Eigen::Isometry3d::Identity();
+      double subset_rmse = 0.0;
+      if (fit_supports(subset, &subset_pose, &subset_rmse)) {
+        append_pose_candidate(subset_pose, subset_rmse);
+      }
+    }
+  }
+  if (pose_candidates.empty()) {
+    return best;
+  }
+  const PoseConsensusCandidate* consensus = &pose_candidates.front();
+  for (const PoseConsensusCandidate& candidate : pose_candidates) {
+    if (candidate.median_board_rmse < consensus->median_board_rmse) {
+      consensus = &candidate;
+    }
+  }
+
+  std::vector<double> consensus_board_rmses;
+  consensus_board_rmses.reserve(locally_valid_supports.size());
+  for (const BoardPoseSupport* support : locally_valid_supports) {
+    consensus_board_rmses.push_back(board_rmse(consensus->pose, *support));
+  }
+  const double median_rmse = MedianFinite(consensus_board_rmses);
+  std::vector<double> absolute_deviations;
+  absolute_deviations.reserve(consensus_board_rmses.size());
+  for (double value : consensus_board_rmses) {
+    absolute_deviations.push_back(std::abs(value - median_rmse));
+  }
+  const double mad = MedianFinite(absolute_deviations);
+  const double inlier_threshold =
+      std::max(3.0, median_rmse + std::max(0.75, 3.0 * 1.4826 * mad));
+  std::vector<const BoardPoseSupport*> inlier_supports;
+  for (std::size_t index = 0; index < locally_valid_supports.size(); ++index) {
+    if (consensus_board_rmses[index] <= inlier_threshold) {
+      inlier_supports.push_back(locally_valid_supports[index]);
+    }
+  }
+  if (inlier_supports.size() < 2) {
+    return best;
+  }
+
+  Eigen::Isometry3d joint_pose = consensus->pose;
+  double joint_rmse = consensus->fit_rmse;
+  Eigen::Isometry3d refit_pose = Eigen::Isometry3d::Identity();
+  double refit_rmse = 0.0;
+  if (fit_supports(inlier_supports, &refit_pose, &refit_rmse)) {
+    joint_pose = refit_pose;
+    joint_rmse = refit_rmse;
+  }
+  best.success = true;
+  best.T_camera_reference = joint_pose.matrix();
+  best.outer_rmse = joint_rmse;
+  best.support_board_ids.clear();
+  for (const BoardPoseSupport* support : inlier_supports) {
+    best.support_board_ids.push_back(support->board_id);
   }
   return best;
 }
@@ -1592,14 +1881,15 @@ OuterTagDetectionResult BuildRescuedOuterDetection(
     int board_id,
     const cv::Size& image_size,
     const std::array<cv::Point2f, 4>& refined_corners,
+    bool tag_id_validated,
     double quality,
     const std::string& summary) {
   OuterTagDetectionResult detection;
   detection.success = true;
   detection.board_id = board_id;
-  detection.detected_tag_id = board_id;
+  detection.detected_tag_id = tag_id_validated ? board_id : -1;
   detection.good = true;
-  detection.hamming = 0;
+  detection.hamming = tag_id_validated ? 0 : -1;
   detection.original_longest_side = std::max(image_size.width, image_size.height);
   detection.chosen_scale_longest_side = detection.original_longest_side;
   detection.chosen_scale_factor = 1.0;
@@ -1637,6 +1927,16 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
     GeometryPriorOuterSeedCandidate candidate,
     OuterTagDetectionResult* rescued_detection) {
   std::array<cv::Point2f, 4> initial_corners = initial_corners_input;
+  candidate.tag_id_validated = tag_id_validated;
+  const QuadTopologyCheck initial_topology =
+      CheckQuadTopology(initial_corners);
+  if (!initial_topology.valid) {
+    candidate.quad_topology_summary =
+        "initial_invalid:" + initial_topology.summary;
+    candidate.reject_reason =
+        validation_source + "_image_evidence_failed_initial_quad_topology";
+    return candidate;
+  }
   const DoubleSphereCameraModel sphere_camera =
       DoubleSphereCameraModel::FromConfig(camera_config);
   if (options.geometry_prior_rescue_enable_spherical_refine &&
@@ -1706,15 +2006,57 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
     max_displacement = std::max(
         max_displacement,
         PointDistance(refined_corners[static_cast<std::size_t>(index)],
-                      initial_corners[static_cast<std::size_t>(index)]));
+                      candidate.predicted_corners[static_cast<std::size_t>(index)]));
   }
   candidate.max_corner_displacement_px = max_displacement;
-  if (options.geometry_prior_rescue_max_corner_displacement_px > 0.0 &&
-      max_displacement >
-          options.geometry_prior_rescue_max_corner_displacement_px) {
+  if (options.geometry_prior_rescue_max_corner_displacement_px > 0.0) {
+    candidate.adaptive_max_corner_displacement_px =
+        options.geometry_prior_rescue_max_corner_displacement_px;
+  } else if (options.geometry_prior_rescue_max_corner_displacement_px == 0.0) {
+    candidate.adaptive_max_corner_displacement_px =
+        std::min(40.0, std::max(4.0, 0.08 * candidate.local_corner_scale_px));
+  }
+  if (std::isfinite(candidate.adaptive_max_corner_displacement_px) &&
+      max_displacement > candidate.adaptive_max_corner_displacement_px) {
     candidate.local_corner_refine_success = false;
     candidate.reject_reason =
         validation_source + "_image_evidence_failed_corner_displacement";
+    return candidate;
+  }
+
+  const QuadTopologyCheck predicted_topology =
+      CheckQuadTopology(candidate.predicted_corners);
+  const QuadTopologyCheck refined_topology = CheckQuadTopology(refined_corners);
+  candidate.predicted_quad_topology_valid = predicted_topology.valid;
+  candidate.predicted_signed_area_px = predicted_topology.signed_area_px;
+  candidate.refined_quad_topology_valid = refined_topology.valid;
+  candidate.refined_area_px = refined_topology.area_px;
+  candidate.refined_signed_area_px = refined_topology.signed_area_px;
+  candidate.refined_to_predicted_area_ratio =
+      predicted_topology.area_px > 1e-9
+          ? refined_topology.area_px / predicted_topology.area_px
+          : std::numeric_limits<double>::quiet_NaN();
+  const bool orientation_preserved =
+      predicted_topology.signed_area_px * refined_topology.signed_area_px > 0.0;
+  const bool area_preserved =
+      std::isfinite(candidate.refined_to_predicted_area_ratio) &&
+      candidate.refined_to_predicted_area_ratio >= 0.5 &&
+      candidate.refined_to_predicted_area_ratio <= 2.0;
+  candidate.quad_topology_preserved =
+      predicted_topology.valid && refined_topology.valid &&
+      orientation_preserved && area_preserved;
+  std::ostringstream topology_summary;
+  topology_summary << "predicted{" << predicted_topology.summary << "}"
+                   << " refined{" << refined_topology.summary << "}"
+                   << " orientation_preserved="
+                   << (orientation_preserved ? 1 : 0)
+                   << " area_ratio="
+                   << candidate.refined_to_predicted_area_ratio;
+  candidate.quad_topology_summary = topology_summary.str();
+  if (!candidate.quad_topology_preserved) {
+    candidate.local_corner_refine_success = false;
+    candidate.reject_reason =
+        validation_source + "_image_evidence_failed_quad_topology";
     return candidate;
   }
 
@@ -1925,7 +2267,7 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
             << " trans_err="
             << candidate.local_vs_global_translation_error;
     *rescued_detection = BuildRescuedOuterDetection(
-        board_id, gray.size(), refined_corners,
+        board_id, gray.size(), refined_corners, tag_id_validated,
         std::max(min_response_ratio, edge_metrics.mean_gradient_ratio),
         summary.str());
   }
@@ -2122,7 +2464,13 @@ GeometryPriorOuterSeedCandidate BuildGeometryPriorOuterSeedCandidate(
     candidate.refined_corners[static_cast<std::size_t>(index)] =
         candidate.predicted_corners[static_cast<std::size_t>(index)];
   }
-  candidate.predicted_area_px = PolygonArea(candidate.predicted_corners);
+  const QuadTopologyCheck predicted_topology =
+      CheckQuadTopology(candidate.predicted_corners);
+  candidate.predicted_area_px = predicted_topology.area_px;
+  candidate.predicted_signed_area_px = predicted_topology.signed_area_px;
+  candidate.predicted_quad_topology_valid = predicted_topology.valid;
+  candidate.quad_topology_summary =
+      "predicted{" + predicted_topology.summary + "}";
   candidate.roi_valid = true;
   candidate.image_evidence_checked = false;
   candidate.image_evidence_success = false;
@@ -2259,6 +2607,7 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
   result.frame_label = frame_input.frame_label;
   result.state_source_label = "bootstrap";
   result.image_size = image.size();
+  CollectVisibleBoardIds(frame_input, &result.visible_board_ids);
 
   const OuterBootstrapFrameState* frame_state = FindFrameState(bootstrap_result, frame_input);
   result.frame_bootstrap_initialized = frame_state != nullptr && frame_state->initialized;
@@ -2373,10 +2722,19 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
         const Eigen::Matrix4d T_camera_board_visible_refit =
             visible_frame_refit.T_camera_reference *
             board_state->T_reference_board;
-        std::vector<int> visible_refit_board_ids;
-        visible_refit_board_ids.push_back(visible_frame_refit.source_board_id);
+        std::vector<int> visible_refit_board_ids =
+            visible_frame_refit.support_board_ids;
+        if (visible_refit_board_ids.empty()) {
+          visible_refit_board_ids.push_back(
+              visible_frame_refit.source_board_id);
+        }
+        const std::string visible_refit_label =
+            result.state_source_label +
+            (visible_frame_refit.support_board_ids.size() >= 2
+                 ? "_visible_refit_consensus"
+                 : "_visible_refit_single");
         evaluate_prediction(T_camera_board_visible_refit,
-                            result.state_source_label + "_visible_refit",
+                            visible_refit_label,
                             visible_frame_refit.source_board_id,
                             visible_frame_refit.outer_rmse,
                             visible_refit_board_ids);
@@ -2450,6 +2808,7 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
   result.frame_label = frame_input.frame_label;
   result.state_source_label = "optimized_scene";
   result.image_size = image.size();
+  CollectVisibleBoardIds(frame_input, &result.visible_board_ids);
 
   const JointSceneFrameState* frame_state = FindFrameState(scene_state, frame_input);
   result.frame_bootstrap_initialized = frame_state != nullptr && frame_state->initialized;
@@ -2564,10 +2923,19 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
         const Eigen::Matrix4d T_camera_board_visible_refit =
             visible_frame_refit.T_camera_reference *
             board_state->T_reference_board;
-        std::vector<int> visible_refit_board_ids;
-        visible_refit_board_ids.push_back(visible_frame_refit.source_board_id);
+        std::vector<int> visible_refit_board_ids =
+            visible_frame_refit.support_board_ids;
+        if (visible_refit_board_ids.empty()) {
+          visible_refit_board_ids.push_back(
+              visible_frame_refit.source_board_id);
+        }
+        const std::string visible_refit_label =
+            result.state_source_label +
+            (visible_frame_refit.support_board_ids.size() >= 2
+                 ? "_visible_refit_consensus"
+                 : "_visible_refit_single");
         evaluate_prediction(T_camera_board_visible_refit,
-                            result.state_source_label + "_visible_refit",
+                            visible_refit_label,
                             visible_frame_refit.source_board_id,
                             visible_frame_refit.outer_rmse,
                             visible_refit_board_ids);

@@ -597,6 +597,9 @@ int main(int argc, char** argv) {
     ati::WriteAutoCameraInitializationCandidatesCsv(
         (output_dir / "auto_camera_initialization_candidates.csv").string(),
         report.baseline_result.auto_camera_initialization);
+    ati::WriteAutoCameraInitializationRefinedBasinsCsv(
+        (output_dir / "auto_camera_initialization_refined_basins.csv").string(),
+        report.baseline_result.auto_camera_initialization);
     ati::WriteAutoCameraInitializationOuterResidualsCsv(
         (output_dir / "auto_camera_initialization_outer_residuals.csv").string(),
         report.baseline_result.auto_camera_initialization);

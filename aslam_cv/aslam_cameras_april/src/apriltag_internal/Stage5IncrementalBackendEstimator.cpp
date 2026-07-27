@@ -19,10 +19,12 @@
 #include <aslam/backend/ErrorTerm.hpp>
 #include <aslam/backend/HomogeneousExpression.hpp>
 #include <aslam/backend/JacobianContainer.hpp>
+#include <aslam/backend/LevenbergMarquardtTrustRegionPolicy.hpp>
 #include <aslam/backend/MapTransformation.hpp>
 #include <aslam/backend/MappedEuclideanPoint.hpp>
 #include <aslam/backend/MappedRotationQuaternion.hpp>
 #include <aslam/backend/MEstimatorPolicies.hpp>
+#include <aslam/backend/Optimizer2.hpp>
 #include <aslam/backend/TransformationExpression.hpp>
 #include <aslam/cameras.hpp>
 #include <aslam/calibration/core/IncrementalEstimator.h>
@@ -31,6 +33,8 @@
 #include <sm/kinematics/Transformation.hpp>
 
 #include <aslam/cameras/apriltag_internal/AngularResidualGeometry.hpp>
+#include <aslam/cameras/apriltag_internal/DoubleSphereCameraModel.hpp>
+#include <aslam/cameras/apriltag_internal/JointReprojectionCostCore.hpp>
 #include <aslam/cameras/apriltag_internal/JointReprojectionResidualEvaluator.hpp>
 #include <aslam/cameras/apriltag_internal/Stage5Benchmark.hpp>
 
@@ -53,6 +57,9 @@ using PinholeEquiProjection =
 using MeiGeometry = aslam::cameras::DistortedOmniCameraGeometry;
 using MeiProjection =
     aslam::cameras::OmniProjection<aslam::cameras::RadialTangentialDistortion>;
+using OmniNoneGeometry = aslam::cameras::OmniCameraGeometry;
+using OmniNoneProjection =
+    aslam::cameras::OmniProjection<aslam::cameras::NoDistortion>;
 using CalibrationBatch = aslam::calibration::OptimizationProblem;
 
 // The incremental estimator computes information gain on the marginalized
@@ -65,6 +72,7 @@ constexpr int kMaxTrustRegionBacktrackingRetries = 3;
 constexpr double kMaxTrustRegionAnchorWeightScale = 4096.0;
 
 enum class CameraOptimizationPhase {
+  kPosePrefitFixedIntrinsics,
   kSeedFixedIntrinsics,
   kCandidateTrustRegion,
 };
@@ -72,15 +80,193 @@ enum class CameraOptimizationPhase {
 enum class SelectionResidualMetric {
   kPixel,
   kAngularTangent,
+  kLocallyWhitenedAngularTangent,
   kChordal,
   kHybridObjective,
   kPixelChordalHybridObjective,
 };
 
+enum class CameraParameterBlock {
+  kProjection,
+  kDistortion,
+};
+
+struct KbDistortionReleaseState {
+  bool k3_released = true;
+  bool k4_released = true;
+};
+
+struct KbRayCurveHealth {
+  bool applicable = false;
+  bool valid = true;
+  int sample_count = 0;
+  double rms_change_deg = 0.0;
+  double max_change_deg = 0.0;
+  double min_radial_derivative = 1.0;
+  std::string failure_reason;
+};
+
+// Error terms are evaluated in parallel. Numerical camera Jacobians must
+// perturb a private camera copy rather than the shared camera design variable.
+template <int ResidualDimension, typename GeometryT, typename AdapterT,
+          typename ResidualEvaluator>
+void AddThreadSafeCameraFiniteDifferenceJacobian(
+    const boost::shared_ptr<AdapterT>& design_variable_adapter,
+    const GeometryT& base_camera,
+    CameraParameterBlock parameter_block,
+    const ResidualEvaluator& evaluate_residual,
+    aslam::backend::JacobianContainer* jacobians) {
+  if (jacobians == nullptr || design_variable_adapter == nullptr ||
+      !design_variable_adapter->isActive()) {
+    return;
+  }
+  const Eigen::MatrixXd base_parameters =
+      design_variable_adapter->getParameters();
+  const int dimension = static_cast<int>(base_parameters.size());
+  if (dimension <= 0) {
+    return;
+  }
+
+  Eigen::Matrix<double, ResidualDimension, Eigen::Dynamic> camera_jacobian(
+      ResidualDimension, dimension);
+  camera_jacobian.setZero();
+  for (int index = 0; index < dimension; ++index) {
+    const Eigen::Index row =
+        static_cast<Eigen::Index>(index % base_parameters.rows());
+    const Eigen::Index col =
+        static_cast<Eigen::Index>(index / base_parameters.rows());
+    const double base_value = base_parameters(row, col);
+    const double epsilon =
+        std::max(1e-7, 1e-6 * std::max(1.0, std::fabs(base_value)));
+
+    Eigen::MatrixXd positive_parameters = base_parameters;
+    positive_parameters(row, col) = base_value + epsilon;
+    GeometryT positive_camera(base_camera);
+    if (parameter_block == CameraParameterBlock::kProjection) {
+      positive_camera.projection().setParameters(positive_parameters);
+    } else {
+      positive_camera.projection().distortion().setParameters(
+          positive_parameters);
+    }
+    bool positive_valid = false;
+    const Eigen::Matrix<double, ResidualDimension, 1> positive_residual =
+        evaluate_residual(positive_camera, &positive_valid);
+
+    Eigen::MatrixXd negative_parameters = base_parameters;
+    negative_parameters(row, col) = base_value - epsilon;
+    GeometryT negative_camera(base_camera);
+    if (parameter_block == CameraParameterBlock::kProjection) {
+      negative_camera.projection().setParameters(negative_parameters);
+    } else {
+      negative_camera.projection().distortion().setParameters(
+          negative_parameters);
+    }
+    bool negative_valid = false;
+    const Eigen::Matrix<double, ResidualDimension, 1> negative_residual =
+        evaluate_residual(negative_camera, &negative_valid);
+
+    if (positive_valid && negative_valid && positive_residual.allFinite() &&
+        negative_residual.allFinite()) {
+      camera_jacobian.col(index) =
+          (positive_residual - negative_residual) / (2.0 * epsilon);
+    }
+  }
+  jacobians->add(design_variable_adapter.get(), camera_jacobian);
+}
+
+bool ConvergedByBearingRelativeObjective(
+    ResidualModel residual_model,
+    const aslam::calibration::IncrementalEstimator::ReturnValue& value,
+    int max_iterations) {
+  if (residual_model == ResidualModel::ImagePlane ||
+      value.linearSolverFailure ||
+      value.numIterations <
+          static_cast<std::size_t>(std::max(1, max_iterations)) ||
+      !std::isfinite(value.JFinal) || !std::isfinite(value.dJFinal) ||
+      value.dJFinal < 0.0) {
+    return false;
+  }
+  constexpr double kBearingRelativeObjectiveTolerance = 1e-3;
+  const double relative_last_objective_decrease =
+      std::abs(value.dJFinal) / std::max(1.0, std::abs(value.JFinal));
+  return std::isfinite(relative_last_objective_decrease) &&
+         relative_last_objective_decrease <=
+             kBearingRelativeObjectiveTolerance;
+}
+
+struct CameraStepConvergence {
+  bool converged = false;
+  double shape_step = 0.0;
+  double focal_relative_step = 0.0;
+  double principal_step_px = 0.0;
+};
+
+CameraStepConvergence EvaluateCameraStepConvergence(
+    const OuterBootstrapCameraIntrinsics& before,
+    const OuterBootstrapCameraIntrinsics& after) {
+  CameraStepConvergence result;
+  result.shape_step = std::max(
+      std::max(std::abs(after.xi - before.xi),
+               std::abs(after.alpha - before.alpha)),
+      std::abs(after.beta - before.beta));
+  if (before.distortion_coeffs.size() == after.distortion_coeffs.size()) {
+    for (std::size_t index = 0; index < before.distortion_coeffs.size();
+         ++index) {
+      result.shape_step = std::max(
+          result.shape_step,
+          std::abs(after.distortion_coeffs[index] -
+                   before.distortion_coeffs[index]));
+    }
+  } else {
+    result.shape_step = std::numeric_limits<double>::infinity();
+  }
+  result.focal_relative_step = std::max(
+      std::abs(after.fu - before.fu) / std::max(1.0, std::abs(before.fu)),
+      std::abs(after.fv - before.fv) / std::max(1.0, std::abs(before.fv)));
+  result.principal_step_px =
+      std::max(std::abs(after.cu - before.cu),
+               std::abs(after.cv - before.cv));
+  // These thresholds are parameter-scale based, independent of residual
+  // units and image count. They only terminate continuation after pose prefit.
+  constexpr double kShapeStepTolerance = 5e-4;
+  constexpr double kFocalRelativeStepTolerance = 5e-4;
+  constexpr double kPrincipalStepTolerancePx = 0.25;
+  result.converged = std::isfinite(result.shape_step) &&
+      std::isfinite(result.focal_relative_step) &&
+      std::isfinite(result.principal_step_px) &&
+      result.shape_step <= kShapeStepTolerance &&
+      result.focal_relative_step <= kFocalRelativeStepTolerance &&
+      result.principal_step_px <= kPrincipalStepTolerancePx;
+  return result;
+}
+
+bool ConvergedByBearingRelativeObjective(
+    ResidualModel residual_model,
+    const aslam::backend::SolutionReturnValue& value,
+    int max_iterations) {
+  if (residual_model == ResidualModel::ImagePlane ||
+      value.linearSolverFailure ||
+      value.iterations < std::max(1, max_iterations) ||
+      !std::isfinite(value.JFinal) || !std::isfinite(value.dJFinal) ||
+      value.dJFinal < 0.0) {
+    return false;
+  }
+  constexpr double kBearingRelativeObjectiveTolerance = 1e-3;
+  const double relative_last_objective_decrease =
+      std::abs(value.dJFinal) / std::max(1.0, std::abs(value.JFinal));
+  return std::isfinite(relative_last_objective_decrease) &&
+         relative_last_objective_decrease <=
+             kBearingRelativeObjectiveTolerance;
+}
+
 SelectionResidualMetric SelectionMetricForResidualModel(
-    ResidualModel residual_model) {
+    ResidualModel residual_model,
+    bool angular_local_whitening_enabled) {
   switch (residual_model) {
     case ResidualModel::SphereAngular:
+      return angular_local_whitening_enabled
+                 ? SelectionResidualMetric::kLocallyWhitenedAngularTangent
+                 : SelectionResidualMetric::kAngularTangent;
     case ResidualModel::NormalizedSphereAngular:
       return SelectionResidualMetric::kAngularTangent;
     case ResidualModel::Chordal:
@@ -102,6 +288,8 @@ const char* SelectionMetricName(SelectionResidualMetric metric) {
       return "pixel";
     case SelectionResidualMetric::kAngularTangent:
       return "tangent_angular";
+    case SelectionResidualMetric::kLocallyWhitenedAngularTangent:
+      return "locally_whitened_tangent_angular";
     case SelectionResidualMetric::kChordal:
       return "chordal";
     case SelectionResidualMetric::kHybridObjective:
@@ -118,6 +306,8 @@ const char* SelectionMetricUnit(SelectionResidualMetric metric) {
       return "px";
     case SelectionResidualMetric::kAngularTangent:
       return "rad";
+    case SelectionResidualMetric::kLocallyWhitenedAngularTangent:
+      return "normalized";
     case SelectionResidualMetric::kChordal:
       return "chordal";
     case SelectionResidualMetric::kHybridObjective:
@@ -136,6 +326,7 @@ bool SelectionMetricUsesAngularHealth(SelectionResidualMetric metric) {
 bool SelectionMetricUsesResidualAwareScoreGate(
     SelectionResidualMetric metric) {
   return metric == SelectionResidualMetric::kAngularTangent ||
+         metric == SelectionResidualMetric::kLocallyWhitenedAngularTangent ||
          metric == SelectionResidualMetric::kChordal ||
          metric == SelectionResidualMetric::kHybridObjective ||
          metric == SelectionResidualMetric::kPixelChordalHybridObjective;
@@ -144,6 +335,10 @@ bool SelectionMetricUsesResidualAwareScoreGate(
 bool SelectionMetricIsHybridObjective(SelectionResidualMetric metric) {
   return metric == SelectionResidualMetric::kHybridObjective ||
          metric == SelectionResidualMetric::kPixelChordalHybridObjective;
+}
+
+bool IsBearingResidualModel(ResidualModel model) {
+  return model != ResidualModel::ImagePlane;
 }
 
 bool ResidualConstructionMatchesMode(ResidualModel model,
@@ -245,6 +440,15 @@ boost::shared_ptr<MeiGeometry> MakeMeiGeometry(
       projection, aslam::cameras::GlobalShutter(), aslam::cameras::NoMask());
 }
 
+boost::shared_ptr<OmniNoneGeometry> MakeOmniNoneGeometry(
+    const OuterBootstrapCameraIntrinsics& intrinsics) {
+  OmniNoneProjection projection(
+      intrinsics.xi, intrinsics.fu, intrinsics.fv, intrinsics.cu,
+      intrinsics.cv, intrinsics.resolution.width, intrinsics.resolution.height);
+  return boost::make_shared<OmniNoneGeometry>(
+      projection, aslam::cameras::GlobalShutter(), aslam::cameras::NoMask());
+}
+
 template <typename GeometryT>
 boost::shared_ptr<GeometryT> MakePersistentGeometry(
     const OuterBootstrapCameraIntrinsics& intrinsics);
@@ -272,6 +476,12 @@ template <>
 boost::shared_ptr<MeiGeometry> MakePersistentGeometry<MeiGeometry>(
     const OuterBootstrapCameraIntrinsics& intrinsics) {
   return MakeMeiGeometry(intrinsics);
+}
+
+template <>
+boost::shared_ptr<OmniNoneGeometry> MakePersistentGeometry<OmniNoneGeometry>(
+    const OuterBootstrapCameraIntrinsics& intrinsics) {
+  return MakeOmniNoneGeometry(intrinsics);
 }
 
 template <typename GeometryT>
@@ -358,6 +568,23 @@ OuterBootstrapCameraIntrinsics CameraToIntrinsics<MeiGeometry>(
   return intrinsics;
 }
 
+template <>
+OuterBootstrapCameraIntrinsics CameraToIntrinsics<OmniNoneGeometry>(
+    const OmniNoneGeometry& geometry) {
+  OuterBootstrapCameraIntrinsics intrinsics;
+  intrinsics.camera_model = "omni";
+  intrinsics.distortion_model = "none";
+  intrinsics.xi = geometry.projection().xi();
+  intrinsics.fu = geometry.projection().fu();
+  intrinsics.fv = geometry.projection().fv();
+  intrinsics.cu = geometry.projection().cu();
+  intrinsics.cv = geometry.projection().cv();
+  intrinsics.distortion_coeffs.clear();
+  intrinsics.resolution =
+      cv::Size(geometry.projection().width(), geometry.projection().height());
+  return intrinsics;
+}
+
 template <typename GeometryT>
 bool ComputeObservationGeometryForCamera(
     const GeometryT& camera,
@@ -369,6 +596,52 @@ bool ComputeObservationGeometryForCamera(
   }
   return ComputeAngularObservationGeometryFromRay(
       observed_image_xy, observed_ray, geometry);
+}
+
+IntermediateCameraConfig MakePersistentIntermediateCameraConfig(
+    const OuterBootstrapCameraIntrinsics& intrinsics) {
+  IntermediateCameraConfig config;
+  config.camera_model = intrinsics.camera_model;
+  config.distortion_model = intrinsics.distortion_model;
+  config.intrinsics = intrinsics.IntrinsicsVector();
+  config.distortion_coeffs = intrinsics.DistortionVector();
+  config.resolution = {intrinsics.resolution.width,
+                       intrinsics.resolution.height};
+  return config;
+}
+
+template <typename GeometryT>
+bool ComputeLocalBearingWhiteningForCamera(
+    const GeometryT&,
+    const Eigen::Vector2d&,
+    const AngularObservationGeometry&,
+    const Stage5IncrementalBackendEstimatorOptions&,
+    BearingCovarianceResult*) {
+  return false;
+}
+
+template <>
+bool ComputeLocalBearingWhiteningForCamera<DsGeometry>(
+    const DsGeometry& camera,
+    const Eigen::Vector2d& observed_image_xy,
+    const AngularObservationGeometry& observation_geometry,
+    const Stage5IncrementalBackendEstimatorOptions& options,
+    BearingCovarianceResult* result) {
+  BearingCovarianceOptions covariance_options;
+  covariance_options.use_pixel_uncertainty = true;
+  covariance_options.use_model_uncertainty = false;
+  covariance_options.pixel_sigma_px =
+      options.angular_local_whitening_pixel_sigma_px;
+  covariance_options.covariance_damping =
+      options.angular_local_whitening_covariance_damping;
+  covariance_options.min_sigma_rad =
+      options.angular_local_whitening_min_sigma_rad;
+  covariance_options.max_whitening_weight =
+      options.angular_local_whitening_max_weight;
+  return ComputeBearingTangentCovariance(
+      MakePersistentIntermediateCameraConfig(
+          CameraToIntrinsics<DsGeometry>(camera)),
+      observed_image_xy, observation_geometry, covariance_options, result);
 }
 
 template <typename GeometryT>
@@ -556,6 +829,20 @@ void FillCameraDiagnostics(const OuterBootstrapCameraIntrinsics& camera,
   }
   if (cv != nullptr) {
     *cv = camera.cv;
+  }
+}
+
+void FillDistortionDiagnostics(const OuterBootstrapCameraIntrinsics& camera,
+                               double* k1,
+                               double* k2,
+                               double* k3,
+                               double* k4) {
+  const std::vector<double> distortion = camera.DistortionVector();
+  double* outputs[] = {k1, k2, k3, k4};
+  for (std::size_t index = 0; index < 4u; ++index) {
+    if (outputs[index] != nullptr) {
+      *outputs[index] = index < distortion.size() ? distortion[index] : 0.0;
+    }
   }
 }
 
@@ -820,70 +1107,37 @@ class IncrementalAngularReprojectionError
       return;
     }
 
-    auto add_finite_difference_camera_jacobian =
-        [&](const auto& design_variable_adapter) {
-          if (design_variable_adapter == nullptr ||
-              !design_variable_adapter->isActive()) {
-            return;
-          }
-          const Eigen::MatrixXd base_parameters =
-              design_variable_adapter->getParameters();
-          const int dimension = static_cast<int>(base_parameters.size());
-          if (dimension <= 0) {
-            return;
-          }
-          Eigen::MatrixXd camera_jacobian(2, dimension);
-          camera_jacobian.setZero();
-          for (int index = 0; index < dimension; ++index) {
-            const Eigen::Index row =
-                static_cast<Eigen::Index>(index % base_parameters.rows());
-            const Eigen::Index col =
-                static_cast<Eigen::Index>(index / base_parameters.rows());
-            const double base_value = base_parameters(row, col);
-            const double epsilon =
-                std::max(1e-7, 1e-6 * std::max(1.0, std::fabs(base_value)));
-
-            Eigen::MatrixXd positive = base_parameters;
-            positive(row, col) = base_value + epsilon;
-            design_variable_adapter->setParameters(positive);
-            AngularObservationGeometry positive_observation;
-            AngularPredictionGeometry positive_prediction;
-            bool positive_valid = false;
-            const Eigen::Vector2d positive_residual =
-                ComputeResidual(&positive_observation, &positive_prediction,
-                                &positive_valid);
-
-            Eigen::MatrixXd negative = base_parameters;
-            negative(row, col) = base_value - epsilon;
-            design_variable_adapter->setParameters(negative);
-            AngularObservationGeometry negative_observation;
-            AngularPredictionGeometry negative_prediction;
-            bool negative_valid = false;
-            const Eigen::Vector2d negative_residual =
-                ComputeResidual(&negative_observation, &negative_prediction,
-                                &negative_valid);
-
-            if (positive_valid && negative_valid &&
-                positive_residual.allFinite() &&
-                negative_residual.allFinite()) {
-              camera_jacobian.col(index) =
-                  (positive_residual - negative_residual) / (2.0 * epsilon);
-            }
-          }
-          design_variable_adapter->setParameters(base_parameters);
-          jacobians.add(design_variable_adapter.get(), camera_jacobian);
+    const GeometryT& base_camera = *camera_dv_.camera();
+    const auto evaluate_residual =
+        [this](const GeometryT& camera, bool* valid) {
+          AngularObservationGeometry observation;
+          AngularPredictionGeometry prediction;
+          return ComputeResidualForCamera(camera, &observation, &prediction,
+                                          valid);
         };
-
-    add_finite_difference_camera_jacobian(
-        const_cast<CameraDv&>(camera_dv_).projectionDesignVariable());
-    add_finite_difference_camera_jacobian(
-        const_cast<CameraDv&>(camera_dv_).distortionDesignVariable());
+    AddThreadSafeCameraFiniteDifferenceJacobian<2>(
+        const_cast<CameraDv&>(camera_dv_).projectionDesignVariable(),
+        base_camera, CameraParameterBlock::kProjection, evaluate_residual,
+        &jacobians);
+    AddThreadSafeCameraFiniteDifferenceJacobian<2>(
+        const_cast<CameraDv&>(camera_dv_).distortionDesignVariable(),
+        base_camera, CameraParameterBlock::kDistortion, evaluate_residual,
+        &jacobians);
   }
 
  private:
   using parent_t = aslam::backend::ErrorTermFs<2>;
 
   Eigen::Vector2d ComputeResidual(
+      AngularObservationGeometry* observation_geometry,
+      AngularPredictionGeometry* prediction_geometry,
+      bool* valid_projection) const {
+    return ComputeResidualForCamera(*camera_dv_.camera(), observation_geometry,
+                                    prediction_geometry, valid_projection);
+  }
+
+  Eigen::Vector2d ComputeResidualForCamera(
+      const GeometryT& camera,
       AngularObservationGeometry* observation_geometry,
       AngularPredictionGeometry* prediction_geometry,
       bool* valid_projection) const {
@@ -900,13 +1154,13 @@ class IncrementalAngularReprojectionError
       observation_valid = observation_geometry->success;
     } else {
       observation_valid = ComputeObservationGeometryForCamera(
-          *camera_dv_.camera(), observed_image_xy_, observation_geometry);
+          camera, observed_image_xy_, observation_geometry);
     }
     const Eigen::Vector4d point_homogeneous = point_camera_.toHomogeneous();
     const Eigen::Vector3d point_camera = point_homogeneous.head<3>();
     *valid_projection = observation_valid &&
-        ComputePredictionGeometryForCamera(
-            *camera_dv_.camera(), point_homogeneous, prediction_geometry);
+        ComputePredictionGeometryForCamera(camera, point_homogeneous,
+                                           prediction_geometry);
     if (!(*valid_projection) || !observation_geometry->success) {
       return Eigen::Vector2d::Constant(invalid_projection_penalty_radians_);
     }
@@ -1024,70 +1278,37 @@ class IncrementalChordalReprojectionError
       return;
     }
 
-    auto add_finite_difference_camera_jacobian =
-        [&](const auto& design_variable_adapter) {
-          if (design_variable_adapter == nullptr ||
-              !design_variable_adapter->isActive()) {
-            return;
-          }
-          const Eigen::MatrixXd base_parameters =
-              design_variable_adapter->getParameters();
-          const int dimension = static_cast<int>(base_parameters.size());
-          if (dimension <= 0) {
-            return;
-          }
-          Eigen::MatrixXd camera_jacobian(3, dimension);
-          camera_jacobian.setZero();
-          for (int index = 0; index < dimension; ++index) {
-            const Eigen::Index row =
-                static_cast<Eigen::Index>(index % base_parameters.rows());
-            const Eigen::Index col =
-                static_cast<Eigen::Index>(index / base_parameters.rows());
-            const double base_value = base_parameters(row, col);
-            const double epsilon =
-                std::max(1e-7, 1e-6 * std::max(1.0, std::fabs(base_value)));
-
-            Eigen::MatrixXd positive = base_parameters;
-            positive(row, col) = base_value + epsilon;
-            design_variable_adapter->setParameters(positive);
-            AngularObservationGeometry positive_observation;
-            AngularPredictionGeometry positive_prediction;
-            bool positive_valid = false;
-            const Eigen::Matrix<double, 3, 1> positive_residual =
-                ComputeResidual(&positive_observation, &positive_prediction,
-                                &positive_valid);
-
-            Eigen::MatrixXd negative = base_parameters;
-            negative(row, col) = base_value - epsilon;
-            design_variable_adapter->setParameters(negative);
-            AngularObservationGeometry negative_observation;
-            AngularPredictionGeometry negative_prediction;
-            bool negative_valid = false;
-            const Eigen::Matrix<double, 3, 1> negative_residual =
-                ComputeResidual(&negative_observation, &negative_prediction,
-                                &negative_valid);
-
-            if (positive_valid && negative_valid &&
-                positive_residual.allFinite() &&
-                negative_residual.allFinite()) {
-              camera_jacobian.col(index) =
-                  (positive_residual - negative_residual) / (2.0 * epsilon);
-            }
-          }
-          design_variable_adapter->setParameters(base_parameters);
-          jacobians.add(design_variable_adapter.get(), camera_jacobian);
+    const GeometryT& base_camera = *camera_dv_.camera();
+    const auto evaluate_residual =
+        [this](const GeometryT& camera, bool* valid) {
+          AngularObservationGeometry observation;
+          AngularPredictionGeometry prediction;
+          return ComputeResidualForCamera(camera, &observation, &prediction,
+                                          valid);
         };
-
-    add_finite_difference_camera_jacobian(
-        const_cast<CameraDv&>(camera_dv_).projectionDesignVariable());
-    add_finite_difference_camera_jacobian(
-        const_cast<CameraDv&>(camera_dv_).distortionDesignVariable());
+    AddThreadSafeCameraFiniteDifferenceJacobian<3>(
+        const_cast<CameraDv&>(camera_dv_).projectionDesignVariable(),
+        base_camera, CameraParameterBlock::kProjection, evaluate_residual,
+        &jacobians);
+    AddThreadSafeCameraFiniteDifferenceJacobian<3>(
+        const_cast<CameraDv&>(camera_dv_).distortionDesignVariable(),
+        base_camera, CameraParameterBlock::kDistortion, evaluate_residual,
+        &jacobians);
   }
 
  private:
   using parent_t = aslam::backend::ErrorTermFs<3>;
 
   Eigen::Matrix<double, 3, 1> ComputeResidual(
+      AngularObservationGeometry* observation_geometry,
+      AngularPredictionGeometry* prediction_geometry,
+      bool* valid_projection) const {
+    return ComputeResidualForCamera(*camera_dv_.camera(), observation_geometry,
+                                    prediction_geometry, valid_projection);
+  }
+
+  Eigen::Matrix<double, 3, 1> ComputeResidualForCamera(
+      const GeometryT& camera,
       AngularObservationGeometry* observation_geometry,
       AngularPredictionGeometry* prediction_geometry,
       bool* valid_projection) const {
@@ -1104,13 +1325,13 @@ class IncrementalChordalReprojectionError
       observation_valid = observation_geometry->success;
     } else {
       observation_valid = ComputeObservationGeometryForCamera(
-          *camera_dv_.camera(), observed_image_xy_, observation_geometry);
+          camera, observed_image_xy_, observation_geometry);
     }
     const Eigen::Vector4d point_homogeneous = point_camera_.toHomogeneous();
     const Eigen::Vector3d point_camera = point_homogeneous.head<3>();
     *valid_projection = observation_valid &&
-        ComputePredictionGeometryForCamera(
-            *camera_dv_.camera(), point_homogeneous, prediction_geometry);
+        ComputePredictionGeometryForCamera(camera, point_homogeneous,
+                                           prediction_geometry);
     if (!(*valid_projection) || !observation_geometry->success ||
         !prediction_geometry->valid_projection ||
         !observation_geometry->observed_ray.allFinite() ||
@@ -1239,59 +1460,23 @@ class IncrementalPolarContinuousHybridReprojectionError
         evaluation.angular_weight * angular_jacobian;
     point_camera_.evaluateJacobians(jacobians, hybrid_jacobian);
 
-    auto add_finite_difference_camera_jacobian =
-        [&](const auto& design_variable_adapter) {
-          if (design_variable_adapter == nullptr ||
-              !design_variable_adapter->isActive()) {
-            return;
-          }
-          const Eigen::MatrixXd base_parameters =
-              design_variable_adapter->getParameters();
-          const int dimension = static_cast<int>(base_parameters.size());
-          if (dimension <= 0) {
-            return;
-          }
-          Eigen::MatrixXd camera_jacobian(2, dimension);
-          camera_jacobian.setZero();
-          for (int index = 0; index < dimension; ++index) {
-            const Eigen::Index row =
-                static_cast<Eigen::Index>(index % base_parameters.rows());
-            const Eigen::Index col =
-                static_cast<Eigen::Index>(index / base_parameters.rows());
-            const double base_value = base_parameters(row, col);
-            const double epsilon =
-                std::max(1e-7, 1e-6 * std::max(1.0, std::fabs(base_value)));
-
-            Eigen::MatrixXd positive = base_parameters;
-            positive(row, col) = base_value + epsilon;
-            design_variable_adapter->setParameters(positive);
-            HybridEvaluation positive_eval;
-            const Eigen::Vector2d positive_residual =
-                ComputeResidual(&positive_eval);
-
-            Eigen::MatrixXd negative = base_parameters;
-            negative(row, col) = base_value - epsilon;
-            design_variable_adapter->setParameters(negative);
-            HybridEvaluation negative_eval;
-            const Eigen::Vector2d negative_residual =
-                ComputeResidual(&negative_eval);
-
-            if (positive_eval.valid_projection &&
-                negative_eval.valid_projection &&
-                positive_residual.allFinite() &&
-                negative_residual.allFinite()) {
-              camera_jacobian.col(index) =
-                  (positive_residual - negative_residual) / (2.0 * epsilon);
-            }
-          }
-          design_variable_adapter->setParameters(base_parameters);
-          jacobians.add(design_variable_adapter.get(), camera_jacobian);
+    const GeometryT& base_camera = *camera_dv_.camera();
+    const auto evaluate_residual =
+        [this](const GeometryT& camera, bool* valid) {
+          HybridEvaluation evaluation;
+          const Eigen::Vector2d residual =
+              ComputeResidualForCamera(camera, &evaluation);
+          *valid = evaluation.valid_projection;
+          return residual;
         };
-
-    add_finite_difference_camera_jacobian(
-        const_cast<CameraDv&>(camera_dv_).projectionDesignVariable());
-    add_finite_difference_camera_jacobian(
-        const_cast<CameraDv&>(camera_dv_).distortionDesignVariable());
+    AddThreadSafeCameraFiniteDifferenceJacobian<2>(
+        const_cast<CameraDv&>(camera_dv_).projectionDesignVariable(),
+        base_camera, CameraParameterBlock::kProjection, evaluate_residual,
+        &jacobians);
+    AddThreadSafeCameraFiniteDifferenceJacobian<2>(
+        const_cast<CameraDv&>(camera_dv_).distortionDesignVariable(),
+        base_camera, CameraParameterBlock::kDistortion, evaluate_residual,
+        &jacobians);
   }
 
  private:
@@ -1306,6 +1491,11 @@ class IncrementalPolarContinuousHybridReprojectionError
   };
 
   Eigen::Vector2d ComputeResidual(HybridEvaluation* evaluation) const {
+    return ComputeResidualForCamera(*camera_dv_.camera(), evaluation);
+  }
+
+  Eigen::Vector2d ComputeResidualForCamera(
+      const GeometryT& camera, HybridEvaluation* evaluation) const {
     if (evaluation == nullptr) {
       throw std::runtime_error(
           "IncrementalPolarContinuousHybridReprojectionError requires output.");
@@ -1319,17 +1509,15 @@ class IncrementalPolarContinuousHybridReprojectionError
       observation_valid = evaluation->observation_geometry.success;
     } else {
       observation_valid = ComputeObservationGeometryForCamera(
-          *camera_dv_.camera(), observed_image_xy_,
-          &evaluation->observation_geometry);
+          camera, observed_image_xy_, &evaluation->observation_geometry);
     }
     const bool image_valid =
-        camera_dv_.camera()->homogeneousToKeypoint(
-            point_homogeneous, evaluation->predicted_image_xy) &&
+        camera.homogeneousToKeypoint(point_homogeneous,
+                                     evaluation->predicted_image_xy) &&
         evaluation->predicted_image_xy.allFinite();
     const bool angular_valid = observation_valid &&
-        ComputePredictionGeometryForCamera(
-            *camera_dv_.camera(), point_homogeneous,
-            &evaluation->prediction_geometry);
+        ComputePredictionGeometryForCamera(camera, point_homogeneous,
+                                           &evaluation->prediction_geometry);
     evaluation->valid_projection =
         image_valid && angular_valid &&
         evaluation->observation_geometry.success;
@@ -1541,6 +1729,28 @@ struct ResidualStats {
   }
 };
 
+struct FullTrainingPoseRefitStats {
+  ResidualStats pixel_stats;
+  int pose_total_count = 0;
+  int pose_success_count = 0;
+  int point_total_count = 0;
+  bool camera_valid = false;
+
+  double PoseSuccessRate() const {
+    return pose_total_count > 0
+               ? static_cast<double>(pose_success_count) /
+                     static_cast<double>(pose_total_count)
+               : 0.0;
+  }
+
+  bool IsUsable() const {
+    return camera_valid && pose_total_count > 0 && point_total_count > 0 &&
+           pixel_stats.total_count == point_total_count &&
+           std::isfinite(pixel_stats.Rmse()) &&
+           std::isfinite(pixel_stats.P95());
+  }
+};
+
 double RegressionLimit(double before_rmse,
                        double ratio,
                        double absolute_margin_px) {
@@ -1548,6 +1758,105 @@ double RegressionLimit(double before_rmse,
     return absolute_margin_px;
   }
   return std::max(before_rmse * ratio, before_rmse + absolute_margin_px);
+}
+
+bool CheckFullTrainingPoseRefitHealthGate(
+    const FullTrainingPoseRefitStats& initial_stats,
+    const FullTrainingPoseRefitStats& committed_before_stats,
+    const FullTrainingPoseRefitStats& candidate_stats,
+    const Stage5IncrementalBackendEstimatorOptions& options,
+    std::string* reason) {
+  if (!options.use_full_training_pose_refit_health_gate) {
+    if (reason != nullptr) {
+      reason->clear();
+    }
+    return true;
+  }
+  if (!initial_stats.IsUsable() || !committed_before_stats.IsUsable() ||
+      !candidate_stats.IsUsable() ||
+      initial_stats.point_total_count != candidate_stats.point_total_count ||
+      committed_before_stats.point_total_count !=
+          candidate_stats.point_total_count ||
+      initial_stats.pose_total_count != candidate_stats.pose_total_count ||
+      committed_before_stats.pose_total_count !=
+          candidate_stats.pose_total_count) {
+    if (reason != nullptr) {
+      std::ostringstream stream;
+      stream << "full_training_pose_refit_health_gate invalid_evaluation"
+             << " initial_usable=" << (initial_stats.IsUsable() ? 1 : 0)
+             << " before_usable="
+             << (committed_before_stats.IsUsable() ? 1 : 0)
+             << " candidate_usable="
+             << (candidate_stats.IsUsable() ? 1 : 0)
+             << " initial_points=" << initial_stats.point_total_count
+             << " before_points=" << committed_before_stats.point_total_count
+             << " candidate_points=" << candidate_stats.point_total_count
+             << " initial_poses=" << initial_stats.pose_total_count
+             << " before_poses=" << committed_before_stats.pose_total_count
+             << " candidate_poses=" << candidate_stats.pose_total_count;
+      *reason = stream.str();
+    }
+    return false;
+  }
+
+  const double before_rmse_limit = RegressionLimit(
+      committed_before_stats.pixel_stats.Rmse(),
+      options.full_training_pose_refit_max_rmse_regression_ratio,
+      options.full_training_pose_refit_max_rmse_regression_abs_px);
+  const double initial_rmse_limit = RegressionLimit(
+      initial_stats.pixel_stats.Rmse(),
+      options.full_training_pose_refit_max_rmse_regression_ratio,
+      options.full_training_pose_refit_max_rmse_regression_abs_px);
+  const double before_p95_limit = RegressionLimit(
+      committed_before_stats.pixel_stats.P95(),
+      options.full_training_pose_refit_max_p95_regression_ratio,
+      options.full_training_pose_refit_max_p95_regression_abs_px);
+  const double initial_p95_limit = RegressionLimit(
+      initial_stats.pixel_stats.P95(),
+      options.full_training_pose_refit_max_p95_regression_ratio,
+      options.full_training_pose_refit_max_p95_regression_abs_px);
+  const double pose_rate_floor = std::max(
+      0.0,
+      std::min(initial_stats.PoseSuccessRate(),
+               committed_before_stats.PoseSuccessRate()) -
+          options.full_training_pose_refit_max_pose_success_rate_drop);
+  const bool pass =
+      candidate_stats.pixel_stats.Rmse() <=
+          std::min(before_rmse_limit, initial_rmse_limit) &&
+      candidate_stats.pixel_stats.P95() <=
+          std::min(before_p95_limit, initial_p95_limit) &&
+      candidate_stats.PoseSuccessRate() >= pose_rate_floor &&
+      candidate_stats.pixel_stats.invalid_projection_count <=
+          std::max(initial_stats.pixel_stats.invalid_projection_count,
+                   committed_before_stats.pixel_stats.invalid_projection_count);
+  if (!pass && reason != nullptr) {
+    std::ostringstream stream;
+    stream << "full_training_pose_refit_health_gate"
+           << " initial_rmse=" << initial_stats.pixel_stats.Rmse()
+           << " before_rmse=" << committed_before_stats.pixel_stats.Rmse()
+           << " candidate_rmse=" << candidate_stats.pixel_stats.Rmse()
+           << " rmse_limit="
+           << std::min(before_rmse_limit, initial_rmse_limit)
+           << " initial_p95=" << initial_stats.pixel_stats.P95()
+           << " before_p95=" << committed_before_stats.pixel_stats.P95()
+           << " candidate_p95=" << candidate_stats.pixel_stats.P95()
+           << " p95_limit=" << std::min(before_p95_limit, initial_p95_limit)
+           << " initial_pose_rate=" << initial_stats.PoseSuccessRate()
+           << " before_pose_rate="
+           << committed_before_stats.PoseSuccessRate()
+           << " candidate_pose_rate=" << candidate_stats.PoseSuccessRate()
+           << " pose_rate_floor=" << pose_rate_floor
+           << " initial_invalid="
+           << initial_stats.pixel_stats.invalid_projection_count
+           << " before_invalid="
+           << committed_before_stats.pixel_stats.invalid_projection_count
+           << " candidate_invalid="
+           << candidate_stats.pixel_stats.invalid_projection_count;
+    *reason = stream.str();
+  } else if (reason != nullptr) {
+    reason->clear();
+  }
+  return pass;
 }
 
 double AngularHealthThresholdRad(
@@ -1613,6 +1922,11 @@ double SelectionHealthThreshold(
     const Stage5IncrementalBackendEstimatorOptions& options,
     const Stage5IncrementalBackendBatchInput& input,
     SelectionResidualMetric metric) {
+  if (options.single_board_dense_grid_profile) {
+    return input.residual_health_threshold_px > 0.0
+               ? input.residual_health_threshold_px
+               : std::max(0.25, options.huber_delta_pixels);
+  }
   if (metric == SelectionResidualMetric::kPixel) {
     return input.residual_health_threshold_px > 0.0
                ? input.residual_health_threshold_px
@@ -1845,7 +2159,13 @@ std::map<FrameBoardKey, ObservationBudget> ComputeObservationBudgets(
 }
 
 double ComputePersistentBalanceWeight(const ObservationBudget& budget,
-                                      JointPointType point_type) {
+                                      JointPointType point_type,
+                                      bool uniform_control_point_mode) {
+  if (uniform_control_point_mode) {
+    // Dense calibration targets contribute one independent measurement per
+    // control point, matching Kalibr's per-corner unit covariance model.
+    return 1.0;
+  }
   const bool has_outer = budget.outer_count > 0;
   const bool has_internal = budget.internal_count > 0;
   double type_budget = 1.0;
@@ -1882,6 +2202,8 @@ class PersistentProblemBuilder {
 	            std::max(1.0, std::abs(baseline_bundle.scene_state.camera.fu)) *
 	            std::max(1.0, std::abs(baseline_bundle.scene_state.camera.fv)))) {
 	    camera_dv_.setActive(false, false, false);
+	    camera_geometry_->projection().distortion().getParameters(
+	        initial_distortion_parameters_);
 	    BuildBoardVariables();
 	  }
 
@@ -1893,6 +2215,17 @@ class PersistentProblemBuilder {
 	    int hybrid_angular_selected_count = 0;
 	    int hybrid_chordal_selected_count = 0;
 	    int angular_observation_geometry_failure_count = 0;
+	    int angular_local_whitening_success_count = 0;
+	    int angular_local_whitening_failure_count = 0;
+	    int angular_local_whitening_clamped_count = 0;
+	    double angular_local_whitening_sigma_sum_rad = 0.0;
+	    double angular_local_whitening_sigma_min_rad =
+	        std::numeric_limits<double>::infinity();
+	    double angular_local_whitening_sigma_max_rad = 0.0;
+	    double angular_local_whitening_weight_sum = 0.0;
+	    double angular_local_whitening_weight_min =
+	        std::numeric_limits<double>::infinity();
+	    double angular_local_whitening_weight_max = 0.0;
 	  };
 
   boost::shared_ptr<CalibrationBatch> BuildBatch(
@@ -1901,11 +2234,16 @@ class PersistentProblemBuilder {
       CameraOptimizationPhase camera_phase,
       const StateSnapshot* camera_anchor_state,
       ResidualConstructionCounts* residual_counts = nullptr,
-      double camera_anchor_weight_scale = 1.0) {
+      double camera_anchor_weight_scale = 1.0,
+      const KbDistortionReleaseState& kb_release_state =
+          KbDistortionReleaseState()) {
     boost::shared_ptr<CalibrationBatch> batch =
         boost::make_shared<CalibrationBatch>();
     AddCameraVariables(camera_phase, batch);
     MaybeAddCameraAnchorPrior(camera_phase, camera_anchor_state, batch,
+                              camera_anchor_weight_scale);
+    MaybeAddKbDistortionPrior(camera_phase, camera_anchor_state,
+                              kb_release_state, batch,
                               camera_anchor_weight_scale);
     AddBoardVariables(batch);
     AddFrameVariables(keys, force_add_frame_variables, batch);
@@ -1964,6 +2302,8 @@ class PersistentProblemBuilder {
 	            &observation_geometry);
 	        const bool use_tangent_angular =
 	            metric == SelectionResidualMetric::kAngularTangent ||
+	            metric ==
+	                SelectionResidualMetric::kLocallyWhitenedAngularTangent ||
 	            (metric == SelectionResidualMetric::kHybridObjective &&
 	             options_.residual_model == ResidualModel::HybridEdgeAngular &&
 	             have_observation_geometry &&
@@ -1986,9 +2326,25 @@ class PersistentProblemBuilder {
 	            continue;
 	          }
 	          if (use_tangent_angular) {
-	            residual_norm = ComputeAngularResidualNorm(
+	            const Eigen::Vector2d angular_residual =
 	                ComputeAngularResidualTangent(observation_geometry,
-	                                              prediction_geometry));
+	                                              prediction_geometry);
+	            if (metric == SelectionResidualMetric::
+	                              kLocallyWhitenedAngularTangent) {
+	              BearingCovarianceResult covariance_result;
+	              if (!ComputeLocalBearingWhiteningForCamera(
+	                      *camera_geometry_, observation.image_xy,
+	                      observation_geometry, options_,
+	                      &covariance_result)) {
+	                ++stats.invalid_projection_count;
+	                continue;
+	              }
+	              residual_norm =
+	                  (covariance_result.sqrt_information * angular_residual)
+	                      .norm();
+	            } else {
+	              residual_norm = ComputeAngularResidualNorm(angular_residual);
+	            }
 	          } else if (use_continuous_hybrid) {
 	            const double angular_weight = ComputePolarContinuousAngularWeight(
 	                observation_geometry.polar_angle_deg,
@@ -2030,6 +2386,88 @@ class PersistentProblemBuilder {
     return stats;
   }
 
+  FullTrainingPoseRefitStats EvaluateFullTrainingPoseRefitPixel() const {
+    FullTrainingPoseRefitStats result;
+    const OuterBootstrapCameraIntrinsics intrinsics = CurrentCamera();
+    const DoubleSphereCameraModel camera = DoubleSphereCameraModel::FromConfig(
+        MakePersistentIntermediateCameraConfig(intrinsics));
+    result.camera_valid = camera.IsValid();
+
+    std::map<FrameBoardKey, std::vector<const JointPointObservation*> >
+        observations_by_key;
+    for (const JointPointObservation& observation :
+         candidate_pool_bundle_.measurement_dataset.solver_observations) {
+      if (!observation.used_in_solver) {
+        continue;
+      }
+      observations_by_key[FrameBoardKey(observation.frame_index,
+                                        observation.board_id)]
+          .push_back(&observation);
+    }
+
+    const double invalid_penalty =
+        std::max(1.0, options_.invalid_projection_penalty_pixels);
+    for (const auto& entry : observations_by_key) {
+      const FrameBoardKey& key = entry.first;
+      const std::vector<const JointPointObservation*>& observations =
+          entry.second;
+      ++result.pose_total_count;
+      result.point_total_count += static_cast<int>(observations.size());
+
+      std::vector<Eigen::Vector3d> object_points;
+      std::vector<cv::Point2f> image_points;
+      object_points.reserve(observations.size());
+      image_points.reserve(observations.size());
+      bool finite_observations = true;
+      for (const JointPointObservation* observation : observations) {
+        finite_observations =
+            finite_observations && observation != nullptr &&
+            observation->target_xyz_board.allFinite() &&
+            observation->image_xy.allFinite();
+        if (observation == nullptr) {
+          continue;
+        }
+        object_points.push_back(observation->target_xyz_board);
+        image_points.emplace_back(
+            static_cast<float>(observation->image_xy.x()),
+            static_cast<float>(observation->image_xy.y()));
+      }
+
+      Eigen::Isometry3d T_camera_board = Eigen::Isometry3d::Identity();
+      double pose_rmse = 0.0;
+      const bool pose_success =
+          result.camera_valid && finite_observations &&
+          object_points.size() >= 4u &&
+          EstimatePoseFromObjectPoints(intrinsics, object_points, image_points,
+                                       &T_camera_board, &pose_rmse) &&
+          T_camera_board.matrix().allFinite() && std::isfinite(pose_rmse);
+      if (pose_success) {
+        ++result.pose_success_count;
+      }
+
+      for (std::size_t index = 0; index < observations.size(); ++index) {
+        const JointPointObservation& observation = *observations[index];
+        double residual_norm = invalid_penalty;
+        bool valid_projection = false;
+        if (pose_success) {
+          Eigen::Vector2d predicted = Eigen::Vector2d::Zero();
+          valid_projection = camera.vsEuclideanToKeypoint(
+              T_camera_board * observation.target_xyz_board, &predicted);
+          if (valid_projection && predicted.allFinite()) {
+            residual_norm = (predicted - observation.image_xy).norm();
+            valid_projection = std::isfinite(residual_norm);
+          }
+        }
+        if (!valid_projection) {
+          residual_norm = invalid_penalty;
+          ++result.pixel_stats.invalid_projection_count;
+        }
+        result.pixel_stats.Add(key, observation.point_type, residual_norm);
+      }
+    }
+    return result;
+  }
+
   CalibrationSceneState BuildSceneState() const {
     CalibrationSceneState scene = candidate_pool_bundle_.scene_state;
     scene.camera = CameraToIntrinsics<GeometryT>(*camera_geometry_);
@@ -2068,6 +2506,76 @@ class PersistentProblemBuilder {
     PoseMatrixMap board_poses;
   };
 
+  aslam::backend::SolutionReturnValue PrefitCandidateFramePoses(
+      const std::set<FrameBoardKey>& keys,
+      int max_iterations,
+      double convergence_delta_j,
+      double convergence_delta_x) {
+    for (auto& entry : board_variables_) {
+      entry.second.rotation_dv->setActive(false);
+      entry.second.translation_dv->setActive(false);
+    }
+    for (auto& entry : frame_variables_) {
+      entry.second.rotation_dv->setActive(false);
+      entry.second.translation_dv->setActive(false);
+    }
+
+    boost::shared_ptr<CalibrationBatch> problem = BuildBatch(
+        keys, true, CameraOptimizationPhase::kPosePrefitFixedIntrinsics,
+        nullptr, nullptr);
+    for (const FrameBoardKey& key : keys) {
+      auto frame_it = frame_variables_.find(key.first);
+      if (frame_it != frame_variables_.end()) {
+        frame_it->second.rotation_dv->setActive(true);
+        frame_it->second.translation_dv->setActive(true);
+      }
+    }
+
+    aslam::backend::Optimizer2Options optimizer_options;
+    optimizer_options.maxIterations = std::max(1, max_iterations);
+    optimizer_options.convergenceDeltaJ = convergence_delta_j;
+    optimizer_options.convergenceDeltaX = convergence_delta_x;
+    optimizer_options.nThreads = 4;
+    optimizer_options.verbose = options_.verbose;
+    aslam::backend::Optimizer2 optimizer(optimizer_options);
+    optimizer.setProblem(problem);
+    const aslam::backend::SolutionReturnValue return_value =
+        optimizer.optimize();
+
+    for (auto& entry : board_variables_) {
+      entry.second.rotation_dv->setActive(!options_.fix_board_layout);
+      entry.second.translation_dv->setActive(!options_.fix_board_layout);
+    }
+    for (auto& entry : frame_variables_) {
+      entry.second.rotation_dv->setActive(true);
+      entry.second.translation_dv->setActive(true);
+    }
+    return return_value;
+  }
+
+  aslam::backend::SolutionReturnValue WarmupSeedIntrinsics(
+      const std::set<FrameBoardKey>& keys,
+      int max_iterations,
+      double convergence_delta_j,
+      double convergence_delta_x) {
+    boost::shared_ptr<CalibrationBatch> problem = BuildBatch(
+        keys, true, CameraOptimizationPhase::kCandidateTrustRegion,
+        nullptr, nullptr);
+    aslam::backend::Optimizer2Options optimizer_options;
+    optimizer_options.maxIterations = std::max(1, max_iterations);
+    optimizer_options.convergenceDeltaJ = convergence_delta_j;
+    optimizer_options.convergenceDeltaX = convergence_delta_x;
+    optimizer_options.nThreads = 4;
+    optimizer_options.verbose = options_.verbose;
+    if (options_.residual_model != ResidualModel::ImagePlane) {
+      optimizer_options.trustRegionPolicy = boost::make_shared<
+          aslam::backend::LevenbergMarquardtTrustRegionPolicy>(10.0);
+    }
+    aslam::backend::Optimizer2 optimizer(optimizer_options);
+    optimizer.setProblem(problem);
+    return optimizer.optimize();
+  }
+
   StateSnapshot CaptureState() const {
     StateSnapshot snapshot;
     camera_geometry_->projection().getParameters(
@@ -2087,6 +2595,106 @@ class PersistentProblemBuilder {
 
   OuterBootstrapCameraIntrinsics CurrentCamera() const {
     return CameraToIntrinsics<GeometryT>(*camera_geometry_);
+  }
+
+  KbRayCurveHealth EvaluateKbRayCurveHealth(
+      const StateSnapshot& reference_state) const {
+    KbRayCurveHealth health;
+    const OuterBootstrapCameraIntrinsics current = CurrentCamera();
+    if (!options_.use_kb_distortion_guard ||
+        !IsBearingResidualModel(options_.residual_model) ||
+        current.NormalizedFamilyString() != "pinhole-equi") {
+      return health;
+    }
+    health.applicable = true;
+    boost::shared_ptr<GeometryT> reference_geometry =
+        MakePersistentGeometry<GeometryT>(current);
+    reference_geometry->projection().setParameters(
+        reference_state.projection_parameters);
+    reference_geometry->projection().distortion().setParameters(
+        reference_state.distortion_parameters);
+
+    double squared_sum = 0.0;
+    const double width = static_cast<double>(current.resolution.width);
+    const double height = static_cast<double>(current.resolution.height);
+    for (int polar_index = 0; polar_index <= 8; ++polar_index) {
+      const double polar_rad = M_PI / 180.0 * (10.0 * polar_index);
+      const int azimuth_count = polar_index == 0 ? 1 : 12;
+      for (int azimuth_index = 0; azimuth_index < azimuth_count;
+           ++azimuth_index) {
+        const double azimuth_rad =
+            2.0 * M_PI * azimuth_index / azimuth_count;
+        Eigen::Vector3d reference_ray(
+            std::sin(polar_rad) * std::cos(azimuth_rad),
+            std::sin(polar_rad) * std::sin(azimuth_rad),
+            std::cos(polar_rad));
+        Eigen::Vector2d image_xy = Eigen::Vector2d::Zero();
+        if (!reference_geometry->euclideanToKeypoint(reference_ray,
+                                                      image_xy) ||
+            !image_xy.allFinite() || image_xy.x() < 0.0 ||
+            image_xy.y() < 0.0 || image_xy.x() >= width ||
+            image_xy.y() >= height) {
+          continue;
+        }
+        Eigen::Vector3d current_ray = Eigen::Vector3d::Zero();
+        if (!camera_geometry_->keypointToEuclidean(image_xy, current_ray) ||
+            !current_ray.allFinite() || current_ray.norm() <= 1e-12) {
+          continue;
+        }
+        current_ray.normalize();
+        const double angle_deg = 180.0 / M_PI * std::atan2(
+            reference_ray.cross(current_ray).norm(),
+            std::max(-1.0, std::min(1.0, reference_ray.dot(current_ray))));
+        squared_sum += angle_deg * angle_deg;
+        health.max_change_deg = std::max(health.max_change_deg, angle_deg);
+        ++health.sample_count;
+      }
+    }
+    if (health.sample_count > 0) {
+      health.rms_change_deg =
+          std::sqrt(squared_sum / static_cast<double>(health.sample_count));
+    }
+
+    const std::vector<double> distortion = current.DistortionVector();
+    if (distortion.size() == 4u) {
+      health.min_radial_derivative = std::numeric_limits<double>::infinity();
+      for (int index = 0; index <= 170; ++index) {
+        const double theta = 1.7 * index / 170.0;
+        const double theta2 = theta * theta;
+        const double derivative =
+            1.0 + 3.0 * distortion[0] * theta2 +
+            5.0 * distortion[1] * theta2 * theta2 +
+            7.0 * distortion[2] * theta2 * theta2 * theta2 +
+            9.0 * distortion[3] * theta2 * theta2 * theta2 * theta2;
+        health.min_radial_derivative =
+            std::min(health.min_radial_derivative, derivative);
+      }
+    }
+
+    health.valid = health.sample_count >= 25 &&
+        std::isfinite(health.rms_change_deg) &&
+        std::isfinite(health.max_change_deg) &&
+        std::isfinite(health.min_radial_derivative) &&
+        health.rms_change_deg <= 1.0 &&
+        health.max_change_deg <= 3.0 &&
+        health.min_radial_derivative >= 0.05;
+    if (!health.valid) {
+      std::ostringstream stream;
+      stream << "kb_ray_curve_validity samples=" << health.sample_count
+             << " rms_change_deg=" << health.rms_change_deg
+             << " max_change_deg=" << health.max_change_deg
+             << " min_radial_derivative="
+             << health.min_radial_derivative;
+      health.failure_reason = stream.str();
+    }
+    return health;
+  }
+
+  void SetKbDistortionGuardReference(const StateSnapshot& reference_state) {
+    if (reference_state.distortion_parameters.rows() == 4 &&
+        reference_state.distortion_parameters.cols() == 1) {
+      initial_distortion_parameters_ = reference_state.distortion_parameters;
+    }
   }
 
   void RestoreState(const StateSnapshot& snapshot) {
@@ -2263,9 +2871,11 @@ class PersistentProblemBuilder {
     constexpr bool kHasDistortionDv =
         GeometryT::projection_t::distortion_t::DesignVariableDimension > 0;
     const bool projection_active =
-        camera_phase == CameraOptimizationPhase::kSeedFixedIntrinsics
-            ? options_.optimize_seed_intrinsics
-            : options_.optimize_candidate_intrinsics;
+        camera_phase == CameraOptimizationPhase::kPosePrefitFixedIntrinsics
+            ? false
+            : (camera_phase == CameraOptimizationPhase::kSeedFixedIntrinsics
+                   ? options_.optimize_seed_intrinsics
+                   : options_.optimize_candidate_intrinsics);
     camera_dv_.setActive(projection_active,
                          projection_active && kHasDistortionDv,
                          false);
@@ -2384,6 +2994,49 @@ class PersistentProblemBuilder {
     }
   }
 
+  void MaybeAddKbDistortionPrior(
+      CameraOptimizationPhase camera_phase,
+      const StateSnapshot* camera_anchor_state,
+      const KbDistortionReleaseState& release_state,
+      const boost::shared_ptr<CalibrationBatch>& batch,
+      double camera_anchor_weight_scale) {
+    const OuterBootstrapCameraIntrinsics current = CurrentCamera();
+    if (camera_phase != CameraOptimizationPhase::kCandidateTrustRegion ||
+        !options_.optimize_candidate_intrinsics ||
+        !options_.use_kb_distortion_guard ||
+        !IsBearingResidualModel(options_.residual_model) ||
+        current.NormalizedFamilyString() != "pinhole-equi" ||
+        camera_anchor_state == nullptr ||
+        camera_anchor_state->distortion_parameters.rows() != 4 ||
+        camera_anchor_state->distortion_parameters.cols() != 1 ||
+        initial_distortion_parameters_.rows() != 4 ||
+        initial_distortion_parameters_.cols() != 1) {
+      return;
+    }
+    Eigen::MatrixXd anchor = camera_anchor_state->distortion_parameters;
+    if (!release_state.k3_released) {
+      anchor(2, 0) = initial_distortion_parameters_(2, 0);
+    }
+    if (!release_state.k4_released) {
+      anchor(3, 0) = initial_distortion_parameters_(3, 0);
+    }
+    Eigen::Vector4d weights;
+    weights[0] = PriorWeightFromSigma(0.02);
+    weights[1] = PriorWeightFromSigma(0.02);
+    weights[2] = PriorWeightFromSigma(
+        release_state.k3_released ? 0.01 : 1e-6);
+    weights[3] = PriorWeightFromSigma(
+        release_state.k4_released ? 0.005 : 1e-6);
+    if (std::isfinite(camera_anchor_weight_scale) &&
+        camera_anchor_weight_scale > 1.0) {
+      weights *= camera_anchor_weight_scale;
+    }
+    boost::shared_ptr<ProjectionAnchorError<4> > prior(
+        new ProjectionAnchorError<4>(
+            camera_dv_.distortionDesignVariable().get(), anchor, weights));
+    batch->addErrorTerm(prior);
+  }
+
   void BuildBoardVariables() {
     std::set<int> board_ids;
     for (const JointSceneBoardState& board : baseline_bundle_.scene_state.boards) {
@@ -2405,7 +3058,8 @@ class PersistentProblemBuilder {
       }
       PoseVariable& variable =
           GetOrCreatePoseVariable(&board_variables_, board_id);
-      InitializePoseVariable(&variable, board->T_reference_board, true);
+      InitializePoseVariable(&variable, board->T_reference_board,
+                             !options_.fix_board_layout);
     }
   }
 
@@ -2494,7 +3148,9 @@ class PersistentProblemBuilder {
           budget_it == observation_budgets_.end() ? ObservationBudget{}
                                                   : budget_it->second;
       const double weight =
-          ComputePersistentBalanceWeight(budget, observation.point_type) *
+          ComputePersistentBalanceWeight(
+              budget, observation.point_type,
+              options_.single_board_dense_grid_profile) *
           std::max(0.0, observation.final_observation_weight);
       if (!(weight > 0.0)) {
         continue;
@@ -2567,7 +3223,10 @@ class PersistentProblemBuilder {
 	          use_continuous_hybrid
 	              ? continuous_angular_weight * chordal_reference_focal_px_ *
 	                    chordal_reference_focal_px_
-	                                : (use_angular_residual ? 1.0 : 0.0);
+	              : (use_angular_residual
+	                     ? chordal_reference_focal_px_ *
+	                           chordal_reference_focal_px_
+	                     : 0.0);
 	      const double chordal_weight_scale =
 	          use_chordal_residual
 	              ? std::max(0.0, options_.chordal_residual_weight)
@@ -2587,13 +3246,58 @@ class PersistentProblemBuilder {
       }
 
 	      if (angular_weight_scale > 0.0 && have_angular_observation_geometry) {
+	        Eigen::Matrix2d angular_inv_r = inv_r * angular_weight_scale;
+	        if (options_.angular_local_whitening_enabled) {
+	          BearingCovarianceResult covariance_result;
+	          if (!ComputeLocalBearingWhiteningForCamera(
+	                  *camera_geometry_, observation.image_xy,
+	                  angular_observation_geometry, options_,
+	                  &covariance_result)) {
+	            if (residual_counts != nullptr) {
+	              ++residual_counts->angular_local_whitening_failure_count;
+	            }
+	            continue;
+	          }
+	          angular_inv_r =
+	              weight * covariance_result.sqrt_information.transpose() *
+	              covariance_result.sqrt_information;
+	          if (residual_counts != nullptr) {
+	            ++residual_counts->angular_local_whitening_success_count;
+	            if (covariance_result.whitening_clamped) {
+	              ++residual_counts->angular_local_whitening_clamped_count;
+	            }
+	            residual_counts->angular_local_whitening_sigma_sum_rad +=
+	                covariance_result.tangent_sigma_mean_rad;
+	            residual_counts->angular_local_whitening_sigma_min_rad =
+	                std::min(
+	                    residual_counts->angular_local_whitening_sigma_min_rad,
+	                    covariance_result.tangent_sigma_min_rad);
+	            residual_counts->angular_local_whitening_sigma_max_rad =
+	                std::max(
+	                    residual_counts->angular_local_whitening_sigma_max_rad,
+	                    covariance_result.tangent_sigma_max_rad);
+	            residual_counts->angular_local_whitening_weight_sum +=
+	                covariance_result.whitening_weight_mean;
+	            residual_counts->angular_local_whitening_weight_min =
+	                std::min(
+	                    residual_counts->angular_local_whitening_weight_min,
+	                    covariance_result.whitening_weight_min);
+	            residual_counts->angular_local_whitening_weight_max =
+	                std::max(
+	                    residual_counts->angular_local_whitening_weight_max,
+	                    covariance_result.whitening_weight_max);
+	          }
+	        }
 	        const double huber_delta_radians =
-	            observation.point_type == JointPointType::Outer
-                ? options_.outer_huber_delta_radians
-                : options_.internal_huber_delta_radians;
+	            options_.single_board_dense_grid_profile
+	                ? std::min(options_.outer_huber_delta_radians,
+	                           options_.internal_huber_delta_radians)
+	                : observation.point_type == JointPointType::Outer
+	                      ? options_.outer_huber_delta_radians
+	                      : options_.internal_huber_delta_radians;
         boost::shared_ptr<IncrementalAngularReprojectionError<GeometryT> >
             error(new IncrementalAngularReprojectionError<GeometryT>(
-                observation.image_xy, inv_r * angular_weight_scale,
+                observation.image_xy, angular_inv_r,
                 huber_delta_radians,
                 options_.use_huber_loss, point_camera, camera_dv_,
                 options_.invalid_projection_penalty_radians,
@@ -2612,9 +3316,12 @@ class PersistentProblemBuilder {
 
 		      if (chordal_weight_scale > 0.0 && have_angular_observation_geometry) {
 	        const double huber_delta_chordal =
-	            observation.point_type == JointPointType::Outer
-	                ? options_.outer_huber_delta_radians
-	                : options_.internal_huber_delta_radians;
+	            options_.single_board_dense_grid_profile
+	                ? std::min(options_.outer_huber_delta_radians,
+	                           options_.internal_huber_delta_radians)
+	                : observation.point_type == JointPointType::Outer
+	                      ? options_.outer_huber_delta_radians
+	                      : options_.internal_huber_delta_radians;
 	        const Eigen::Matrix3d inv_r_chordal =
 	            weight * chordal_weight_scale * chordal_reference_focal_px_ *
 	            chordal_reference_focal_px_ * Eigen::Matrix3d::Identity();
@@ -2665,6 +3372,7 @@ class PersistentProblemBuilder {
 	  boost::shared_ptr<GeometryT> camera_geometry_;
 	  CameraDv camera_dv_;
 	  double chordal_reference_focal_px_ = 1.0;
+	  Eigen::MatrixXd initial_distortion_parameters_;
 	  PoseVariableMap frame_variables_;
 	  PoseVariableMap board_variables_;
 	};
@@ -2674,6 +3382,8 @@ Stage5IncrementalBackendEstimatorOptions MakeOptions(
     const AslamBackendCalibrationOptions& backend_runner_options) {
   Stage5IncrementalBackendEstimatorOptions options;
   options.enabled = true;
+  options.single_board_dense_grid_profile =
+      selection_options.single_board_dense_grid_profile;
   options.information_gain_threshold =
       selection_options.acceptance_information_gain_threshold;
   options.rank_gain_threshold =
@@ -2688,6 +3398,22 @@ Stage5IncrementalBackendEstimatorOptions MakeOptions(
   options.check_validity = false;
   options.use_huber_loss = backend_runner_options.use_huber_loss;
   options.residual_model = backend_runner_options.residual_model;
+  if (options.residual_model != ResidualModel::ImagePlane) {
+    // Match Kalibr's incremental camera-calibration state-step tolerance.
+    // Bearing objectives contain weak pose/depth directions for which the
+    // pixel profile's stricter 1e-4 threshold causes false non-convergence.
+    options.convergence_delta_x =
+        std::max(options.convergence_delta_x, 1e-3);
+  }
+  if (options.residual_model != ResidualModel::ImagePlane) {
+    // Bearing-space modes use a larger per-pass safety ceiling and adaptive
+    // continuation. Pixel mode keeps its established trial budget.
+    constexpr int kBearingMaximumIterationsPerPass = 50;
+    options.max_iterations = std::max(
+        kBearingMaximumIterationsPerPass,
+        std::max(options.max_iterations,
+                 backend_runner_options.max_iterations));
+  }
   options.huber_delta_pixels =
       std::min(backend_runner_options.outer_huber_delta_pixels,
                backend_runner_options.internal_huber_delta_pixels);
@@ -2711,6 +3437,16 @@ Stage5IncrementalBackendEstimatorOptions MakeOptions(
 	      backend_runner_options.chordal_residual_weight;
 	  options.angular_use_normalize_jacobian =
 	      backend_runner_options.angular_use_normalize_jacobian;
+  options.angular_local_whitening_enabled =
+      backend_runner_options.angular_local_whitening_enabled;
+  options.angular_local_whitening_pixel_sigma_px =
+      backend_runner_options.angular_local_whitening_pixel_sigma_px;
+  options.angular_local_whitening_covariance_damping =
+      backend_runner_options.angular_local_whitening_covariance_damping;
+  options.angular_local_whitening_min_sigma_rad =
+      backend_runner_options.angular_local_whitening_min_sigma_rad;
+  options.angular_local_whitening_max_weight =
+      backend_runner_options.angular_local_whitening_max_weight;
   options.angular_observed_ray_mode =
       backend_runner_options.angular_observed_ray_mode;
   options.optimize_seed_intrinsics =
@@ -2718,6 +3454,7 @@ Stage5IncrementalBackendEstimatorOptions MakeOptions(
       selection_options.force_include_list_is_exact_input;
   options.optimize_candidate_intrinsics =
       selection_options.optimize_intrinsics_in_trial;
+  options.fix_board_layout = selection_options.persistent_fix_board_layout;
   options.use_candidate_intrinsics_anchor_prior =
       selection_options.optimize_intrinsics_in_trial &&
       selection_options.persistent_intrinsics_anchor_prior_enabled;
@@ -2740,6 +3477,28 @@ Stage5IncrementalBackendEstimatorOptions MakeOptions(
   options.adaptive_saturation_stop_enabled =
       selection_options.budget_mode ==
       TrialBackendFrameBoardSelectionOptions::BudgetMode::KalibrStyle;
+  if (options.single_board_dense_grid_profile) {
+    // kalibr_calibrate_cameras sets maxIterations=50 for each incremental
+    // target-view batch. Our camera has already been initialized jointly from
+    // all training views; keep that state fixed while the single forced seed
+    // pose is stabilized. Releasing six DS parameters against one planar view
+    // is rank-deficient and can destroy an otherwise valid initialization.
+    // Candidate batches release intrinsics immediately afterwards.
+    options.max_iterations = 50;
+    options.convergence_delta_j = 1e-3;
+    options.convergence_delta_x = 1e-3;
+    options.check_validity = true;
+    options.optimize_seed_intrinsics = false;
+    options.optimize_candidate_intrinsics = true;
+    options.use_candidate_intrinsics_anchor_prior = false;
+    options.use_split_residual_health_gate = true;
+    options.use_bearing_pixel_safety_gate = false;
+    options.use_kb_distortion_guard = false;
+    options.adaptive_saturation_stop_enabled = false;
+    options.max_candidate_focal_relative_step = 0.0;
+    options.max_candidate_principal_step_px = 0.0;
+    options.max_candidate_xi_alpha_step = 0.0;
+  }
   return options;
 }
 
@@ -2944,9 +3703,17 @@ bool IsStage5IncrementalBackendEstimatorCompatible(
   if (baseline_family != "ds-none" &&
       baseline_family != "eucm-none" &&
       baseline_family != "pinhole-equi" &&
-      baseline_family != "omni-radtan") {
+      baseline_family != "omni-radtan" &&
+      baseline_family != "omni-none") {
     return set_reason(
-        "persistent incremental estimator supports ds-none, eucm-none, pinhole-equi, and omni-radtan only");
+        "persistent incremental estimator supports ds-none, eucm-none, pinhole-equi, omni-none, and omni-radtan only");
+  }
+  if (backend_runner_options.angular_local_whitening_enabled &&
+      (backend_runner_options.residual_model != ResidualModel::SphereAngular ||
+       baseline_family != "ds-none")) {
+    return set_reason(
+        "angular local whitening currently requires sphere_angular with "
+        "ds-none");
   }
   if (!backend_options.optimize_frame_poses ||
       !backend_options.optimize_board_poses) {
@@ -2983,6 +3750,56 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
 
   const Stage5IncrementalBackendEstimatorOptions estimator_options =
       MakeOptions(selection_options, backend_runner_options);
+  const bool fixed_forced_schedule =
+      !candidate_batches.empty() &&
+      std::all_of(
+          candidate_batches.begin(), candidate_batches.end(),
+          [](const Stage5IncrementalBackendBatchInput& input) {
+            return input.force;
+          });
+  result.board_layout_fixed = estimator_options.fix_board_layout;
+  const double reference_fu =
+      std::max(1.0, std::abs(baseline_bundle.scene_state.camera.fu));
+  const double reference_fv =
+      std::max(1.0, std::abs(baseline_bundle.scene_state.camera.fv));
+  result.solver_bearing_reference_focal_px =
+      std::sqrt(reference_fu * reference_fv);
+  result.solver_bearing_residual_scale =
+      estimator_options.residual_model == ResidualModel::ImagePlane ||
+              estimator_options.angular_local_whitening_enabled
+          ? 1.0
+          : result.solver_bearing_reference_focal_px;
+  result.solver_max_iterations = estimator_options.max_iterations;
+  result.solver_convergence_delta_j = estimator_options.convergence_delta_j;
+  result.solver_convergence_delta_x = estimator_options.convergence_delta_x;
+  if (estimator_options.single_board_dense_grid_profile) {
+    result.solver_profile_name =
+        "kalibr_checkerboard_dense_grid_incremental";
+    result.solver_objective_unit =
+        estimator_options.residual_model == ResidualModel::ImagePlane
+            ? "px"
+            : "px_equivalent";
+  } else if (estimator_options.residual_model == ResidualModel::ImagePlane) {
+    result.solver_profile_name = "pixel_native_incremental_trust_region";
+    result.solver_objective_unit = "px";
+  } else if (estimator_options.angular_local_whitening_enabled) {
+    result.solver_profile_name =
+        "tangent_local_covariance_whitened_incremental_trust_region";
+    result.solver_objective_unit = "normalized";
+  } else if (estimator_options.residual_model == ResidualModel::SphereAngular) {
+    result.solver_profile_name =
+        "tangent_fixed_focal_px_equivalent_incremental_trust_region";
+    result.solver_objective_unit = "px_equivalent";
+  } else if (estimator_options.residual_model ==
+             ResidualModel::PolarContinuousHybrid) {
+    result.solver_profile_name =
+        "polar_continuous_px_equivalent_incremental_trust_region";
+    result.solver_objective_unit = "px_equivalent";
+  } else {
+    result.solver_profile_name =
+        "bearing_fixed_focal_px_equivalent_incremental_trust_region";
+    result.solver_objective_unit = "px_equivalent";
+  }
   if (!std::isfinite(estimator_options.hybrid_angular_threshold_deg) ||
       estimator_options.hybrid_angular_threshold_deg < 0.0 ||
       estimator_options.hybrid_angular_threshold_deg > 180.0 ||
@@ -2996,7 +3813,19 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
       !std::isfinite(estimator_options.pixel_residual_weight) ||
       estimator_options.pixel_residual_weight < 0.0 ||
       !std::isfinite(estimator_options.chordal_residual_weight) ||
-      estimator_options.chordal_residual_weight < 0.0) {
+      estimator_options.chordal_residual_weight < 0.0 ||
+      !std::isfinite(
+          estimator_options.angular_local_whitening_pixel_sigma_px) ||
+      estimator_options.angular_local_whitening_pixel_sigma_px <= 0.0 ||
+      !std::isfinite(
+          estimator_options.angular_local_whitening_covariance_damping) ||
+      estimator_options.angular_local_whitening_covariance_damping < 0.0 ||
+      !std::isfinite(
+          estimator_options.angular_local_whitening_min_sigma_rad) ||
+      estimator_options.angular_local_whitening_min_sigma_rad <= 0.0 ||
+      !std::isfinite(
+          estimator_options.angular_local_whitening_max_weight) ||
+      estimator_options.angular_local_whitening_max_weight < 1.0) {
     result.failure_reason = "invalid residual-model configuration";
     return result;
   }
@@ -3009,17 +3838,32 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
     return result;
   }
   const SelectionResidualMetric selection_metric =
-      SelectionMetricForResidualModel(estimator_options.residual_model);
+      SelectionMetricForResidualModel(
+          estimator_options.residual_model,
+          estimator_options.angular_local_whitening_enabled);
   result.selection_metric_name = SelectionMetricName(selection_metric);
   result.selection_metric_unit = SelectionMetricUnit(selection_metric);
   result.residual_health_threshold_source =
-      selection_metric == SelectionResidualMetric::kPixel
+      estimator_options.single_board_dense_grid_profile
+          ? "diagnostics_only_kalibr_information_rank_acceptance"
+          : selection_metric == SelectionResidualMetric::kPixel
           ? "pixel_trial_rmse_threshold"
           : "adaptive_seed_and_candidate_metric_stats";
   result.normalize_information_gain_by_board_observation =
       estimator_options.normalize_information_gain_by_board_observation;
   result.split_residual_health_gate_enabled =
       estimator_options.use_split_residual_health_gate;
+  result.bearing_pixel_safety_gate_enabled =
+      estimator_options.use_bearing_pixel_safety_gate &&
+      IsBearingResidualModel(estimator_options.residual_model);
+  result.full_training_pose_refit_health_gate_enabled =
+      estimator_options.use_full_training_pose_refit_health_gate;
+  const std::string active_camera_family =
+      baseline_bundle.scene_state.camera.NormalizedFamilyString();
+  result.kb_distortion_guard_enabled =
+      estimator_options.use_kb_distortion_guard &&
+      IsBearingResidualModel(estimator_options.residual_model) &&
+      active_camera_family == "pinhole-equi";
   result.adaptive_saturation_stop_enabled =
       estimator_options.adaptive_saturation_stop_enabled;
 
@@ -3027,7 +3871,10 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
   // The persistent Stage5 layer owns accept/reject so the health metric can
   // follow the selected residual model. Keep each optimized candidate
   // temporarily, then explicitly commit or roll it back below.
-  inc_options.infoGainDelta = -std::numeric_limits<double>::max();
+  inc_options.infoGainDelta =
+      estimator_options.single_board_dense_grid_profile
+          ? estimator_options.information_gain_threshold
+          : -std::numeric_limits<double>::max();
   inc_options.checkValidity = estimator_options.check_validity;
   inc_options.verbose = estimator_options.verbose;
   aslam::calibration::LinearSolverOptions solver_options;
@@ -3040,7 +3887,6 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
       estimator_options.convergence_delta_x;
   optimizer_options.verbose = estimator_options.verbose;
   optimizer_options.nThreads = 4;
-
   try {
     PersistentProblemBuilder<GeometryT> builder(
         baseline_bundle, candidate_pool_bundle, estimator_options);
@@ -3057,14 +3903,108 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
     result.seed_frame_count = static_cast<int>(seed_frames.size());
     result.seed_point_count = CountBatchPoints(
         candidate_pool_bundle.measurement_dataset, seed_keys);
+    const FullTrainingPoseRefitStats initial_full_training_stats =
+        builder.EvaluateFullTrainingPoseRefitPixel();
+    FullTrainingPoseRefitStats committed_full_training_stats =
+        initial_full_training_stats;
+    result.initial_full_training_pixel_rmse =
+        initial_full_training_stats.pixel_stats.Rmse();
+    result.initial_full_training_pixel_p95 =
+        initial_full_training_stats.pixel_stats.P95();
+    result.initial_full_training_pose_success_rate =
+        initial_full_training_stats.PoseSuccessRate();
+    result.initial_full_training_pose_success_count =
+        initial_full_training_stats.pose_success_count;
+    result.initial_full_training_pose_total_count =
+        initial_full_training_stats.pose_total_count;
+    result.initial_full_training_invalid_projection_count =
+        initial_full_training_stats.pixel_stats.invalid_projection_count;
+    if (result.full_training_pose_refit_health_gate_enabled &&
+        !initial_full_training_stats.IsUsable()) {
+      result.failure_reason =
+          "initial full-training independent-pose refit evaluation failed";
+      return result;
+    }
     const typename PersistentProblemBuilder<GeometryT>::StateSnapshot seed_state =
         builder.CaptureState();
+    result.seed_intrinsics_warmup_attempted =
+        estimator_options.optimize_seed_intrinsics &&
+        !estimator_options.single_board_dense_grid_profile;
+    if (result.seed_intrinsics_warmup_attempted) {
+      const aslam::backend::SolutionReturnValue seed_warmup =
+          builder.WarmupSeedIntrinsics(
+              seed_keys, estimator_options.max_iterations,
+              estimator_options.convergence_delta_j,
+              estimator_options.convergence_delta_x);
+      result.seed_intrinsics_warmup_iterations = seed_warmup.iterations;
+      result.seed_intrinsics_warmup_objective_start = seed_warmup.JStart;
+      result.seed_intrinsics_warmup_objective_final = seed_warmup.JFinal;
+      result.seed_intrinsics_warmup_last_delta_j = seed_warmup.dJFinal;
+      result.seed_intrinsics_warmup_last_delta_x = seed_warmup.dXFinal;
+      result.seed_intrinsics_warmup_converged_by_relative_objective =
+          ConvergedByBearingRelativeObjective(
+              estimator_options.residual_model, seed_warmup,
+              estimator_options.max_iterations);
+      const bool seed_warmup_hit_ceiling =
+          seed_warmup.iterations >= estimator_options.max_iterations;
+      std::string seed_warmup_state_reason;
+      result.seed_intrinsics_warmup_success =
+          !seed_warmup.linearSolverFailure &&
+          (!seed_warmup_hit_ceiling ||
+           result.seed_intrinsics_warmup_converged_by_relative_objective) &&
+          std::isfinite(seed_warmup.JStart) &&
+          std::isfinite(seed_warmup.JFinal) &&
+          seed_warmup.JFinal <= seed_warmup.JStart &&
+          builder.CurrentStateFinite(&seed_warmup_state_reason);
+      const FullTrainingPoseRefitStats warmup_full_training_stats =
+          builder.EvaluateFullTrainingPoseRefitPixel();
+      std::string warmup_full_training_reason;
+      result.seed_intrinsics_warmup_full_training_health_pass =
+          fixed_forced_schedule ||
+          CheckFullTrainingPoseRefitHealthGate(
+              initial_full_training_stats, initial_full_training_stats,
+              warmup_full_training_stats, estimator_options,
+              &warmup_full_training_reason);
+      result.seed_intrinsics_warmup_success =
+          result.seed_intrinsics_warmup_success &&
+          result.seed_intrinsics_warmup_full_training_health_pass;
+      if (!result.seed_intrinsics_warmup_success) {
+        builder.RestoreState(seed_state);
+        std::ostringstream stream;
+        stream << "Independent seed intrinsics warm-up was rolled back"
+               << " iterations=" << seed_warmup.iterations
+               << " JStart=" << seed_warmup.JStart
+               << " JFinal=" << seed_warmup.JFinal
+               << " dJFinal=" << seed_warmup.dJFinal
+               << " dXFinal=" << seed_warmup.dXFinal
+               << " linear_solver_failure="
+               << (seed_warmup.linearSolverFailure ? 1 : 0);
+        if (!seed_warmup_state_reason.empty()) {
+          stream << " state_reason=" << seed_warmup_state_reason;
+        }
+        if (!warmup_full_training_reason.empty()) {
+          stream << " full_training_reason="
+                 << warmup_full_training_reason;
+        }
+        result.warnings.push_back(stream.str());
+        committed_full_training_stats = initial_full_training_stats;
+      } else {
+        committed_full_training_stats = warmup_full_training_stats;
+      }
+    } else {
+      result.seed_intrinsics_warmup_success = true;
+    }
     typename PersistentProblemBuilder<GeometryT>::ResidualConstructionCounts
         seed_residual_counts;
-    boost::shared_ptr<CalibrationBatch> seed_batch =
-        builder.BuildBatch(seed_keys, true,
-                           CameraOptimizationPhase::kSeedFixedIntrinsics,
-                           nullptr, &seed_residual_counts);
+    // Seed and candidate intrinsics have separate responsibilities. In the
+    // perturbation-recovery protocol the seed establishes poses while keeping
+    // the perturbed camera unchanged; candidate batches release intrinsics.
+    const CameraOptimizationPhase seed_camera_phase =
+        CameraOptimizationPhase::kSeedFixedIntrinsics;
+    const typename PersistentProblemBuilder<GeometryT>::StateSnapshot
+        committed_seed_state = builder.CaptureState();
+    boost::shared_ptr<CalibrationBatch> seed_batch = builder.BuildBatch(
+        seed_keys, true, seed_camera_phase, nullptr, &seed_residual_counts);
     std::string seed_contract_reason;
     if (!ResidualConstructionMatchesMode(
             estimator_options.residual_model,
@@ -3089,6 +4029,38 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
 	        seed_residual_counts.hybrid_chordal_selected_count;
 	    result.angular_observation_geometry_failure_count +=
 	        seed_residual_counts.angular_observation_geometry_failure_count;
+    const int whitening_success_before_seed =
+        result.angular_local_whitening_success_count;
+    result.angular_local_whitening_success_count +=
+        seed_residual_counts.angular_local_whitening_success_count;
+    result.angular_local_whitening_failure_count +=
+        seed_residual_counts.angular_local_whitening_failure_count;
+    result.angular_local_whitening_clamped_count +=
+        seed_residual_counts.angular_local_whitening_clamped_count;
+    result.angular_local_whitening_sigma_sum_rad +=
+        seed_residual_counts.angular_local_whitening_sigma_sum_rad;
+    result.angular_local_whitening_weight_sum +=
+        seed_residual_counts.angular_local_whitening_weight_sum;
+    if (seed_residual_counts.angular_local_whitening_success_count > 0) {
+      result.angular_local_whitening_sigma_min_rad =
+          whitening_success_before_seed == 0
+              ? seed_residual_counts.angular_local_whitening_sigma_min_rad
+              : std::min(
+                    result.angular_local_whitening_sigma_min_rad,
+                    seed_residual_counts.angular_local_whitening_sigma_min_rad);
+      result.angular_local_whitening_sigma_max_rad = std::max(
+          result.angular_local_whitening_sigma_max_rad,
+          seed_residual_counts.angular_local_whitening_sigma_max_rad);
+      result.angular_local_whitening_weight_min =
+          whitening_success_before_seed == 0
+              ? seed_residual_counts.angular_local_whitening_weight_min
+              : std::min(
+                    result.angular_local_whitening_weight_min,
+                    seed_residual_counts.angular_local_whitening_weight_min);
+      result.angular_local_whitening_weight_max = std::max(
+          result.angular_local_whitening_weight_max,
+          seed_residual_counts.angular_local_whitening_weight_max);
+    }
     const aslam::calibration::IncrementalEstimator::ReturnValue seed_ret =
         estimator.addBatch(seed_batch, true);
     result.seed_batch_count = seed_ret.batchAccepted ? 1 : 0;
@@ -3096,8 +4068,86 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
       result.failure_reason = "forced seed batch was not accepted";
       return result;
     }
+    const FullTrainingPoseRefitStats seed_batch_full_training_stats =
+        builder.EvaluateFullTrainingPoseRefitPixel();
+    std::string seed_batch_full_training_reason;
+    if (!fixed_forced_schedule &&
+        !CheckFullTrainingPoseRefitHealthGate(
+            initial_full_training_stats, committed_full_training_stats,
+            seed_batch_full_training_stats, estimator_options,
+            &seed_batch_full_training_reason)) {
+      builder.RestoreState(committed_seed_state);
+      result.failure_reason =
+          "forced seed batch violated full-training pose-refit health: " +
+          seed_batch_full_training_reason;
+      return result;
+    }
+    committed_full_training_stats = seed_batch_full_training_stats;
+    result.seed_information_rank = static_cast<int>(seed_ret.rankTheta);
+    result.seed_information_rank_deficiency =
+        static_cast<int>(seed_ret.rankThetaDeficiency);
+    result.seed_information_baseline_valid =
+        seed_ret.rankTheta >= 0 && seed_ret.rankThetaDeficiency >= 0 &&
+        seed_ret.rankTheta + seed_ret.rankThetaDeficiency > 0;
+    bool camera_information_activation_pending = false;
+    if (!result.seed_information_baseline_valid) {
+      if (!estimator_options.optimize_seed_intrinsics &&
+          estimator_options.optimize_candidate_intrinsics) {
+        camera_information_activation_pending = true;
+        result.warnings.push_back(
+            "Persistent seed kept camera intrinsics fixed; the first valid "
+            "candidate batch will establish the active-camera information "
+            "baseline while releasing intrinsics.");
+      } else {
+        std::ostringstream stream;
+        stream << "persistent seed did not establish a valid active-camera "
+                  "information baseline: rankTheta="
+               << seed_ret.rankTheta
+               << " rankThetaDeficiency=" << seed_ret.rankThetaDeficiency
+               << " optimize_candidate_intrinsics="
+               << (estimator_options.optimize_candidate_intrinsics ? 1 : 0);
+        result.failure_reason = stream.str();
+        return result;
+      }
+    }
     result.seed_information_group_dim =
-        static_cast<int>(seed_ret.rankTheta + seed_ret.rankThetaDeficiency);
+        result.seed_information_baseline_valid
+            ? static_cast<int>(seed_ret.rankTheta +
+                               seed_ret.rankThetaDeficiency)
+            : -1;
+    const Eigen::VectorXd& seed_scaled_singular_values =
+        seed_ret.singularValuesScaled.size() > 0
+            ? seed_ret.singularValuesScaled
+            : seed_ret.singularValues;
+    double min_singular_value = std::numeric_limits<double>::infinity();
+    double max_singular_value = 0.0;
+    for (Eigen::Index index = 0;
+         index < seed_scaled_singular_values.size(); ++index) {
+      const double value = std::abs(seed_scaled_singular_values[index]);
+      if (!std::isfinite(value) || value <= 0.0) {
+        continue;
+      }
+      min_singular_value = std::min(min_singular_value, value);
+      max_singular_value = std::max(max_singular_value, value);
+    }
+    if (std::isfinite(min_singular_value) && max_singular_value > 0.0) {
+      result.seed_information_scaled_min_singular_value = min_singular_value;
+      result.seed_information_scaled_max_singular_value = max_singular_value;
+      result.seed_information_scaled_condition_number =
+          max_singular_value / min_singular_value;
+    }
+    if (active_camera_family == "ds-none" &&
+        seed_ret.sigma2Theta.rows() == 6 &&
+        seed_ret.sigma2Theta.cols() == 6) {
+      const double cu_variance = seed_ret.sigma2Theta(4, 4);
+      const double cv_variance = seed_ret.sigma2Theta(5, 5);
+      if (std::isfinite(cu_variance) && cu_variance >= 0.0) {
+        result.seed_information_ds_cu_stddev_px = std::sqrt(cu_variance);
+      }
+      if (std::isfinite(cv_variance) && cv_variance >= 0.0) {
+        result.seed_information_ds_cv_stddev_px = std::sqrt(cv_variance);
+      }
+    }
     std::string seed_state_invalid_reason;
     bool seed_state_restored = false;
     if (!builder.CurrentStateFinite(&seed_state_invalid_reason)) {
@@ -3109,10 +4159,24 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
           seed_state_invalid_reason);
     }
 
-    int current_rank =
-        seed_state_restored ? -1 : static_cast<int>(seed_ret.rankTheta);
+    if (seed_state_restored) {
+      result.failure_reason =
+          "persistent seed state became invalid after forced seed batch";
+      if (!seed_state_invalid_reason.empty()) {
+        result.failure_reason += ": " + seed_state_invalid_reason;
+      }
+      return result;
+    }
+    // Candidate guards compare against the committed post-warmup seed. The
+    // incoming state remains available separately for warmup rollback.
+    const typename PersistentProblemBuilder<GeometryT>::StateSnapshot
+        guard_reference_state = builder.CaptureState();
+    builder.SetKbDistortionGuardReference(guard_reference_state);
+    int current_rank = result.seed_information_rank;
     const ResidualStats seed_metric_stats =
         builder.EvaluateAccepted(seed_keys, selection_metric);
+    const ResidualStats seed_pixel_stats =
+        builder.EvaluateAccepted(seed_keys, SelectionResidualMetric::kPixel);
     result.seed_acceptance_metric_rmse = seed_metric_stats.Rmse();
     result.seed_acceptance_metric_p95 = seed_metric_stats.P95();
     if (selection_metric != SelectionResidualMetric::kPixel) {
@@ -3177,10 +4241,16 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
     result.adaptive_saturation_tail_ordering_score_threshold =
         tail_ordering_score_threshold;
     int consecutive_nonproductive_batches = 0;
+    double cumulative_accepted_information_gain = 0.0;
 
     for (const Stage5IncrementalBackendBatchInput& raw_input :
          candidate_batches) {
       Stage5IncrementalBackendBatchInput input = raw_input;
+      const bool camera_information_activation_batch =
+          camera_information_activation_pending;
+      if (camera_information_activation_batch) {
+        input.force = true;
+      }
       if (selection_metric != SelectionResidualMetric::kPixel) {
         const ResidualStats candidate_pre_stats =
             builder.EvaluateAccepted(input.frame_board_keys, selection_metric);
@@ -3238,6 +4308,18 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
       batch_result.rank_gain_threshold =
           estimator_options.rank_gain_threshold;
       batch_result.rank_theta_before = current_rank;
+      batch_result.full_training_pixel_rmse_before =
+          committed_full_training_stats.pixel_stats.Rmse();
+      batch_result.full_training_pixel_p95_before =
+          committed_full_training_stats.pixel_stats.P95();
+      batch_result.full_training_pose_success_rate_before =
+          committed_full_training_stats.PoseSuccessRate();
+      batch_result.full_training_pose_success_count_before =
+          committed_full_training_stats.pose_success_count;
+      batch_result.full_training_pose_total_count =
+          committed_full_training_stats.pose_total_count;
+      batch_result.full_training_invalid_projection_count_before =
+          committed_full_training_stats.pixel_stats.invalid_projection_count;
       FillCameraDiagnostics(builder.CurrentCamera(),
                             &batch_result.camera_xi_before,
                             &batch_result.camera_alpha_before,
@@ -3245,6 +4327,26 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
                             &batch_result.camera_fv_before,
                             &batch_result.camera_cu_before,
                             &batch_result.camera_cv_before);
+      FillDistortionDiagnostics(builder.CurrentCamera(),
+                                &batch_result.camera_k1_before,
+                                &batch_result.camera_k2_before,
+                                &batch_result.camera_k3_before,
+                                &batch_result.camera_k4_before);
+      const bool camera_information_full_rank =
+          result.seed_information_baseline_valid && current_rank >= 0 &&
+          result.seed_information_group_dim > 0 &&
+          current_rank >= result.seed_information_group_dim;
+      KbDistortionReleaseState kb_release_state;
+      if (result.kb_distortion_guard_enabled) {
+        kb_release_state.k3_released = camera_information_full_rank &&
+            result.accepted_batch_count >= 3 &&
+            cumulative_accepted_information_gain >= 0.75;
+        kb_release_state.k4_released = camera_information_full_rank &&
+            result.accepted_batch_count >= 6 &&
+            cumulative_accepted_information_gain >= 1.50;
+      }
+      batch_result.kb_k3_released = kb_release_state.k3_released;
+      batch_result.kb_k4_released = kb_release_state.k4_released;
       ++result.attempted_batch_count;
 
       if (input.frame_board_keys.empty() ||
@@ -3262,8 +4364,49 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
 
       const typename PersistentProblemBuilder<GeometryT>::StateSnapshot
           batch_state = builder.CaptureState();
+      if (estimator_options.residual_model != ResidualModel::ImagePlane) {
+        constexpr int kPosePrefitMaximumIterations = 100;
+        batch_result.pose_prefit_attempted = true;
+        const aslam::backend::SolutionReturnValue pose_prefit =
+            builder.PrefitCandidateFramePoses(
+                input.frame_board_keys, kPosePrefitMaximumIterations,
+                estimator_options.convergence_delta_j,
+                estimator_options.convergence_delta_x);
+        batch_result.pose_prefit_iterations = pose_prefit.iterations;
+        batch_result.pose_prefit_objective_start = pose_prefit.JStart;
+        batch_result.pose_prefit_objective_final = pose_prefit.JFinal;
+        batch_result.pose_prefit_last_delta_j = pose_prefit.dJFinal;
+        batch_result.pose_prefit_last_delta_x = pose_prefit.dXFinal;
+        batch_result.pose_prefit_success =
+            !pose_prefit.linearSolverFailure &&
+            pose_prefit.iterations < kPosePrefitMaximumIterations &&
+            std::isfinite(pose_prefit.JStart) &&
+            std::isfinite(pose_prefit.JFinal) &&
+            pose_prefit.JFinal <= pose_prefit.JStart;
+        if (!batch_result.pose_prefit_success) {
+          builder.RestoreState(batch_state);
+          std::ostringstream stream;
+          stream << "candidate_pose_prefit_failed iterations="
+                 << pose_prefit.iterations
+                 << " JStart=" << pose_prefit.JStart
+                 << " JFinal=" << pose_prefit.JFinal
+                 << " dJFinal=" << pose_prefit.dJFinal
+                 << " dXFinal=" << pose_prefit.dXFinal
+                 << " linear_solver_failure="
+                 << (pose_prefit.linearSolverFailure ? 1 : 0);
+          batch_result.reject_reason = stream.str();
+          batch_result.committed_or_rollback = "rollback";
+          ++result.rejected_batch_count;
+          result.batch_results.push_back(batch_result);
+          ++consecutive_nonproductive_batches;
+          continue;
+        }
+      }
       const ResidualStats committed_before_stats =
           builder.EvaluateAccepted(result.accepted_keys, selection_metric);
+      const ResidualStats committed_before_pixel_stats =
+          builder.EvaluateAccepted(result.accepted_keys,
+                                   SelectionResidualMetric::kPixel);
       batch_result.rmse_before = committed_before_stats.Rmse();
       batch_result.outer_rmse_before = committed_before_stats.OuterRmse();
       batch_result.internal_rmse_before =
@@ -3275,6 +4418,8 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
       batch_result.acceptance_metric_threshold =
           SelectionHealthThreshold(estimator_options, input, selection_metric);
       batch_result.acceptance_metric_before = committed_before_stats.Rmse();
+      batch_result.pixel_rmse_before = committed_before_pixel_stats.Rmse();
+      batch_result.pixel_p95_before = committed_before_pixel_stats.P95();
       aslam::calibration::IncrementalEstimator::ReturnValue ret;
       boost::shared_ptr<CalibrationBatch> batch;
       bool incremental_accepted = false;
@@ -3316,6 +4461,10 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
             batch_result.qr_tolerance = active_ret.qrTolerance;
             batch_result.objective_start = active_ret.JStart;
             batch_result.objective_final = active_ret.JFinal;
+            batch_result.objective_last_delta_j = active_ret.dJFinal;
+            batch_result.state_last_delta_x = active_ret.dXFinal;
+            batch_result.linear_solver_failure =
+                active_ret.linearSolverFailure;
             batch_result.elapsed_time_seconds = active_ret.elapsedTime;
             batch_result.objective_finite =
                 std::isfinite(active_ret.JStart) &&
@@ -3334,6 +4483,7 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
                    static_cast<double>(batch_result.rank_theta_before)) >
                       estimator_options.rank_gain_threshold));
             const bool residual_score_gate_pass =
+                !estimator_options.single_board_dense_grid_profile &&
                 SelectionMetricUsesResidualAwareScoreGate(selection_metric) &&
                 std::isfinite(input.ordering_score) &&
                 input.ordering_score >= tail_ordering_score_threshold;
@@ -3349,17 +4499,31 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
                                   &batch_result.camera_fv_after,
                                   &batch_result.camera_cu_after,
                                   &batch_result.camera_cv_after);
+            FillDistortionDiagnostics(builder.CurrentCamera(),
+                                      &batch_result.camera_k1_after,
+                                      &batch_result.camera_k2_after,
+                                      &batch_result.camera_k3_after,
+                                      &batch_result.camera_k4_after);
+            const bool reached_iteration_ceiling =
+                batch_result.last_solver_pass_iterations >=
+                std::max(1, estimator_options.max_iterations);
+            batch_result.converged_by_relative_objective =
+                ConvergedByBearingRelativeObjective(
+                    estimator_options.residual_model, active_ret,
+                    estimator_options.max_iterations);
             batch_result.optimization_success =
-                active_ret.numIterations <
-                static_cast<std::size_t>(
-                    std::max(1, estimator_options.max_iterations));
+                !active_ret.linearSolverFailure &&
+                (!reached_iteration_ceiling ||
+                 batch_result.converged_by_relative_objective ||
+                 batch_result.converged_by_camera_step);
             batch_result.solution_valid =
-                input.force ||
-                (batch_result.objective_finite &&
+                batch_result.optimization_success &&
+                (input.force ||
+                 (batch_result.objective_finite &&
 		                 batch_result.objective_gate_pass &&
 			                 (batch_result.information_gate_pass ||
 			                  residual_score_gate_pass) &&
-			                 batch_result.residual_health_pass);
+			                 batch_result.residual_health_pass));
             batch_result.trust_region_pass = true;
             batch_result.trust_region_retry_count = retry_count;
             batch_result.trust_region_backtracking_used = retry_count > 0;
@@ -3392,7 +4556,7 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         batch = builder.BuildBatch(input.frame_board_keys, true,
                                    CameraOptimizationPhase::kCandidateTrustRegion,
                                    &batch_state, &residual_counts,
-                                   anchor_weight_scale);
+                                   anchor_weight_scale, kb_release_state);
         batch_result.image_plane_residual_count =
             residual_counts.image_plane_residual_count;
 	        batch_result.angular_residual_count =
@@ -3417,6 +4581,38 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
 	            residual_counts.hybrid_chordal_selected_count;
 	        result.angular_observation_geometry_failure_count +=
 	            residual_counts.angular_observation_geometry_failure_count;
+        const int whitening_success_before_batch =
+            result.angular_local_whitening_success_count;
+        result.angular_local_whitening_success_count +=
+            residual_counts.angular_local_whitening_success_count;
+        result.angular_local_whitening_failure_count +=
+            residual_counts.angular_local_whitening_failure_count;
+        result.angular_local_whitening_clamped_count +=
+            residual_counts.angular_local_whitening_clamped_count;
+        result.angular_local_whitening_sigma_sum_rad +=
+            residual_counts.angular_local_whitening_sigma_sum_rad;
+        result.angular_local_whitening_weight_sum +=
+            residual_counts.angular_local_whitening_weight_sum;
+        if (residual_counts.angular_local_whitening_success_count > 0) {
+          result.angular_local_whitening_sigma_min_rad =
+              whitening_success_before_batch == 0
+                  ? residual_counts.angular_local_whitening_sigma_min_rad
+                  : std::min(
+                        result.angular_local_whitening_sigma_min_rad,
+                        residual_counts.angular_local_whitening_sigma_min_rad);
+          result.angular_local_whitening_sigma_max_rad = std::max(
+              result.angular_local_whitening_sigma_max_rad,
+              residual_counts.angular_local_whitening_sigma_max_rad);
+          result.angular_local_whitening_weight_min =
+              whitening_success_before_batch == 0
+                  ? residual_counts.angular_local_whitening_weight_min
+                  : std::min(
+                        result.angular_local_whitening_weight_min,
+                        residual_counts.angular_local_whitening_weight_min);
+          result.angular_local_whitening_weight_max = std::max(
+              result.angular_local_whitening_weight_max,
+              residual_counts.angular_local_whitening_weight_max);
+        }
         std::string residual_contract_reason;
         if (!ResidualConstructionMatchesMode(
                 estimator_options.residual_model,
@@ -3439,8 +4635,67 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
           return false;
         }
         try {
-          const aslam::calibration::IncrementalEstimator::ReturnValue
-              attempt_ret = estimator.addBatch(batch, false);
+          OuterBootstrapCameraIntrinsics pass_camera_before =
+              builder.CurrentCamera();
+          aslam::calibration::IncrementalEstimator::ReturnValue attempt_ret =
+              estimator.addBatch(batch, input.force);
+          CameraStepConvergence camera_step = EvaluateCameraStepConvergence(
+              pass_camera_before, builder.CurrentCamera());
+          const double initial_objective = attempt_ret.JStart;
+          const double information_gain = attempt_ret.informationGain;
+          double total_elapsed_time = attempt_ret.elapsedTime;
+          std::size_t total_iterations = attempt_ret.numIterations;
+          std::size_t last_pass_iterations = attempt_ret.numIterations;
+          int continuation_round_count = 0;
+          while (attempt_ret.batchAccepted &&
+                 (estimator_options.residual_model != ResidualModel::ImagePlane ||
+                  camera_information_activation_batch) &&
+                 last_pass_iterations >= static_cast<std::size_t>(
+                     estimator_options.max_iterations) &&
+                 !ConvergedByBearingRelativeObjective(
+                     estimator_options.residual_model, attempt_ret,
+                     estimator_options.max_iterations) &&
+                 !camera_step.converged &&
+                 continuation_round_count <
+                     estimator_options.max_continuation_rounds) {
+            pass_camera_before = builder.CurrentCamera();
+            const aslam::calibration::IncrementalEstimator::ReturnValue
+                continuation_ret = estimator.reoptimize();
+            camera_step = EvaluateCameraStepConvergence(
+                pass_camera_before, builder.CurrentCamera());
+            ++continuation_round_count;
+            last_pass_iterations = continuation_ret.numIterations;
+            total_iterations += continuation_ret.numIterations;
+            total_elapsed_time += continuation_ret.elapsedTime;
+            attempt_ret = continuation_ret;
+            attempt_ret.batchAccepted = true;
+            attempt_ret.informationGain = information_gain;
+            attempt_ret.JStart = initial_objective;
+            attempt_ret.numIterations = total_iterations;
+            attempt_ret.elapsedTime = total_elapsed_time;
+            if (attempt_ret.linearSolverFailure ||
+                !std::isfinite(attempt_ret.JFinal)) {
+              break;
+            }
+          }
+          batch_result.last_solver_pass_iterations =
+              static_cast<int>(last_pass_iterations);
+          batch_result.converged_by_camera_step = camera_step.converged;
+          batch_result.last_camera_shape_step = camera_step.shape_step;
+          batch_result.last_camera_focal_relative_step =
+              camera_step.focal_relative_step;
+          batch_result.last_camera_principal_step_px =
+              camera_step.principal_step_px;
+          batch_result.continuation_round_count = continuation_round_count;
+          batch_result.continuation_guard_hit =
+              continuation_round_count >=
+                  estimator_options.max_continuation_rounds &&
+              last_pass_iterations >= static_cast<std::size_t>(
+                  estimator_options.max_iterations) &&
+              !ConvergedByBearingRelativeObjective(
+                  estimator_options.residual_model, attempt_ret,
+                  estimator_options.max_iterations) &&
+              !camera_step.converged;
           incremental_accepted = attempt_ret.batchAccepted;
           populate_from_return_value(attempt_ret, incremental_accepted,
                                      retry_count, anchor_weight_scale);
@@ -3477,6 +4732,23 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         continue;
       }
 
+      if (camera_information_activation_batch &&
+          (ret.rankTheta < 0 || ret.rankThetaDeficiency < 0 ||
+           ret.rankTheta + ret.rankThetaDeficiency <= 0)) {
+        if (incremental_accepted) {
+          estimator.rejectBatch(batch);
+        }
+        builder.RestoreState(batch_state);
+        batch_result.batch_accepted = false;
+        batch_result.solution_valid = false;
+        batch_result.reject_reason =
+            "camera_information_activation_failed";
+        batch_result.committed_or_rollback = "rollback";
+        ++result.rejected_batch_count;
+        result.batch_results.push_back(batch_result);
+        continue;
+      }
+
       while (!batch_result.batch_accepted &&
              incremental_accepted &&
              !add_batch_exception &&
@@ -3505,6 +4777,22 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         }
         if (!batch_result.objective_finite) {
           return std::string("incremental_nonfinite_objective");
+        }
+        if (!batch_result.optimization_success) {
+          std::ostringstream stream;
+          stream << "incremental_optimizer_nonconvergence iterations="
+                 << batch_result.num_iterations
+                 << " last_pass_iterations="
+                 << batch_result.last_solver_pass_iterations
+                 << " max_iterations_per_pass="
+                 << estimator_options.max_iterations
+                 << " continuation_rounds="
+                 << batch_result.continuation_round_count
+                 << " continuation_guard_hit="
+                 << (batch_result.continuation_guard_hit ? 1 : 0)
+                 << " JStart=" << batch_result.objective_start
+                 << " JFinal=" << batch_result.objective_final;
+          return stream.str();
         }
         if (!batch_result.objective_gate_pass) {
           std::ostringstream stream;
@@ -3553,6 +4841,16 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         if (!batch_result.split_residual_health_pass) {
           return std::string("incremental_split_residual_health_gate");
         }
+        if (!batch_result.pixel_safety_gate_pass) {
+          return std::string("incremental_bearing_pixel_safety_gate");
+        }
+        if (!batch_result.full_training_pose_refit_health_pass) {
+          return std::string(
+              "incremental_full_training_pose_refit_health_gate");
+        }
+        if (!batch_result.ray_curve_validity_pass) {
+          return std::string("incremental_kb_ray_curve_validity_gate");
+        }
         return incremental_accepted
                    ? std::string("incremental_solution_validity_gate")
                    : std::string("incremental_backend_rejected_batch");
@@ -3560,6 +4858,9 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
       ResidualStats committed_candidate_stats;
       ResidualStats candidate_only_stats;
       bool committed_candidate_stats_ready = false;
+      FullTrainingPoseRefitStats candidate_full_training_stats =
+          committed_full_training_stats;
+      bool candidate_full_training_stats_ready = false;
       if (batch_result.batch_accepted) {
         std::set<FrameBoardKey> candidate_accepted_keys = result.accepted_keys;
         candidate_accepted_keys.insert(input.frame_board_keys.begin(),
@@ -3598,7 +4899,110 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
             committed_candidate_stats.InternalP95();
         batch_result.acceptance_metric_after =
             committed_candidate_stats.Rmse();
-	        if (batch_result.acceptance_metric_threshold > 0.0 &&
+
+        const ResidualStats candidate_only_pixel_stats =
+            builder.EvaluateAccepted(input.frame_board_keys,
+                                     SelectionResidualMetric::kPixel);
+        const ResidualStats committed_candidate_pixel_stats =
+            builder.EvaluateAccepted(candidate_accepted_keys,
+                                     SelectionResidualMetric::kPixel);
+        batch_result.candidate_pixel_rmse_after =
+            candidate_only_pixel_stats.Rmse();
+        batch_result.candidate_pixel_p95_after =
+            candidate_only_pixel_stats.P95();
+        batch_result.pixel_rmse_after =
+            committed_candidate_pixel_stats.Rmse();
+        batch_result.pixel_p95_after =
+            committed_candidate_pixel_stats.P95();
+
+        if (batch_result.batch_accepted &&
+            estimator_options.single_board_dense_grid_profile &&
+            committed_before_stats.total_count > 0) {
+          const ResidualStats committed_existing_after_stats =
+              builder.EvaluateAccepted(result.accepted_keys,
+                                       selection_metric);
+          const double existing_rmse_limit = std::max(
+              1.005 * committed_before_stats.Rmse(),
+              committed_before_stats.Rmse() + 0.002);
+          const double existing_p95_limit = std::max(
+              1.01 * committed_before_stats.P95(),
+              committed_before_stats.P95() + 0.005);
+          if (committed_existing_after_stats.Rmse() > existing_rmse_limit ||
+              committed_existing_after_stats.P95() > existing_p95_limit) {
+            std::ostringstream stream;
+            stream << "checkerboard_committed_stability_gate"
+                   << " before_rmse=" << committed_before_stats.Rmse()
+                   << " existing_after_rmse="
+                   << committed_existing_after_stats.Rmse()
+                   << " rmse_limit=" << existing_rmse_limit
+                   << " before_p95=" << committed_before_stats.P95()
+                   << " existing_after_p95="
+                   << committed_existing_after_stats.P95()
+                   << " p95_limit=" << existing_p95_limit;
+            state_invalid_reason = stream.str();
+            batch_result.solution_valid = false;
+            batch_result.batch_accepted = false;
+            batch_result.committed_or_rollback = "rollback";
+            batch_result.split_residual_health_pass = false;
+            ++result.split_residual_health_rejected_count;
+          }
+        }
+
+        if (result.bearing_pixel_safety_gate_enabled && !input.force) {
+          std::string pixel_safety_reason;
+          batch_result.pixel_safety_gate_pass =
+              CheckSplitResidualHealthGate(
+                  committed_before_pixel_stats,
+                  committed_candidate_pixel_stats,
+                  candidate_only_pixel_stats, estimator_options, input,
+                  SelectionResidualMetric::kPixel, &pixel_safety_reason);
+          const double seed_rmse_limit = RegressionLimit(
+              seed_pixel_stats.Rmse(), 1.35, 0.50);
+          const double seed_p95_limit = RegressionLimit(
+              seed_pixel_stats.P95(), 1.50, 1.00);
+          if (batch_result.pixel_rmse_after > seed_rmse_limit ||
+              batch_result.pixel_p95_after > seed_p95_limit) {
+            batch_result.pixel_safety_gate_pass = false;
+            std::ostringstream stream;
+            stream << "bearing_pixel_safety_global seed_rmse="
+                   << seed_pixel_stats.Rmse()
+                   << " after_rmse=" << batch_result.pixel_rmse_after
+                   << " rmse_limit=" << seed_rmse_limit
+                   << " seed_p95=" << seed_pixel_stats.P95()
+                   << " after_p95=" << batch_result.pixel_p95_after
+                   << " p95_limit=" << seed_p95_limit;
+            pixel_safety_reason = stream.str();
+          }
+          if (!batch_result.pixel_safety_gate_pass) {
+            state_invalid_reason = pixel_safety_reason;
+            batch_result.solution_valid = false;
+            batch_result.batch_accepted = false;
+            batch_result.committed_or_rollback = "rollback";
+            ++result.bearing_pixel_safety_rejected_count;
+          }
+        }
+
+        if (batch_result.batch_accepted &&
+            result.kb_distortion_guard_enabled) {
+          const KbRayCurveHealth ray_health =
+              builder.EvaluateKbRayCurveHealth(guard_reference_state);
+          batch_result.ray_curve_rms_change_deg =
+              ray_health.rms_change_deg;
+          batch_result.ray_curve_max_change_deg =
+              ray_health.max_change_deg;
+          batch_result.ray_curve_min_radial_derivative =
+              ray_health.min_radial_derivative;
+          batch_result.ray_curve_validity_pass = ray_health.valid;
+          if (!ray_health.valid) {
+            state_invalid_reason = ray_health.failure_reason;
+            batch_result.solution_valid = false;
+            batch_result.batch_accepted = false;
+            batch_result.committed_or_rollback = "rollback";
+            ++result.kb_ray_curve_validity_rejected_count;
+          }
+        }
+	        if (!input.force &&
+            batch_result.acceptance_metric_threshold > 0.0 &&
             batch_result.rmse_after >
                 batch_result.acceptance_metric_threshold) {
           std::ostringstream stream;
@@ -3631,11 +5035,52 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
             ++result.split_residual_health_rejected_count;
           }
         }
+        if (batch_result.batch_accepted && !input.force &&
+            result.full_training_pose_refit_health_gate_enabled) {
+          candidate_full_training_stats =
+              builder.EvaluateFullTrainingPoseRefitPixel();
+          candidate_full_training_stats_ready = true;
+          batch_result.full_training_pixel_rmse_after =
+              candidate_full_training_stats.pixel_stats.Rmse();
+          batch_result.full_training_pixel_p95_after =
+              candidate_full_training_stats.pixel_stats.P95();
+          batch_result.full_training_pose_success_rate_after =
+              candidate_full_training_stats.PoseSuccessRate();
+          batch_result.full_training_pose_success_count_after =
+              candidate_full_training_stats.pose_success_count;
+          batch_result.full_training_invalid_projection_count_after =
+              candidate_full_training_stats.pixel_stats
+                  .invalid_projection_count;
+          std::string full_training_reason;
+          batch_result.full_training_pose_refit_health_pass =
+              CheckFullTrainingPoseRefitHealthGate(
+                  initial_full_training_stats,
+                  committed_full_training_stats,
+                  candidate_full_training_stats, estimator_options,
+                  &full_training_reason);
+          if (!batch_result.full_training_pose_refit_health_pass) {
+            state_invalid_reason = full_training_reason;
+            batch_result.solution_valid = false;
+            batch_result.batch_accepted = false;
+            batch_result.committed_or_rollback = "rollback";
+            ++result.full_training_pose_refit_health_rejected_count;
+          }
+        }
       }
       if (batch_result.batch_accepted) {
         result.accepted_keys.insert(input.frame_board_keys.begin(),
                                     input.frame_board_keys.end());
         current_rank = static_cast<int>(ret.rankTheta);
+        if (camera_information_activation_batch) {
+          camera_information_activation_pending = false;
+          result.seed_information_rank = static_cast<int>(ret.rankTheta);
+          result.seed_information_rank_deficiency =
+              static_cast<int>(ret.rankThetaDeficiency);
+          result.seed_information_group_dim = static_cast<int>(
+              ret.rankTheta + ret.rankThetaDeficiency);
+          result.seed_information_baseline_valid = true;
+          batch_result.accept_reason = "camera_information_activation";
+        }
         if (!committed_candidate_stats_ready) {
           committed_candidate_stats =
               builder.EvaluateAccepted(result.accepted_keys,
@@ -3651,7 +5096,11 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
             committed_candidate_stats.InternalP95();
         batch_result.acceptance_metric_after =
             committed_candidate_stats.Rmse();
-	        batch_result.accept_reason =
+	        if (candidate_full_training_stats_ready) {
+	          committed_full_training_stats = candidate_full_training_stats;
+	        }
+	        if (!camera_information_activation_batch) {
+	          batch_result.accept_reason =
 	            input.force
 	                ? "force"
 	                : (SelectionMetricUsesResidualAwareScoreGate(selection_metric)
@@ -3660,7 +5109,10 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
 	                                  estimator_options.information_gain_threshold
 	                              ? "incremental_information_gain"
 	                              : "incremental_rank_gain"));
+	        }
         ++result.accepted_batch_count;
+        cumulative_accepted_information_gain +=
+            std::max(0.0, batch_result.normalized_information_gain);
         consecutive_nonproductive_batches = 0;
       } else {
         const std::string active_reject_reason = make_reject_reason();
@@ -3678,6 +5130,9 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         const bool residual_or_validity_reject =
             !batch_result.residual_health_pass ||
             !batch_result.split_residual_health_pass ||
+            !batch_result.pixel_safety_gate_pass ||
+            !batch_result.full_training_pose_refit_health_pass ||
+            !batch_result.ray_curve_validity_pass ||
             !batch_result.trust_region_pass ||
             !batch_result.objective_gate_pass ||
             !batch_result.solution_valid;
@@ -3700,9 +5155,76 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
             std::max(result.trust_region_backtracking_max_anchor_scale,
                      batch_result.trust_region_anchor_weight_scale);
       }
+      if (batch_result.attempted) {
+        if (batch_result.num_iterations <= 1) {
+          ++result.solver_single_iteration_batch_count;
+        }
+        if (batch_result.last_solver_pass_iterations >=
+            estimator_options.max_iterations) {
+          ++result.solver_max_iteration_batch_count;
+        }
+        if (batch_result.objective_decreased) {
+          ++result.solver_objective_decreased_batch_count;
+        }
+        if (batch_result.converged_by_relative_objective) {
+          ++result.solver_relative_objective_converged_batch_count;
+        }
+        if (batch_result.converged_by_camera_step) {
+          ++result.solver_camera_step_converged_batch_count;
+        }
+        if (batch_result.continuation_round_count > 0) {
+          ++result.solver_continuation_batch_count;
+          result.solver_continuation_round_count +=
+              batch_result.continuation_round_count;
+        }
+        if (batch_result.continuation_guard_hit) {
+          ++result.solver_continuation_guard_hit_count;
+        }
+      }
       result.batch_results.push_back(batch_result);
     }
 
+    const typename PersistentProblemBuilder<GeometryT>::StateSnapshot
+        final_state = builder.CaptureState();
+    for (const auto& initial_board : seed_state.board_poses) {
+      const auto final_it = final_state.board_poses.find(initial_board.first);
+      if (final_it == final_state.board_poses.end()) {
+        continue;
+      }
+      ++result.board_layout_pose_count;
+      const Eigen::Matrix4d& initial_pose = initial_board.second;
+      const Eigen::Matrix4d& final_pose = final_it->second;
+      result.board_layout_max_matrix_abs_delta = std::max(
+          result.board_layout_max_matrix_abs_delta,
+          (final_pose - initial_pose).cwiseAbs().maxCoeff());
+      result.board_layout_max_translation_delta = std::max(
+          result.board_layout_max_translation_delta,
+          (final_pose.block<3, 1>(0, 3) -
+           initial_pose.block<3, 1>(0, 3)).norm());
+      const Eigen::Matrix3d relative_rotation =
+          initial_pose.block<3, 3>(0, 0).transpose() *
+          final_pose.block<3, 3>(0, 0);
+      const double cosine = std::max(
+          -1.0, std::min(1.0, 0.5 * (relative_rotation.trace() - 1.0)));
+      constexpr double kRadiansToDegrees = 180.0 / 3.14159265358979323846;
+      result.board_layout_max_rotation_delta_deg = std::max(
+          result.board_layout_max_rotation_delta_deg,
+          std::acos(cosine) * kRadiansToDegrees);
+    }
+    const FullTrainingPoseRefitStats final_full_training_stats =
+        builder.EvaluateFullTrainingPoseRefitPixel();
+    result.final_full_training_pixel_rmse =
+        final_full_training_stats.pixel_stats.Rmse();
+    result.final_full_training_pixel_p95 =
+        final_full_training_stats.pixel_stats.P95();
+    result.final_full_training_pose_success_rate =
+        final_full_training_stats.PoseSuccessRate();
+    result.final_full_training_pose_success_count =
+        final_full_training_stats.pose_success_count;
+    result.final_full_training_pose_total_count =
+        final_full_training_stats.pose_total_count;
+    result.final_full_training_invalid_projection_count =
+        final_full_training_stats.pixel_stats.invalid_projection_count;
     result.optimized_scene_state = builder.BuildSceneState();
     result.curated_bundle = BuildCuratedBundle(
         baseline_bundle, candidate_pool_bundle, result.optimized_scene_state,
@@ -3772,6 +5294,11 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimator(
   }
   if (family == "omni-radtan") {
     return RunStage5IncrementalBackendEstimatorTyped<MeiGeometry>(
+        baseline_bundle, candidate_pool_bundle, selection_options,
+        backend_runner_options, candidate_batches);
+  }
+  if (family == "omni-none") {
+    return RunStage5IncrementalBackendEstimatorTyped<OmniNoneGeometry>(
         baseline_bundle, candidate_pool_bundle, selection_options,
         backend_runner_options, candidate_batches);
   }

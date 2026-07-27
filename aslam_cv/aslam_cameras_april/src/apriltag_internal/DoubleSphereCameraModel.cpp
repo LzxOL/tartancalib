@@ -76,6 +76,9 @@ std::string NormalizeFamilyString(const std::string& camera_model,
   if (normalized_camera == "omni" && normalized_distortion == "radtan") {
     return "omni-radtan";
   }
+  if (normalized_camera == "omni" && normalized_distortion == "none") {
+    return "omni-none";
+  }
   return "";
 }
 
@@ -145,6 +148,14 @@ boost::shared_ptr<CameraGeometryBase> MakeGeometry(
         new DistortedOmniCameraGeometry(
             projection, GlobalShutter(), NoMask()));
   }
+  if (family == "omni-none") {
+    const std::vector<double>& intrinsics = config.intrinsics;
+    OmniProjection<NoDistortion> projection(
+        intrinsics[0], intrinsics[1], intrinsics[2], intrinsics[3], intrinsics[4],
+        config.resolution[0], config.resolution[1]);
+    return boost::shared_ptr<CameraGeometryBase>(
+        new OmniCameraGeometry(projection, GlobalShutter(), NoMask()));
+  }
   throw std::runtime_error(
       "Unsupported camera family: camera_model=" + config.camera_model +
       " distortion_model=" + config.distortion_model);
@@ -157,7 +168,7 @@ bool HasExpectedIntrinsicsSize(const std::string& family, std::size_t size) {
   if (family == "pinhole-equi") {
     return size == 4;
   }
-  if (family == "omni-radtan") {
+  if (family == "omni-radtan" || family == "omni-none") {
     return size == 5;
   }
   return false;
@@ -196,7 +207,7 @@ std::vector<double> OuterBootstrapCameraIntrinsics::IntrinsicsVector() const {
   if (family == "pinhole-equi") {
     return {fu, fv, cu, cv};
   }
-  if (family == "omni-radtan") {
+  if (family == "omni-radtan" || family == "omni-none") {
     return {xi, fu, fv, cu, cv};
   }
   return {};
@@ -230,7 +241,7 @@ std::vector<std::string> OuterBootstrapCameraIntrinsics::IntrinsicsLabels() cons
   if (family == "pinhole-equi") {
     return {"fu", "fv", "cu", "cv"};
   }
-  if (family == "omni-radtan") {
+  if (family == "omni-radtan" || family == "omni-none") {
     return {"xi", "fu", "fv", "cu", "cv"};
   }
   return {};
@@ -283,7 +294,7 @@ bool OuterBootstrapCameraIntrinsics::SetIntrinsicsVector(const std::vector<doubl
     cv = values[3];
     return true;
   }
-  if (family == "omni-radtan") {
+  if (family == "omni-radtan" || family == "omni-none") {
     xi = values[0];
     fu = values[1];
     fv = values[2];
@@ -370,7 +381,7 @@ DoubleSphereCameraModel DoubleSphereCameraModel::FromConfig(
     camera.fv_ = config.intrinsics[1];
     camera.cu_ = config.intrinsics[2];
     camera.cv_ = config.intrinsics[3];
-  } else if (family == "omni-radtan") {
+  } else if (family == "omni-radtan" || family == "omni-none") {
     camera.xi_ = config.intrinsics[0];
     camera.fu_ = config.intrinsics[1];
     camera.fv_ = config.intrinsics[2];
@@ -436,10 +447,11 @@ bool DoubleSphereCameraModel::estimateTransformation(
 
   std::vector<cv::Point3f> filtered_object_points;
   std::vector<cv::Point2f> normalized_points;
+  std::vector<Eigen::Vector3d> observed_directions;
   filtered_object_points.reserve(object_points.size());
   normalized_points.reserve(image_points.size());
-  constexpr double kMaxRayAngleRadians =
-      80.0 * 3.14159265358979323846 / 180.0;
+  observed_directions.reserve(image_points.size());
+  Eigen::Vector3d mean_direction = Eigen::Vector3d::Zero();
 
   for (std::size_t i = 0; i < image_points.size(); ++i) {
     Eigen::Vector3d back_projection;
@@ -449,55 +461,259 @@ bool DoubleSphereCameraModel::estimateTransformation(
       continue;
     }
     const Eigen::Vector3d direction = back_projection.normalized();
-    if (direction.z() <= std::cos(kMaxRayAngleRadians)) {
+    if (!direction.allFinite()) {
       continue;
     }
-
     filtered_object_points.push_back(object_points[i]);
-    normalized_points.emplace_back(
-        static_cast<float>(direction.x() / direction.z()),
-        static_cast<float>(direction.y() / direction.z()));
+    observed_directions.push_back(direction);
+    mean_direction += direction;
   }
 
-  if (filtered_object_points.size() < 4) {
+  if (filtered_object_points.size() < 4 || mean_direction.norm() < 1e-9) {
     return false;
   }
 
-  cv::Mat local_rvec;
-  cv::Mat local_tvec;
+  const Eigen::Vector3d tangent_z = mean_direction.normalized();
+  Eigen::Vector3d tangent_reference = Eigen::Vector3d::UnitY();
+  if (std::abs(tangent_reference.dot(tangent_z)) > 0.95) {
+    tangent_reference = Eigen::Vector3d::UnitX();
+  }
+  const Eigen::Vector3d tangent_x =
+      tangent_reference.cross(tangent_z).normalized();
+  const Eigen::Vector3d tangent_y = tangent_z.cross(tangent_x).normalized();
+  Eigen::Matrix3d R_tangent_camera;
+  R_tangent_camera.row(0) = tangent_x.transpose();
+  R_tangent_camera.row(1) = tangent_y.transpose();
+  R_tangent_camera.row(2) = tangent_z.transpose();
+  if (!R_tangent_camera.allFinite()) {
+    return false;
+  }
+  for (const Eigen::Vector3d& direction : observed_directions) {
+    const Eigen::Vector3d tangent_direction =
+        R_tangent_camera * direction;
+    if (!tangent_direction.allFinite() || tangent_direction.z() <= 1e-3) {
+      return false;
+    }
+    normalized_points.emplace_back(
+        static_cast<float>(tangent_direction.x() / tangent_direction.z()),
+        static_cast<float>(tangent_direction.y() / tangent_direction.z()));
+  }
+
   const cv::Mat identity_camera = cv::Mat::eye(3, 3, CV_64F);
   const cv::Mat dist_coeffs = cv::Mat::zeros(4, 1, CV_64F);
 
-  bool success = false;
-  if (filtered_object_points.size() == 4) {
-    success = cv::solvePnP(filtered_object_points, normalized_points,
-                           identity_camera, dist_coeffs, local_rvec, local_tvec,
-                           false, cv::SOLVEPNP_IPPE);
-  }
-  if (!success) {
-    success = cv::solvePnP(filtered_object_points, normalized_points,
-                           identity_camera, dist_coeffs, local_rvec, local_tvec,
-                           false, cv::SOLVEPNP_ITERATIVE);
-  }
-  if (!success) {
-    return false;
+  auto evaluate_candidate =
+      [this, &object_points, &image_points](const cv::Mat& candidate_rvec,
+                                           const cv::Mat& candidate_tvec) {
+        cv::Mat rotation_cv;
+        cv::Rodrigues(candidate_rvec, rotation_cv);
+        cv::Mat rotation64;
+        cv::Mat translation64;
+        rotation_cv.convertTo(rotation64, CV_64F);
+        candidate_tvec.convertTo(translation64, CV_64F);
+        if (rotation64.rows != 3 || rotation64.cols != 3 ||
+            translation64.total() < 3u ||
+            translation64.at<double>(2, 0) <= 0.0) {
+          return std::numeric_limits<double>::infinity();
+        }
+        Eigen::Matrix3d rotation = Eigen::Matrix3d::Zero();
+        for (int row = 0; row < 3; ++row) {
+          for (int column = 0; column < 3; ++column) {
+            rotation(row, column) = rotation64.at<double>(row, column);
+          }
+        }
+        const Eigen::Vector3d translation(
+            translation64.at<double>(0, 0),
+            translation64.at<double>(1, 0),
+            translation64.at<double>(2, 0));
+        if (!rotation.allFinite() || !translation.allFinite()) {
+          return std::numeric_limits<double>::infinity();
+        }
+
+        double squared_error_sum = 0.0;
+        for (std::size_t index = 0; index < object_points.size(); ++index) {
+          const cv::Point3f& object = object_points[index];
+          const Eigen::Vector3d point_camera =
+              rotation * Eigen::Vector3d(object.x, object.y, object.z) +
+              translation;
+          Eigen::Vector2d projected = Eigen::Vector2d::Zero();
+          if (!vsEuclideanToKeypoint(point_camera, &projected) ||
+              !projected.allFinite()) {
+            return std::numeric_limits<double>::infinity();
+          }
+          const double dx =
+              projected.x() - static_cast<double>(image_points[index].x);
+          const double dy =
+              projected.y() - static_cast<double>(image_points[index].y);
+          squared_error_sum += dx * dx + dy * dy;
+        }
+        return std::sqrt(squared_error_sum /
+                         static_cast<double>(object_points.size()));
+      };
+
+  auto tangent_pose_to_camera =
+      [&R_tangent_camera](const cv::Mat& tangent_rvec,
+                          const cv::Mat& tangent_tvec,
+                          cv::Mat* camera_rvec,
+                          cv::Mat* camera_tvec) {
+        if (camera_rvec == nullptr || camera_tvec == nullptr) {
+          return false;
+        }
+        cv::Mat tangent_rotation_cv;
+        cv::Rodrigues(tangent_rvec, tangent_rotation_cv);
+        cv::Mat tangent_rotation64;
+        cv::Mat tangent_translation64;
+        tangent_rotation_cv.convertTo(tangent_rotation64, CV_64F);
+        tangent_tvec.convertTo(tangent_translation64, CV_64F);
+        if (tangent_rotation64.rows != 3 || tangent_rotation64.cols != 3 ||
+            tangent_translation64.total() < 3u) {
+          return false;
+        }
+        Eigen::Matrix3d R_tangent_object = Eigen::Matrix3d::Zero();
+        for (int row = 0; row < 3; ++row) {
+          for (int column = 0; column < 3; ++column) {
+            R_tangent_object(row, column) =
+                tangent_rotation64.at<double>(row, column);
+          }
+        }
+        const Eigen::Vector3d t_tangent_object(
+            tangent_translation64.at<double>(0, 0),
+            tangent_translation64.at<double>(1, 0),
+            tangent_translation64.at<double>(2, 0));
+        const Eigen::Matrix3d R_camera_object =
+            R_tangent_camera.transpose() * R_tangent_object;
+        const Eigen::Vector3d t_camera_object =
+            R_tangent_camera.transpose() * t_tangent_object;
+        if (!R_camera_object.allFinite() || !t_camera_object.allFinite()) {
+          return false;
+        }
+        cv::Mat camera_rotation(3, 3, CV_64F);
+        for (int row = 0; row < 3; ++row) {
+          for (int column = 0; column < 3; ++column) {
+            camera_rotation.at<double>(row, column) =
+                R_camera_object(row, column);
+          }
+        }
+        cv::Rodrigues(camera_rotation, *camera_rvec);
+        *camera_tvec = (cv::Mat_<double>(3, 1)
+            << t_camera_object.x(), t_camera_object.y(), t_camera_object.z());
+        return true;
+      };
+
+  std::vector<cv::Mat> candidate_rvecs;
+  std::vector<cv::Mat> candidate_tvecs;
+  try {
+    cv::solvePnPGeneric(filtered_object_points,
+                        normalized_points,
+                        identity_camera,
+                        dist_coeffs,
+                        candidate_rvecs,
+                        candidate_tvecs,
+                        false,
+                        cv::SOLVEPNP_IPPE);
+  } catch (const cv::Exception&) {
+    candidate_rvecs.clear();
+    candidate_tvecs.clear();
   }
 
-  success = cv::solvePnP(filtered_object_points, normalized_points,
-                         identity_camera, dist_coeffs, local_rvec, local_tvec,
-                         true, cv::SOLVEPNP_ITERATIVE);
+  cv::Mat best_rvec;
+  cv::Mat best_tvec;
+  double best_rmse = std::numeric_limits<double>::infinity();
+  const std::size_t candidate_count =
+      std::min(candidate_rvecs.size(), candidate_tvecs.size());
+  for (std::size_t candidate_index = 0;
+       candidate_index < candidate_count;
+       ++candidate_index) {
+    cv::Mat refined_rvec = candidate_rvecs[candidate_index].clone();
+    cv::Mat refined_tvec = candidate_tvecs[candidate_index].clone();
+    bool refined = false;
+    try {
+      refined = cv::solvePnP(filtered_object_points,
+                             normalized_points,
+                             identity_camera,
+                             dist_coeffs,
+                             refined_rvec,
+                             refined_tvec,
+                             true,
+                             cv::SOLVEPNP_ITERATIVE);
+    } catch (const cv::Exception&) {
+      refined = false;
+    }
+    if (!refined) {
+      refined_rvec = candidate_rvecs[candidate_index];
+      refined_tvec = candidate_tvecs[candidate_index];
+    }
+    cv::Mat camera_candidate_rvec;
+    cv::Mat camera_candidate_tvec;
+    if (!tangent_pose_to_camera(refined_rvec,
+                                refined_tvec,
+                                &camera_candidate_rvec,
+                                &camera_candidate_tvec)) {
+      continue;
+    }
+    const double candidate_rmse =
+        evaluate_candidate(camera_candidate_rvec, camera_candidate_tvec);
+    if (candidate_rmse < best_rmse) {
+      best_rmse = candidate_rmse;
+      best_rvec = camera_candidate_rvec.clone();
+      best_tvec = camera_candidate_tvec.clone();
+    }
+  }
+
+  bool success = !best_rvec.empty() && !best_tvec.empty() &&
+                 std::isfinite(best_rmse);
   if (!success) {
-    return false;
+    cv::Mat local_rvec;
+    cv::Mat local_tvec;
+    const int method = filtered_object_points.size() >= 6u
+                           ? cv::SOLVEPNP_ITERATIVE
+                           : cv::SOLVEPNP_SQPNP;
+    try {
+      success = cv::solvePnP(filtered_object_points, normalized_points,
+                             identity_camera, dist_coeffs, local_rvec,
+                             local_tvec, false, method);
+    } catch (const cv::Exception&) {
+      success = false;
+    }
+    if (success) {
+      try {
+        success = cv::solvePnP(filtered_object_points,
+                               normalized_points,
+                               identity_camera,
+                               dist_coeffs,
+                               local_rvec,
+                               local_tvec,
+                               true,
+                               cv::SOLVEPNP_ITERATIVE);
+      } catch (const cv::Exception&) {
+        success = false;
+      }
+    }
+    cv::Mat camera_fallback_rvec;
+    cv::Mat camera_fallback_tvec;
+    const bool converted =
+        success && tangent_pose_to_camera(local_rvec,
+                                          local_tvec,
+                                          &camera_fallback_rvec,
+                                          &camera_fallback_tvec);
+    if (converted &&
+        std::isfinite(evaluate_candidate(camera_fallback_rvec,
+                                         camera_fallback_tvec))) {
+      best_rvec = camera_fallback_rvec;
+      best_tvec = camera_fallback_tvec;
+    } else {
+      return false;
+    }
   }
 
   cv::Mat tvec64;
-  local_tvec.convertTo(tvec64, CV_64F);
+  best_tvec.convertTo(tvec64, CV_64F);
   if (tvec64.at<double>(2, 0) <= 0.0) {
     return false;
   }
 
-  *rvec = local_rvec;
-  *tvec = local_tvec;
+  *rvec = best_rvec;
+  *tvec = best_tvec;
   return true;
 }
 

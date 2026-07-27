@@ -183,7 +183,8 @@ double ComputePolarAngleWeightScale(
     const DoubleSphereCameraModel& camera,
     const JointPointObservation& observation,
     const JointReprojectionCostOptions& options) {
-  if (observation.point_type != JointPointType::Internal ||
+  if ((!options.uniform_control_point_mode &&
+       observation.point_type != JointPointType::Internal) ||
       options.polar_angle_weight_mode == "none" ||
       options.polar_angle_weight_mode == "diagnostic_only") {
     return 1.0;
@@ -655,7 +656,9 @@ JointCostEvaluation JointReprojectionCostCore::Evaluate(
     const bool has_internal = budget.internal_count > 0;
     double type_budget = 1.0;
     int type_count = 1;
-    if (has_outer && has_internal) {
+    if (options_.uniform_control_point_mode) {
+      type_count = 1;
+    } else if (has_outer && has_internal) {
       type_budget = observation.point_type == JointPointType::Outer ? 0.5 : 0.5;
       type_count = observation.point_type == JointPointType::Outer ?
           budget.outer_count : budget.internal_count;
@@ -705,12 +708,17 @@ JointCostEvaluation JointReprojectionCostCore::Evaluate(
         point_eval.active_angular_weight * point_eval.angular_residual_xy;
     const double active_squared_norm = active_residual.squaredNorm();
     const double active_residual_norm = std::sqrt(std::max(0.0, active_squared_norm));
-    const double huber_delta =
-        observation.point_type == JointPointType::Outer
-            ? (use_angular_residual ? options_.outer_huber_delta_radians
-                                    : options_.outer_huber_delta_pixels)
-            : (use_angular_residual ? options_.internal_huber_delta_radians
-                                    : options_.internal_huber_delta_pixels);
+    const double huber_delta = options_.uniform_control_point_mode
+        ? (use_angular_residual
+               ? std::min(options_.outer_huber_delta_radians,
+                          options_.internal_huber_delta_radians)
+               : std::min(options_.outer_huber_delta_pixels,
+                          options_.internal_huber_delta_pixels))
+        : observation.point_type == JointPointType::Outer
+              ? (use_angular_residual ? options_.outer_huber_delta_radians
+                                      : options_.outer_huber_delta_pixels)
+              : (use_angular_residual ? options_.internal_huber_delta_radians
+                                      : options_.internal_huber_delta_pixels);
     point_eval.huber_weight = HuberWeight(active_residual_norm, huber_delta);
     point_eval.final_weight =
         point_eval.balance_weight * point_eval.quality_weight *
