@@ -1,0 +1,60 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand*\HyPL@Entry[1]{}
+\citation{ref03,ref04,ref05,ref07,ref08}
+\citation{ref06,ref09,ref10}
+\citation{usenko2018double}
+\HyPL@Entry{0<</S/D>>}
+\@writefile{toc}{\contentsline {section}{\numberline {I}INTRODUCTION}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {II}Related Work}{1}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {II-A}宽视场相机模型与标定方法}{1}{subsection.2.1}\protected@file@percent }
+\citation{ref0opencv}
+\citation{ref06}
+\citation{ref11}
+\citation{ref13,ref14,ref15,ref16}
+\citation{ref17}
+\citation{ref18}
+\citation{ref19}
+\citation{ref20}
+\citation{ref21}
+\citation{ref22}
+\citation{ref23}
+\citation{ref12}
+\citation{ref24}
+\citation{ref25}
+\citation{ref20}
+\@writefile{toc}{\contentsline {subsection}{\numberline {II-B}标定目标与特征观测}{2}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {II-C}多板标定与观测设计}{2}{subsection.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {II-D}Maintaining the Integrity of the Specifications}{2}{subsection.2.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {III}Method}{2}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {III-A}Multi-Board Target Formulation}{2}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {III-B}Camera Model Initialization}{3}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {III-C}Internal Lattice Point Recovery}{3}{subsection.3.3}\protected@file@percent }
+\newlabel{sec:internal_point_recovery}{{III-C}{3}{Internal Lattice Point Recovery}{subsection.3.3}{}}
+\newlabel{eq:nominal_internal_prediction}{{8}{3}{Internal Lattice Point Recovery}{equation.8}{}}
+\newlabel{eq:spherical_boundary_interpolation}{{9}{3}{Internal Lattice Point Recovery}{equation.9}{}}
+\newlabel{eq:internal_point_seed}{{10}{3}{Internal Lattice Point Recovery}{equation.10}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {III-D}Spherical Bundle Adjustment}{3}{subsection.3.4}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces xxxxxx}}{4}{figure.1}\protected@file@percent }
+\newlabel{fig:corner_distribution}{{1}{4}{xxxxxx}{figure.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {IV}EXPERIMENT}{4}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {IV-A}Experimental Setup}{4}{subsection.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {IV-B}Ablation}{4}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {IV-B.1}Internal Seed Generation}{4}{subsubsection.4.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {IV-B.2}Internal Observation Evaluation}{4}{subsubsection.4.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {IV-C}Camera Pose Estimation}{4}{subsection.4.3}\protected@file@percent }
+\bibstyle{IEEEtran}
+\bibdata{references}
+\bibcite{usenko2018double}{1}
+\@writefile{lot}{\contentsline {table}{\numberline {I}{\ignorespaces  Cross-backend verification on the held-out multi-board and independent checkerboard test sets. BabelCalib uses the same detected observations and target geometry as ours. }}{5}{table.1}\protected@file@percent }
+\newlabel{tab:cross_backend_verification}{{I}{5}{Cross-backend verification on the held-out multi-board and independent checkerboard test sets. BabelCalib uses the same detected observations and target geometry as ours}{table.1}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces 内部观测对受扰 DS 内参恢复的影响。Outer-only 与 Outer+Internal 共享相同的 Outer4 frame--board observations、 受扰初值和配对噪声；Outer+Internal 仅额外加入恢复的内部格点。 (a) 消除位姿后的最弱内参方向 $W_1$ 上的 Schur 信息。 (b) 在固定参考射线网格上计算的、恢复模型相对参考模型的径向像素 位移 P95。(c) 不同 frame--board 预算下的外围 Ray Error P95。 两种设置均从 $2^\circ $ 外围扰动出发，并仅优化 DS 内参。 图 (b) 和 (c) 汇总 100 组配对试验，曲线和阴影分别表示中位数和 IQR；外围区域定义为 $\rho \geq 0.7$。}}{5}{figure.2}\protected@file@percent }
+\newlabel{fig:internal-point-ablation}{{2}{5}{内部观测对受扰 DS 内参恢复的影响。Outer-only 与 Outer+Internal 共享相同的 Outer4 frame--board observations、 受扰初值和配对噪声；Outer+Internal 仅额外加入恢复的内部格点。 (a) 消除位姿后的最弱内参方向 $W_1$ 上的 Schur 信息。 (b) 在固定参考射线网格上计算的、恢复模型相对参考模型的径向像素 位移 P95。(c) 不同 frame--board 预算下的外围 Ray Error P95。 两种设置均从 $2^\circ $ 外围扰动出发，并仅优化 DS 内参。 图 (b) 和 (c) 汇总 100 组配对试验，曲线和阴影分别表示中位数和 IQR；外围区域定义为 $\rho \geq 0.7$。}{figure.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {II}{\ignorespaces Internal-seed ablation with a shared Outer4 initialization.}}{5}{table.2}\protected@file@percent }
+\newlabel{tab:internal_seed_ablation}{{II}{5}{Internal-seed ablation with a shared Outer4 initialization}{table.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {IV-D}Cross-Backend Evaluation}{5}{subsection.4.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {V}CONCLUSIONS}{5}{section.5}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {III}{\ignorespaces Reprojection performance on two held-out multi-board sets and one checkerboard set. Metrics are reported as RMSE [px], P95 [px], and Inlier@1px [\%].}}{6}{table.3}\protected@file@percent }
+\newlabel{tab:reprojection_comparison}{{III}{6}{Reprojection performance on two held-out multi-board sets and one checkerboard set. Metrics are reported as RMSE [px], P95 [px], and Inlier@1px [\%]}{table.3}{}}
+\@writefile{toc}{\contentsline {section}{References}{6}{section*.3}\protected@file@percent }
+\gdef \@abspage@last{6}

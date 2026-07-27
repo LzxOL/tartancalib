@@ -1,0 +1,493 @@
+% !TeX program = xelatex
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%2345678901234567890123456789012345678901234567890123456789012345678901234567890
+%        1         2         3         4         5         6         7         8
+
+\documentclass[letterpaper, 10 pt, conference]{ieeeconf}  % Comment this line out if you need a4paper
+
+%\documentclass[a4paper, 10pt, conference]{ieeeconf}      % Use this line for a4 paper
+
+\IEEEoverridecommandlockouts                              % This command is only needed if 
+                                                          % you want to use the \thanks command
+
+\overrideIEEEmargins                                      % Needed to meet printer requirements.
+
+%In case you encounter the following error:
+%Error 1010 The PDF file may be corrupt (unable to open PDF file) OR
+%Error 1000 An error occurred while parsing a contents stream. Unable to analyze the PDF file.
+%This is a known problem with pdfLaTeX conversion filter. The file cannot be opened with acrobat reader
+%Please use one of the alternatives below to circumvent this error by uncommenting one or the other
+%\pdfobjcompresslevel=0
+%\pdfminorversion=4
+
+% See the \addtolength command later in the file to balance the column lengths
+% on the last page of the document
+
+% The following packages can be found on http:\\www.ctan.org
+%\usepackage{graphics} % for pdf, bitmapped graphics files
+%\usepackage{epsfig} % for postscript graphics files
+%\usepackage{mathptmx} % assumes new font selection scheme installed
+%\usepackage{times} % assumes new font selection scheme installed
+%\usepackage{amsmath} % assumes amsmath package installed
+%\usepackage{amssymb}  % assumes amsmath package installed
+
+% Draft-only Chinese support. `scheme=plain` preserves the IEEE section style.
+\usepackage[UTF8,scheme=plain,fontset=fandol]{ctex}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{cite}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{microtype}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{multirow}
+\usepackage{balance}
+\usepackage{tabularx}
+\usepackage{array}
+
+
+\title{\LARGE \bf
+Preparation of Papers for IEEE Sponsored Conferences \& Symposia*
+}
+
+
+\author{Albert Author$^{1}$ and Bernard D. Researcher$^{2}$% <-this % stops a space
+\thanks{*This work was not supported by any organization}% <-this % stops a space
+\thanks{$^{1}$Albert Author is with Faculty of Electrical Engineering, Mathematics and Computer Science,
+        University of Twente, 7500 AE Enschede, The Netherlands
+        {\tt\small albert.author@papercept.net}}%
+\thanks{$^{2}$Bernard D. Researcheris with the Department of Electrical Engineering, Wright State University,
+        Dayton, OH 45435, USA
+        {\tt\small b.d.researcher@ieee.org}}%
+}
+
+
+\begin{document}
+
+
+
+\maketitle
+\thispagestyle{empty}
+\pagestyle{empty}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{abstract}
+
+This electronic document is a ÒliveÓ template. The various components of your paper [title, text, heads, etc.] are already defined on the style sheet, as illustrated by the portions given in this document.
+
+\end{abstract}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{INTRODUCTION}
+
+通常，相机标定通过已知的几何机构平面，并根据目标特征的图像位置估计相机内参和位姿。棋盘格和Aprilgrid
+等单平面标定板因结构简单、特征易于识别而被广泛使用。在ordinary lenses下，通过平移和旋转单板标定板，
+可以获得足够的观测以约束相机模型。对于wide-angle lenses，情况则更加困难。其投影模型具有较强的非线性，
+标定的稳定性高度依赖可靠的初始化。当观测仅覆盖有效的径向范围，焦距尺度与畸变系数可能会产生相似的像素变化，使得这些参数难以分离，
+并导致病态的线性化更新。这表明，大视场标定不仅需要足够数量的特征，还需要观测跨越不同径向区域，从而为焦距与投影模型参数提供更具区分力的几何约束。
+
+然而，单块平面目标在每个视角中仅形成有限且连续的图像支撑区域，其径向覆盖受到目标投影范围的限制。扩大目标的投
+影范围虽然能够增加径向跨度，但也会使同一目标跨越投影变化更强的区域，对特征检测和亚像素定位提出更高要求。已有宽
+视场标定研究表明，严重畸变会降低传统目标检测与特征精化的可靠性，而借助中间相机模型进行目标重投影和自适应精化
+可以恢复更多有效观测。 因此，单板采集面临径向覆盖与观测可靠性之间的实际权衡，需要一种能够在不同视场区域布置可
+靠观测、同时保持局部检测稳定性的标定框架。
+
+Building on this analysis, 我们采用多个具有唯一编码的单 AprilTag 板作为可独立识别的标定单元，并将其
+分布在不同视场和径向区域。与特征集中在单一连续目标区域内的棋盘格或 AprilGrid 不同，该设计允许多块标定板在同
+一幅图像中被独立检测和关联，从而扩大观测的空间与径向覆盖，而无需依赖一个连续的大尺寸目标跨越多个强投影变化区域。
+不过，单个 AprilTag 只能提供四个稀疏的角点，本文将其成为 outer corners。为获得更密集的约束，我们进一步利用
+intermediate camera model 预测Tag平面上内部晶格特征的图像位置，并结合局部图像特征对其进行定位和refinement。
+由此，分布广泛但局部稀疏的外角点观测被扩展为不同视场区域中的密集且几何一致的标定观测。基于这些设计，我们构建了一个
+面向大视场中心相机的多板标定系统，将分布式目标检测、密集观测构建和相机标定集成到统一流程中。
+
+
+基于上述观察，我们采用多个具有唯一编码的单 AprilTag 板作为可独立识别的标定单元，并将其分布在不同视场和径向区域。
+与特征集中于单一连续目标区域的棋盘格或 AprilGrid 不同，该设计允许多块标定板在同一幅图像中被独立检测和关联，从而
+扩大观测的空间与径向覆盖，而无需依赖单个大尺寸目标跨越多个投影变化显著的区域。每个 AprilTag 直接提供四个稀疏角点
+，本文将其称为 outer corners。为提高每幅图像所提供的局部观测密度，我们进一步利用
+ intermediate camera model 预测 Tag 平面上预定义内部晶格特征的图像位置，并结合局部图像证据对其进行定位和 refine
+ ment。由此，空间分布广泛但局部稀疏的外角点观测被扩展为不同视场区域中的密集且几何一致的标定观测，从而降低标定对大量图像
+ 和特定数据选择的依赖。基于这些设计，我们构建了一套面向大视场中心相机的多板标定系统，将分布式目标检测、密集观测恢复与相机标定集成到统一流程中。
+
+Our main contributions are summarized as follows:
+
+\begin{itemize}
+\setlength{\itemsep}{1pt}
+\setlength{\parskip}{0pt}
+\setlength{\parsep}{0pt}
+\item We present an open-source, easy-to-deploy, and flexible multi-board
+calibration system for wide-angle central cameras. The system supports
+multiple uniquely coded single-AprilTag boards with flexible spatial
+placement and independent orientations, allowing the target layout to be
+adapted to different camera configurations and calibration environments.
+
+\item 针对大视场标定中观测空间分布不足、局部约束稀疏以及高畸变区域特征定位不稳定的问题，
+我们提出一种分布式多板设计及中间相机模型辅助的内部特征定位与精化方法。分布式标定板扩大了
+观测的空间与径向覆盖，而中间模型辅助定位进一步在各视场区域形成密集且几何一致的标定约束。
+
+\item 我们通过跨后端与独立测试集实验表明，仅使用稀疏外部角点时，优化可能在保持相近重
+投影误差的同时得到显著偏移的内参，或在更灵活的相机模型下失效；稠密内部观测能够减少参数歧
+义，提高标定结果的一致性与求解可靠性。
+
+We evaluate the method on several datasets and camera models through held-out
+reprojection, ablation, cross-backend calibration, and camera pose estimation
+experiments.
+
+\section{}
+
+\subsection{Selecting a Template (Heading 2)}
+
+First, confirm that you have the correct template for your paper size. This template has been tailored for output on the US-letter paper size. 
+It may be used for A4 paper size if the paper size setting is suitably modified.
+
+\subsection{Maintaining the Integrity of the Specifications}
+
+The template is used to format your paper and style the text. All margins, column widths, line spaces, and text fonts are prescribed; please do not alter them. You may note peculiarities. For example, the head margin in this template measures proportionately more than is customary. This measurement and others are deliberate, using specifications that anticipate your paper as one part of the entire proceedings, and not as an independent document. Please do not revise any of the current designations
+
+\section{MATH}
+
+\begin{table*}[t]
+\centering
+\caption{Reprojection performance on two held-out multi-board sets and one checkerboard set. Metrics are reported as RMSE [px], P95 [px], and Inlier@1px [\%].}
+\label{tab:reprojection_comparison}
+\scriptsize
+\renewcommand{\arraystretch}{1.06}
+\setlength{\tabcolsep}{2.6pt}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}clccccccccc@{}}
+\toprule
+\multirow{2}{*}{Model} & \multirow{2}{*}{Method}
+& \multicolumn{3}{c}{Multi-Board Set 1}
+& \multicolumn{3}{c}{Multi-Board Set 2}
+& \multicolumn{3}{c}{Checkerboard Set} \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-8}\cmidrule(lr){9-11}
+& & RMSE $\downarrow$ & P95 $\downarrow$ & Inl. $\uparrow$
+  & RMSE $\downarrow$ & P95 $\downarrow$ & Inl. $\uparrow$
+  & RMSE $\downarrow$ & P95 $\downarrow$ & Inl. $\uparrow$ \\
+\midrule
+\multirow{4}{*}{DS}
+& \textbf{Ours}       & \textbf{0.523} & \textbf{0.990} & \textbf{95.1} & \textbf{0.634} & \textbf{1.378} & \textbf{88.2} & -- & -- & -- \\
+& Kalibr              & 0.600 & 1.093 & 92.6 & 0.806 & 1.638 & 84.2 & -- & -- & -- \\
+& TartanCalib         & 0.623 & 1.155 & 91.7 & 0.814 & 1.671 & 83.7 & -- & -- & -- \\
+& BabelCalib          & 0.618 & 1.147 & 91.7 & 0.848 & 1.682 & 83.6 & -- & -- & -- \\
+\addlinespace[2pt]
+
+\multirow{6}{*}{KB}
+& \textbf{Ours}       & \textbf{0.522} & \textbf{0.984} & \textbf{95.3} & \textbf{0.631} & \textbf{1.375} & \textbf{88.5} & -- & -- & -- \\
+& Kalibr              & 0.599 & 1.092 & 92.7 & 0.761 & 1.585 & 84.8 & -- & -- & -- \\
+& TartanCalib         & 0.619 & 1.140 & 91.8 & 0.782 & 1.595 & 84.6 & -- & -- & -- \\
+& CamOdoCal           & 0.605 & 1.119 & 92.5 & 0.763 & 1.587 & 85.0 & -- & -- & -- \\
+& BabelCalib          & 0.617 & 1.147 & 91.8 & 0.792 & 1.628 & 84.2 & -- & -- & -- \\
+& OpenCV fisheye      & 0.583 & 1.071 & 93.1 & 0.760 & 1.570 & 85.2 & -- & -- & -- \\
+\addlinespace[2pt]
+
+\multirow{6}{*}{\shortstack{UCM\\/ Mei}}
+& \textbf{Ours}       & \textbf{0.520} & \textbf{0.989} & \textbf{95.2} & \textbf{0.636} & \textbf{1.377} & \textbf{88.3} & -- & -- & -- \\
+& Kalibr              & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+& TartanCalib         & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+& CamOdoCal           & 0.605 & 1.110 & 92.6 & 0.816 & 1.645 & 83.9 & -- & -- & -- \\
+& BabelCalib          & 0.737 & 1.335 & 87.5 & 1.207 & 1.756 & 83.7 & -- & -- & -- \\
+& OpenCV omnidir      & 0.606 & 1.108 & 92.2 & 0.852 & 1.686 & 83.6 & -- & -- & -- \\
+\addlinespace[2pt]
+
+\multirow{4}{*}{EUCM}
+& \textbf{Ours}       & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+& Kalibr              & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+& TartanCalib         & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+& BabelCalib          & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular*}
+\end{table*}
+
+Before you begin to format your paper, first write and save the content as a separate text file. Keep your text and graphic files separate until after the text has been formatted and styled. Do not use hard tabs, and limit use of hard returns to only one return at the end of a paragraph. Do not add any kind of pagination anywhere in the paper. Do not number text heads-the template will do that for you.
+
+Finally, complete content and organizational editing before formatting. Please take note of the following items when proofreading spelling and grammar:
+
+\subsection{Abbreviations and Acronyms} Define abbreviations and acronyms the first time they are used in the text, even after they have been defined in the abstract. Abbreviations such as IEEE, SI, MKS, CGS, sc, dc, and rms do not have to be defined. Do not use abbreviations in the title or heads unless they are unavoidable.
+
+\subsection{Units}
+
+\begin{itemize}
+
+\item Use either SI (MKS) or CGS as primary units. (SI units are encouraged.) English units may be used as secondary units (in parentheses). An exception would be the use of English units as identifiers in trade, such as Ò3.5-inch disk driveÓ.
+\item Avoid combining SI and CGS units, such as current in amperes and magnetic field in oersteds. This often leads to confusion because equations do not balance dimensionally. If you must use mixed units, clearly state the units for each quantity that you use in an equation.
+\item Do not mix complete spellings and abbreviations of units: ÒWb/m2Ó or Òwebers per square meterÓ, not Òwebers/m2Ó.  Spell out units when they appear in text: Ò. . . a few henriesÓ, not Ò. . . a few HÓ.
+\item Use a zero before decimal points: Ò0.25Ó, not Ò.25Ó. Use Òcm3Ó, not ÒccÓ. (bullet list)
+
+\end{itemize}
+
+
+\subsection{Equations}
+
+The equations are an exception to the prescribed specifications of this template. You will need to determine whether or not your equation should be typed using either the Times New Roman or the Symbol font (please no other font). To create multileveled equations, it may be necessary to treat the equation as a graphic and insert it into the text after your paper is styled. Number equations consecutively. Equation numbers, within parentheses, are to position flush right, as in (1), using a right tab stop. To make your equations more compact, you may use the solidus ( / ), the exp function, or appropriate exponents. Italicize Roman symbols for quantities and variables, but not Greek symbols. Use a long dash rather than a hyphen for a minus sign. Punctuate equations with commas or periods when they are part of a sentence, as in
+
+$$
+\alpha + \beta = \chi \eqno{(1)}
+$$
+
+Note that the equation is centered using a center tab stop. Be sure that the symbols in your equation have been defined before or immediately following the equation. Use Ò(1)Ó, not ÒEq. (1)Ó or Òequation (1)Ó, except at the beginning of a sentence: ÒEquation (1) is . . .Ó
+
+\subsection{Some Common Mistakes}
+\begin{itemize}
+
+
+\item The word ÒdataÓ is plural, not singular.
+\item The subscript for the permeability of vacuum ?0, and other common scientific constants, is zero with subscript formatting, not a lowercase letter ÒoÓ.
+\item In American English, commas, semi-/colons, periods, question and exclamation marks are located within quotation marks only when a complete thought or name is cited, such as a title or full quotation. When quotation marks are used, instead of a bold or italic typeface, to highlight a word or phrase, punctuation should appear outside of the quotation marks. A parenthetical phrase or statement at the end of a sentence is punctuated outside of the closing parenthesis (like this). (A parenthetical sentence is punctuated within the parentheses.)
+\item A graph within a graph is an ÒinsetÓ, not an ÒinsertÓ. The word alternatively is preferred to the word ÒalternatelyÓ (unless you really mean something that alternates).
+\item Do not use the word ÒessentiallyÓ to mean ÒapproximatelyÓ or ÒeffectivelyÓ.
+\item In your paper title, if the words Òthat usesÓ can accurately replace the word ÒusingÓ, capitalize the ÒuÓ; if not, keep using lower-cased.
+\item Be aware of the different meanings of the homophones ÒaffectÓ and ÒeffectÓ, ÒcomplementÓ and ÒcomplimentÓ, ÒdiscreetÓ and ÒdiscreteÓ, ÒprincipalÓ and ÒprincipleÓ.
+\item Do not confuse ÒimplyÓ and ÒinferÓ.
+\item The prefix ÒnonÓ is not a word; it should be joined to the word it modifies, usually without a hyphen.
+\item There is no period after the ÒetÓ in the Latin abbreviation Òet al.Ó.
+\item The abbreviation Òi.e.Ó means Òthat isÓ, and the abbreviation Òe.g.Ó means Òfor exampleÓ.
+
+\end{itemize}
+
+
+\section{USING THE TEMPLATE}
+
+\begin{table*}[t]
+\centering
+\caption{
+Cross-backend verification on the held-out multi-board and independent
+checkerboard test sets. BabelCalib uses the same detected observations
+and target geometry as ours.
+}
+\label{tab:cross_backend_verification}
+
+\footnotesize
+\setlength{\tabcolsep}{3.2pt}
+\renewcommand{\arraystretch}{1.08}
+
+\begin{tabularx}{\textwidth}{
+@{}
+l
+>{\raggedright\arraybackslash}p{3.75cm}
+@{\hspace{1pt}}
+c
+c
+>{\centering\arraybackslash}X
+c
+c
+@{}
+}
+\toprule
+\multirow{2}{*}{Model}
+& \multirow{2}{*}{Method / Observations}
+& \multirow{2}{*}{$f_u / f_v$}
+& \multirow{2}{*}{$c_u / c_v$}
+& \multirow{2}{*}{Model Params.}
+& \multicolumn{2}{c}{Test RMSE [px] $\downarrow$} \\
+\cmidrule(lr){6-7}
+&
+&
+&
+&
+& Multi-board
+& Checkerboard \\
+\midrule
+
+\multirow{3}{*}{DS}
+& Ours
+& 1175.65 / 1175.29
+& 2242.88 / 2275.61
+& $[-0.1905,\ 0.6171]$
+& \textbf{0.5228}
+& \textbf{0.5918} \\
+
+& BabelCalib w/ Outer+Internal
+& 1176.56 / 1175.92
+& 2242.90 / 2275.63
+& $[-0.1914,\ 0.6175]$
+& 0.5293
+& 0.6020 \\
+
+& BabelCalib w/ Outer4 only
+& 1943.49 / 1943.08
+& 2242.91 / 2275.67
+& $[0.3401,\ 0.8048]$
+& $0.5256^{\dagger}$
+& -- \\
+
+\midrule
+
+\multirow{3}{*}{KB}
+& Ours
+& 1451.58 / 1451.10
+& 2242.37 / 2275.38
+& $[-0.0197,\ 0.0010,\ -0.0032,\ 0.0006]$
+& \textbf{0.5216}
+& \textbf{0.5960} \\
+
+& BabelCalib w/ Outer+Internal
+& 1454.52 / 1453.74
+& 2242.91 / 2275.65
+& $[-0.0196,\ -0.0018,\ -0.0007,\ -0.0001]$
+& 0.5286
+& 0.6052 \\
+
+& BabelCalib w/ Outer4 only
+& --
+& --
+& --
+& --
+& -- \\
+
+\bottomrule
+\end{tabularx}
+
+\vspace{2pt}
+\parbox{\textwidth}{
+\scriptsize
+$^\dagger$ The Outer4-only setting achieves a comparable multi-board
+test RMSE but converges to a substantially shifted intrinsic parameterization.
+}
+\end{table*}
+
+\begin{table}[t]
+\centering
+\caption{Internal-observation ablation under a fixed split and backend. Max. error denotes the maximum frame--board RMSE.}
+\label{tab:internal_seed_ablation}
+\footnotesize
+\setlength{\tabcolsep}{1.5pt}
+\renewcommand{\arraystretch}{1.05}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Method
+& \shortstack{Reproj.\\[-1pt]Err. [px] $\downarrow$}
+& \shortstack{Outer\\[-1pt]Err. [px] $\downarrow$}
+& \shortstack{Internal\\[-1pt]Err. [px] $\downarrow$}
+& \shortstack{Max.\\[-1pt]Err. [px] $\downarrow$} \\
+\midrule
+Outer-only & 0.5251 & \textbf{0.1002} & 0.5582 & 1.679 \\
+Local Pinhole & 4.3647 & 0.1089 & 4.6499 & 50.353 \\
+\textbf{Ours} & \textbf{0.5243} & 0.1030 & \textbf{0.5572} & \textbf{1.678} \\
+\bottomrule
+\end{tabular}
+\end{table}
+Use this sample document as your LaTeX source file to create your document. Save this file as {\bf root.tex}. You have to make sure to use the cls file that came with this distribution. If you use a different style file, you cannot expect to get required margins. Note also that when you are creating your out PDF file, the source file is only part of the equation. {\it Your \TeX\ $\rightarrow$ PDF filter determines the output file size. Even if you make all the specifications to output a letter file in the source - if your filter is set to produce A4, you will only get A4 output. }
+
+It is impossible to account for all possible situation, one would encounter using \TeX. If you are using multiple \TeX\ files you must make sure that the ``MAIN`` source file is called root.tex - this is particularly important if your conference is using PaperPlaza's built in \TeX\ to PDF conversion tool.
+
+\subsection{Headings, etc}
+
+Text heads organize the topics on a relational, hierarchical basis. For example, the paper title is the primary text head because all subsequent material relates and elaborates on this one topic. If there are two or more sub-topics, the next level head (uppercase Roman numerals) should be used and, conversely, if there are not at least two sub-topics, then no subheads should be introduced. Styles named ÒHeading 1Ó, ÒHeading 2Ó, ÒHeading 3Ó, and ÒHeading 4Ó are prescribed.
+
+\subsection{Figures and Tables}
+
+Positioning Figures and Tables: Place figures and tables at the top and bottom of columns. Avoid placing them in the middle of columns. Large figures and tables may span across both columns. Figure captions should be below the figures; table heads should appear above the tables. Insert figures and tables after they are cited in the text. Use the abbreviation ÒFig. 1Ó, even at the beginning of a sentence.
+
+% Table 4: single-column residual-objective evaluation.
+% Generated by scripts/generate_residual_mode_multiset_table.py.
+% Values are read from Stage5 result summaries; do not edit manually.
+\begin{table}[t]
+\centering
+\caption{Residual-objective ablation under the Double Sphere model.}
+\label{tab:residual_mode_multiset}
+\small
+\setlength{\tabcolsep}{1.6pt}
+\renewcommand{\arraystretch}{1.03}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\multicolumn{5}{@{}l}{\textit{(a) Holdout image-plane accuracy}} \\
+Residual & Seq. A & Seq. B & Seq. C & Mean \\
+ & \multicolumn{4}{c}{Reprojection RMSE [px] $\downarrow$} \\
+\midrule
+Pixel & 0.5193 & 0.5042 & 0.5269 & 0.5168 \\
+Spherical & 0.5195 & \textbf{0.5035} & 0.5269 & 0.5167 \\
+Hybrid & \textbf{0.5191} & 0.5042 & \textbf{0.5266} & \textbf{0.5166} \\
+\addlinespace[1pt]
+Kalibr (DS) & 0.6284 & 0.5666 & 0.6386 & 0.6112 \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{(b) View-angle-conditioned ray accuracy}} \\
+Residual & $0$--$30^{\circ}$ & $30$--$50^{\circ}$ & $\geq 50^{\circ}$ & Overall \\
+ & \multicolumn{4}{c}{True angular RMSE [mrad] $\downarrow$} \\
+\midrule
+Pixel & 0.3204 & 0.3493 & 0.4117 & 0.3488 \\
+Spherical & 0.3205 & \textbf{0.3489} & \textbf{0.4107} & \textbf{0.3486} \\
+Hybrid & \textbf{0.3202} & 0.3491 & 0.4114 & 0.3486 \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{(c) Cross-sequence geometric stability and cost}} \\
+Residual & Overall & Outer & Cross-seq. & BA time \\
+ & RMSE [px] & RMSE [px] & ray RMS [deg] & [s] \\
+\midrule
+Pixel & 0.5168 & \textbf{0.1255} & 0.2334 & \textbf{1.0} \\
+Spherical & 0.5167 & 0.1275 & \textbf{0.2237} & 10.3 \\
+Hybrid & \textbf{0.5166} & 0.1277 & 0.2281 & 12.6 \\
+\bottomrule
+\end{tabular}
+\vspace{2pt}
+\parbox{\columnwidth}{\footnotesize \textit{Protocol.} Polar bins are assigned once using the shared initialization camera. Cross-seq. ray RMS is the pairwise ray-curve disagreement over 1,422 shared image locations (4,266 ray pairs). BA time is the mean incremental-optimization runtime. All metrics are lower-is-better.}
+\end{table}
+
+
+
+   \begin{figure}[thpb]
+      \centering
+      \framebox{\parbox{3in}{We suggest that you use a text box to insert a graphic (which is ideally a 300 dpi TIFF or EPS file, with all fonts embedded) because, in an document, this method is somewhat more stable than directly inserting a picture.
+}}
+      %\includegraphics[scale=1.0]{figurefile}
+      \caption{Inductance of oscillation winding on amorphous
+       magnetic core versus DC bias magnetic field}
+      \label{figurelabel}
+   \end{figure}
+   
+
+Figure Labels: Use 8 point Times New Roman for Figure labels. Use words rather than symbols or abbreviations when writing Figure axis labels to avoid confusing the reader. As an example, write the quantity ÒMagnetizationÓ, or ÒMagnetization, MÓ, not just ÒMÓ. If including units in the label, present them within parentheses. Do not label axes only with units. In the example, write ÒMagnetization (A/m)Ó or ÒMagnetization {A[m(1)]}Ó, not just ÒA/mÓ. Do not label axes with a ratio of quantities and units. For example, write ÒTemperature (K)Ó, not ÒTemperature/K.Ó
+
+\section{CONCLUSIONS}
+
+A conclusion section is not required. Although a conclusion may review the main points of the paper, do not replicate the abstract as the conclusion. A conclusion might elaborate on the importance of the work or suggest applications and extensions. 
+
+\addtolength{\textheight}{-12cm}   % This command serves to balance the column lengths
+                                  % on the last page of the document manually. It shortens
+                                  % the textheight of the last page by a suitable amount.
+                                  % This command does not take effect until the next page
+                                  % so it should come on the page before the last. Make
+                                  % sure that you do not shorten the textheight too much.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section*{APPENDIX}
+
+Appendixes should appear before the acknowledgment.
+
+\section*{ACKNOWLEDGMENT}
+
+The preferred spelling of the word ÒacknowledgmentÓ in America is without an ÒeÓ after the ÒgÓ. Avoid the stilted expression, ÒOne of us (R. B. G.) thanks . . .Ó  Instead, try ÒR. B. G. thanksÓ. Put sponsor acknowledgments in the unnumbered footnote on the first page.
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+References are important to the reader; therefore, each citation must be complete and correct. If at all possible, references should be commonly available publications.
+
+
+
+\begin{thebibliography}{99}
+
+\bibitem{c1} G. O. Young, ÒSynthetic structure of industrial plastics (Book style with paper title and editor),Ó 	in Plastics, 2nd ed. vol. 3, J. Peters, Ed.  New York: McGraw-Hill, 1964, pp. 15Ð64.
+
+
+
+
+
+\end{thebibliography}
+
+
+
+
+\end{document}

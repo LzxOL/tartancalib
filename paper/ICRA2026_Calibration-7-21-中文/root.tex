@@ -1,0 +1,817 @@
+% !TeX program = xelatex
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%2345678901234567890123456789012345678901234567890123456789012345678901234567890
+%        1         2         3         4         5         6         7         8
+
+\documentclass[letterpaper, 10 pt, conference]{ieeeconf}  % Comment this line out if you need a4paper
+
+%\documentclass[a4paper, 10pt, conference]{ieeeconf}      % Use this line for a4 paper
+
+\IEEEoverridecommandlockouts                              % This command is only needed if 
+                                                          % you want to use the \thanks command
+
+\overrideIEEEmargins                                      % Needed to meet printer requirements.
+
+%In case you encounter the following error:
+%Error 1010 The PDF file may be corrupt (unable to open PDF file) OR
+%Error 1000 An error occurred while parsing a contents stream. Unable to analyze the PDF file.
+%This is a known problem with pdfLaTeX conversion filter. The file cannot be opened with acrobat reader
+%Please use one of the alternatives below to circumvent this error by uncommenting one or the other
+%\pdfobjcompresslevel=0
+%\pdfminorversion=4
+
+% See the \addtolength command later in the file to balance the column lengths
+% on the last page of the document
+
+% The following packages can be found on http:\\www.ctan.org
+%\usepackage{graphics} % for pdf, bitmapped graphics files
+%\usepackage{epsfig} % for postscript graphics files
+%\usepackage{mathptmx} % assumes new font selection scheme installed
+%\usepackage{times} % assumes new font selection scheme installed
+%\usepackage{amsmath} % assumes amsmath package installed
+%\usepackage{amssymb}  % assumes amsmath package installed
+
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[utf8]{inputenc}
+  \usepackage[T1]{fontenc}
+\else
+  \usepackage{fontspec}
+  \usepackage{xeCJK}
+  \setCJKmainfont{Songti SC}
+  \setCJKsansfont{Heiti SC}
+  \setCJKmonofont{Songti SC}
+  \XeTeXlinebreaklocale "zh"
+  \XeTeXlinebreakskip=0pt plus 1pt
+\fi
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{cite}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{microtype}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{multirow}
+\usepackage{balance}
+\usepackage{tabularx}
+\usepackage{array}
+
+
+\title{\LARGE \bf
+Preparation of Papers for IEEE Sponsored Conferences \& Symposia*
+}
+
+
+\author{Albert Author$^{1}$ and Bernard D. Researcher$^{2}$% <-this % stops a space
+\thanks{*This work was not supported by any organization}% <-this % stops a space
+\thanks{$^{1}$Albert Author is with Faculty of Electrical Engineering, Mathematics and Computer Science,
+        University of Twente, 7500 AE Enschede, The Netherlands
+        {\tt\small albert.author@papercept.net}}%
+\thanks{$^{2}$Bernard D. Researcheris with the Department of Electrical Engineering, Wright State University,
+        Dayton, OH 45435, USA
+        {\tt\small b.d.researcher@ieee.org}}%
+}
+
+
+\begin{document}
+
+
+
+\maketitle
+\thispagestyle{empty}
+\pagestyle{empty}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{abstract}
+
+This electronic document is a ÒliveÓ template. The various components of your paper [title, text, heads, etc.] are already defined on the style sheet, as illustrated by the portions given in this document.
+
+\end{abstract}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{INTRODUCTION}
+
+宽视场中心相机，如鱼眼相机，能够在单幅图像中覆盖更大的场景角度范围，为视觉里程计、三维重建等几何
+视觉任务提供更广的场景可见范围。然而，额外的视场只有在像素位置与空间入射射线之间的映射得到准确估
+计时，才能转化为可靠的几何信息。与普通视场相机相比，宽视场相机标定主要面临两方面困难：一方面，其
+投影模型具有更强的非线性，对模型选择、参数初始化和非线性优化提出了更高要求；另一方面，视场外围显
+著的投影变化和图像形变增加了标定目标检测与特征定位的难度。因此，现有研究主要沿两条互补路线展开，
+即改进宽视场相机模型及其参数求解，以及提高标定特征和输入观测的质量。
+
+本文主要关注后一条路线，并从平面标定目标所提供的观测约束出发。通常，相机标定通过已知几何的平面标定目标，并根据目
+标特征的图像位置估计相机内参和位姿。棋盘格和Aprilgrid
+等单平面标定板因结构简单、特征易于识别而被广泛使用。在ordinary lenses下，通过平移和旋转单板标定板，
+可以获得足够的观测以约束相机模型。对于wide-angle lenses，情况则更加困难。其投影模型具有较强的非线性，
+标定的稳定性高度依赖可靠的初始化。当观测仅覆盖有限的径向范围，焦距尺度与畸变系数可能会产生相似的像素变化，使得这些参数难以分离，
+并导致病态的线性化更新。这表明，大视场标定不仅需要足够数量的特征，还需要观测跨越不同径向区域，从而为焦距与投影模型参数提供更具区分力的几何约束。
+
+然而，利用单块连续平面目标同时获得广泛的图像域覆盖和可靠的局部观测并不容易，其径向覆盖受到目标投影范围的限制。扩大目标的投
+影范围虽然能够增加径向跨度，但也会使同一目标跨越投影变化更强的区域，对特征检测和亚像素定位提出更高要求。已有宽
+视场标定研究表明，严重畸变会降低传统目标检测与特征精化的可靠性，而借助中间相机模型进行目标重投影和自适应精化
+可以恢复更多有效观测。 因此，单板采集面临径向覆盖与观测可靠性之间的实际权衡，需要一种能够在不同视场区域布置可
+靠观测、同时保持局部检测稳定性的标定框架。
+
+Building on this analysis, 我们采用多个具有唯一编码的单
+AprilTag 板作为可独立识别的标定单元，并将其分布在不同视场
+和径向区域。与特征集中在单一连续目标区域内的棋盘格或
+AprilGrid 不同，该设计允许多块标定板在同一幅图像中被独立
+检测和关联，从而扩大观测的空间与径向覆盖，而无须依赖一个
+连续的大尺寸目标跨越多个强投影变化区域。
+
+
+单个 AprilTag 只能提供四个稀疏角点，本文将其记为
+Outer4。我们首先使用大分布式的 Outer4 初始化得到
+的 intermediate camera model、帧位姿和板间几
+何。随后，利用该中间模型在 viewin
+g-ray domain 中构造 Tag 平面内部晶格点的初始位置，并结合局部图像信息进行定位和 refinement。由此，
+最终，两类观测被共同纳入统一的多板 Bun
+dle Adjustment：分布式 Outer4 提供跨视场的广域支撑并建立可靠的
+初始几何，而恢复的内部格点进一步密化各局部目标区域中的几何约束，共
+同支持宽视场投影模型的可靠细化。基于这一方法，我们构建了一个面向宽视
+场中心相机的完整多板标定系统，将多板检测与关联、内部观测恢复以及联合参数优化集成到统一流程中。
+
+Our main contributions are summarized as follows:
+
+\begin{itemize}
+\setlength{\itemsep}{1pt}
+\setlength{\parskip}{0pt}
+\setlength{\parsep}{0pt}
+\item We present an open-source, easy-to-deploy, and flexible multi-board
+calibration system for wide-angle central cameras.
+\item To address insufficient spatial coverage of calibration observations and unreliable feature refinement, we propose a distributed multi-board design based on single AprilTags, together with an intermediate-model-assisted internal lattice-point refinement method. On the evaluated sequence, the distributed design improves occupied-grid coverage by $14.6$ percentage points under the same frame--board budget.
+\item 我们在相同的 Outer4 初始化条件下，通过受控分析隔离恢复的内部格点观测所带来的作用。
+结果表明，局部观测密化能够提供互补约束，使宽视场投影模型得到更准确、更加符合真实几何的估计。
+\end{itemize}
+
+Tests on several datasets and camera models cover reprojection error, ablations,
+cross-backend calibration, and held-out pose estimation. The results show
+reliable calibration and competitive accuracy.
+
+\section{Related Work}
+
+\subsection{宽视场相机模型与标定方法}
+
+典型的相机标定流程需要首先选择参数化或通用相机模型，并根据目标观测估计相应的模型参数。由于宽视场镜头的投影显著偏离传统透视模型，已有研究提出了多种面向鱼眼和
+中心全向相机的投影模型。常用的低维参数模型包括 FOV、Kannala--Brandt、统一相机模型及其扩展，以及 Double Sphere 等
+\cite{ref03,ref04,ref05,ref07,ref08}。参数模型通常使用较少的自由度，以紧凑形式描述宽视场投影。多项式和通用相机模型则使用更高维的参数化方式，直接建立像素与空间射线之间的映射
+\cite{ref06,ref09,ref10}。前者便于参数估计和后续使用，后者减少了对特定解析投影形式的依赖，但需要估计更多模型参数~\cite{usenko2018double}
+
+现有标定工具从不同角度支持宽视场模型的实际估计。
+OpenCV 提供基于入射角多项式模型的鱼眼相机标定与校正接口，因接口成熟且易于使用而被广泛采用
+\cite{ref0opencv}；OCamCalib 是面向中心全向相机的经典标定工具箱，采用
+多项式成像模型和棋盘格目标完成标定\cite{ref06}。
+广泛使用的 Kalibr 将多种投影与畸变模型、
+标定目标以及多相机内外参估计整合到统一工具链中
+\cite{ref11}。BabelCalib 面向一般中心相机，通过反投影
+模型初始化、模型间回归和鲁棒估计，提高不同模型族下的
+参数求解稳定性。本文兼容常用的宽视场中心相机模型，但关注
+的重点是如何构造能够覆盖整个成像域的标定观测。
+
+\subsection{标定目标与特征观测}
+
+平面标定通常采用棋盘格、圆点阵列和编码标记。AprilTag、ArUco
+等编码目标通过提供局部身份信息，改善了目标关联和部分可见条件下的检测
+\cite{ref13,ref14,ref15,ref16}。其他目标设计则关注控制点密度和定位精度。例如，Deltille Grid 使用三角形平铺和局部曲面拟合
+\cite{ref17}，圆形编码目标则利用投影几何在复杂视角下实现精确定位
+\cite{ref18}。
+
+然而，视场外围的显著形变仍会降低目标检测和亚像素定位的可靠性。
+TartanCalib 利用中间相机模型重投影连续 AprilTag 网格，并根据目标的投影外观自适应精化特征
+\cite{ref19}。CO-Calib 则结合学习式目标检测器和分析引导的帧选择器，以提高目标检测能力并构造适合初始化的观测集合
+\cite{ref20}。作为学习式方法，其性能可能依赖训练数据对实际相机、目标外观、打印质量和照明条件的覆盖，跨成像域的稳定性仍需进一步验证。
+
+本文同样利用中间模型，但在目标组织和观测构造方面有所不同。我们将具有唯一编码的单 AprilTag 板分布于不同的图像位置和径向区域，而不是在单个连续网格上精化已有特征，也不需要训练针对特定任务的角点检测器。每块板仅有四个外角点参与相机模型、帧位姿及板间几何的初始化，本文将其记为 Outer4；内部晶格观测在初始化完成后才于 viewing-ray domain 中恢复，因此不参与初始模型的建立。
+
+\subsection{多板标定与观测设计}
+
+多个标定目标已被用于增强复杂相机系统中的几何连接。CALICO
+利用刚性 pattern rig 标定视场不重叠或观测不同步的相机网络
+\cite{ref21}。MC-Calib 支持任意数量的编码标定板，并通过渐进式估计恢复相机和目标位姿
+\cite{ref22}。Meta-Calib 将 ArUco 编码与高精度控制点结合，支持单板和多板配置
+\cite{ref23}。BabelCalib 同样能够处理多块平面目标、部分可见观测和未知板间变换
+\cite{ref12}。这些方法主要利用多目标建立相机间连接、恢复目标几何或支持复杂的多相机配置。
+
+标定观测的采集也可以从参数不确定性的角度进行设计。AprilCal
+根据当前标定状态推荐后续目标姿态
+\cite{ref24}，Calibration Wizard 则选择能够最大程度降低内参预期不确定性的目标位姿
+\cite{ref25}。近期，CO-Calib 指出，检测数量和简单的图像平面分布并不足以解释多鱼眼标定失败；当观测仅覆盖有限的径向范围时，焦距尺度与鱼眼投影形状参数可能产生耦合，并导致条件不良的初始化更新
+\cite{ref20}。
+
+不同于在已有序列中选择信息量较高帧的方法，本文将观测设计前移至标定目标的空间布局。分布式 Outer4 观测建立跨图像域和径向区域的广域支撑，中间模型引导的内部格点恢复则密化各局部目标区域中的几何约束。两类观测最终进入统一的多板 Bundle Adjustment，并分别为初始几何建立和宽视场相机模型细化提供互补约束。
+
+\subsection{Maintaining the Integrity of the Specifications}
+
+The template is used to format your paper and style the text. All margins, column widths, line spaces, and text fonts are prescribed; please do not alter them. You may note peculiarities. For example, the head margin in this template measures proportionately more than is customary. This measurement and others are deliberate, using specifications that anticipate your paper as one part of the entire proceedings, and not as an independent document. Please do not revise any of the current designations
+
+\section{Method}
+
+\subsection{Multi-Board Target Formulation}
+
+Our calibration target consists of $N$ rigid boards, each carrying a
+uniquely coded AprilTag:
+\begin{equation}
+\mathcal{B}=\{B_0,B_1,\ldots,B_{N-1}\},
+\end{equation}
+where $B_0$ is selected as the reference board. Let
+$\mathcal{F}_{B_b}$ denote the local coordinate frame of board $B_b$,
+and let $\mathbf{p}_{b,j}\in\mathbb{R}^3$ denote the $j$-th target point
+expressed in $\mathcal{F}_{B_b}$. The target points include the directly
+detected outer corners and the internal lattice points recovered in
+Sec.~\ref{sec:internal_point_recovery}.
+
+We use $\mathcal{F}_{B_0}$ as the common coordinate frame of the
+multi-board target and fix
+$\mathbf{T}_{B_0B_0}=\mathbf{I}$.
+Let $\mathbf{T}_{B_0B_b}\in SE(3)$ denote the static rigid transform
+from $\mathcal{F}_{B_b}$ to $\mathcal{F}_{B_0}$. For frame $t$, let
+$\mathcal{F}_{C_t}$ be the camera coordinate frame and let
+$\mathbf{T}_{C_tB_0}\in SE(3)$ denote the pose of the reference board
+in $\mathcal{F}_{C_t}$. A point on board $B_b$ is therefore
+expressed in the camera frame as
+\begin{equation}
+\mathbf{x}_{t,b,j}
+=
+\mathbf{T}_{C_tB_0}
+\mathbf{T}_{B_0B_b}
+\mathbf{p}_{b,j}.
+\end{equation}
+
+Given the camera parameters $\boldsymbol{\theta}$ and the projection
+function $\pi(\cdot;\boldsymbol{\theta})$, the predicted image
+location is
+\begin{equation}
+\hat{\mathbf{u}}_{t,b,j}
+=
+\pi\!\left(
+\mathbf{x}_{t,b,j};
+\boldsymbol{\theta}
+\right)
+=
+\pi\!\left(
+\mathbf{T}_{C_tB_0}
+\mathbf{T}_{B_0B_b}
+\mathbf{p}_{b,j};
+\boldsymbol{\theta}
+\right).
+\end{equation}
+The corresponding image observation is denoted by
+$\mathbf{u}_{t,b,j}\in\mathbb{R}^2$. We collect all valid
+observations in
+\begin{equation}
+\mathcal{O}
+=
+\left\{
+(t,b,j,\mathbf{u}_{t,b,j})
+\right\}.
+\end{equation}
+The unknown variables comprise the camera parameters
+$\boldsymbol{\theta}$, the per-frame reference-board poses
+$\{\mathbf{T}_{C_tB_0}\}$, and the static inter-board transforms
+$\{\mathbf{T}_{B_0B_b}\}_{b=1}^{N-1}$.
+
+\subsection{Camera Model Initialization}
+
+At the beginning of calibration, no reliable camera model is available,
+while a usable initialization is important for nonlinear wide-angle
+calibration. The distributed AprilTag boards provide robust outer-corner
+observations across different image and radial regions. We use these
+observations to initialize the camera model. For a given camera-model
+family, we construct an initial parameter vector
+$\boldsymbol{\theta}^{0}$ using the image resolution and model-specific
+default values.
+
+For board $B_b$ observed in frame $t$, let
+$\mathcal{C}^{\mathrm{out}}_{t,b}$ denote its valid outer-corner
+observations. We define the reprojection residual as
+\begin{equation}
+\mathbf{r}^{\mathrm{out}}_{t,b,j}
+(\boldsymbol{\theta},\mathbf{T})
+=
+\mathbf{u}_{t,b,j}
+-
+\pi\!\left(
+\mathbf{T}\mathbf{p}_{b,j};
+\boldsymbol{\theta}
+\right).
+\end{equation}
+Given $\boldsymbol{\theta}^{0}$, a temporary frame--board pose is
+initialized by
+\begin{equation}
+\widetilde{\mathbf{T}}^{0}_{C_tB_b}
+=
+\operatorname*{arg\,min}_{\mathbf{T}\in SE(3)}
+\sum_{j\in\mathcal{C}^{\mathrm{out}}_{t,b}}
+\left\|
+\mathbf{r}^{\mathrm{out}}_{t,b,j}
+(\boldsymbol{\theta}^{0},\mathbf{T})
+\right\|_2^2 .
+\end{equation}
+
+We perform this initialization independently for all valid frame--board
+observations and reject estimates with invalid poses or excessive
+reprojection errors. Let $\mathcal{S}$ denote the retained frame--board
+pairs. We then jointly refine the camera parameters and temporary poses:
+\begin{equation}
+\begin{aligned}
+&\boldsymbol{\theta}^{*},
+\left\{
+\widetilde{\mathbf{T}}^{*}_{C_tB_b}
+\right\}
+\\
+&\quad =
+\operatorname*{arg\,min}_{
+\boldsymbol{\theta},
+\{\widetilde{\mathbf{T}}_{C_tB_b}\}}
+\sum_{(t,b)\in\mathcal{S}}
+\sum_{j\in\mathcal{C}^{\mathrm{out}}_{t,b}}
+\rho\!\left(
+\left\|
+\mathbf{r}^{\mathrm{out}}_{t,b,j}
+\left(
+\boldsymbol{\theta},
+\widetilde{\mathbf{T}}_{C_tB_b}
+\right)
+\right\|_2^2
+\right).
+\end{aligned}
+\end{equation}
+where $\rho(\cdot)$ is a robust loss function. At this stage, the boards
+are not coupled through the unknown inter-board geometry; each valid
+frame--board observation is assigned an independent pose. The optimized
+parameters $\boldsymbol{\theta}^{*}$ initialize the subsequent complete
+multi-board calibration and serve as the intermediate camera model for
+internal-point recovery.
+
+\subsection{Internal Lattice Point Recovery}
+\label{sec:internal_point_recovery}
+
+The outer corners provide stable board localization and are sufficient
+to bootstrap an intermediate camera model. However, the four
+observations from each tag remain locally sparse for final calibration.
+We therefore use the intermediate model to recover image observations
+for predefined internal lattice points, combining model-guided
+prediction with local image evidence.
+
+Given the intermediate camera parameters $\boldsymbol{\theta}^{*}$,
+we reuse the temporary frame--board pose
+$\widetilde{\mathbf{T}}^{*}_{C_tB_b}$ obtained in Sec.~\ref{sec:camera_init}.
+For an internal lattice point
+$\mathbf{p}_{b,j}$, $j\in\mathcal{C}^{\mathrm{int}}_b$, its direct
+geometric projection
+\begin{equation}
+\widehat{\mathbf{u}}^{\mathrm{nom}}_{t,b,j}
+=
+\pi\!\left(
+\widetilde{\mathbf{T}}^{*}_{C_tB_b}
+\mathbf{p}_{b,j};
+\boldsymbol{\theta}^{*}
+\right)
+\label{eq:nominal_internal_prediction}
+\end{equation}
+provides a nominal prediction and is used as a fallback when the
+boundary-based seed described below is unavailable.
+
+To construct the primary seed, we sample support points along the four
+observed tag boundaries and back-project them onto the unit sphere using
+the intermediate camera model. The resulting top, bottom, left, and
+right boundary-ray curves are denoted by
+$\mathbf{r}_{T}(s)$, $\mathbf{r}_{B}(s)$,
+$\mathbf{r}_{L}(t)$, and $\mathbf{r}_{R}(t)$, respectively.
+Let $(s_j,t_j)\in[0,1]^2$ be the normalized horizontal and vertical
+coordinates of $\mathbf{p}_{b,j}$ on the board lattice. We interpolate
+the opposite boundary curves as
+\begin{equation}
+\begin{aligned}
+\mathbf{r}_{v}
+&=
+\operatorname{slerp}\!\left(
+\mathbf{r}_{T}(s_j),
+\mathbf{r}_{B}(s_j),
+t_j
+\right),\\
+\mathbf{r}_{h}
+&=
+\operatorname{slerp}\!\left(
+\mathbf{r}_{L}(t_j),
+\mathbf{r}_{R}(t_j),
+s_j
+\right).
+\end{aligned}
+\label{eq:spherical_boundary_interpolation}
+\end{equation}
+The two interpolated rays are blended and projected back to the image:
+\begin{equation}
+\widetilde{\mathbf{d}}^{\mathrm{int}}_{t,b,j}
+=
+\frac{\mathbf{r}_{v}+\mathbf{r}_{h}}
+{\left\|\mathbf{r}_{v}+\mathbf{r}_{h}\right\|_2},
+\qquad
+\widetilde{\mathbf{u}}^{\mathrm{int}}_{t,b,j}
+=
+\pi\!\left(
+\widetilde{\mathbf{d}}^{\mathrm{int}}_{t,b,j};
+\boldsymbol{\theta}^{*}
+\right).
+\label{eq:internal_point_seed}
+\end{equation}
+
+Starting from $\widetilde{\mathbf{u}}^{\mathrm{int}}_{t,b,j}$, we
+perform a local search in the viewing-ray domain and then refine the
+candidate to subpixel accuracy in the original image. A recovered
+observation is rejected if it falls outside the image, lacks sufficient
+local image evidence, or deviates from its seed by more than a predefined
+threshold. Each accepted observation retains its board and lattice-point
+indices and is added to $\mathcal{O}$ for joint optimization together
+with the outer corners.
+
+\subsection{Spherical Bundle Adjustment}
+
+Standard bundle adjustment minimizes reprojection errors in the image
+plane. For wide-angle cameras, however, the ray deviation corresponding
+to a pixel residual depends on the image location and the local Jacobian
+of the projection model. We therefore provide optional ray-domain and
+hybrid objectives for final refinement.
+
+Given an image observation $\mathbf{u}_{t,b,j}$, we back-project it
+using the current camera parameters and normalize it to obtain the
+observed ray:
+\begin{equation}
+\mathbf{d}^{\mathrm{obs}}_{t,b,j}
+=
+\frac{
+\pi^{-1}(\mathbf{u}_{t,b,j};
+\boldsymbol{\theta})
+}{
+\left\|
+\pi^{-1}(\mathbf{u}_{t,b,j};
+\boldsymbol{\theta})
+\right\|_2
+}.
+\end{equation}
+The corresponding predicted ray is obtained from the transformed target
+point defined in Sec.~IV-A:
+\begin{equation}
+\mathbf{d}^{\mathrm{pred}}_{t,b,j}
+=
+\frac{\mathbf{x}_{t,b,j}}
+{\|\mathbf{x}_{t,b,j}\|_2}.
+\end{equation}
+Let $\mathbf{B}_{t,b,j}\in\mathbb{R}^{3\times2}$ be an orthonormal
+tangent basis at $\mathbf{d}^{\mathrm{obs}}_{t,b,j}$. The local ray
+residual is defined as
+\begin{equation}
+\mathbf{r}^{\mathrm{ray}}_{t,b,j}
+=
+\mathbf{B}_{t,b,j}^{\top}
+\left(
+\mathbf{d}^{\mathrm{pred}}_{t,b,j}
+-
+\mathbf{d}^{\mathrm{obs}}_{t,b,j}
+\right).
+\end{equation}
+This two-dimensional residual preserves the tangential degrees of
+freedom of the ray discrepancy and provides a first-order approximation
+of angular error in the small-residual regime. The observed ray and its
+tangent basis are updated together with the camera parameters during
+optimization.
+
+We additionally define a normalized hybrid residual that balances the
+pixel reprojection residual $\mathbf{r}^{\mathrm{px}}_{t,b,j}$ and the
+ray residual:
+\begin{equation}
+\mathbf{r}^{\mathrm{hyb}}_{t,b,j}
+=
+\begin{bmatrix}
+\sqrt{1-\lambda}\,
+\mathbf{r}^{\mathrm{px}}_{t,b,j}/s_{\mathrm{px}}
+\\
+\sqrt{\lambda}\,
+\mathbf{r}^{\mathrm{ray}}_{t,b,j}/s_{\mathrm{ray}}
+\end{bmatrix},
+\qquad
+\lambda\in[0,1],
+\end{equation}
+where $s_{\mathrm{px}}$ and $s_{\mathrm{ray}}$ are fixed normalization
+scales computed from the median residual magnitudes before final
+refinement. The standard pixel objective is used by default, while the
+ray-domain and hybrid objectives are provided as optional final
+refinement alternatives.
+
+\section{EXPERIMENT}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{pic/corner_distribution_and_coverage_efficiency.png}
+    \caption{xxxxxx}
+    \label{fig:corner_distribution}
+\end{figure}
+
+\begin{table*}[t]
+\centering
+\caption{
+Cross-backend verification on the held-out multi-board and independent
+checkerboard test sets. BabelCalib uses the same detected observations
+and target geometry as ours.
+}
+\label{tab:cross_backend_verification}
+
+\footnotesize
+\setlength{\tabcolsep}{3.2pt}
+\renewcommand{\arraystretch}{1.08}
+
+\begin{tabularx}{\textwidth}{
+@{}
+l
+>{\raggedright\arraybackslash}p{3.75cm}
+@{\hspace{1pt}}
+c
+c
+>{\centering\arraybackslash}X
+c
+c
+@{}
+}
+\toprule
+\multirow{2}{*}{Model}
+& \multirow{2}{*}{Method / Observations}
+& \multirow{2}{*}{$f_u / f_v$}
+& \multirow{2}{*}{$c_u / c_v$}
+& \multirow{2}{*}{Model Params.}
+& \multicolumn{2}{c}{Test RMSE [px] $\downarrow$} \\
+\cmidrule(lr){6-7}
+&
+&
+&
+&
+& Multi-board
+& Checkerboard \\
+\midrule
+
+\multirow{3}{*}{DS}
+& Ours
+& 1175.65 / 1175.29
+& 2242.88 / 2275.61
+& $[-0.1905,\ 0.6171]$
+& \textbf{0.5228}
+& \textbf{0.5918} \\
+
+& BabelCalib w/ Outer+Internal
+& 1176.56 / 1175.92
+& 2242.90 / 2275.63
+& $[-0.1914,\ 0.6175]$
+& 0.5293
+& 0.6020 \\
+
+& BabelCalib w/ Outer4 only
+& 1943.49 / 1943.08
+& 2242.91 / 2275.67
+& $[0.3401,\ 0.8048]$
+& $0.5256^{\dagger}$
+& -- \\
+
+\midrule
+
+\multirow{3}{*}{KB}
+& Ours
+& 1451.58 / 1451.10
+& 2242.37 / 2275.38
+& $[-0.0197,\ 0.0010,\ -0.0032,\ 0.0006]$
+& \textbf{0.5216}
+& \textbf{0.5960} \\
+
+& BabelCalib w/ Outer+Internal
+& 1454.52 / 1453.74
+& 2242.91 / 2275.65
+& $[-0.0196,\ -0.0018,\ -0.0007,\ -0.0001]$
+& 0.5286
+& 0.6052 \\
+
+& BabelCalib w/ Outer4 only
+& --
+& --
+& --
+& --
+& -- \\
+
+\bottomrule
+\end{tabularx}
+
+\vspace{2pt}
+\parbox{\textwidth}{
+\scriptsize
+$^\dagger$ The Outer4-only setting achieves a comparable multi-board
+test RMSE but converges to a substantially shifted intrinsic parameterization.
+}
+\end{table*}
+
+\begin{table}[t]
+\centering
+\caption{Internal-seed ablation with a shared Outer4 initialization.}
+\label{tab:internal_seed_ablation}
+\footnotesize
+\setlength{\tabcolsep}{1.5pt}
+\renewcommand{\arraystretch}{1.05}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Method
+& \shortstack{Reproj.\\[-1pt]Err. [px] $\downarrow$}
+& \shortstack{Outer\\[-1pt]Err. [px] $\downarrow$}
+& \shortstack{Internal\\[-1pt]Err. [px] $\downarrow$}
+& \shortstack{Max.\\[-1pt]Err. [px] $\downarrow$} \\
+\midrule
+Outer-only & 0.5251 & \textbf{0.1002} & 0.5582 & 1.679 \\
+Virtual Pinhole Patch & 4.3647 & 0.1089 & 4.6499 & 50.353 \\
+\textbf{Spherical Seed} & \textbf{0.5243} & 0.1030 & \textbf{0.5572} & \textbf{1.678} \\
+\bottomrule
+\end{tabular}
+\vspace{2pt}
+\parbox{\columnwidth}{\scriptsize \textit{Note.} Spherical Seed is our method. Internal error uses frozen validation points excluded from Outer-only optimization; max. error is the maximum frame--board RMSE.}
+\end{table}
+
+Use this sample document as your LaTeX source file to create your document. Save this file as {\bf root.tex}. You have to make sure to use the cls file that came with this distribution. If you use a different style file, you cannot expect to get required margins. Note also that when you are creating your out PDF file, the source file is only part of the equation. {\it Your \TeX\ $\rightarrow$ PDF filter determines the output file size. Even if you make all the specifications to output a letter file in the source - if your filter is set to produce A4, you will only get A4 output. }
+
+It is impossible to account for all possible situation, one would encounter using \TeX. If you are using multiple \TeX\ files you must make sure that the ``MAIN`` source file is called root.tex - this is particularly important if your conference is using PaperPlaza's built in \TeX\ to PDF conversion tool.
+
+\subsection{Experimental Setup}
+
+
+\subsection{Ablation}
+本节分别考察内部格点观测的生成可靠性及其对相机标定的约束作用：前者比较不同 internal-seed 构造域，后者在控制初始化与观测前缀后，分析内部格点能否改善内参恢复。
+\subsubsection{Internal Seed Generation}
+在得到准确的外四角点的前提下，内部格点的细化依赖于初始 seed 的几何位置。我们比较 Virtual Pinhole Patch 与
+Spherical Seed 两种生成方式：前者借鉴 TartanCalib 利用中间相机模型将宽视场图像重映射至虚拟针孔视图、以辅助高畸变区域特征处理的思路。
+后者在 viewing-ray domain 中通过 spherical interpolation 生成 seed。两种设置共享相同的
+Outer4 初始化、局部细化和优化后端，表中同时列出不恢复内部格点的 Outer-only 基线。
+
+表~\ref{tab:internal_seed_ablation} 给出了结果。Virtual Pinhole Patch 的 outer error
+与 Spherical Seed 接近，但 internal error 和 maximum error 明显增大，并导致整体
+重投影误差恶化。这表明退化主要来自不可靠的内部 seed，而非 Outer4 检测或初始化。相比之下，Spherical Seed 在加
+入内部观测后仍保持与 Outer-only 相近的整体误差，说明 viewing-ray-domain 构造能够
+生成与宽视场投影几何一致的内部观测。
+
+\subsubsection{Internal Observation Evaluation}
+上一小节已验证 Spherical Seed 可恢复可靠的内部观测。由于它与 Outer-only 共享相同的 Outer4
+初始化，两种设置均从接近收敛的模型出发，最终重投影误差难以单独反映内部格点对内参恢复的作用。
+为使这一作用可被直接评价，我们令两种设置从完全相同的受扰初值出发，并比较其在相同观测条件下对初始模型偏差的约束能力。
+为此，我们在 DS 模型下构造受控的内参恢复实验：令两种设置从相同的受扰初值出发，直接比较其校正
+初始模型偏差的能力。两者共享参考场景、相同的 Outer4 frame--board observations 和配对噪声；唯一差别是
+Outer+Internal 加入由 Spherical Seed 恢复的内部格点。
+
+宽视场标定中，有限的径向观测可能使焦距尺度与投影形状参数产生相近的残差变化。为避免任意扰动单个内参，
+我们从完整 Outer-only 观测的 pose-eliminated Schur 信息矩阵中提取最弱约束方向 $\mathbf d_{W_1}$，
+并将其固定用于两种设置和全部观测预算。对于方法 $m$ 和预算 $b$，沿该方向的总信息定义为
+\begin{equation}
+I_{W_1}^{m,b}=
+\mathbf d_{W_1}^{\top}\mathbf S_c^{m,b}\mathbf d_{W_1},
+\end{equation}
+
+随后，我们沿该方向扰动参考 DS 内参，使初始模型在外围区域 $\rho\geq0.7$ 的 Ray Error P95
+为 $2^\circ$。图~\ref{fig:internal-point-ablation} 分别考察弱方向约束、全视场模型恢复误差和
+达到外围精度目标所需的观测预算。
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.98\textwidth]{pic/internal_point_ablation.pdf}
+  \caption{内部观测对受扰 DS 内参恢复的影响。Outer-only 与
+  Outer+Internal 共享相同的 Outer4 frame--board observations、
+  受扰初值和配对噪声；Outer+Internal 仅额外加入恢复的内部格点。
+  (a) 消除位姿后的最弱内参方向 $W_1$ 上的 Schur 信息。
+  (b) 在固定参考射线网格上计算的、恢复模型相对参考模型的径向像素
+  位移 P95。(c) 不同 frame--board 预算下的外围 Ray Error P95。
+  两种设置均从 $2^\circ$ 外围扰动出发，并仅优化 DS 内参。
+  图 (b) 和 (c) 汇总 100 组配对试验，曲线和阴影分别表示中位数和
+  IQR；外围区域定义为 $\rho \geq 0.7$。}
+  \label{fig:internal-point-ablation}
+\end{figure*}
+
+如图~\ref{fig:internal-point-ablation}(a) 所示，加入内部格点后，在全部 frame--board
+预算下均获得更强的弱方向约束。图~\ref{fig:internal-point-ablation}(b) 显示，恢复模型在全视场
+内更接近参考模型，且改善在图像外围更明显。图~\ref{fig:internal-point-ablation}(c) 给出一致的
+预算趋势：Outer+Internal 以更少的观测预算达到预设的外围精度目标。这些结果表明，内部格点不替代
+分布式 Outer4 提供的初始化，而是在其基础上补充局部约束，从而改善高畸变外围区域的 DS 模型恢复。
+
+\subsection{Camera Pose Estimation}
+
+为了评估标定结果在未见观测上的几何泛化能力，我们在 held-out
+test images 上进行相机位姿估计，并将数据随机划分为 $7{:}3$ 的
+训练集和测试集。对于每种方法，测试阶段固定待评价的相机内参和统一的
+多板目标几何，仅通过鲁棒重投影优化估计每帧参考板到相机的位姿。
+随后，在该帧所有可见的 board 观测上计算重投影误差，并采用 RMSE、
+P95 和 Inlier@1px 作为评价指标。
+
+由于对照的基线方法的原生流程无法直接适配本文的多板标定场景，我们使用
+标准棋盘格标定流程估计相机内参，再将所得内参与本文方法置于相同的
+held-out 多板位姿估计任务中进行参考性对比。
+
+\subsection{Cross-Backend Evaluation}
+
+为检验本文构造的分布式多板观测是否依赖于特定的标定
+后端，以及这些观测在不同宽视场投影模型下能否保持有效，
+我们将前端输出的同一组 Outer4 与内部晶格对应关系导出至
+BabelCalib，并分别拟合 Double Sphere（DS）和
+Kannala--Brandt（KB）模型。实验中，两种模型严格共享相同
+的训练--测试划分、二维观测、板内控制点、固定板间几何和
+图像尺寸；BabelCalib 不重新执行目标检测或特征精化。
+因此，两次运行之间仅改变最终的前向相机模型，而与本文后端
+上相应模型的结果比较，则进一步用于考察所构造观测在不同
+求解器之间的可迁移性。
+
+\begin{table*}[t]
+  \centering
+  \caption{Reprojection performance on two held-out multi-board sets and one checkerboard set. Metrics are reported as RMSE [px], P95 [px], and Inlier@1px [\%].}
+  \label{tab:reprojection_comparison}
+  \scriptsize
+  \renewcommand{\arraystretch}{1.06}
+  \setlength{\tabcolsep}{2.6pt}
+  \begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}clccccccccc@{}}
+  \toprule
+  \multirow{2}{*}{Model} & \multirow{2}{*}{Method}
+  & \multicolumn{3}{c}{Multi-Board Set 1}
+  & \multicolumn{3}{c}{Multi-Board Set 2}
+  & \multicolumn{3}{c}{Checkerboard Set} \\
+  \cmidrule(lr){3-5}\cmidrule(lr){6-8}\cmidrule(lr){9-11}
+  & & RMSE $\downarrow$ & P95 $\downarrow$ & Inl. $\uparrow$
+    & RMSE $\downarrow$ & P95 $\downarrow$ & Inl. $\uparrow$
+    & RMSE $\downarrow$ & P95 $\downarrow$ & Inl. $\uparrow$ \\
+  \midrule
+  \multirow{4}{*}{DS}
+  & \textbf{Ours}       & \textbf{0.523} & \textbf{0.990} & \textbf{95.1} & \textbf{0.634} & \textbf{1.378} & \textbf{88.2} & -- & -- & -- \\
+  & Kalibr              & 0.600 & 1.093 & 92.6 & 0.806 & 1.638 & 84.2 & -- & -- & -- \\
+  & TartanCalib         & 0.623 & 1.155 & 91.7 & 0.814 & 1.671 & 83.7 & -- & -- & -- \\
+  & BabelCalib          & 0.618 & 1.147 & 91.7 & 0.848 & 1.682 & 83.6 & -- & -- & -- \\
+  \addlinespace[2pt]
+  
+  \multirow{6}{*}{KB}
+  & \textbf{Ours}       & \textbf{0.522} & \textbf{0.984} & \textbf{95.3} & \textbf{0.631} & \textbf{1.375} & \textbf{88.5} & -- & -- & -- \\
+  & Kalibr              & 0.599 & 1.092 & 92.7 & 0.761 & 1.585 & 84.8 & -- & -- & -- \\
+  & TartanCalib         & 0.619 & 1.140 & 91.8 & 0.782 & 1.595 & 84.6 & -- & -- & -- \\
+  & CamOdoCal           & 0.605 & 1.119 & 92.5 & 0.763 & 1.587 & 85.0 & -- & -- & -- \\
+  & BabelCalib          & 0.617 & 1.147 & 91.8 & 0.792 & 1.628 & 84.2 & -- & -- & -- \\
+  & OpenCV fisheye      & 0.583 & 1.071 & 93.1 & 0.760 & 1.570 & 85.2 & -- & -- & -- \\
+  \addlinespace[2pt]
+  
+  \multirow{6}{*}{\shortstack{UCM\\/ Mei}}
+  & \textbf{Ours}       & \textbf{0.520} & \textbf{0.989} & \textbf{95.2} & \textbf{0.636} & \textbf{1.377} & \textbf{88.3} & -- & -- & -- \\
+  & Kalibr              & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & TartanCalib         & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & CamOdoCal           & 0.605 & 1.110 & 92.6 & 0.816 & 1.645 & 83.9 & -- & -- & -- \\
+  & BabelCalib          & 0.737 & 1.335 & 87.5 & 1.207 & 1.756 & 83.7 & -- & -- & -- \\
+  & OpenCV omnidir      & 0.606 & 1.108 & 92.2 & 0.852 & 1.686 & 83.6 & -- & -- & -- \\
+  \addlinespace[2pt]
+  
+  \multirow{4}{*}{EUCM}
+  & \textbf{Ours}       & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & Kalibr              & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & TartanCalib         & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  & BabelCalib          & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+  \bottomrule
+  \end{tabular*}
+  \end{table*}  
+
+\section{CONCLUSIONS}
+
+A conclusion section is not required. Although a conclusion may review the main points of the paper, do not replicate the abstract as the conclusion. A conclusion might elaborate on the importance of the work or suggest applications and extensions. 
+
+\addtolength{\textheight}{-12cm}   % This command serves to balance the column lengths
+                                  % on the last page of the document manually. It shortens
+                                  % the textheight of the last page by a suitable amount.
+                                  % This command does not take effect until the next page
+                                  % so it should come on the page before the last. Make
+                                  % sure that you do not shorten the textheight too much.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section*{APPENDIX}
+
+Appendixes should appear before the acknowledgment.
+
+\section*{ACKNOWLEDGMENT}
+
+The preferred spelling of the word ÒacknowledgmentÓ in America is without an ÒeÓ after the ÒgÓ. Avoid the stilted expression, ÒOne of us (R. B. G.) thanks . . .Ó  Instead, try ÒR. B. G. thanksÓ. Put sponsor acknowledgments in the unnumbered footnote on the first page.
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+References are important to the reader; therefore, each citation must be complete and correct. If at all possible, references should be commonly available publications.
+
+
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+
+
+\end{document}

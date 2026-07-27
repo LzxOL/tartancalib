@@ -1,0 +1,97 @@
+\begin{table*}[t]
+\centering
+\caption{
+Cross-backend verification on the held-out multi-board and independent
+checkerboard test sets. BabelCalib uses the same detected observations
+and target geometry as ours.
+}
+\label{tab:cross_backend_verification}
+
+\footnotesize
+\setlength{\tabcolsep}{3.2pt}
+\renewcommand{\arraystretch}{1.08}
+
+\begin{tabularx}{\textwidth}{
+@{}
+l
+>{\raggedright\arraybackslash}p{3.75cm}
+@{\hspace{1pt}}
+c
+c
+>{\centering\arraybackslash}X
+c
+c
+@{}
+}
+\toprule
+\multirow{2}{*}{Model}
+& \multirow{2}{*}{Method / Observations}
+& \multirow{2}{*}{$f_u / f_v$}
+& \multirow{2}{*}{$c_u / c_v$}
+& \multirow{2}{*}{Model Params.}
+& \multicolumn{2}{c}{Test RMSE [px] $\downarrow$} \\
+\cmidrule(lr){6-7}
+&
+&
+&
+&
+& Multi-board
+& Checkerboard \\
+\midrule
+
+\multirow{3}{*}{DS}
+& Ours
+& 1175.65 / 1175.29
+& 2242.88 / 2275.61
+& $[-0.1905,\ 0.6171]$
+& \textbf{0.5228}
+& \textbf{0.5918} \\
+
+& BabelCalib w/ Outer+Internal
+& 1176.56 / 1175.92
+& 2242.90 / 2275.63
+& $[-0.1914,\ 0.6175]$
+& 0.5293
+& 0.6020 \\
+
+& BabelCalib w/ Outer-only
+& 1943.49 / 1943.08
+& 2242.91 / 2275.67
+& $[0.3401,\ 0.8048]$
+& $0.5256^{\dagger}$
+& -- \\
+
+\midrule
+
+\multirow{3}{*}{KB}
+& Ours
+& 1451.58 / 1451.10
+& 2242.37 / 2275.38
+& $[-0.0197,\ 0.0010,\ -0.0032,\ 0.0006]$
+& \textbf{0.5216}
+& \textbf{0.5960} \\
+
+& BabelCalib w/ Outer+Internal
+& 1454.52 / 1453.74
+& 2242.91 / 2275.65
+& $[-0.0196,\ -0.0018,\ -0.0007,\ -0.0001]$
+& 0.5286
+& 0.6052 \\
+
+& BabelCalib w/ Outer-only
+& --
+& --
+& --
+& --
+& -- \\
+
+\bottomrule
+\end{tabularx}
+
+\vspace{2pt}
+\parbox{\textwidth}{
+\scriptsize
+$^\dagger$ The Outer-only setting achieves a comparable multi-board
+test RMSE but converges to a substantially shifted intrinsic parameterization.
+}
+\end{table*}

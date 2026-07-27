@@ -1,0 +1,95 @@
+success: 1
+failure_reason: 
+baseline_protocol_label: stage5_backend_auto_v2_camera_aware_outer__internal_pose_rescue_enabled__geometry_prior_rescue_no_geometry_only_pose_refit__pre_backend_filter_enabled__backend_pixel_only
+dataset_label: stage5_residual_ablation_20260719_1444190clear_pixel
+split_signature: random_holdout_ratio_0.300000_seed_1337_holdout_indices_1,2,9,12,16,17,19,23,25,28,29,32,36,38,42,44
+split_mode: random_holdout_ratio
+holdout_stride: 5
+holdout_offset: 0
+holdout_ratio: 0.3
+split_random_seed: 1337
+training_frame_count: 38
+holdout_frame_count: 16
+stage5_input_mode: images
+precomputed_training_source: 
+precomputed_holdout_source: 
+precomputed_target_mode_requested: auto
+precomputed_target_mode_resolved: 
+precomputed_board_count: 0
+precomputed_single_board_ba_mode: 0
+checkerboard_robust_checkpoint_selection_used: 0
+checkerboard_robust_checkpoint_criterion: 
+checkerboard_robust_checkpoint_label: 
+checkerboard_robust_checkpoint_attempt_order: -1
+checkerboard_robust_checkpoint_frame_median_rmse: 0
+checkerboard_robust_checkpoint_frame_p90_rmse: 0
+checkerboard_robust_checkpoint_huber_rmse: 0
+checkerboard_robust_checkpoint_fold_median_mean_rmse: 0
+checkerboard_robust_checkpoint_fold_median_max_rmse: 0
+checkerboard_robust_checkpoint_fold_median_std_rmse: 0
+precomputed_uniform_control_point_mode: 0
+precomputed_training_frame_count: 0
+precomputed_training_board_observation_count: 0
+precomputed_training_outer_point_count: 0
+precomputed_training_internal_point_count: 0
+precomputed_holdout_frame_count: 0
+precomputed_holdout_board_observation_count: 0
+precomputed_holdout_outer_point_count: 0
+precomputed_holdout_internal_point_count: 0
+precomputed_boards_rt_used_to_initialize_layout: 0
+external_holdout_observation_source: training_scene_regeneration
+external_holdout_self_frontend_prepass_used: 0
+external_holdout_self_frontend_prepass_success: 0
+external_holdout_self_frontend_prepass_failure_reason: 
+external_holdout_self_frontend_prepass_seconds: 0
+fair_protocol_matched: 1
+diagnostic_only: 0
+kalibr_camera_model_family: ds-none
+kalibr_training_split_signature: random_holdout_ratio_0.300000_seed_1337_holdout_indices_1,2,9,12,16,17,19,23,25,28,29,32,36,38,42,44
+kalibr_source_label: config/mono_fisheye_calib_3_25_right-camchain.yaml
+additional_reference_camera_count: 0
+internal_joint_refine_mode: off
+internal_joint_refine_target_mode: high_residual_and_blur_bad_board
+internal_joint_refine_backend_input_changed: 0
+internal_joint_refine_candidate_board_count: 0
+internal_joint_refine_accepted_board_count: 0
+internal_joint_refine_rolled_back_board_count: 0
+internal_joint_refine_eligible_internal_point_count: 0
+internal_joint_refine_refined_internal_point_count: 0
+internal_joint_refine_mean_displacement_px: 0
+internal_blur_board_weight_mode: off
+internal_blur_board_weight_backend_input_changed: 0
+internal_blur_board_weight_low_patch_gradient_quantile: 0.05
+internal_blur_board_weight_patch_gradient_threshold: 0
+internal_blur_board_weight_downweighted_board_observation_count: 0
+internal_blur_board_weight_downweighted_internal_point_count: 0
+internal_blur_board_weight_mean_weight: 1
+internal_observation_weight_mode: off
+internal_observation_weight_policy: quality
+internal_observation_weight_backend_input_changed: 0
+internal_observation_weight_low_quality_quantile: 0.2
+internal_observation_weight_quality_threshold: 0
+internal_observation_weight_residual_consistency_ratio_threshold: 0
+internal_observation_weight_downweighted_internal_point_count: 0
+internal_observation_weight_mean_weight: 1
+comparison_scope: output_level_and_evaluator_level_only
+evaluation_protocol: camera_only_outer_refit_pose_plus_outer_internal_reprojection
+camera_aware_outer_rescue_attempted_board_count: 0
+camera_aware_outer_rescue_used_board_count: 0
+warning: Automatic camera initialization requires every configured board in each contributing frame: required_board_ids=1,2,3,4,5, accepted_frames=38/38, accepted_observations=190/190. Incomplete frames remain available only to full-health evaluation and do not influence seed construction, candidate ranking, information selection, or initialization LM.
+warning: Layout/LOO diagnostics are not allowed to update DS intrinsics; the selected initialization seed may only be refined by the outer-corner LM with independent per-board poses.
+warning: DS grid enumeration is disabled; using direct four-corner outer-quad Omni gamma candidates only as diagnostics; final seed selection is based on multi-observation pose health.
+warning: Added a compact physically plausible DS seed set around resolution/pi; selection uses all outer observations, not a single tag gamma median.
+warning: DS parameter grid enumeration is disabled; using outer-only DS initialization candidates.
+warning: Fixed-layout frame-cohesion LM diagnostics skipped by default: diagnostics_only=1, layout_updates_intrinsics=0, and this diagnostic can dominate full-dataset initialization runtime. Intrinsics are selected by independent outer-only board-pose LM plus full outer health.
+warning: Kalibr-style multi-start LM trial rank=1 source=multi_observation_outer_physical_ds_seed seed_fu=1005.35 seed_alpha=0.5 seed_beta=1 refined_fu=1171.82 refined_alpha=0.616276 refined_beta=1 refined_xi=-0.19008 seed_objective=29.3462 refined_objective=0.0100962 lm_initial_rmse=5.40384 lm_final_rmse=0.0981616 lm_robust_loss_delta_px=0 lm_initial_robust_rmse=5.40384 lm_final_robust_rmse=0.0981616 lm_initial_downweighted_points=0 lm_final_downweighted_points=0 lm_selection_objective=0.0096357 full_outer_health_weight=0.001 combined_lm_selection_objective=0.0096458 selected_frames=38 selected_board_observations=190 fixed_layout_frame_constraint=0 layout_updates_intrinsics=0 layout_variables_optimized=0 camera_step_gate=finite_model_validity_only pose_fit_gate_applied=0 pose_fit_gate_rejected=0 pose_fit_gate_median_rmse=0.0701434 pose_fit_gate_mad_rmse=0.0290434 pose_fit_gate_threshold_rmse=8.
+warning: Kalibr-style multi-start LM trial rank=2 source=multi_observation_outer_physical_ds_seed seed_fu=1148.97 seed_alpha=0.5 seed_beta=1 refined_fu=1171.82 refined_alpha=0.616276 refined_beta=1 refined_xi=-0.19008 seed_objective=47.3924 refined_objective=0.0100962 lm_initial_rmse=7.3252 lm_final_rmse=0.0981616 lm_robust_loss_delta_px=0 lm_initial_robust_rmse=7.3252 lm_final_robust_rmse=0.0981616 lm_initial_downweighted_points=0 lm_final_downweighted_points=0 lm_selection_objective=0.0096357 full_outer_health_weight=0.001 combined_lm_selection_objective=0.0096458 selected_frames=38 selected_board_observations=190 fixed_layout_frame_constraint=0 layout_updates_intrinsics=0 layout_variables_optimized=0 camera_step_gate=finite_model_validity_only pose_fit_gate_applied=0 pose_fit_gate_rejected=0 pose_fit_gate_median_rmse=0.0701439 pose_fit_gate_mad_rmse=0.0290439 pose_fit_gate_threshold_rmse=8.
+warning: Kalibr-style multi-start LM trial rank=3 source=multi_observation_outer_physical_ds_seed seed_fu=1292.59 seed_alpha=0.5 seed_beta=1 refined_fu=1171.82 refined_alpha=0.616276 refined_beta=1 refined_xi=-0.19008 seed_objective=65.0252 refined_objective=0.0100963 lm_initial_rmse=8.56081 lm_final_rmse=0.0981616 lm_robust_loss_delta_px=0 lm_initial_robust_rmse=8.56081 lm_final_robust_rmse=0.0981616 lm_initial_downweighted_points=0 lm_final_downweighted_points=0 lm_selection_objective=0.0096357 full_outer_health_weight=0.001 combined_lm_selection_objective=0.0096458 selected_frames=38 selected_board_observations=190 fixed_layout_frame_constraint=0 layout_updates_intrinsics=0 layout_variables_optimized=0 camera_step_gate=finite_model_validity_only pose_fit_gate_applied=0 pose_fit_gate_rejected=0 pose_fit_gate_median_rmse=0.0701435 pose_fit_gate_mad_rmse=0.0290433 pose_fit_gate_threshold_rmse=8.
+warning: Kalibr-style multi-start LM trial rank=4 source=fallback_outer_only_ds_seed seed_fu=1436.21 seed_alpha=0.5 seed_beta=1 refined_fu=1605.15 refined_alpha=0.72287 refined_beta=1 refined_xi=0.134205 seed_objective=79.2006 refined_objective=0.0688452 lm_initial_rmse=9.39565 lm_final_rmse=0.256185 lm_robust_loss_delta_px=0 lm_initial_robust_rmse=9.39565 lm_final_robust_rmse=0.256185 lm_initial_downweighted_points=0 lm_final_downweighted_points=0 lm_selection_objective=0.065631 full_outer_health_weight=0.001 combined_lm_selection_objective=0.0656998 selected_frames=38 selected_board_observations=190 fixed_layout_frame_constraint=0 layout_updates_intrinsics=0 layout_variables_optimized=0 camera_step_gate=finite_model_validity_only pose_fit_gate_applied=0 pose_fit_gate_rejected=0 pose_fit_gate_median_rmse=0.133902 pose_fit_gate_mad_rmse=0.0633435 pose_fit_gate_threshold_rmse=8.
+warning: Kalibr-style multi-start LM trial rank=5 source=multi_observation_outer_physical_ds_seed seed_fu=2441.56 seed_alpha=0.5 seed_beta=1 refined_fu=2500.72 refined_alpha=0.95 refined_beta=1 refined_xi=-0.0387276 seed_objective=81.5396 refined_objective=32.0093 lm_initial_rmse=9.37465 lm_final_rmse=6.54451 lm_robust_loss_delta_px=0 lm_initial_robust_rmse=9.37465 lm_final_robust_rmse=6.54451 lm_initial_downweighted_points=0 lm_final_downweighted_points=0 lm_selection_objective=42.8306 full_outer_health_weight=0.001 combined_lm_selection_objective=42.8626 selected_frames=38 selected_board_observations=190 fixed_layout_frame_constraint=0 layout_updates_intrinsics=0 layout_variables_optimized=0 camera_step_gate=finite_model_validity_only pose_fit_gate_applied=0 pose_fit_gate_rejected=0 pose_fit_gate_median_rmse=4.51273 pose_fit_gate_mad_rmse=1.80465 pose_fit_gate_threshold_rmse=25.9174.
+warning: Kalibr-style multi-start LM trial rank=6 source=multi_observation_outer_physical_ds_seed seed_fu=1579.84 seed_alpha=0.5 seed_beta=1 refined_fu=1704.25 refined_alpha=0.747418 refined_beta=1 refined_xi=0.196613 seed_objective=89.5506 refined_objective=0.0378869 lm_initial_rmse=9.9434 lm_final_rmse=0.190322 lm_robust_loss_delta_px=0 lm_initial_robust_rmse=9.9434 lm_final_robust_rmse=0.190322 lm_initial_downweighted_points=0 lm_final_downweighted_points=0 lm_selection_objective=0.0362225 full_outer_health_weight=0.001 combined_lm_selection_objective=0.0362604 selected_frames=38 selected_board_observations=190 fixed_layout_frame_constraint=0 layout_updates_intrinsics=0 layout_variables_optimized=0 camera_step_gate=finite_model_validity_only pose_fit_gate_applied=0 pose_fit_gate_rejected=0 pose_fit_gate_median_rmse=0.0993421 pose_fit_gate_mad_rmse=0.051237 pose_fit_gate_threshold_rmse=8.
+warning: Kalibr-style multi-start LM trial rank=7 source=multi_observation_outer_physical_ds_seed seed_fu=2154.32 seed_alpha=0.5 seed_beta=1 refined_fu=2014.05 refined_alpha=0.880714 refined_beta=1 refined_xi=0.119261 seed_objective=90.6235 refined_objective=4.8294 lm_initial_rmse=9.98335 lm_final_rmse=2.19591 lm_robust_loss_delta_px=0 lm_initial_robust_rmse=9.98335 lm_final_robust_rmse=2.19591 lm_initial_downweighted_points=0 lm_final_downweighted_points=0 lm_selection_objective=4.822 full_outer_health_weight=0.001 combined_lm_selection_objective=4.82683 selected_frames=38 selected_board_observations=190 fixed_layout_frame_constraint=0 layout_updates_intrinsics=0 layout_variables_optimized=0 camera_step_gate=finite_model_validity_only pose_fit_gate_applied=0 pose_fit_gate_rejected=0 pose_fit_gate_median_rmse=1.75532 pose_fit_gate_mad_rmse=0.5235 pose_fit_gate_threshold_rmse=8.
+warning: Kalibr-style multi-start LM trial rank=8 source=multi_observation_outer_physical_ds_seed seed_fu=1723.46 seed_alpha=0.5 seed_beta=1 refined_fu=1719.25 refined_alpha=0.751122 refined_beta=1 refined_xi=0.205866 seed_objective=95.9106 refined_objective=0.0339316 lm_initial_rmse=10.2353 lm_final_rmse=0.180138 lm_robust_loss_delta_px=0 lm_initial_robust_rmse=10.2353 lm_final_robust_rmse=0.180138 lm_initial_downweighted_points=0 lm_final_downweighted_points=0 lm_selection_objective=0.0324497 full_outer_health_weight=0.001 combined_lm_selection_objective=0.0324837 selected_frames=38 selected_board_observations=190 fixed_layout_frame_constraint=0 layout_updates_intrinsics=0 layout_variables_optimized=0 camera_step_gate=finite_model_validity_only pose_fit_gate_applied=0 pose_fit_gate_rejected=0 pose_fit_gate_median_rmse=0.0944047 pose_fit_gate_mad_rmse=0.0481256 pose_fit_gate_threshold_rmse=8.
+warning: Kalibr-style multi-start LM trial rank=9 source=multi_observation_outer_physical_ds_seed seed_fu=1938.89 seed_alpha=0.5 seed_beta=1 refined_fu=1788.45 refined_alpha=0.768138 refined_beta=1 refined_xi=0.248068 seed_objective=96.1247 refined_objective=0.0191426 lm_initial_rmse=10.2794 lm_final_rmse=0.135386 lm_robust_loss_delta_px=0 lm_initial_robust_rmse=10.2794 lm_final_robust_rmse=0.135386 lm_initial_downweighted_points=0 lm_final_downweighted_points=0 lm_selection_objective=0.0183294 full_outer_health_weight=0.001 combined_lm_selection_objective=0.0183485 selected_frames=38 selected_board_observations=190 fixed_layout_frame_constraint=0 layout_updates_intrinsics=0 layout_variables_optimized=0 camera_step_gate=finite_model_validity_only pose_fit_gate_applied=0 pose_fit_gate_rejected=0 pose_fit_gate_median_rmse=0.075536 pose_fit_gate_mad_rmse=0.0322211 pose_fit_gate_threshold_rmse=8.
+warning: Outer-only multi-start selected-observation outer_only_independent_board_pose_lm_rank1 selected 38 frames / 190 pose-init-valid board observations from adaptive coverage/diversity plus intrinsics-information selection; tried 9 candidate seeds and accepted 1 objective-improving updates; final health was evaluated on all observations.
+warning: Pose-excitation diagnostic: board-normal p95 spread min/median/max=15.3303/16.8951/17.0329 deg; median tilt range=22.9866 deg; normal-xy axis-balance min/median/max=0.0200853/0.0215729/0.111953; single-axis boards=5/5; global axis balance=0.548923; assessment=single_axis_rotation_excitation_principal_risk. Thresholds are diagnostic only and never gate initialization.

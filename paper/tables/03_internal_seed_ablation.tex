@@ -1,0 +1,21 @@
+\begin{table}[t]
+\centering
+\caption{Internal-observation ablation under a fixed split and backend. Max. error denotes the maximum frame--board RMSE.}
+\label{tab:internal_seed_ablation}
+\footnotesize
+\setlength{\tabcolsep}{1.5pt}
+\renewcommand{\arraystretch}{1.05}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Method
+& \shortstack{Reproj.\\[-1pt]Err. [px] $\downarrow$}
+& \shortstack{Outer\\[-1pt]Err. [px] $\downarrow$}
+& \shortstack{Internal\\[-1pt]Err. [px] $\downarrow$}
+& \shortstack{Max.\\[-1pt]Err. [px] $\downarrow$} \\
+\midrule
+Outer-only & 0.5251 & \textbf{0.1002} & 0.5582 & 1.679 \\
+Local Pinhole & 4.3647 & 0.1089 & 4.6499 & 50.353 \\
+\textbf{Ours} & \textbf{0.5243} & 0.1030 & \textbf{0.5572} & \textbf{1.678} \\
+\bottomrule
+\end{tabular}
+\end{table}

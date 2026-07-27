@@ -1,0 +1,37 @@
+\begin{table}[t]
+\centering
+\caption{Spherical bundle-adjustment ablation on the close-distance frozen test set. All variants use identical training frames, fixed backend inputs, and 3,150 test points.}
+\label{tab:spherical_ba_ablation}
+\footnotesize
+\setlength{\tabcolsep}{2.2pt}
+\renewcommand{\arraystretch}{1.05}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\multicolumn{5}{@{}l}{\textit{(a) Image-plane accuracy}} \\
+Residual & Train A & Train B & Mean & P95 \\
+ & \multicolumn{4}{c}{Reprojection error [px] $\downarrow$} \\
+\midrule
+Pixel & 1.0983 & 1.0206 & 1.0595 & 2.0860 \\
+Spherical & 1.0929 & 1.0130 & 1.0529 & 2.0770 \\
+Hybrid & \textbf{1.0902} & \textbf{1.0104} & \textbf{1.0503} & \textbf{2.0606} \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{(b) View-angle accuracy}} \\
+Residual & $0$--$30^{\circ}$ & $30$--$50^{\circ}$ & $\geq50^{\circ}$ & Ray RMS \\
+ & \multicolumn{3}{c}{True angular RMSE [mrad] $\downarrow$} & [deg] $\downarrow$ \\
+\midrule
+Pixel & 0.6079 & 0.6895 & 0.8271 & 0.2100 \\
+Spherical & 0.6074 & \textbf{0.6857} & 0.8171 & \textbf{0.1994} \\
+Hybrid & \textbf{0.6068} & 0.6860 & \textbf{0.8130} & 0.2044 \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{(c) Robustness and cost}} \\
+Residual & Overall & Outer & Inlier@1 & BA time \\
+ & RMSE [px] & RMSE [px] & [\%] $\uparrow$ & [s] $\downarrow$ \\
+\midrule
+Pixel & 1.0595 & 0.5397 & 70.17 & \textbf{0.6} \\
+Spherical & 1.0529 & 0.5369 & \textbf{70.70} & 5.5 \\
+Hybrid & \textbf{1.0503} & \textbf{0.5238} & \textbf{70.70} & 6.4 \\
+\bottomrule
+\end{tabular}
+\vspace{2pt}
+\parbox{\columnwidth}{\scriptsize \textit{Protocol.} Results are macro-averaged over two disjoint training captures. The close-distance test contains no training frame. Polar bins use the shared initialization camera; angular errors use each method's final camera. Ray RMS measures cross-capture ray-curve disagreement over 1,422 image locations.}
+\end{table}

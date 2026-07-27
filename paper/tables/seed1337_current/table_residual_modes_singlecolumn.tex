@@ -1,0 +1,42 @@
+% Single-column paper table. Data source:
+% paper/tables/seed1337_current/table_residual_modes_*_data.csv
+\begin{table}[t]
+  \centering
+  \caption{Residual-objective ablation under the Double Sphere model. All
+  variants use identical initialization, train--test splits, and frozen
+  holdout observations. Hybrid attains the lowest reprojection error on two of
+  three sequences, while Spherical gives the best macro-average and
+  high-angle accuracy.}
+  \label{tab:residual_modes_singlecolumn}
+  \small
+  \setlength{\tabcolsep}{3.0pt}
+  \renewcommand{\arraystretch}{1.04}
+  \begin{tabular}{@{}lrrrr@{}}
+    \toprule
+    \multicolumn{5}{@{}l}{\textit{(a) Held-out reprojection RMSE [px] $\downarrow$}} \\
+    Residual & Seq. A & Seq. B & Seq. C & Mean \\
+    \midrule
+    Pixel     & 0.51933 & 0.50425 & 0.50084 & 0.50814 \\
+    Spherical & 0.51956 & \textbf{0.50312} & 0.50049 & \textbf{0.50772} \\
+    Hybrid    & \textbf{0.51926} & 0.50373 & \textbf{0.50026} & 0.50775 \\
+    \addlinespace[1pt]
+    Kalibr (DS) & 0.62837 & 0.56662 & 0.61958 & 0.60486 \\
+    \midrule
+    \multicolumn{5}{@{}l}{\textit{(b) Angular accuracy and geometric stability}} \\
+    Residual & $0$--$30^\circ$ & $30$--$50^\circ$ & $\geq 50^\circ$ & Ray RMS \\
+             & \multicolumn{3}{c}{Angular RMSE [mrad] $\downarrow$}
+             & [deg] $\downarrow$ \\
+    \midrule
+    Pixel     & 0.3317 & 0.3339 & 0.3859 & \textbf{0.3024} \\
+    Spherical & 0.3314 & \textbf{0.3335} & \textbf{0.3853} & 0.3082 \\
+    Hybrid    & \textbf{0.3312} & 0.3336 & 0.3859 & 0.3103 \\
+    \bottomrule
+  \end{tabular}
+  \vspace{2pt}
+  \parbox{0.98\columnwidth}{\footnotesize
+  \textit{Protocol.} Seq. A/B/C denote 1444190-clear, 134853-clear, and
+  192347-clear, respectively. Results use a 70/30 split with seed 1337.
+  Polar bins are assigned using the shared initialization camera. Ray RMS is
+  the pairwise cross-sequence ray-curve disagreement over 1,422 image
+  locations. Best results are in bold.}
+\end{table}

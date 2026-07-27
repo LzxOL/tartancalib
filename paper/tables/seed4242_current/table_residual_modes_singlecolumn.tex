@@ -1,0 +1,47 @@
+% Single-column table generated from the seed-4242 current-baseline rerun.
+\begin{table}[t]
+  \centering
+  \caption{Residual-objective ablation under the Double Sphere model. All
+  modes share initialization, splits, and frozen holdout observations.
+  Spherical provides the best macro-average accuracy and cross-sequence ray
+  consistency, while Hybrid is competitive in the central field of view.}
+  \label{tab:residual_modes_singlecolumn}
+  \footnotesize
+  \setlength{\tabcolsep}{2.6pt}
+  \renewcommand{\arraystretch}{1.03}
+  \begin{tabular}{@{}lrrrr@{}}
+    \toprule
+    \multicolumn{5}{@{}l}{\textit{(a) Held-out reprojection RMSE [px] $\downarrow$}} \\
+    Residual & Seq. A & Seq. B & Seq. C & Mean \\
+    \midrule
+    Pixel     & 0.54014 & 0.47778 & 0.54252 & 0.52015 \\
+    Spherical & 0.53999 & \textbf{0.47710} & \textbf{0.54133} & \textbf{0.51947} \\
+    Hybrid    & \textbf{0.53995} & 0.47746 & 0.54148 & 0.51963 \\
+    \addlinespace[1pt]
+    Kalibr (DS) & 0.66693 & 0.54995 & 0.63417 & 0.61702 \\
+    \midrule
+    \multicolumn{5}{@{}l}{\textit{(b) View-angle-conditioned ray accuracy}} \\
+    Residual & $0$--$30^\circ$ & $30$--$50^\circ$ & $\geq 50^\circ$ & Overall \\
+             & \multicolumn{4}{c}{True angular RMSE [mrad] $\downarrow$} \\
+    \midrule
+    Pixel     & 0.3425 & 0.3423 & 0.3991 & 0.3512 \\
+    Spherical & \textbf{0.3421} & 0.3422 & \textbf{0.3963} & \textbf{0.3506} \\
+    Hybrid    & 0.3423 & \textbf{0.3421} & 0.3976 & 0.3507 \\
+    \midrule
+    \multicolumn{5}{@{}l}{\textit{(c) Accuracy, geometric stability, and efficiency}} \\
+    Residual & Overall & Outer & Cross-seq. & Time \\
+             & RMSE [px] & RMSE [px] & Ray RMS [deg] & [s] \\
+    \midrule
+    Pixel     & 0.5201 & \textbf{0.1249} & 0.7616 & \textbf{8.5} \\
+    Spherical & \textbf{0.5195} & 0.1262 & \textbf{0.7349} & 38.3 \\
+    Hybrid    & 0.5196 & 0.1261 & 0.7477 & 41.0 \\
+    \bottomrule
+  \end{tabular}
+  \vspace{2pt}
+  \parbox{0.98\columnwidth}{\footnotesize
+  \textit{Protocol.} Seq. A/B/C denote 1444190-clear, 134853-clear, and
+  192347-clear. All experiments use a 70/30 split with seed 4242. Polar bins
+  are assigned using the shared initialization camera. Cross-sequence ray RMS
+  measures pairwise disagreement over 1,422 shared image locations. Best
+  results are in bold.}
+\end{table}
