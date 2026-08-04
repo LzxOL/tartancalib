@@ -74,16 +74,31 @@ def parse_nonnegative_int(values: dict[str, str], key: str) -> int:
     return value
 
 
+def require_flag(values: dict[str, str], key: str, expected: str) -> None:
+    if values.get(key) != expected:
+        fail(f"Stage6 final-intrinsics export requires {key}={expected}, got {values.get(key)!r}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage6-output", type=Path, required=True)
-    parser.add_argument("--left-intrinsics", type=Path, required=True)
-    parser.add_argument("--right-intrinsics", type=Path, required=True)
+    parser.add_argument("--left-intrinsics", type=Path)
+    parser.add_argument("--right-intrinsics", type=Path)
+    parser.add_argument(
+        "--use-stage6-final-intrinsics",
+        action="store_true",
+        help="Use stereo_final_{left,right}_intrinsics.yaml emitted by this Stage6 run.",
+    )
     parser.add_argument("--training-left-dir", type=Path, required=True)
     parser.add_argument("--training-right-dir", type=Path, required=True)
     parser.add_argument("--holdout-left-dir", type=Path, required=True)
     parser.add_argument("--holdout-right-dir", type=Path, required=True)
     parser.add_argument("--max-pair-delta-ms", type=float, default=1.0)
+    parser.add_argument(
+        "--holdout-role",
+        choices=("external_validation_only", "within_sequence_holdout"),
+        default="external_validation_only",
+    )
     parser.add_argument("--bundle-dir", type=Path, required=True)
     args = parser.parse_args()
 
@@ -92,8 +107,21 @@ def main() -> int:
     stage6 = args.stage6_output.resolve()
     if not stage6.is_dir():
         fail(f"missing Stage6 output directory: {stage6}")
-    left = require_existing(args.left_intrinsics, "left intrinsics")
-    right = require_existing(args.right_intrinsics, "right intrinsics")
+    intrinsics_summary = parse_key_values(stage6 / "stereo_intrinsics_sanity_summary.txt")
+    if args.use_stage6_final_intrinsics:
+        if args.left_intrinsics is not None or args.right_intrinsics is not None:
+            fail("--use-stage6-final-intrinsics cannot be combined with --left-intrinsics/--right-intrinsics")
+        require_flag(intrinsics_summary, "stage6_uses_external_intrinsics", "0")
+        require_flag(intrinsics_summary, "stage6_projection_intrinsics_active", "1")
+        left = require_existing(stage6 / "stereo_final_left_intrinsics.yaml", "Stage6 final left intrinsics")
+        right = require_existing(stage6 / "stereo_final_right_intrinsics.yaml", "Stage6 final right intrinsics")
+        intrinsics_source = "stage6_final_in_process"
+    else:
+        if args.left_intrinsics is None or args.right_intrinsics is None:
+            fail("provide both --left-intrinsics/--right-intrinsics or use --use-stage6-final-intrinsics")
+        left = require_existing(args.left_intrinsics, "left intrinsics")
+        right = require_existing(args.right_intrinsics, "right intrinsics")
+        intrinsics_source = "external_input"
     extrinsic = require_existing(stage6 / "stereo_extrinsic.yaml", "Stage6 stereo extrinsic")
     pairing = parse_key_values(stage6 / "stereo_pairing_summary.txt")
     extrinsic_summary = parse_key_values(stage6 / "stereo_extrinsic_summary.txt")
@@ -159,11 +187,17 @@ def main() -> int:
             "left_dir": str(args.holdout_left_dir.resolve()),
             "right_dir": str(args.holdout_right_dir.resolve()),
             "strict_timestamp_pair_count": holdout_pair_count,
-            "role": "external_validation_only",
+            "role": args.holdout_role,
             "excluded_from_stage6_optimization": True,
         },
         "stage6": {
-            "intrinsics_mode": "fixed_stage5",
+            "intrinsics_source": intrinsics_source,
+            "intrinsics_mode": intrinsics_summary.get("stage6_intrinsics_mode", "unknown"),
+            "effective_intrinsics_mode": intrinsics_summary.get("stage6_effective_intrinsics_mode", "unknown"),
+            "projection_intrinsics_active": intrinsics_summary.get("stage6_projection_intrinsics_active", "unknown"),
+            "projection_release_reason": intrinsics_summary.get("stage6_projection_release_reason", "unknown"),
+            "left_intrinsics_changed": intrinsics_summary.get("left_intrinsics_changed", "unknown"),
+            "right_intrinsics_changed": intrinsics_summary.get("right_intrinsics_changed", "unknown"),
             "persistent_pose_structure": "independent_pair_board",
             "final_global_ba_skipped": True,
             "frame_pairing_mode": pairing.get("pairing_mode"),

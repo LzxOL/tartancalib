@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -20,6 +21,57 @@ def parse_key_value_file(path: Path) -> Dict[str, str]:
         key, value = line.split(":", 1)
         data[key.strip()] = value.strip()
     return data
+
+
+def parse_numeric_vector(value: str) -> List[float] | None:
+    match = re.fullmatch(r"\s*\[([^\]]*)\]\s*", value)
+    if not match:
+        return None
+    try:
+        values = [float(token.strip()) for token in match.group(1).split(",") if token.strip()]
+    except ValueError:
+        return None
+    return values if all(math.isfinite(item) for item in values) else None
+
+
+def parse_final_camera_yaml(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8")
+    values: Dict[str, str] = {}
+    for key in ("camera_model", "distortion_model", "intrinsics", "resolution"):
+        match = re.search(rf"(?m)^\s*{re.escape(key)}:\s*([^#\n]+)", text)
+        if match:
+            values[key] = match.group(1).strip()
+    return values
+
+
+def verify_final_camera_yaml(directory: Path, side: str, intrinsics: Dict[str, str],
+                             results: List[Tuple[str, str, str]]) -> None:
+    filename = f"stereo_final_{side}_intrinsics.yaml"
+    if not require_file(directory, filename, results):
+        return
+    exported = parse_final_camera_yaml(directory / filename)
+    prefix = "left" if side == "left" else "right"
+    for field in ("camera_model", "distortion_model"):
+        expected = intrinsics.get(f"{prefix}_{field}", "")
+        if exported.get(field) == expected:
+            add_result(results, "PASS", f"final {side} YAML {field}")
+        else:
+            add_result(results, "FAIL", f"final {side} YAML {field}",
+                       f"got {exported.get(field, '')!r}, expected {expected!r}")
+    for field in ("intrinsics", "resolution"):
+        actual = parse_numeric_vector(exported.get(field, ""))
+        expected = parse_numeric_vector(intrinsics.get(f"{prefix}_{field}", ""))
+        if (actual is not None and expected is not None and len(actual) == len(expected)
+                # The summary is intentionally human-readable and rounds values;
+                # the exported YAML is the full-precision source of truth.
+                and all(abs(lhs - rhs) <= max(1e-5, 5e-6 * max(1.0, abs(rhs)))
+                        for lhs, rhs in zip(actual, expected))):
+            add_result(results, "PASS", f"final {side} YAML {field} matches summary")
+        else:
+            add_result(results, "FAIL", f"final {side} YAML {field} matches summary",
+                       f"got {exported.get(field, '')!r}, expected {intrinsics.get(f'{prefix}_{field}', '')!r}")
 
 
 def parse_csv(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
@@ -200,9 +252,9 @@ def verify_frontend_prefilter(runtime: Dict[str, str],
 
 def verify_directory(directory: Path,
                      require_rejection: bool,
-                     require_reference: bool,
                      expected_pose_structure: str,
-                     require_visualizations: bool) -> Tuple[bool, List[Tuple[str, str, str]]]:
+                     require_visualizations: bool,
+                     require_final_camera_yamls: bool) -> Tuple[bool, List[Tuple[str, str, str]]]:
     results: List[Tuple[str, str, str]] = []
     required_artifacts = [
         "stage6_init_summary.txt",
@@ -228,7 +280,6 @@ def verify_directory(directory: Path,
     intrinsics = parse_key_value_file(directory / "stereo_intrinsics_sanity_summary.txt")
     pairing = parse_key_value_file(directory / "stereo_pairing_summary.txt")
     runtime = parse_key_value_file(directory / "stage6_runtime_summary.txt")
-    reference = parse_key_value_file(directory / "stereo_reference_holdout_summary.txt")
 
     require_kv(init, "stage6_initialization_role", "seed_only_no_selection", results)
     for key in (
@@ -283,14 +334,34 @@ def verify_directory(directory: Path,
         add_result(results, "PASS", "reprojection uses extrinsic-only holdout only")
     require_positive_float(reprojection, "training_total_stereo_rmse", results)
     if expected_pose_structure == "independent_pair_board":
-        require_close_float(
-            persistent,
-            "final_selected_rmse",
-            reprojection,
-            "training_total_stereo_rmse",
-            1e-4,
-            results,
-        )
+        metric_name = persistent.get("persistent_incremental_residual_metric_name", "")
+        if metric_name == "pixel_px":
+            require_close_float(
+                persistent,
+                "final_selected_rmse",
+                reprojection,
+                "training_total_stereo_rmse",
+                1e-4,
+                results,
+            )
+        elif metric_name in {"tangent_plane_rad", "pixel_tangent_px_equivalent"}:
+            # The persistent selector reports its active objective domain while
+            # the reprojection summary is always an independent pixel-space
+            # evaluation. Comparing these values would mix units.
+            require_positive_float(persistent, "final_selected_rmse", results)
+            add_result(
+                results,
+                "PASS",
+                "final_selected_rmse uses a non-pixel persistent metric",
+                metric_name,
+            )
+        else:
+            add_result(
+                results,
+                "FAIL",
+                "persistent_incremental_residual_metric_name supported",
+                f"got {metric_name!r}",
+            )
     require_positive_float(
         reprojection, "holdout_extrinsic_only_total_stereo_rmse", results
     )
@@ -301,13 +372,26 @@ def verify_directory(directory: Path,
     require_positive_float(extrinsic, "baseline_length", results)
     require_positive_int(extrinsic, "selected_pair_count", results)
 
-    require_nonempty_kv(intrinsics, "left_intrinsics_path", results)
-    require_nonempty_kv(intrinsics, "right_intrinsics_path", results)
-    require_kv(intrinsics, "same_intrinsics_path", "0", results)
+    require_kv(intrinsics, "stage6_uses_external_intrinsics", "0", results)
+    require_kv(
+        intrinsics,
+        "left_camera_seed_source",
+        "stage6_auto_left_monocular_frontend",
+        results,
+    )
+    require_kv(
+        intrinsics,
+        "right_camera_seed_source",
+        "stage6_auto_right_monocular_frontend",
+        results,
+    )
     require_kv(intrinsics, "same_intrinsics_parameters", "0", results)
     require_kv(intrinsics, "same_resolution", "1", results)
     require_kv(intrinsics, "likely_intrinsics_shared_scale_issue", "0", results)
     require_nonempty_kv(intrinsics, "stage6_intrinsics_mode", results)
+    if require_final_camera_yamls:
+        verify_final_camera_yaml(directory, "left", intrinsics, results)
+        verify_final_camera_yaml(directory, "right", intrinsics, results)
     requested_intrinsics_mode = intrinsics.get("stage6_requested_intrinsics_mode", "")
     if requested_intrinsics_mode in {
         "regularized_joint_projection",
@@ -336,24 +420,6 @@ def verify_directory(directory: Path,
         pairing, "inherits_stage5_persistent_accepted_set", results
     )
     verify_frontend_prefilter(runtime, results)
-
-    if reference:
-        require_kv(reference, "comparison_metric", "extrinsic_only_holdout", results)
-        require_positive_float(
-            reference, "ours_extrinsic_only_holdout_total_stereo_rmse", results
-        )
-        require_positive_float(
-            reference, "reference_extrinsic_only_holdout_total_stereo_rmse", results
-        )
-        require_positive_int(reference, "extrinsic_only_holdout_used_pair_count", results)
-        require_positive_int(
-            reference, "reference_extrinsic_only_holdout_used_pair_count", results
-        )
-    elif require_reference:
-        add_result(results, "FAIL", "reference holdout summary present", "missing")
-    else:
-        add_result(results, "INFO", "reference holdout summary present",
-                   "not required")
 
     batch_columns, batch_rows = parse_csv(
         directory / "stage6_persistent_incremental_batch_decisions.csv"
@@ -472,11 +538,6 @@ def main() -> int:
         help="Fail unless at least one persistent batch was rejected/rolled back.",
     )
     parser.add_argument(
-        "--require-reference",
-        action="store_true",
-        help="Fail unless stereo_reference_holdout_summary.txt is present and valid.",
-    )
-    parser.add_argument(
         "--expected-pose-structure",
         choices=("independent_pair_board", "shared_frame_layout"),
         default="independent_pair_board",
@@ -487,6 +548,11 @@ def main() -> int:
         action="store_true",
         help="Fail unless backend-input PNG visualizations are present.",
     )
+    parser.add_argument(
+        "--require-final-camera-yamls",
+        action="store_true",
+        help="Fail unless exported Stage6 final camera YAML files match the final summary.",
+    )
     args = parser.parse_args()
 
     overall_success = True
@@ -495,9 +561,9 @@ def main() -> int:
         success, results = verify_directory(
             directory,
             args.require_rejection,
-            args.require_reference,
             args.expected_pose_structure,
             args.require_visualizations,
+            args.require_final_camera_yamls,
         )
         overall_success = overall_success and success
         lines = [f"directory: {directory}", f"success: {1 if success else 0}"]

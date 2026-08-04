@@ -16,11 +16,7 @@ cmake --build build --target run_stage6_stereo_extrinsic -j 8
   --right-image "${DATASET}/right" \
   --left-config aslam_cv/aslam_cameras_april/config/example_apriltag_internal.yaml \
   --right-config aslam_cv/aslam_cameras_april/config/example_apriltag_internal.yaml \
-  --left-intrinsics intrintic/catalog/canonical/left/stereo-4-2-3__left__tartancalib__ds.yaml \
-  --right-intrinsics intrintic/catalog/canonical/right/checkerboard-6-23__right__tartancalib__ds.yaml \
-  --stereo-reference-camchain config/stereo_4_2-3-camchain.yaml \
-  --stereo-reference-left-intrinsics intrintic/catalog/canonical/left/stereo-4-2-3__left__kalibr-stereo__ds.yaml \
-  --stereo-reference-right-intrinsics intrintic/catalog/canonical/right/stereo-4-2-3__right__kalibr-stereo__ds.yaml \
+  --models ds-none \
   --output "${OUTPUT_DIR}" \
   --cache-dir "${CACHE_DIR}" \
   --stage6-stereo-measurement-source all_valid \
@@ -35,7 +31,6 @@ cmake --build build --target run_stage6_stereo_extrinsic -j 8
   --stage6-enable-persistent-incremental-stereo-ba
 
 python3 tools/verify_stage6_persistent_outputs.py \
-  --require-reference \
   --expected-pose-structure independent_pair_board \
   --write-report \
   "${OUTPUT_DIR}"

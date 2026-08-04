@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import re
@@ -105,6 +106,60 @@ def read_text(path: Path) -> str:
     if not path.is_file():
         fail(f"missing input file: {path}")
     return path.read_text(encoding="utf-8")
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_ours_bundle_manifest(
+    manifest_path: Path,
+    left_path: Path,
+    right_path: Path,
+    extrinsic_path: Path,
+) -> dict[str, object]:
+    """Reject a stale or mixed Ours stereo bundle before downstream scoring."""
+    try:
+        manifest = json.loads(read_text(manifest_path))
+    except json.JSONDecodeError as error:
+        fail(f"invalid Ours stereo bundle manifest {manifest_path}: {error}")
+    if not isinstance(manifest, dict):
+        fail(f"Ours stereo bundle manifest must be an object: {manifest_path}")
+    if manifest.get("bundle_schema_version") != 1:
+        fail("unsupported Ours stereo bundle manifest schema")
+    if manifest.get("model") != "ds-none":
+        fail("Ours stereo bundle is not a ds-none calibration")
+    stage6 = manifest.get("stage6")
+    if not isinstance(stage6, dict):
+        fail("Ours stereo bundle lacks Stage6 provenance")
+    if stage6.get("intrinsics_source") != "stage6_final_in_process":
+        fail("Ours stereo bundle does not use Stage6 final in-process intrinsics")
+    if str(stage6.get("projection_intrinsics_active")) != "1":
+        fail("Ours stereo bundle did not optimize projection intrinsics in Stage6")
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        fail("Ours stereo bundle lacks file checksums")
+    expected_files = {
+        "left_intrinsics.yaml": left_path,
+        "right_intrinsics.yaml": right_path,
+        "stereo_extrinsic.yaml": extrinsic_path,
+    }
+    for name, path in expected_files.items():
+        entry = files.get(name)
+        expected = entry.get("sha256") if isinstance(entry, dict) else None
+        actual = sha256(path.resolve()) if path.is_file() else None
+        if not isinstance(expected, str) or actual != expected:
+            fail(f"Ours bundle checksum mismatch for {name}: {path}")
+    return {
+        "path": str(manifest_path.resolve()),
+        "sha256": sha256(manifest_path.resolve()),
+        "stage6_source_output": manifest.get("stage6_source_output"),
+        "intrinsics_source": stage6["intrinsics_source"],
+    }
 
 
 def yaml_block(text: str, key: str) -> str:
@@ -605,8 +660,61 @@ def run_self_checks(camera: DoubleSphereCamera, spec: RectificationSpec) -> dict
     return {"ds_roundtrip_max_px": roundtrip, "map_valid_ratio": float(np.mean(valid_map))}
 
 
-def write_protocol(output_dir: Path, args: argparse.Namespace, spec: RectificationSpec, pairs: Sequence[ImagePair], checks: dict[str, float], systems: Sequence[StereoSystem], timestamp_pair_count: int) -> None:
-    payload = {"protocol": "Stereo Rectification and Disparity Visualization", "test_left_dir": str(args.left_dir), "test_right_dir": str(args.right_dir), "calibration_left_dir": str(args.calibration_left_dir), "calibration_right_dir": str(args.calibration_right_dir), "timestamp_pairing": {"rule": "global_one_to_one_greedy_minimum_absolute_timestamp_difference", "tolerance_ms": args.timestamp_tolerance_ms, "eligible_pair_count": timestamp_pair_count, "selected_timestamp_deltas_ns": [pair.timestamp_delta_ns for pair in pairs]}, "frame_count": len(pairs), "frame_ids": [pair.frame_id for pair in pairs], "virtual_pinhole": {"width": spec.width, "height": spec.height, "horizontal_fov_deg": spec.hfov_deg, "focal_px": spec.focal, "interpolation": "INTER_LINEAR"}, "sgbm": {"min_disparity": spec.min_disparity, "num_disparities": spec.num_disparities, "block_size": spec.block_size, "P1": 8 * spec.block_size * spec.block_size, "P2": 32 * spec.block_size * spec.block_size, "uniqueness_ratio": 10, "speckle_window_size": 100, "speckle_range": 2, "left_right_consistency_px": 1.0}, "systems": [{"name": item.name, "left_intrinsics": item.left.__dict__, "right_intrinsics": item.right.__dict__, "baseline_m": float(np.linalg.norm(item.translation_cam1_cam0))} for item in systems], "checks": checks}
+def write_protocol(
+    output_dir: Path,
+    args: argparse.Namespace,
+    spec: RectificationSpec,
+    pairs: Sequence[ImagePair],
+    checks: dict[str, float],
+    systems: Sequence[StereoSystem],
+    timestamp_pair_count: int,
+    ours_bundle: dict[str, object] | None,
+) -> None:
+    payload = {
+        "protocol": "Stereo Rectification and Disparity Visualization",
+        "test_left_dir": str(args.left_dir),
+        "test_right_dir": str(args.right_dir),
+        "calibration_left_dir": str(args.calibration_left_dir),
+        "calibration_right_dir": str(args.calibration_right_dir),
+        "timestamp_pairing": {
+            "rule": "global_one_to_one_greedy_minimum_absolute_timestamp_difference",
+            "tolerance_ms": args.timestamp_tolerance_ms,
+            "eligible_pair_count": timestamp_pair_count,
+            "selected_timestamp_deltas_ns": [pair.timestamp_delta_ns for pair in pairs],
+        },
+        "frame_count": len(pairs),
+        "frame_ids": [pair.frame_id for pair in pairs],
+        "virtual_pinhole": {
+            "width": spec.width,
+            "height": spec.height,
+            "horizontal_fov_deg": spec.hfov_deg,
+            "focal_px": spec.focal,
+            "interpolation": "INTER_LINEAR",
+        },
+        "sgbm": {
+            "min_disparity": spec.min_disparity,
+            "num_disparities": spec.num_disparities,
+            "block_size": spec.block_size,
+            "P1": 8 * spec.block_size * spec.block_size,
+            "P2": 32 * spec.block_size * spec.block_size,
+            "uniqueness_ratio": 10,
+            "speckle_window_size": 100,
+            "speckle_range": 2,
+            "left_right_consistency_px": 1.0,
+        },
+        "systems": [
+            {
+                "name": item.name,
+                "left_intrinsics": item.left.__dict__,
+                "right_intrinsics": item.right.__dict__,
+                "baseline_m": float(np.linalg.norm(item.translation_cam1_cam0)),
+            }
+            for item in systems
+        ],
+        "kalibr_calibration_label": args.kalibr_calibration_label,
+        "ours_bundle": ours_bundle,
+        "checks": checks,
+    }
     (output_dir / "protocol.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
@@ -626,7 +734,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ours-left-intrinsics", type=Path, default=DEFAULT_OURS_LEFT)
     parser.add_argument("--ours-right-intrinsics", type=Path, default=DEFAULT_OURS_RIGHT)
     parser.add_argument("--ours-extrinsic", type=Path, default=DEFAULT_OURS_EXTRINSIC)
+    parser.add_argument(
+        "--ours-bundle-manifest",
+        type=Path,
+        help="Require the Ours YAMLs to match a self-contained Stage6 bundle manifest.",
+    )
     parser.add_argument("--kalibr-camchain", type=Path, default=DEFAULT_KALIBR)
+    parser.add_argument(
+        "--kalibr-calibration-label",
+        default="checkerboard control",
+        help="Calibration-source label recorded in protocol.json for the Kalibr control.",
+    )
     parser.add_argument("--left-dir", type=Path, default=DEFAULT_LEFT_DIR)
     parser.add_argument("--right-dir", type=Path, default=DEFAULT_RIGHT_DIR)
     parser.add_argument("--calibration-left-dir", type=Path, default=DEFAULT_CALIB_LEFT_DIR)
@@ -658,6 +776,16 @@ def main() -> int:
             path.unlink(missing_ok=True)
     args.output.mkdir(parents=True, exist_ok=True)
     spec = RectificationSpec(args.width, args.height, args.hfov_deg, 0, 192, 7)
+    ours_bundle = (
+        verify_ours_bundle_manifest(
+            args.ours_bundle_manifest,
+            args.ours_left_intrinsics,
+            args.ours_right_intrinsics,
+            args.ours_extrinsic,
+        )
+        if args.ours_bundle_manifest is not None
+        else None
+    )
     ours = load_ours_system(args.ours_left_intrinsics, args.ours_right_intrinsics, args.ours_extrinsic)
     kalibr = load_kalibr_system(args.kalibr_camchain)
     systems = [kalibr, ours]
@@ -754,7 +882,7 @@ def main() -> int:
     figure_path = render_figure(args.output, figure_images, spec)
     if not args.skip_pdf:
         write_figure_pdf(args.output, figure_path)
-    write_protocol(args.output, args, spec, pairs, checks, systems, len(raw_pairs))
+    write_protocol(args.output, args, spec, pairs, checks, systems, len(raw_pairs), ours_bundle)
     print(f"output={args.output}")
     for method, row in metrics.items():
         print(f"{method}: epipolar_p95={row['epipolar_p95']:.4f}px peripheral_p95={row['peripheral_p95']:.4f}px valid={100.0 * row['valid_ratio']:.2f}% peripheral_valid={100.0 * row['peripheral_valid_ratio']:.2f}%")

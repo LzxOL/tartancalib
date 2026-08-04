@@ -394,8 +394,6 @@ def write_report(path: Path, sync_rows: list[dict[str, Any]], selected_pairs: li
         return {}
     selected_ids = [pair.frame_id for pair in selected_pairs]
     selected_deltas = ", ".join(f"f{pair.frame_id}={parse_timestamp(pair.right_path) - parse_timestamp(pair.left_path)} ns" for pair in selected_pairs)
-    rotation_min = min(float(row["rotation_delta_deg"]) for row in essential_rows)
-    rotation_max = max(float(row["rotation_delta_deg"]) for row in essential_rows)
     lines = ["# Rectified Epipolar Error Audit", "", "## Scope", "",
              "This audit does not alter Stage5, Stage6, intrinsics, stereo extrinsics, frozen frame selection, or SGBM.",
              f"Ours calibration artifacts: `{ours_provenance}`.",
@@ -421,10 +419,25 @@ def write_report(path: Path, sync_rows: list[dict[str, Any]], selected_pairs: li
         loaded = next(row for row in direction_rows if row["method"] == method and row["transform_hypothesis"] == "loaded_cam1_from_cam0")
         inverse = next(row for row in direction_rows if row["method"] == method and row["transform_hypothesis"] == "inverse_misread_as_cam1_from_cam0")
         lines.append(f"- {method}: known-corner P95 is {loaded['p95']:.3f}px with the documented `cam1<-cam0` transform and {inverse['p95']:.3f}px if its full inverse is incorrectly treated as `cam1<-cam0`.")
-    lines += ["", "## Conclusion", "", "- The original SIFT matches are not a defensible epipolar metric: their median error is already large and the frozen CSV did not retain Lowe second-neighbor distances, so it cannot audit ratio margins retrospectively.",
-              "- The same large error persists for AprilTag ID and canonical-corner correspondences. Thus SIFT mismatches are not the only cause.",
-              f"- The independently estimated relative rotations differ from the loaded transforms by {rotation_min:.3f}-{rotation_max:.3f} degrees. Since synthetic points rectify to numerical precision, remaining large real-image error indicates that the supplied intrinsics/extrinsic do not jointly explain these test-image correspondences.",
-              "- Treat this audit as a geometry-validation gate. A downstream figure is paper-eligible only after same-ID AprilTag errors and the calibration-artifact provenance are both reported."]
+    lines += ["", "## Conclusion", "",
+              "- Frozen SIFT matches remain a secondary visualization diagnostic; same-ID AprilTag corners are the identity-preserved geometry metric."]
+    for method in ("Kalibr", "Ours"):
+        known = select(known_stats, method, "all", "known_apriltag_outer_corners")
+        p95 = float(known.get("p95", math.nan))
+        inlier = 100.0 * float(known.get("inlier_1", math.nan))
+        rotations = [float(row["rotation_delta_deg"]) for row in essential_rows if row["method"] == method]
+        if math.isfinite(p95) and p95 <= 1.0:
+            verdict = "is geometrically consistent with the frozen external sequence"
+        elif math.isfinite(p95) and p95 <= 3.0:
+            verdict = "is substantially improved but still has residual geometric mismatch"
+        else:
+            verdict = "does not jointly explain the frozen external correspondences"
+        lines.append(
+            f"- {method}: known-corner P95={p95:.3f}px and Inlier@1px={inlier:.2f}%; "
+            f"the supplied calibration {verdict}. Relative-rotation mismatch is "
+            f"{min(rotations):.3f}-{max(rotations):.3f} deg."
+        )
+    lines.append("- Treat this audit as a geometry-validation gate. A downstream figure is paper-eligible only after same-ID AprilTag errors and calibration-artifact provenance are both reported.")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

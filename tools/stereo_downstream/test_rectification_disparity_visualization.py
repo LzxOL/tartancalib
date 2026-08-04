@@ -2,6 +2,7 @@
 """Dependency-free geometry checks for the DS downstream visualization tool."""
 
 import importlib.util
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -53,8 +54,54 @@ def test_timestamp_pairing() -> None:
         assert pairs[0].timestamp_delta_ns == 500
 
 
+def test_selfcontained_bundle_manifest() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        files = {}
+        for name, payload in {
+            "left_intrinsics.yaml": "left\n",
+            "right_intrinsics.yaml": "right\n",
+            "stereo_extrinsic.yaml": "extrinsic\n",
+        }.items():
+            path = root / name
+            path.write_text(payload, encoding="utf-8")
+            files[name] = {"sha256": MODULE.sha256(path)}
+        manifest = {
+            "bundle_schema_version": 1,
+            "model": "ds-none",
+            "files": files,
+            "stage6": {
+                "intrinsics_source": "stage6_final_in_process",
+                "projection_intrinsics_active": "1",
+            },
+        }
+        manifest_path = root / "stereo_bundle_manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        audit = MODULE.verify_ours_bundle_manifest(
+            manifest_path,
+            root / "left_intrinsics.yaml",
+            root / "right_intrinsics.yaml",
+            root / "stereo_extrinsic.yaml",
+        )
+        assert audit["intrinsics_source"] == "stage6_final_in_process"
+
+        (root / "left_intrinsics.yaml").write_text("tampered\n", encoding="utf-8")
+        try:
+            MODULE.verify_ours_bundle_manifest(
+                manifest_path,
+                root / "left_intrinsics.yaml",
+                root / "right_intrinsics.yaml",
+                root / "stereo_extrinsic.yaml",
+            )
+        except RuntimeError as error:
+            assert "checksum mismatch" in str(error)
+        else:
+            raise AssertionError("tampered bundle must be rejected")
+
+
 if __name__ == "__main__":
     test_roundtrip()
     test_invalid_and_vertical_offset()
     test_timestamp_pairing()
+    test_selfcontained_bundle_manifest()
     print("stereo downstream geometry checks: OK")

@@ -5,20 +5,122 @@ compares exactly two complete systems: `Kalibr` and `Ours`. Each system uses
 its own left/right intrinsics and stereo extrinsic; no intrinsic/extrinsic
 cross-combination is permitted.
 
+## Peripheral Epipolar Consistency
+
+`evaluate_peripheral_epipolar_consistency.py` is the first quantitative
+downstream experiment. It evaluates complete `Kalibr` and `Ours` stereo
+bundles on frozen, raw-image mutual-SIFT matches. The matching stage has no
+access to either calibration. Each method then independently unprojects the
+same pixel pairs, evaluates the same symmetric bearing-to-epipolar-plane angle
+formula using its frozen `T_cam1_cam0`, and reports the same fixed sensor-radial
+polar bands: central `[0,30)`, middle `[30,60)`, and peripheral `[60,80)` deg.
+The bands are a method-independent equidistant sensor-polar proxy, so a method
+cannot improve its score by changing which matches belong to the periphery.
+
+The Ours input is guarded: its Stage6 persistent-selection summary must report
+`spherical_tangent`. A pixel-refined bundle is rejected instead of silently
+being included. Create the required self-contained Outer4+Internal angular
+bundle as follows:
+
+```bash
+STAGE6_BA_MODE=angular scripts/run_stage6_selfcontained_ds_bundle.sh \
+  image/datatset_5_1/stereo_dataset_20260430_1444190-clear \
+  result_may/stage6_selfcontained_ds_angular_tangent_20260802 \
+  intrintic/catalog/current_baseline/stereo_bundles/2026_08_02_stage6_selfcontained_ds_angular_tangent_1444190_stride3
+```
+
+Then run the independent evaluation. Exact capture timestamps are mandatory;
+the test data must not be part of the Stage6 calibration input.
+
+```bash
+python3 tools/stereo_downstream/evaluate_peripheral_epipolar_consistency.py \
+  --ours-bundle intrintic/catalog/current_baseline/stereo_bundles/2026_08_02_stage6_selfcontained_ds_angular_tangent_1444190_stride3 \
+  --kalibr-camchain config/stereo_4_2-3-camchain.yaml \
+  --left-dir image/mid_far_dataset/stereo_dataset_20260430_144928/left \
+  --right-dir image/mid_far_dataset/stereo_dataset_20260430_144928/right \
+  --calibration-left-dir image/datatset_5_1/stereo_dataset_20260430_1444190-clear/left \
+  --calibration-right-dir image/datatset_5_1/stereo_dataset_20260430_1444190-clear/right \
+  --timestamp-tolerance-ms 0 \
+  --output paper_experiments/2026_08_02_peripheral_epipolar_consistency_ds
+```
+
+It writes the immutable frame/match manifests, all per-match ray errors and
+rectified coordinates, regional metrics, a compact LaTex table, a polar-band
+curve, and a spatial peripheral overlay. It refuses to produce the final
+table if any method/region has no valid angular or vertical-disparity samples.
+`mid_far 144928` is an independent multi-board diagnostic sequence, not a
+natural-scene result; point the same command at an explicitly frozen natural
+test sequence for the paper's natural-scene claim.
+
 Run the frozen protocol only with a provenance-locked bundle:
 
 ```bash
-BUNDLE_DIR=intrintic/catalog/current_baseline/stereo_bundles/2026_07_27_ours_ds_train1444190_timestamp1ms \
+BUNDLE_DIR=intrintic/catalog/current_baseline/stereo_bundles/2026_08_02_stage6_selfcontained_ds_1444190_stride3 \
+KALIBR_CAMCHAIN=config/stereo_4_2-3-camchain.yaml \
+KALIBR_CALIBRATION_LABEL="checkerboard control" \
 scripts/run_stereo_rectification_disparity_visualization.sh
 ```
+
+To create a new self-contained bundle in one step, run:
+
+```bash
+scripts/run_stage6_selfcontained_ds_bundle.sh \
+  image/datatset_5_1/stereo_dataset_20260430_1444190-clear \
+  result_may/stage6_selfcontained_ds_20260802 \
+  intrintic/catalog/current_baseline/stereo_bundles/2026_08_02_stage6_selfcontained_ds_1444190
+```
+
+The command rejects an existing nonempty bundle, verifies the two native final
+camera YAMLs, and records checksums before any downstream evaluation can use
+the result.
+
+The default Kalibr camchain is the intended checkerboard-calibration control.
+Its source label is written to `protocol.json`; use the same label in the paper
+caption or table note, rather than describing it as a same-training-set run.
 
 ## Provenance-locked stereo bundle
 
 Do not combine a left intrinsic YAML, right intrinsic YAML, and an external
-YAML from separate calibration runs. First estimate the stereo external on
-strictly timestamp-synchronized *training* pairs with both intrinsics fixed,
-then create the immutable three-file bundle below. The holdout sequence is
-recorded only for validation and is excluded from the Stage6 optimization.
+YAML from separate calibration runs. The preferred protocol is a
+self-contained Stage6 run: it creates both monocular seeds in process, jointly
+optimizes left/right projection intrinsics and `T_cam1_cam0`, then exports all
+three final YAMLs from the same `optimized_scene`.
+
+## Self-contained Stage6 bundle
+
+After a successful Stage6 run with
+`--stage6-intrinsics-mode adaptive_regularized_joint_projection`, verify its
+native final-camera exports and freeze them as one bundle:
+
+```bash
+python3 tools/verify_stage6_persistent_outputs.py \
+  --expected-pose-structure independent_pair_board \
+  --require-final-camera-yamls \
+  result_may/stage6_frozen_selfcontained_ds_final_bundle_20260802
+
+python3 tools/stereo_downstream/create_provenance_locked_stereo_bundle.py \
+  --stage6-output result_may/stage6_frozen_selfcontained_ds_final_bundle_20260802 \
+  --use-stage6-final-intrinsics \
+  --training-left-dir image/datatset_5_1/stereo_dataset_20260430_1444190-clear/left \
+  --training-right-dir image/datatset_5_1/stereo_dataset_20260430_1444190-clear/right \
+  --holdout-left-dir image/datatset_5_1/stereo_dataset_20260430_1444190-clear/left \
+  --holdout-right-dir image/datatset_5_1/stereo_dataset_20260430_1444190-clear/right \
+  --holdout-role within_sequence_holdout \
+  --max-pair-delta-ms 0 \
+  --bundle-dir intrintic/catalog/current_baseline/stereo_bundles/2026_08_02_stage6_selfcontained_ds_1444190_stride3
+```
+
+`--use-stage6-final-intrinsics` rejects historical YAML inputs and requires:
+`stage6_uses_external_intrinsics=0`, active projection-intrinsics optimization,
+and the two final YAMLs that match the Stage6 final summary. The holdout role
+must be `within_sequence_holdout` when it is a split of the same sequence;
+use `external_validation_only` only for a distinct frozen sequence.
+
+## Fixed-intrinsics diagnostic bundle
+
+The following legacy-style flow is retained only to isolate stereo-extrinsic
+effects with fixed camera intrinsics. It is not the preferred final comparison
+against Kalibr's jointly calibrated stereo system.
 
 ```bash
 python3 tools/stereo_downstream/create_provenance_locked_stereo_bundle.py \
@@ -99,6 +201,10 @@ python3 tools/stereo_downstream/test_rectification_disparity_visualization.py
 python3 tools/stereo_downstream/run_rectification_disparity_visualization.py \
   --smoke --output result_may/stereo_rectification_disparity_smoke
 ```
+
+The wrapper passes `--ours-bundle-manifest`, which validates all three hashes
+and requires `stage6_final_in_process` intrinsics with active Stage6 projection
+optimization. Direct Python calls can use the same flag to enforce the check.
 
 ## Epipolar-error audit
 
