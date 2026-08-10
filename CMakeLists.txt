@@ -310,6 +310,7 @@ add_library(tartancalib_apriltag_internal_core STATIC
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/ApriltagInternalDetector.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/CalibrationStateBundle.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/AngularResidualGeometry.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/BoardDetectionPipeline.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/DoubleSphereCameraModel.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/FrozenRound2BaselinePipeline.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/JointMeasurementCuration.cpp"
@@ -326,6 +327,7 @@ add_library(tartancalib_apriltag_internal_core STATIC
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/MultiBoardOuterBootstrap.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/MultiScaleOuterTagDetector.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/OuterDetectionCache.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/InternalRegenerationCache.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/OuterOnlyCameraInitializer.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/PolarAngleResidualDiagnostics.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/PrecomputedObservationImporter.cpp"
@@ -335,6 +337,7 @@ add_library(tartancalib_apriltag_internal_core STATIC
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/StereoExtrinsicCalibrationRunner.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/StereoExtrinsicProblemBuilder.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/Stage5Runtime.cpp"
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/Stage5CacheManifest.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/Stage5Benchmark.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/Stage5BackendDiagnosticWriters.cpp"
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/apriltag_internal/IterativeCoarseCalibrationExperiment.cpp"
@@ -358,6 +361,18 @@ add_executable(detect_apriltag_internal
   "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/detect_apriltag_internal_main.cpp"
 )
 target_link_libraries(detect_apriltag_internal PRIVATE
+  tartancalib_apriltag_internal_core
+  ${OpenCV_LIBS}
+  Boost::filesystem
+)
+
+# Targeted diagnostic for difficult large-Tag / high-distortion frames.  It is
+# intentionally separate from the production frontend and only visualizes a
+# user-specified local sphere-patch sweep.
+add_executable(run_probe_local_sphere_patch_apriltag
+  "${TARTANCALIB_APRILTAG_INTERNAL_DIR}/src/run_probe_local_sphere_patch_apriltag_main.cpp"
+)
+target_link_libraries(run_probe_local_sphere_patch_apriltag PRIVATE
   tartancalib_apriltag_internal_core
   ${OpenCV_LIBS}
   Boost::filesystem

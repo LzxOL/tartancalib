@@ -1,11 +1,14 @@
 #include <aslam/cameras/apriltag_internal/ApriltagInternalDetector.hpp>
+#include <aslam/cameras/apriltag_internal/BoardDetectionPipeline.hpp>
 #include <aslam/cameras/apriltag_internal/MultiBoardInternalMeasurementRegenerator.hpp>
 #include <aslam/cameras/apriltag_internal/MultiBoardOuterBootstrap.hpp>
 #include <aslam/cameras/apriltag_internal/MultiScaleOuterTagDetector.hpp>
+#include <aslam/cameras/apriltag_internal/OuterDetectionCache.hpp>
 
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -27,6 +30,11 @@ struct CmdArgs {
   bool show = false;
   bool save_overlays = true;
   int reference_board_id = 1;
+  double internal_pose_rescue_max_ray_angle_deg = 88.0;
+  std::string outer_cache_dir;
+  std::vector<std::string> frame_labels;
+  std::vector<double> bootstrap_camera_intrinsics;
+  bool disable_bootstrap_intrinsics_optimization = false;
 };
 
 struct FrameRecord {
@@ -40,7 +48,55 @@ void PrintUsage(const char* program) {
       << "Usage:\n"
       << "  " << program
       << " --image IMAGE_OR_DIR --config APRILTAG_INTERNAL_YAML --output OUTPUT_DIR"
-      << " [--all] [--show] [--no-save-overlays] [--reference-board-id ID]\n";
+      << " [--all] [--show] [--no-save-overlays] [--reference-board-id ID]"
+      << " [--internal-pose-rescue-max-ray-angle-deg DEG]"
+      << " [--outer-cache-dir DIR] [--frame-labels LABEL0,LABEL1,...]"
+      << " [--bootstrap-camera-intrinsics XI,ALPHA,FU,FV,CU,CV]"
+      << " [--disable-bootstrap-intrinsics-optimization]\n";
+}
+
+std::vector<std::string> ParseCommaSeparatedLabels(const std::string& value) {
+  std::vector<std::string> labels;
+  std::string current;
+  for (const char character : value) {
+    if (character == ',') {
+      if (!current.empty()) {
+        labels.push_back(current);
+        current.clear();
+      }
+    } else {
+      current.push_back(character);
+    }
+  }
+  if (!current.empty()) {
+    labels.push_back(current);
+  }
+  return labels;
+}
+
+std::vector<double> ParseCommaSeparatedDoubles(const std::string& value) {
+  std::vector<double> values;
+  std::string current;
+  for (const char character : value) {
+    if (character == ',') {
+      if (current.empty()) {
+        throw std::runtime_error("Empty value in comma-separated camera intrinsics.");
+      }
+      values.push_back(std::stod(current));
+      current.clear();
+    } else {
+      current.push_back(character);
+    }
+  }
+  if (current.empty()) {
+    throw std::runtime_error("Empty value in comma-separated camera intrinsics.");
+  }
+  values.push_back(std::stod(current));
+  if (values.size() != 6) {
+    throw std::runtime_error(
+        "--bootstrap-camera-intrinsics requires six values: XI,ALPHA,FU,FV,CU,CV.");
+  }
+  return values;
 }
 
 CmdArgs ParseArgs(int argc, char** argv) {
@@ -61,6 +117,17 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.save_overlays = false;
     } else if (token == "--reference-board-id" && i + 1 < argc) {
       args.reference_board_id = std::stoi(argv[++i]);
+    } else if (token == "--internal-pose-rescue-max-ray-angle-deg" &&
+               i + 1 < argc) {
+      args.internal_pose_rescue_max_ray_angle_deg = std::stod(argv[++i]);
+    } else if (token == "--outer-cache-dir" && i + 1 < argc) {
+      args.outer_cache_dir = argv[++i];
+    } else if (token == "--frame-labels" && i + 1 < argc) {
+      args.frame_labels = ParseCommaSeparatedLabels(argv[++i]);
+    } else if (token == "--bootstrap-camera-intrinsics" && i + 1 < argc) {
+      args.bootstrap_camera_intrinsics = ParseCommaSeparatedDoubles(argv[++i]);
+    } else if (token == "--disable-bootstrap-intrinsics-optimization") {
+      args.disable_bootstrap_intrinsics_optimization = true;
     } else if (token == "--help" || token == "-h") {
       PrintUsage(argv[0]);
       std::exit(0);
@@ -86,7 +153,10 @@ bool IsImageFile(const fs::path& path) {
          extension == ".bmp" || extension == ".tif" || extension == ".tiff";
 }
 
-std::vector<std::string> CollectImagePaths(const std::string& image_path, bool all) {
+std::vector<std::string> CollectImagePaths(
+    const std::string& image_path,
+    bool all,
+    const std::vector<std::string>& requested_frame_labels) {
   const fs::path input(image_path);
   if (!all) {
     return {image_path};
@@ -106,7 +176,11 @@ std::vector<std::string> CollectImagePaths(const std::string& image_path, bool a
 
   std::vector<std::string> image_paths;
   for (fs::directory_iterator it(directory), end; it != end; ++it) {
-    if (IsImageFile(it->path())) {
+    const bool label_selected =
+        requested_frame_labels.empty() ||
+        std::find(requested_frame_labels.begin(), requested_frame_labels.end(),
+                  it->path().stem().string()) != requested_frame_labels.end();
+    if (IsImageFile(it->path()) && label_selected) {
       image_paths.push_back(it->path().string());
     }
   }
@@ -178,7 +252,9 @@ std::vector<int> NormalizeBoardIds(const std::vector<int>& configured_ids, int f
   return board_ids;
 }
 
-ati::ApriltagInternalDetectionOptions MakeDetectionOptions(const ati::ApriltagInternalConfig& config) {
+ati::ApriltagInternalDetectionOptions MakeDetectionOptions(
+    const ati::ApriltagInternalConfig& config,
+    const CmdArgs& args) {
   ati::ApriltagInternalDetectionOptions options;
   options.do_subpix_refinement = true;
   options.max_subpix_displacement2 = config.max_subpix_displacement2;
@@ -190,6 +266,8 @@ ati::ApriltagInternalDetectionOptions MakeDetectionOptions(const ati::ApriltagIn
   options.internal_subpix_window_max = config.internal_subpix_window_max;
   options.internal_subpix_displacement_scale = config.internal_subpix_displacement_scale;
   options.max_internal_subpix_displacement = config.max_internal_subpix_displacement;
+  options.internal_pose_rescue_max_ray_angle_deg =
+      args.internal_pose_rescue_max_ray_angle_deg;
   options.outer_detector_config = config.outer_detector_config;
   return options;
 }
@@ -244,7 +322,10 @@ void WriteRegenerationCsv(
   std::ofstream output(output_path.string());
   output << "frame_index,frame_label,board_id,frame_bootstrap_initialized,"
          << "board_bootstrap_initialized,pose_prior_used,tag_detected,success,"
-         << "valid_outer_corners,valid_internal_corners\n";
+         << "valid_outer_corners,valid_internal_corners,failure_reason,"
+         << "pose_rescue_attempted,pose_rescue_success,pose_rescue_used,"
+         << "pose_rescue_rmse,pose_rescue_max_ray_angle_deg,"
+         << "pose_rescue_ray_angle_limit_deg,pose_rescue_failure_reason\n";
 
   for (const ati::InternalRegenerationFrameResult& frame_result : frame_results) {
     for (const ati::RegeneratedBoardMeasurement& measurement : frame_result.board_measurements) {
@@ -257,7 +338,15 @@ void WriteRegenerationCsv(
              << (measurement.detection.tag_detected ? 1 : 0) << ","
              << (measurement.detection.success ? 1 : 0) << ","
              << measurement.detection.valid_corner_count << ","
-             << measurement.detection.valid_internal_corner_count << "\n";
+             << measurement.detection.valid_internal_corner_count << ","
+             << measurement.detection.failure_reason << ","
+             << (measurement.detection.pose_rescue_attempted ? 1 : 0) << ","
+             << (measurement.detection.pose_rescue_success ? 1 : 0) << ","
+             << (measurement.detection.pose_rescue_used ? 1 : 0) << ","
+             << measurement.detection.pose_rescue_rmse << ","
+             << measurement.detection.pose_rescue_max_ray_angle_deg << ","
+             << measurement.detection.pose_rescue_ray_angle_limit_deg << ","
+             << measurement.detection.pose_rescue_failure_reason << "\n";
     }
   }
 }
@@ -273,13 +362,33 @@ int main(int argc, char** argv) {
     config.tag_id = config.tag_ids.front();
     config.outer_detector_config.tag_ids = config.tag_ids;
     config.outer_detector_config.tag_id = config.tag_id;
-    const ati::ApriltagInternalDetectionOptions detection_options = MakeDetectionOptions(config);
-    const ati::MultiScaleOuterTagDetector outer_detector(config.outer_detector_config);
-    const ati::OuterBootstrapOptions bootstrap_options = MakeBootstrapOptions(config, args);
+    const ati::ApriltagInternalDetectionOptions detection_options =
+        MakeDetectionOptions(config, args);
+    ati::OuterBootstrapOptions bootstrap_options = MakeBootstrapOptions(config, args);
+    if (!args.bootstrap_camera_intrinsics.empty()) {
+      const std::vector<double>& values = args.bootstrap_camera_intrinsics;
+      bootstrap_options.initial_camera.camera_model = "ds";
+      bootstrap_options.initial_camera.distortion_model = "none";
+      bootstrap_options.initial_camera.xi = values[0];
+      bootstrap_options.initial_camera.alpha = values[1];
+      bootstrap_options.initial_camera.fu = values[2];
+      bootstrap_options.initial_camera.fv = values[3];
+      bootstrap_options.initial_camera.cu = values[4];
+      bootstrap_options.initial_camera.cv = values[5];
+      bootstrap_options.initial_camera.resolution = cv::Size(4512, 4512);
+    }
+    if (args.disable_bootstrap_intrinsics_optimization) {
+      bootstrap_options.max_coordinate_descent_iterations = 0;
+    }
     const ati::MultiBoardOuterBootstrap bootstrap(config, bootstrap_options);
-    const ati::MultiBoardInternalMeasurementRegenerator regenerator(config, detection_options);
+    const ati::BoardDetectionPipeline board_detection_pipeline(config, detection_options);
+    const ati::OuterDetectionCache detection_cache(
+        config.outer_detector_config,
+        ati::OuterDetectionCacheOptions{!args.outer_cache_dir.empty(),
+                                        args.outer_cache_dir});
 
-    const std::vector<std::string> image_paths = CollectImagePaths(args.image_path, args.all);
+    const std::vector<std::string> image_paths =
+        CollectImagePaths(args.image_path, args.all, args.frame_labels);
     const fs::path output_dir(args.output_path);
     EnsureDirectoryExists(output_dir);
     const fs::path overlay_dir = output_dir / "internal_regeneration_overlays";
@@ -303,7 +412,19 @@ int main(int argc, char** argv) {
         throw std::runtime_error("Failed to read image: " + image_path);
       }
 
-      const ati::OuterTagMultiDetectionResult outer_detections = outer_detector.DetectMultiple(image);
+      ati::OuterTagMultiDetectionResult outer_detections;
+      std::string cache_warning;
+      const bool cache_hit = detection_cache.Load(
+          image_path, &outer_detections, &cache_warning);
+      if (!cache_hit) {
+        outer_detections = board_detection_pipeline.DetectOuter(image);
+        if (detection_cache.enabled() &&
+            !detection_cache.Save(image_path, outer_detections, &cache_warning) &&
+            !cache_warning.empty()) {
+          std::cerr << "Outer detection cache store warning: "
+                    << cache_warning << "\n";
+        }
+      }
 
       FrameRecord frame;
       frame.image_path = image_path;
@@ -318,7 +439,8 @@ int main(int argc, char** argv) {
 
       std::cout << "  [" << (image_index + 1) << "/" << image_paths.size() << "] "
                 << frame_label << " success_boards="
-                << outer_detections.SuccessfulBoardCount() << "\n";
+                << outer_detections.SuccessfulBoardCount()
+                << (cache_hit ? " source=cache" : " source=detector") << "\n";
     }
 
     const ati::OuterBootstrapResult bootstrap_result = bootstrap.Solve(bootstrap_frames);
@@ -339,12 +461,14 @@ int main(int argc, char** argv) {
       }
 
       const ati::InternalRegenerationFrameResult frame_result =
-          regenerator.RegenerateFrame(image, frames[frame_index].regeneration_input, bootstrap_result);
+          board_detection_pipeline.RegenerateFrame(
+              image, frames[frame_index].regeneration_input, bootstrap_result);
       frame_results.push_back(frame_result);
 
       if (args.save_overlays || args.show) {
         cv::Mat overlay;
-        regenerator.DrawFrameOverlay(image, frame_result, &overlay);
+        board_detection_pipeline.measurement_regenerator().DrawFrameOverlay(
+            image, frame_result, &overlay);
         if (args.save_overlays) {
           const fs::path overlay_path =
               overlay_dir / (frames[frame_index].regeneration_input.frame_label +

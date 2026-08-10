@@ -73,6 +73,15 @@ struct GeometryPriorOuterSeedCandidate {
   int rectified_patch_detected_tag_id = -1;
   int rectified_patch_hamming = -1;
   std::string rectified_patch_summary;
+  bool geometry_guided_tag_likelihood_checked = false;
+  bool geometry_guided_tag_likelihood_passed = false;
+  std::string geometry_guided_tag_likelihood_mode;
+  int geometry_guided_tag_likelihood_expected_hamming = -1;
+  int geometry_guided_tag_likelihood_runner_up_id = -1;
+  int geometry_guided_tag_likelihood_runner_up_hamming = -1;
+  int geometry_guided_tag_likelihood_hamming_margin = -1;
+  double geometry_guided_tag_likelihood_contrast = 0.0;
+  std::string geometry_guided_tag_likelihood_summary;
   bool roi_redetect_checked = false;
   bool roi_redetect_success = false;
   int roi_redetect_detected_tag_id = -1;

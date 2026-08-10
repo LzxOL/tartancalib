@@ -40,6 +40,7 @@ add_library(${PROJECT_NAME}
   src/apriltag_internal/ApriltagInternalDebugVisualization.cpp
   src/apriltag_internal/AngularResidualGeometry.cpp
   src/apriltag_internal/AslamBackendCalibrationRunner.cpp
+  src/apriltag_internal/BoardDetectionPipeline.cpp
   src/apriltag_internal/CalibrationStateBundle.cpp
   src/apriltag_internal/DoubleSphereCameraModel.cpp
   src/apriltag_internal/FrozenRound2BaselinePipeline.cpp
@@ -55,9 +56,11 @@ add_library(${PROJECT_NAME}
   src/apriltag_internal/MultiBoardOuterBootstrap.cpp
   src/apriltag_internal/MultiScaleOuterTagDetector.cpp
   src/apriltag_internal/OuterDetectionCache.cpp
+  src/apriltag_internal/InternalRegenerationCache.cpp
   src/apriltag_internal/OuterOnlyCameraInitializer.cpp
   src/apriltag_internal/PolarAngleResidualDiagnostics.cpp
   src/apriltag_internal/Stage5Runtime.cpp
+  src/apriltag_internal/Stage5CacheManifest.cpp
   src/apriltag_internal/Stage5Benchmark.cpp
   src/apriltag_internal/Stage5BackendDiagnosticWriters.cpp
   src/apriltag_internal/Stage6IncrementalBatchEstimator.cpp

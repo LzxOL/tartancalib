@@ -37,15 +37,35 @@ void WriteStage5RuntimeSummary(const std::string& path,
   std::ofstream output(path.c_str());
   output << "runtime_mode: " << ToString(summary.runtime_mode) << "\n";
   output << "cache_dir: " << summary.cache_dir << "\n";
+  output << "cache_layout_version: " << summary.cache_layout_version << "\n";
+  output << "cache_dataset_label: " << summary.cache_dataset_label << "\n";
+  output << "cache_dataset_image_root: "
+         << summary.cache_dataset_image_root << "\n";
   output << "cache_enabled: " << (summary.cache_enabled ? 1 : 0) << "\n";
   output << "training_detection_cache_hits: "
          << summary.training_detection_cache_hits << "\n";
   output << "training_detection_cache_misses: "
          << summary.training_detection_cache_misses << "\n";
+  output << "training_detection_stage_layout_cache_hits: "
+         << summary.training_detection_stage_layout_cache_hits << "\n";
+  output << "training_detection_legacy_layout_cache_hits: "
+         << summary.training_detection_legacy_layout_cache_hits << "\n";
+  output << "training_internal_regeneration_cache_hits: "
+         << summary.training_internal_regeneration_cache_hits << "\n";
+  output << "training_internal_regeneration_cache_misses: "
+         << summary.training_internal_regeneration_cache_misses << "\n";
   output << "holdout_detection_cache_hits: "
          << summary.holdout_detection_cache_hits << "\n";
   output << "holdout_detection_cache_misses: "
          << summary.holdout_detection_cache_misses << "\n";
+  output << "holdout_detection_stage_layout_cache_hits: "
+         << summary.holdout_detection_stage_layout_cache_hits << "\n";
+  output << "holdout_detection_legacy_layout_cache_hits: "
+         << summary.holdout_detection_legacy_layout_cache_hits << "\n";
+  output << "holdout_internal_regeneration_cache_hits: "
+         << summary.holdout_internal_regeneration_cache_hits << "\n";
+  output << "holdout_internal_regeneration_cache_misses: "
+         << summary.holdout_internal_regeneration_cache_misses << "\n";
   output << "round1_regeneration_attempted_internal_corners: "
          << summary.round1_regeneration_attempted_internal_corners << "\n";
   output << "round1_regeneration_valid_internal_corners: "

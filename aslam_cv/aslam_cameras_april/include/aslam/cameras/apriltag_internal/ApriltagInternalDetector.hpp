@@ -76,6 +76,23 @@ struct ApriltagInternalDetectionOptions {
   double geometry_prior_rescue_accept_max_outer_rmse = 8.0;
   double geometry_prior_rescue_accept_max_rotation_error_deg = 5.0;
   double geometry_prior_rescue_accept_max_translation_error = 0.08;
+  // Opt-in large-tag recovery. A pose hypothesis from at least two visible
+  // boards is refined against the image, then rendered back to a canonical
+  // tag plane with the active camera model. The expected tag code must be a
+  // clear photometric winner before the refined corners become an observation.
+  bool geometry_guided_tag_likelihood_enabled = false;
+  int geometry_guided_tag_likelihood_min_visible_boards = 2;
+  int geometry_guided_tag_likelihood_max_expected_hamming = 6;
+  int geometry_guided_tag_likelihood_min_hamming_margin = 3;
+  double geometry_guided_tag_likelihood_min_contrast = 0.10;
+  // A single anchor board cannot provide same-frame consensus. Permit it only
+  // when the anchor is a direct exact-ID observation and require materially
+  // stronger code evidence for every recovered board.
+  bool geometry_guided_tag_likelihood_allow_single_anchor = false;
+  double geometry_guided_tag_likelihood_single_anchor_max_outer_rmse = 0.50;
+  int geometry_guided_tag_likelihood_single_anchor_max_expected_hamming = 2;
+  int geometry_guided_tag_likelihood_single_anchor_min_hamming_margin = 6;
+  double geometry_guided_tag_likelihood_single_anchor_min_contrast = 0.15;
   MultiScaleOuterTagDetectorConfig outer_detector_config;
 };
 
@@ -299,8 +316,6 @@ class ApriltagInternalDetector {
   std::size_t default_board_index_ = 0;
   std::unique_ptr<MultiScaleOuterTagDetector> outer_detector_;
 };
-
-IntermediateCameraConfig LoadExternalCameraConfig(const std::string& camera_yaml_path);
 
 }  // namespace apriltag_internal
 }  // namespace cameras

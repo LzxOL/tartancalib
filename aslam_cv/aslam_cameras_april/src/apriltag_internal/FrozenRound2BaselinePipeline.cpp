@@ -1,5 +1,7 @@
 #include <aslam/cameras/apriltag_internal/FrozenRound2BaselinePipeline.hpp>
 
+#include <aslam/cameras/apriltag_internal/BoardDetectionPipeline.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -230,6 +232,46 @@ void ReplaceDetectionByBoardId(
   }
 }
 
+// Keep decoder outputs as untrusted proposals until the regenerator validates
+// them against the expected ID, image evidence, and the frame pose.  In
+// particular, this must not alter success, corners, or the failure reason.
+void MergeWrongIdProposalsByBoardId(
+    const OuterTagDetectionResult& rescue_detection,
+    OuterTagMultiDetectionResult* detections) {
+  if (detections == nullptr || rescue_detection.wrong_id_proposals.empty()) {
+    return;
+  }
+  for (OuterTagDetectionResult& detection : detections->detections) {
+    if (detection.board_id != rescue_detection.board_id) {
+      continue;
+    }
+    for (const OuterWrongIdProposal& proposal :
+         rescue_detection.wrong_id_proposals) {
+      const auto existing = std::find_if(
+          detection.wrong_id_proposals.begin(),
+          detection.wrong_id_proposals.end(),
+          [&proposal](const OuterWrongIdProposal& candidate) {
+            return candidate.detected_tag_id == proposal.detected_tag_id &&
+                   candidate.source == proposal.source;
+          });
+      const bool proposal_is_better =
+          existing == detection.wrong_id_proposals.end() ||
+          proposal.hamming < existing->hamming ||
+          (proposal.hamming == existing->hamming &&
+           proposal.area_px > existing->area_px);
+      if (!proposal_is_better) {
+        continue;
+      }
+      if (existing == detection.wrong_id_proposals.end()) {
+        detection.wrong_id_proposals.push_back(proposal);
+      } else {
+        *existing = proposal;
+      }
+    }
+    return;
+  }
+}
+
 void ReplaceMeasurementByBoardId(
     const OuterBoardMeasurement& replacement,
     OuterTagMultiDetectionResult* detections) {
@@ -280,6 +322,19 @@ void RunCameraAwareOuterRescue(
   rescue_config.camera_aware_sphere_patch_max_hamming =
       summary->max_hamming;
   rescue_config.camera_aware_sphere_patch_commit_mapped_corners = true;
+  summary->zero_detection_atlas_enabled =
+      rescue_config.camera_aware_sphere_patch_rescue_zero_detection_frames;
+  if (summary->zero_detection_atlas_enabled &&
+      rescue_config.camera_aware_sphere_patch_use_extended_atlas) {
+    summary->patch_plan =
+        "dense_5x5_fov56_plus_wide_3x3_fov72_plus_extended_boundary_atlas_plus_zero_fine_9x9_fov42";
+  } else if (summary->zero_detection_atlas_enabled) {
+    summary->patch_plan =
+        "dense_5x5_fov56_plus_wide_3x3_fov72_plus_zero_fine_9x9_fov42";
+  } else if (rescue_config.camera_aware_sphere_patch_use_extended_atlas) {
+    summary->patch_plan =
+        "dense_5x5_fov56_plus_wide_3x3_fov72_plus_extended_boundary_atlas";
+  }
   const MultiScaleOuterTagDetector rescue_detector(rescue_config);
 
   for (std::size_t frame_index = 0; frame_index < frame_sources.size();
@@ -292,6 +347,11 @@ void RunCameraAwareOuterRescue(
     if (baseline.SuccessfulBoardCount() ==
         static_cast<int>(baseline.requested_board_ids.size())) {
       ++summary->baseline_all_boards_frame_count;
+    }
+    const bool baseline_has_zero_detections =
+        baseline.SuccessfulBoardCount() == 0;
+    if (baseline_has_zero_detections) {
+      ++summary->zero_detection_frame_count;
     }
 
     std::vector<int> missing_board_ids;
@@ -330,6 +390,13 @@ void RunCameraAwareOuterRescue(
           FindMeasurementByBoardId(rescued, board_id);
       const OuterTagDetectionResult* baseline_detection =
           FindDetectionByBoardId(baseline, board_id);
+      if (baseline_has_zero_detections && rescue_detection != nullptr &&
+          rescue_detection->attempted_local_patch_rescue) {
+        ++summary->zero_detection_atlas_attempted_board_observation_count;
+      }
+      if (rescue_detection != nullptr) {
+        MergeWrongIdProposalsByBoardId(*rescue_detection, committed);
+      }
       if (rescue_detection == nullptr || rescue_measurement == nullptr ||
           !rescue_detection->success ||
           !rescue_detection->used_local_patch_rescue ||
@@ -1074,9 +1141,28 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       options_.geometry_prior_rescue_accept_max_rotation_error_deg;
   detection_options.geometry_prior_rescue_accept_max_translation_error =
       options_.geometry_prior_rescue_accept_max_translation_error;
-  const MultiScaleOuterTagDetector outer_detector(config.outer_detector_config);
+  detection_options.geometry_guided_tag_likelihood_enabled =
+      options_.geometry_guided_tag_likelihood_enabled;
+  detection_options.geometry_guided_tag_likelihood_min_visible_boards =
+      options_.geometry_guided_tag_likelihood_min_visible_boards;
+  detection_options.geometry_guided_tag_likelihood_max_expected_hamming =
+      options_.geometry_guided_tag_likelihood_max_expected_hamming;
+  detection_options.geometry_guided_tag_likelihood_min_hamming_margin =
+      options_.geometry_guided_tag_likelihood_min_hamming_margin;
+  detection_options.geometry_guided_tag_likelihood_min_contrast =
+      options_.geometry_guided_tag_likelihood_min_contrast;
+  detection_options.geometry_guided_tag_likelihood_allow_single_anchor =
+      options_.geometry_guided_tag_likelihood_allow_single_anchor;
+  detection_options.geometry_guided_tag_likelihood_single_anchor_max_outer_rmse =
+      options_.geometry_guided_tag_likelihood_single_anchor_max_outer_rmse;
+  detection_options.geometry_guided_tag_likelihood_single_anchor_max_expected_hamming =
+      options_.geometry_guided_tag_likelihood_single_anchor_max_expected_hamming;
+  detection_options.geometry_guided_tag_likelihood_single_anchor_min_hamming_margin =
+      options_.geometry_guided_tag_likelihood_single_anchor_min_hamming_margin;
+  detection_options.geometry_guided_tag_likelihood_single_anchor_min_contrast =
+      options_.geometry_guided_tag_likelihood_single_anchor_min_contrast;
   OuterBootstrapOptions bootstrap_options = MakeBootstrapOptions(config, options_);
-  const MultiBoardInternalMeasurementRegenerator regenerator(config, detection_options);
+  const BoardDetectionPipeline board_detection_pipeline(config, detection_options);
   JointMeasurementBuildOptions build_options;
   build_options.reference_board_id = options_.reference_board_id;
   build_options.include_internal_points = options_.include_internal_points;
@@ -1133,6 +1219,10 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       config.outer_detector_config,
       OuterDetectionCacheOptions{options_.enable_outer_detection_cache,
                                  options_.outer_detection_cache_dir});
+  const InternalRegenerationCache internal_regeneration_cache(
+      config, detection_options,
+      InternalRegenerationCacheOptions{options_.enable_outer_detection_cache,
+                                        options_.outer_detection_cache_dir});
 
   std::vector<OuterBootstrapFrameInput> bootstrap_frames;
   std::vector<InternalRegenerationFrameInput> regeneration_inputs;
@@ -1149,8 +1239,19 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
       OuterTagMultiDetectionResult outer_detections;
       std::string cache_warning;
-      if (detection_cache.Load(frame_source.image_path, &outer_detections, &cache_warning)) {
+      OuterDetectionCacheLoadSource cache_load_source =
+          OuterDetectionCacheLoadSource::None;
+      if (detection_cache.Load(frame_source.image_path, &outer_detections,
+                               &cache_warning, &cache_load_source)) {
         ++result.runtime_breakdown.training_detection_cache.cache_hits;
+        if (cache_load_source == OuterDetectionCacheLoadSource::StageLayout) {
+          ++result.runtime_breakdown.training_detection_cache
+                .stage_layout_cache_hits;
+        } else if (cache_load_source ==
+                   OuterDetectionCacheLoadSource::LegacyLayout) {
+          ++result.runtime_breakdown.training_detection_cache
+                .legacy_layout_cache_hits;
+        }
       } else {
         ++result.runtime_breakdown.training_detection_cache.cache_misses;
         if (!cache_warning.empty()) {
@@ -1158,7 +1259,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
           AppendUniqueWarning("Outer detection cache load warning: " + cache_warning,
                               &result.warnings);
         }
-        outer_detections = outer_detector.DetectMultiple(image);
+        outer_detections = board_detection_pipeline.DetectOuter(image);
         if (detection_cache.enabled() &&
             !detection_cache.Save(frame_source.image_path, outer_detections,
                                   &cache_warning)) {
@@ -1529,16 +1630,47 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       }
 
       InternalRegenerationFrameResult regeneration_result;
-      if (round1_regeneration_state != nullptr) {
-        regeneration_result =
-            regenerator.RegenerateFrame(image, regeneration_inputs[frame_index],
-                                        *round1_regeneration_state);
-        regeneration_result.state_source_label = "outer_only_intermediate";
-      } else {
-        regeneration_result =
-            regenerator.RegenerateFrame(image, regeneration_inputs[frame_index],
-                                        result.bootstrap_result);
+      const std::string regeneration_state_signature =
+          round1_regeneration_state != nullptr
+              ? InternalRegenerationCache::MakeSceneStateSignature(
+                    *round1_regeneration_state)
+              : InternalRegenerationCache::MakeBootstrapStateSignature(
+                    result.bootstrap_result);
+      std::string internal_cache_warning;
+      const bool internal_cache_hit = internal_regeneration_cache.Load(
+          frame_sources[frame_index].image_path,
+          regeneration_inputs[frame_index], regeneration_state_signature,
+          &regeneration_result, &internal_cache_warning);
+      if (!internal_cache_hit) {
+        if (!internal_cache_warning.empty()) {
+          AppendUniqueWarning(
+              "Internal regeneration cache load warning: " +
+                  internal_cache_warning,
+              &result.warnings);
+        }
+        if (round1_regeneration_state != nullptr) {
+          regeneration_result = board_detection_pipeline.RegenerateFrame(
+              image, regeneration_inputs[frame_index],
+              *round1_regeneration_state);
+          regeneration_result.state_source_label = "outer_only_intermediate";
+        } else {
+          regeneration_result = board_detection_pipeline.RegenerateFrame(
+              image, regeneration_inputs[frame_index], result.bootstrap_result);
+        }
+        if (internal_regeneration_cache.enabled() &&
+            !internal_regeneration_cache.Save(
+                frame_sources[frame_index].image_path,
+                regeneration_inputs[frame_index], regeneration_state_signature,
+                regeneration_result, &internal_cache_warning) &&
+            !internal_cache_warning.empty()) {
+          AppendUniqueWarning(
+              "Internal regeneration cache store warning: " +
+                  internal_cache_warning,
+              &result.warnings);
+        }
       }
+      result.runtime_breakdown.training_internal_regeneration_cache =
+          internal_regeneration_cache.stats();
       AccumulateRegenerationRuntime(
           regeneration_result.runtime_breakdown,
           &result.runtime_breakdown.round1_regeneration_pose_estimation_seconds,
@@ -1580,6 +1712,16 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   if (!result.round1.validation_summary.success) {
     result.failure_reason = result.round1.validation_summary.failure_reason;
     AppendWarnings(result.round1.validation_summary.warnings, &result.warnings);
+    return result;
+  }
+
+  if (options_.frontend_only) {
+    result.success = true;
+    AppendUniqueWarning(
+        "Stage5 frontend-only mode completed after detection, initialization, "
+        "rescue, regeneration, and measurement construction; measurement "
+        "selection and all backend optimization were intentionally skipped.",
+        &result.warnings);
     return result;
   }
 
@@ -1668,10 +1810,39 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
           return result;
         }
 
-        const InternalRegenerationFrameResult regeneration_result =
-            regenerator.RegenerateFrame(
-                image, regeneration_inputs[frame_index],
+        InternalRegenerationFrameResult regeneration_result;
+        const std::string regeneration_state_signature =
+            InternalRegenerationCache::MakeSceneStateSignature(
                 result.round1.optimization_result.optimized_state);
+        std::string internal_cache_warning;
+        const bool internal_cache_hit = internal_regeneration_cache.Load(
+            frame_sources[frame_index].image_path,
+            regeneration_inputs[frame_index], regeneration_state_signature,
+            &regeneration_result, &internal_cache_warning);
+        if (!internal_cache_hit) {
+          if (!internal_cache_warning.empty()) {
+            AppendUniqueWarning(
+                "Internal regeneration cache load warning: " +
+                    internal_cache_warning,
+                &result.warnings);
+          }
+          regeneration_result = board_detection_pipeline.RegenerateFrame(
+              image, regeneration_inputs[frame_index],
+              result.round1.optimization_result.optimized_state);
+          if (internal_regeneration_cache.enabled() &&
+              !internal_regeneration_cache.Save(
+                  frame_sources[frame_index].image_path,
+                  regeneration_inputs[frame_index], regeneration_state_signature,
+                  regeneration_result, &internal_cache_warning) &&
+              !internal_cache_warning.empty()) {
+            AppendUniqueWarning(
+                "Internal regeneration cache store warning: " +
+                    internal_cache_warning,
+                &result.warnings);
+          }
+        }
+        result.runtime_breakdown.training_internal_regeneration_cache =
+            internal_regeneration_cache.stats();
         AccumulateRegenerationRuntime(
             regeneration_result.runtime_breakdown,
             &result.runtime_breakdown.round2_regeneration_pose_estimation_seconds,

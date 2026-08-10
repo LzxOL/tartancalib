@@ -25,11 +25,22 @@ struct Stage5RuntimeStageRecord {
 struct Stage5RuntimeSummary {
   Stage5RuntimeMode runtime_mode = Stage5RuntimeMode::Research;
   std::string cache_dir;
+  std::string cache_layout_version;
+  std::string cache_dataset_label;
+  std::string cache_dataset_image_root;
   bool cache_enabled = false;
   int training_detection_cache_hits = 0;
   int training_detection_cache_misses = 0;
+  int training_detection_stage_layout_cache_hits = 0;
+  int training_detection_legacy_layout_cache_hits = 0;
+  int training_internal_regeneration_cache_hits = 0;
+  int training_internal_regeneration_cache_misses = 0;
   int holdout_detection_cache_hits = 0;
   int holdout_detection_cache_misses = 0;
+  int holdout_detection_stage_layout_cache_hits = 0;
+  int holdout_detection_legacy_layout_cache_hits = 0;
+  int holdout_internal_regeneration_cache_hits = 0;
+  int holdout_internal_regeneration_cache_misses = 0;
   int round1_regeneration_attempted_internal_corners = 0;
   int round1_regeneration_valid_internal_corners = 0;
   int round2_regeneration_attempted_internal_corners = 0;

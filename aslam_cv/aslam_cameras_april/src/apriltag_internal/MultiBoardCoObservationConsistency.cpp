@@ -108,7 +108,7 @@ struct LayoutMetric {
 IntermediateCameraConfig MakeCameraConfig(
     const StereoCameraFixedCalibration& calibration) {
   IntermediateCameraConfig config;
-  config.camera_yaml = calibration.source_yaml_path;
+  config.camera_yaml.clear();
   config.camera_model = calibration.camera_model;
   config.distortion_model = calibration.distortion_model;
   config.intrinsics = calibration.intrinsics;

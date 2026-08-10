@@ -24,9 +24,17 @@ struct CachedOuterDetectionRecord {
   OuterTagMultiDetectionResult detection_result;
 };
 
+enum class OuterDetectionCacheLoadSource {
+  None = 0,
+  StageLayout,
+  LegacyLayout,
+};
+
 struct OuterDetectionCacheStats {
   int cache_hits = 0;
   int cache_misses = 0;
+  int stage_layout_cache_hits = 0;
+  int legacy_layout_cache_hits = 0;
   int load_failures = 0;
   int store_failures = 0;
 };
@@ -43,7 +51,8 @@ class OuterDetectionCache {
 
   bool Load(const std::string& image_path,
             OuterTagMultiDetectionResult* detection_result,
-            std::string* warning) const;
+            std::string* warning,
+            OuterDetectionCacheLoadSource* load_source = nullptr) const;
   bool Save(const std::string& image_path,
             const OuterTagMultiDetectionResult& detection_result,
             std::string* warning) const;

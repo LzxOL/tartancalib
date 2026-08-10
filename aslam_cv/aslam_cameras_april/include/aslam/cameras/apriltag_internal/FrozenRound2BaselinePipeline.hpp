@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <aslam/cameras/apriltag_internal/CalibrationStateBundle.hpp>
+#include <aslam/cameras/apriltag_internal/InternalRegenerationCache.hpp>
 #include <aslam/cameras/apriltag_internal/MultiBoardInternalMeasurementRegenerator.hpp>
 #include <aslam/cameras/apriltag_internal/OuterDetectionCache.hpp>
 #include <aslam/cameras/apriltag_internal/OuterOnlyCameraInitializer.hpp>
@@ -66,6 +67,7 @@ struct OuterOnlyIntermediateCalibrationResult {
 
 struct FrozenRound2BaselineRuntimeBreakdown {
   OuterDetectionCacheStats training_detection_cache;
+  InternalRegenerationCacheStats training_internal_regeneration_cache;
   double training_outer_detection_seconds = 0.0;
   double auto_camera_initialization_seconds = 0.0;
   double camera_aware_outer_rescue_seconds = 0.0;
@@ -142,6 +144,9 @@ struct CameraAwareOuterRescueSummary {
   int baseline_all_boards_frame_count = 0;
   int attempted_frame_count = 0;
   int attempted_board_observation_count = 0;
+  bool zero_detection_atlas_enabled = false;
+  int zero_detection_frame_count = 0;
+  int zero_detection_atlas_attempted_board_observation_count = 0;
   int rescued_board_observation_count = 0;
   int final_success_count = 0;
   int final_all_boards_frame_count = 0;
@@ -158,6 +163,9 @@ struct CameraAwareOuterRescueSummary {
 struct FrozenRound2BaselineOptions {
   ApriltagInternalConfig config;
   int reference_board_id = 1;
+  // Complete detection/initialization/recovery and build frontend
+  // observations, then stop before selection or any persistent backend BA.
+  bool frontend_only = false;
   bool outer_only_ablation_mode = false;
   bool include_internal_points = true;
   bool optimize_intrinsics = false;
@@ -237,6 +245,16 @@ struct FrozenRound2BaselineOptions {
   double geometry_prior_rescue_accept_max_outer_rmse = 8.0;
   double geometry_prior_rescue_accept_max_rotation_error_deg = 5.0;
   double geometry_prior_rescue_accept_max_translation_error = 0.08;
+  bool geometry_guided_tag_likelihood_enabled = true;
+  int geometry_guided_tag_likelihood_min_visible_boards = 2;
+  int geometry_guided_tag_likelihood_max_expected_hamming = 6;
+  int geometry_guided_tag_likelihood_min_hamming_margin = 3;
+  double geometry_guided_tag_likelihood_min_contrast = 0.10;
+  bool geometry_guided_tag_likelihood_allow_single_anchor = false;
+  double geometry_guided_tag_likelihood_single_anchor_max_outer_rmse = 0.50;
+  int geometry_guided_tag_likelihood_single_anchor_max_expected_hamming = 2;
+  int geometry_guided_tag_likelihood_single_anchor_min_hamming_margin = 6;
+  double geometry_guided_tag_likelihood_single_anchor_min_contrast = 0.15;
   bool enable_outer_only_intermediate_calibration = false;
   bool intermediate_diagnostic_only = true;
   bool use_intermediate_for_round1_internal_regeneration = false;

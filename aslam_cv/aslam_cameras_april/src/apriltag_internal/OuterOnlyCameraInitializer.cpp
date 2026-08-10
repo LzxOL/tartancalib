@@ -105,6 +105,10 @@ struct OuterObservationRecord {
   std::vector<Eigen::Vector3d> object_points;
   std::vector<cv::Point2f> image_points;
   bool used_direct_dense_control_points = false;
+  // Propagated from OuterBoardMeasurement so camera initialization can keep
+  // rescued corners visible, but evaluate/gate them separately.
+  bool used_local_patch_rescue = false;
+  std::string local_patch_rescue_summary;
   int internal_point_count = 0;
   std::array<cv::Point2f, 4> diagnostic_outer_image_points{};
 };
@@ -1001,6 +1005,10 @@ std::vector<OuterObservationRecord> CollectOuterObservations(
       observation.frame_label = frame.frame_label;
       observation.board_id = measurement.board_id;
       observation.quality = measurement.detection_quality;
+      observation.used_local_patch_rescue =
+          measurement.used_local_patch_rescue;
+      observation.local_patch_rescue_summary =
+          measurement.local_patch_rescue_summary;
       for (int index = 0; index < 4; ++index) {
         if (!measurement.refined_corner_valid[
                 static_cast<std::size_t>(index)]) {
@@ -1556,6 +1564,8 @@ struct PoseFitOutlierGateResult {
   std::vector<OuterObservationRecord> accepted_observations;
   int pose_failure_count = 0;
   int rejected_outlier_count = 0;
+  int rescued_observation_count = 0;
+  int rescued_pose_gate_rejected_count = 0;
   bool gate_applied = false;
   double median_rmse = std::numeric_limits<double>::quiet_NaN();
   double mad_rmse = std::numeric_limits<double>::quiet_NaN();
@@ -1564,7 +1574,9 @@ struct PoseFitOutlierGateResult {
 
 PoseFitOutlierGateResult FilterPoseFitOutliersForInitialization(
     const OuterBootstrapCameraIntrinsics& camera,
-    const std::vector<OuterObservationRecord>& observations) {
+    const std::vector<OuterObservationRecord>& observations,
+    bool gate_rescued_observations = true,
+    double rescued_observation_pose_rmse_gate_pixels = 8.0) {
   PoseFitOutlierGateResult result;
   struct SuccessfulPoseFit {
     const OuterObservationRecord* observation = nullptr;
@@ -1585,6 +1597,20 @@ PoseFitOutlierGateResult FilterPoseFitOutliersForInitialization(
         !std::isfinite(rmse)) {
       ++result.pose_failure_count;
       continue;
+    }
+    if (observation.used_local_patch_rescue) {
+      ++result.rescued_observation_count;
+      if (gate_rescued_observations &&
+          rescued_observation_pose_rmse_gate_pixels > 0.0 &&
+          rmse > rescued_observation_pose_rmse_gate_pixels) {
+        // A patch rescue is camera-aware and therefore has a different
+        // failure mode from an ordinary subpixel corner.  Do not let one
+        // badly mapped rescue corner pull the camera basin; reject it with a
+        // dedicated gate before the generic MAD gate is computed.
+        ++result.rescued_pose_gate_rejected_count;
+        result.gate_applied = true;
+        continue;
+      }
     }
     successful.push_back(SuccessfulPoseFit{&observation, rmse});
     errors.push_back(rmse);
@@ -4000,7 +4026,8 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrOuterLm(
     double robust_loss_delta_pixels,
     const std::set<std::string>& additional_fixed_camera_labels = {},
     const std::map<std::pair<int, int>, double>* observation_weights =
-        nullptr) {
+        nullptr,
+    double rescued_observation_lm_weight = 0.25) {
   KalibrOuterLmRefinementResult result;
   result.camera = initial_camera;
   result.robust_loss_delta_pixels =
@@ -4021,12 +4048,17 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrOuterLm(
     KalibrOuterLmView view;
     view.observation = &observation;
     view.T_camera_board = pose;
+    if (observation.used_local_patch_rescue &&
+        std::isfinite(rescued_observation_lm_weight) &&
+        rescued_observation_lm_weight > 0.0) {
+      view.observation_weight = rescued_observation_lm_weight;
+    }
     if (observation_weights != nullptr) {
       const auto weight_it = observation_weights->find(
           std::make_pair(observation.frame_index, observation.board_id));
       if (weight_it != observation_weights->end() &&
           std::isfinite(weight_it->second) && weight_it->second > 0.0) {
-        view.observation_weight = weight_it->second;
+        view.observation_weight *= weight_it->second;
       }
     }
     views.push_back(view);
@@ -5103,6 +5135,7 @@ std::vector<AutoCameraInitializationResidual> EvaluateSelectedResiduals(
     residual.frame_label = observation.frame_label;
     residual.board_id = observation.board_id;
     residual.quality = observation.quality;
+    residual.used_local_patch_rescue = observation.used_local_patch_rescue;
 
     Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
     double pose_fit_outer_rmse = 0.0;
@@ -5216,6 +5249,7 @@ void AppendBootstrapObservationRecord(
   record.frame_label = observation.frame_label;
   record.board_id = observation.board_id;
   record.used_in_lm = used_in_lm;
+  record.used_local_patch_rescue = observation.used_local_patch_rescue;
   record.pose_init_success = pose_init_success;
   record.pose_fit_outer_rmse = pose_fit_outer_rmse;
   for (int corner_index = 0; corner_index < 4; ++corner_index) {
@@ -5728,6 +5762,10 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
       options_.prefer_lower_focal_in_near_tie ? 1 : 0;
   result.stage5_init_near_tie_relative_objective_tolerance =
       std::max(0.0, options_.near_tie_relative_objective_tolerance);
+  result.stage5_init_shared_frame_board_constraint_enabled =
+      options_.enable_shared_frame_board_constraint ? 1 : 0;
+  result.stage5_init_rescued_outer_observation_lm_weight =
+      options_.rescued_outer_observation_lm_weight;
   result.stage5_init_kb_focal_source = "not_applicable";
   result.stage5_init_kb_row_circle_focal_available = 0;
   result.stage5_init_kb_zero_distortion_seed = 0;
@@ -5871,11 +5909,25 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
           ? std::vector<OuterObservationRecord>{}
           : FilterObservationsByFrameIndices(
                 unfiltered_outer_observations, initialization_frame_indices);
-  const std::vector<OuterObservationRecord> all_observations =
+  const std::vector<OuterObservationRecord> complete_frame_observations =
       FilterObservationsByFrameIndices(
           full_health_observations, initialization_frame_indices);
   result.stage5_init_observation_count_after_complete_frame_filter =
+      static_cast<int>(complete_frame_observations.size());
+  const std::vector<OuterObservationRecord> all_observations =
+      options_.include_all_valid_outer_observations_in_evaluation
+          ? full_health_observations
+          : complete_frame_observations;
+  result.stage5_init_camera_evaluation_observation_count =
       static_cast<int>(all_observations.size());
+  result.stage5_init_all_valid_outer_observations_used =
+      options_.include_all_valid_outer_observations_in_evaluation ? 1 : 0;
+  result.stage5_init_rescued_outer_observation_count = 0;
+  for (const OuterObservationRecord& observation : all_observations) {
+    if (observation.used_local_patch_rescue) {
+      ++result.stage5_init_rescued_outer_observation_count;
+    }
+  }
   if (options_.require_all_configured_boards_per_frame) {
     std::ostringstream warning;
     warning << "Automatic camera initialization requires every configured "
@@ -5888,9 +5940,10 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
             << result.stage5_init_observation_count_after_complete_frame_filter
             << "/"
             << result.stage5_init_observation_count_before_complete_frame_filter
-            << ". Incomplete frames remain available only to full-health "
-               "evaluation and do not influence seed construction, candidate "
-               "ranking, information selection, or initialization LM.";
+            << ". Complete-frame observations remain the seed-construction "
+               "diagnostic set; all valid outer observations are used for "
+               "camera evaluation/LM when enabled, including incomplete "
+               "frames.";
     AppendUniqueWarning(warning.str(), &result.warnings);
   }
   if (options_.use_direct_dense_control_points) {
@@ -6180,7 +6233,9 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
           }
           const PoseFitOutlierGateResult pose_fit_gate =
               FilterPoseFitOutliersForInitialization(seed_candidate.camera,
-                                                     lm_observations);
+                                                     lm_observations,
+                                                     options_.gate_rescued_outer_observations,
+                                                     options_.rescued_outer_observation_pose_rmse_gate_pixels);
           PoseFitOutlierGateResult effective_pose_fit_gate = pose_fit_gate;
           int cumulative_pose_fit_outlier_count =
               pose_fit_gate.rejected_outlier_count;
@@ -6210,7 +6265,9 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
 	                                                 selected_lm_observations,
 	                                                 dense_grid_lm
 	                                                     ? options_.dense_grid_lm_huber_delta_pixels
-	                                                     : 0.0);
+	                                                     : 0.0,
+	                                                 {}, nullptr,
+	                                                 options_.rescued_outer_observation_lm_weight);
 
           // Intrinsics refinement can change the independent PnP basin of an
           // otherwise successful observation. Recheck pose health at the
@@ -6219,7 +6276,9 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
           for (int cleanup_pass = 0; cleanup_pass < 2; ++cleanup_pass) {
             const PoseFitOutlierGateResult refined_pose_fit_gate =
                 FilterPoseFitOutliersForInitialization(
-                    lm_refined.camera, selected_lm_observations);
+                    lm_refined.camera, selected_lm_observations,
+                    options_.gate_rescued_outer_observations,
+                    options_.rescued_outer_observation_pose_rmse_gate_pixels);
             if (!refined_pose_fit_gate.gate_applied ||
                 refined_pose_fit_gate.rejected_outlier_count <= 0) {
               if (cumulative_pose_fit_outlier_count == 0) {
@@ -6250,7 +6309,9 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
                     selected_lm_observations,
                     dense_grid_lm
                         ? options_.dense_grid_lm_huber_delta_pixels
-                        : 0.0);
+                        : 0.0,
+                    {}, nullptr,
+                    options_.rescued_outer_observation_lm_weight);
             cleaned_refinement.initial_rmse =
                 previous_refinement.initial_rmse;
             cleaned_refinement.initial_robust_rmse =
@@ -6289,7 +6350,9 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
                ++reconciliation_pass) {
             const PoseFitOutlierGateResult reconciled_pose_fit_gate =
                 FilterPoseFitOutliersForInitialization(
-                    lm_refined.camera, lm_observations);
+                    lm_refined.camera, lm_observations,
+                    options_.gate_rescued_outer_observations,
+                    options_.rescued_outer_observation_pose_rmse_gate_pixels);
             effective_pose_fit_gate = reconciled_pose_fit_gate;
             cumulative_pose_fit_outlier_count =
                 reconciled_pose_fit_gate.rejected_outlier_count;
@@ -6314,7 +6377,9 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
                     selected_lm_observations,
                     dense_grid_lm
                         ? options_.dense_grid_lm_huber_delta_pixels
-                        : 0.0);
+                        : 0.0,
+                    {}, nullptr,
+                    options_.rescued_outer_observation_lm_weight);
             reconciled_refinement.initial_rmse =
                 previous_refinement.initial_rmse;
             reconciled_refinement.initial_robust_rmse =
@@ -6348,11 +6413,70 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
           std::vector<OuterObservationRecord> selection_lm_observations =
               selected_lm_observations;
           bool used_fixed_layout_frame_constraint = false;
+          BootstrapLayout shared_layout;
+          KalibrOuterLmRefinementResult shared_layout_refinement;
+          int shared_layout_frame_count = 0;
+          int shared_layout_board_count = 0;
+          int shared_layout_observation_count = 0;
+          if (!dense_grid_lm && options_.enable_shared_frame_board_constraint) {
+            // The independent LM can explain a wrong camera by giving every
+            // frame-board pair its own pose.  Re-estimate a common board
+            // layout, then optimize one pose per frame.  The resulting
+            // camera is used for basin selection; the board layout itself is
+            // not committed to the later Stage5 backend.
+            shared_layout = BuildBootstrapLayoutFromCamera(
+                selection_refined.camera, frames, config_);
+            if (shared_layout.success &&
+                !shared_layout.T_reference_board_by_id.empty()) {
+              const std::vector<KalibrOuterLmFrameView> shared_frame_views =
+                  BuildAllKalibrOuterLmFrameViews(
+                      selection_refined.camera, all_observations, shared_layout);
+              shared_layout_frame_count =
+                  static_cast<int>(shared_frame_views.size());
+              shared_layout_board_count = static_cast<int>(
+                  shared_layout.T_reference_board_by_id.size());
+              for (const KalibrOuterLmFrameView& frame_view :
+                   shared_frame_views) {
+                shared_layout_observation_count +=
+                    static_cast<int>(frame_view.observations.size());
+              }
+              if (!shared_frame_views.empty()) {
+                shared_layout_refinement =
+                    RefineCandidateCameraKalibrFrameCohesionLm(
+                        selection_refined.camera, shared_frame_views,
+                        shared_layout.T_reference_board_by_id, 0.0);
+                if (shared_layout_refinement.camera.IsValid() &&
+                    shared_layout_refinement.residual_count > 0 &&
+                    std::isfinite(shared_layout_refinement.final_robust_rmse)) {
+                  selection_refined = shared_layout_refinement;
+                  selection_objective_label =
+                      "outer_only_shared_frame_board_constraint_lm_plus_full_outer_health";
+                  lm_source_label =
+                      "outer_only_shared_frame_board_constraint_lm_rank" +
+                      std::to_string(seed_candidate.rank);
+                  used_fixed_layout_frame_constraint = true;
+                  selection_frame_indices.clear();
+                  for (const KalibrOuterLmFrameView& frame_view :
+                       shared_frame_views) {
+                    selection_frame_indices.insert(frame_view.frame_index);
+                  }
+                  selection_lm_observations = all_observations;
+                  selected_pose_success_count =
+                      shared_layout_observation_count;
+                  selected_pose_failure_count = std::max(
+                      0, static_cast<int>(all_observations.size()) -
+                             shared_layout_observation_count);
+                }
+              }
+            }
+          }
           if (!frame_cohesion_diagnostics_skip_logged) {
             AppendUniqueWarning(
                 dense_grid_lm
                     ? "Dense control-point initialization uses an independent target pose for every frame-board observation and all valid imported control points; no board-layout variables update intrinsics."
-                    : "Fixed-layout frame-cohesion LM diagnostics skipped by default: diagnostics_only=1, layout_updates_intrinsics=0, and this diagnostic can dominate full-dataset initialization runtime. Intrinsics are selected by independent outer-only board-pose LM plus full outer health.",
+                    : (options_.enable_shared_frame_board_constraint
+                           ? "Outer-only initialization uses an independent-pose LM only for basin seeding, then selects with a shared board-layout / shared frame-pose LM; layout variables remain fixed after bootstrap."
+                           : "Shared frame-board initialization constraint disabled; selecting with independent outer-only board-pose LM plus full outer health."),
                 &result.warnings);
             frame_cohesion_diagnostics_skip_logged = true;
           }
@@ -6417,11 +6541,21 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
 	              << " lm_selection_objective=" << lm_selection_objective
 	              << " full_outer_health_weight="
 	              << full_outer_health_selection_weight
-	              << " combined_lm_selection_objective="
-	              << combined_lm_selection_objective
-	              << " selected_frames=" << selection_frame_indices.size()
-	              << " selected_board_observations="
-	              << selection_refined.view_count
+              << " combined_lm_selection_objective="
+              << combined_lm_selection_objective
+              << " selected_frames=" << selection_frame_indices.size()
+              << " selected_board_observations="
+              << selection_refined.view_count
+              << " shared_layout_constraint_used="
+              << (used_fixed_layout_frame_constraint ? 1 : 0)
+              << " shared_layout_frames=" << shared_layout_frame_count
+              << " shared_layout_boards=" << shared_layout_board_count
+              << " shared_layout_observations="
+              << shared_layout_observation_count
+              << " shared_layout_initial_rmse="
+              << shared_layout_refinement.initial_rmse
+              << " shared_layout_final_rmse="
+              << shared_layout_refinement.final_rmse
               << " fixed_layout_frame_constraint="
               << (used_fixed_layout_frame_constraint ? 1 : 0)
               << " layout_updates_intrinsics=0"
@@ -6439,8 +6573,15 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
               << effective_pose_fit_gate.threshold_rmse << ".";
 	          AppendUniqueWarning(trial_warning.str(), &result.warnings);
 
+	          const bool shared_constraint_finite =
+	              used_fixed_layout_frame_constraint &&
+	              selection_refined.camera.IsValid() &&
+	              std::isfinite(selection_refined.final_robust_cost) &&
+	              std::isfinite(selection_refined.final_robust_rmse);
+	          const bool refinement_health_acceptable =
+	              selection_refined.improved || shared_constraint_finite;
 	          const bool full_outer_health_acceptable =
-	              selection_refined.improved &&
+	              refinement_health_acceptable &&
 	              std::isfinite(selection_refined.final_robust_rmse) &&
 	              selection_refined.residual_count > 0 &&
 	              (options_.use_direct_dense_control_points
@@ -6533,6 +6674,18 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
           basin_record.lm_final_rmse = selection_refined.final_rmse;
           basin_record.lm_final_robust_rmse =
               selection_refined.final_robust_rmse;
+          basin_record.shared_layout_constraint_used =
+              used_fixed_layout_frame_constraint ? 1 : 0;
+          basin_record.shared_layout_frame_count = shared_layout_frame_count;
+          basin_record.shared_layout_board_count = shared_layout_board_count;
+          basin_record.shared_layout_observation_count =
+              shared_layout_observation_count;
+          basin_record.shared_layout_initial_rmse =
+              shared_layout_refinement.initial_rmse;
+          basin_record.shared_layout_final_rmse =
+              shared_layout_refinement.final_rmse;
+          basin_record.shared_layout_final_robust_rmse =
+              shared_layout_refinement.final_robust_rmse;
           basin_record.combined_selection_objective =
               combined_lm_selection_objective;
           basin_record.full_outer_health_acceptable =
@@ -6589,6 +6742,24 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
           result.stage5_init_fixed_layout_frame_constraint_used =
               used_fixed_layout_frame_constraint ? 1 : 0;
           result.stage5_init_optimizes_layout_variables = 0;
+          result.stage5_init_shared_frame_board_constraint_enabled =
+              options_.enable_shared_frame_board_constraint ? 1 : 0;
+          result.stage5_init_shared_frame_board_constraint_used =
+              used_fixed_layout_frame_constraint ? 1 : 0;
+          result.stage5_init_uses_layout_to_update_intrinsics =
+              used_fixed_layout_frame_constraint ? 1 : 0;
+          result.stage5_init_layout_loo_diagnostics_only =
+              used_fixed_layout_frame_constraint ? 0 : 1;
+          result.stage5_init_shared_layout_board_count =
+              shared_layout_board_count;
+          result.stage5_init_shared_layout_frame_count =
+              shared_layout_frame_count;
+          result.stage5_init_shared_layout_observation_count =
+              shared_layout_observation_count;
+          result.stage5_init_shared_layout_initial_rmse =
+              shared_layout_refinement.initial_rmse;
+          result.stage5_init_shared_layout_final_rmse =
+              shared_layout_refinement.final_rmse;
           result.stage5_init_lm_selection_objective =
               selection_objective_label;
           result.selected_candidate_refined = true;
@@ -6739,6 +6910,8 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
               best_pose_fit_gate.gate_applied ? 1 : 0;
           result.stage5_init_pose_fit_outlier_rejected_count =
               best_pose_fit_gate.rejected_outlier_count;
+          result.stage5_init_rescued_outer_observation_pose_gate_rejected_count =
+              best_pose_fit_gate.rescued_pose_gate_rejected_count;
           result.stage5_init_pose_fit_outlier_median_rmse =
               best_pose_fit_gate.median_rmse;
           result.stage5_init_pose_fit_outlier_mad_rmse =
@@ -6924,7 +7097,9 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
       result.selected_camera.IsValid()) {
     const PoseFitOutlierGateResult profile_pose_fit_gate =
         FilterPoseFitOutliersForInitialization(result.selected_camera,
-                                               all_observations);
+                                               all_observations,
+                                               options_.gate_rescued_outer_observations,
+                                               options_.rescued_outer_observation_pose_rmse_gate_pixels);
     PopulatePrincipalProfile(
         result.selected_camera,
         profile_pose_fit_gate.accepted_observations,
@@ -7103,6 +7278,20 @@ void WriteAutoCameraInitializationSummary(
          << result.stage5_init_fixed_layout_frame_constraint_used << "\n";
   output << "stage5_init_optimizes_layout_variables: "
          << result.stage5_init_optimizes_layout_variables << "\n";
+  output << "stage5_init_shared_frame_board_constraint_enabled: "
+         << result.stage5_init_shared_frame_board_constraint_enabled << "\n";
+  output << "stage5_init_shared_frame_board_constraint_used: "
+         << result.stage5_init_shared_frame_board_constraint_used << "\n";
+  output << "stage5_init_shared_layout_board_count: "
+         << result.stage5_init_shared_layout_board_count << "\n";
+  output << "stage5_init_shared_layout_frame_count: "
+         << result.stage5_init_shared_layout_frame_count << "\n";
+  output << "stage5_init_shared_layout_observation_count: "
+         << result.stage5_init_shared_layout_observation_count << "\n";
+  output << "stage5_init_shared_layout_initial_rmse: "
+         << result.stage5_init_shared_layout_initial_rmse << "\n";
+  output << "stage5_init_shared_layout_final_rmse: "
+         << result.stage5_init_shared_layout_final_rmse << "\n";
   output << "stage5_init_lm_selection_objective: "
          << result.stage5_init_lm_selection_objective << "\n";
   output << "stage5_init_lm_min_relative_objective_improvement: "
@@ -7365,6 +7554,13 @@ void WriteAutoCameraInitializationSummary(
          << result.stage5_init_pose_fit_outlier_gate_applied << "\n";
   output << "stage5_init_pose_fit_outlier_rejected_count: "
          << result.stage5_init_pose_fit_outlier_rejected_count << "\n";
+  output << "stage5_init_rescued_outer_observation_count: "
+         << result.stage5_init_rescued_outer_observation_count << "\n";
+  output << "stage5_init_rescued_outer_observation_pose_gate_rejected_count: "
+         << result.stage5_init_rescued_outer_observation_pose_gate_rejected_count
+         << "\n";
+  output << "stage5_init_rescued_outer_observation_lm_weight: "
+         << result.stage5_init_rescued_outer_observation_lm_weight << "\n";
   output << "stage5_init_pose_fit_outlier_median_rmse: "
          << result.stage5_init_pose_fit_outlier_median_rmse << "\n";
   output << "stage5_init_pose_fit_outlier_mad_rmse: "
@@ -7390,6 +7586,10 @@ void WriteAutoCameraInitializationSummary(
   output << "stage5_init_observation_count_after_complete_frame_filter: "
          << result.stage5_init_observation_count_after_complete_frame_filter
          << "\n";
+  output << "stage5_init_camera_evaluation_observation_count: "
+         << result.stage5_init_camera_evaluation_observation_count << "\n";
+  output << "stage5_init_all_valid_outer_observations_used: "
+         << result.stage5_init_all_valid_outer_observations_used << "\n";
   output << "stage5_init_runtime_seconds: "
          << result.stage5_init_runtime_seconds << "\n";
   output << "stage5_init_selected_frame_count: " << result.lm_frame_count << "\n";
@@ -7617,7 +7817,11 @@ void WriteAutoCameraInitializationRefinedBasinsCsv(
       << "refined_cu,refined_cv,selected_frame_count,"
       << "selected_board_observation_count,residual_count,iteration_count,"
       << "seed_objective,full_outer_objective,lm_initial_rmse,lm_final_rmse,"
-      << "lm_final_robust_rmse,combined_selection_objective,"
+      << "lm_final_robust_rmse,shared_layout_constraint_used,"
+      << "shared_layout_frame_count,shared_layout_board_count,"
+      << "shared_layout_observation_count,shared_layout_initial_rmse,"
+      << "shared_layout_final_rmse,shared_layout_final_robust_rmse,"
+      << "combined_selection_objective,"
       << "full_outer_health_acceptable,camera_step_finite,"
       << "objective_improved_before_near_tie_policy,compared_as_near_tie,"
       << "preferred_by_lower_focal_near_tie_policy,"
@@ -7643,6 +7847,13 @@ void WriteAutoCameraInitializationRefinedBasinsCsv(
            << basin.seed_objective << "," << basin.full_outer_objective
            << "," << basin.lm_initial_rmse << "," << basin.lm_final_rmse
            << "," << basin.lm_final_robust_rmse << ","
+           << basin.shared_layout_constraint_used << ","
+           << basin.shared_layout_frame_count << ","
+           << basin.shared_layout_board_count << ","
+           << basin.shared_layout_observation_count << ","
+           << basin.shared_layout_initial_rmse << ","
+           << basin.shared_layout_final_rmse << ","
+           << basin.shared_layout_final_robust_rmse << ","
            << basin.combined_selection_objective << ","
            << (basin.full_outer_health_acceptable ? 1 : 0) << ","
            << (basin.camera_step_finite ? 1 : 0) << ","
@@ -7662,7 +7873,8 @@ void WriteAutoCameraInitializationOuterResidualsCsv(
     const std::string& path,
     const AutoCameraInitializationResult& result) {
   std::ofstream output(path.c_str());
-  output << "source_label,frame_index,frame_label,board_id,quality,pose_success,"
+  output << "source_label,frame_index,frame_label,board_id,quality,"
+         << "used_local_patch_rescue,pose_success,"
          << "pose_fit_outer_rmse,failure_reason\n";
   for (const AutoCameraInitializationResidual& residual : result.selected_residuals) {
     output << residual.source_label << ","
@@ -7670,6 +7882,7 @@ void WriteAutoCameraInitializationOuterResidualsCsv(
            << residual.frame_label << ","
            << residual.board_id << ","
            << residual.quality << ","
+           << (residual.used_local_patch_rescue ? 1 : 0) << ","
            << (residual.pose_success ? 1 : 0) << ","
            << residual.pose_fit_outer_rmse << ","
            << residual.failure_reason << "\n";
@@ -7680,7 +7893,8 @@ void WriteAutoCameraInitializationBootstrapViewsCsv(
     const std::string& path,
     const AutoCameraInitializationResult& result) {
   std::ofstream output(path.c_str());
-  output << "frame_index,frame_label,board_id,used_in_lm,pose_init_success,"
+  output << "frame_index,frame_label,board_id,used_in_lm,"
+         << "used_local_patch_rescue,pose_init_success,"
          << "pose_fit_outer_rmse,corner_index,x,y\n";
   for (const AutoCameraInitializationBootstrapObservation& observation :
        result.lm_bootstrap_observations) {
@@ -7691,6 +7905,7 @@ void WriteAutoCameraInitializationBootstrapViewsCsv(
              << observation.frame_label << ","
              << observation.board_id << ","
              << (observation.used_in_lm ? 1 : 0) << ","
+             << (observation.used_local_patch_rescue ? 1 : 0) << ","
              << (observation.pose_init_success ? 1 : 0) << ","
              << observation.pose_fit_outer_rmse << ","
              << corner_index << ","

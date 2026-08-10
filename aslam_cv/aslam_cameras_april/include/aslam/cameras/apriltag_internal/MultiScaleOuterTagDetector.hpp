@@ -46,8 +46,20 @@ struct OuterRefineCameraConfig {
 struct MultiScaleOuterTagDetectorConfig {
   int tag_id = 1;
   std::vector<int> tag_ids;
+  // Frontend inspection only. When enabled, each frame first discovers the
+  // decoded IDs present in that frame and then refines only those tags. It is
+  // intentionally not a substitute for the explicit board topology required
+  // by calibration and bundle adjustment.
+  bool auto_discover_tag_ids = false;
   double min_border_distance = 4.0;
   int max_scales_to_try = 0;
+  // Keep the legacy all-scale sweep by default. The adaptive cascade scans a
+  // few low-resolution full images, validates their corners on the original
+  // image, then visits higher-resolution full images only when required.
+  bool enable_adaptive_scale_cascade = false;
+  std::vector<double> adaptive_coarse_scale_divisors{4.5, 3.5, 2.5};
+  std::vector<double> adaptive_fallback_scale_divisors{2.0, 1.5, 1.0};
+  int adaptive_coarse_max_hamming = 0;
   bool enable_outer_spherical_refinement = true;
   bool do_outer_subpix_refinement = true;
   double outer_local_context_scale = 0.05;
@@ -78,6 +90,11 @@ struct MultiScaleOuterTagDetectorConfig {
   bool enable_camera_aware_sphere_patch_rescue = true;
   int camera_aware_sphere_patch_max_hamming = 0;
   bool camera_aware_sphere_patch_commit_mapped_corners = true;
+  // A full-view patch atlas is substantially more expensive for a frame with
+  // no initial detections. Keep that recovery tier explicit: a recovered tag
+  // is still required to be an exact requested-ID decode before it is used.
+  bool camera_aware_sphere_patch_rescue_zero_detection_frames = false;
+  bool camera_aware_sphere_patch_use_extended_atlas = false;
   OuterRefineCameraConfig refine_camera;
 
   // Legacy compatibility fields. Old YAML keys may still populate these,
@@ -192,11 +209,22 @@ struct OuterCornerVerificationDebugInfo {
   int subpix_window_clamp_limit = 0;
   bool subpix_window_clamped = false;
   int subpix_window_radius = 0;
+  bool subpix_unstable_rollback_detected = false;
+  int subpix_unstable_rollback_iteration = 0;
+  double subpix_unstable_rollback_max_displacement = 0.0;
   double refine_displacement_limit = 0.0;
   bool refined_valid = false;
   bool verification_passed = false;
   bool subpix_applied = false;
   std::string failure_reason;
+};
+
+struct OuterWrongIdProposal {
+  int detected_tag_id = -1;
+  int hamming = -1;
+  double area_px = 0.0;
+  std::array<Eigen::Vector2d, 4> corners_original_image{};
+  std::string source;
 };
 
 struct OuterSphericalCornerRefinementDebug {
@@ -251,12 +279,16 @@ struct OuterTagDetectionResult {
   int chosen_scale_longest_side = 0;
   double chosen_scale_factor = 1.0;
   std::string scale_configuration_mode;
+  int adaptive_coarse_scale_attempt_count = 0;
+  int adaptive_fallback_scale_attempt_count = 0;
+  bool adaptive_high_resolution_fallback_triggered = false;
   bool used_corner_fusion = false;
   int hamming = -1;
   bool good = false;
   bool attempted_local_patch_rescue = false;
   bool used_local_patch_rescue = false;
   std::string local_patch_rescue_summary;
+  std::vector<OuterWrongIdProposal> wrong_id_proposals;
   std::array<Eigen::Vector2d, 4> coarse_corners_scaled_image{};
   std::array<Eigen::Vector2d, 4> coarse_corners_original_image{};
   std::array<Eigen::Vector2d, 4> refined_corners_original_image{};
@@ -340,6 +372,7 @@ class MultiScaleOuterTagDetector {
 
   OuterTagDetectionResult Detect(const cv::Mat& image) const;
   OuterTagMultiDetectionResult DetectMultiple(const cv::Mat& image) const;
+  std::vector<int> DiscoverTagIds(const cv::Mat& image) const;
   std::vector<OuterTagDetectionResult> DetectMultiple(
       const cv::Mat& image, const std::vector<int>& requested_tag_ids) const;
   void DrawDetection(const OuterTagDetectionResult& detection,

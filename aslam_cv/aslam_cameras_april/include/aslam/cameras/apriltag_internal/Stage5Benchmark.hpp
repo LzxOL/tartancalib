@@ -11,6 +11,7 @@
 #include <opencv2/core.hpp>
 
 #include <aslam/cameras/apriltag_internal/FrozenRound2BaselinePipeline.hpp>
+#include <aslam/cameras/apriltag_internal/InternalRegenerationCache.hpp>
 #include <aslam/cameras/apriltag_internal/AslamBackendCalibrationRunner.hpp>
 #include <aslam/cameras/apriltag_internal/JointMeasurementCuration.hpp>
 #include <aslam/cameras/apriltag_internal/KalibrStyleBatchAcceptance.hpp>
@@ -23,6 +24,7 @@ namespace apriltag_internal {
 
 struct CalibrationBenchmarkSplitOptions {
   std::string mode = "random_holdout_ratio";
+  bool all_frames_training = false;
   int holdout_stride = 5;
   int holdout_offset = 0;
   double holdout_ratio = 0.30;
@@ -172,6 +174,11 @@ struct CameraModelRefitEvaluationResult {
   int outer_point_count = 0;
   int internal_point_count = 0;
   double overall_rmse = 0.0;
+  // Tangent-plane unit-bearing RMSE after the same held-out pose refit used
+  // for pixel reprojection evaluation. This is an evaluation metric only.
+  int angular_point_count = 0;
+  double overall_angular_rmse_rad = 0.0;
+  double overall_angular_rmse_deg = 0.0;
   double p95_reprojection_error = 0.0;
   double outer_only_rmse = 0.0;
   double internal_only_rmse = 0.0;
@@ -304,6 +311,7 @@ struct Stage5BenchmarkRuntimeBreakdown {
   double pre_backend_filter_seconds = 0.0;
   double internal_blur_filter_seconds = 0.0;
   OuterDetectionCacheStats holdout_detection_cache;
+  InternalRegenerationCacheStats holdout_internal_regeneration_cache;
 };
 
 struct TrialBackendFrameBoardSelectionOptions {
@@ -1011,6 +1019,9 @@ struct Stage5LargeIntrinsicPerturbationState {
 struct Stage5BenchmarkInput {
   std::vector<FrozenRound2BaselineFrameSource> all_frames;
   std::vector<FrozenRound2BaselineFrameSource> external_holdout_frames;
+  // Runs the complete image frontend on all_frames but intentionally does not
+  // build a backend problem, select observations, or optimize a backend.
+  bool frontend_only = false;
   bool use_precomputed_training_measurements = false;
   FrozenPrecomputedMeasurementInput precomputed_training_measurements;
   bool use_precomputed_holdout_measurements = false;
@@ -1201,7 +1212,8 @@ class Stage5Benchmark {
       const FrozenRound2BaselineOptions& baseline_options,
       const JointReprojectionSceneState& optimized_scene_state,
       const std::string& split_signature,
-      OuterDetectionCacheStats* cache_stats) const;
+      OuterDetectionCacheStats* cache_stats,
+      InternalRegenerationCacheStats* internal_cache_stats = nullptr) const;
 
  private:
   CalibrationEvaluationDataset BuildTrainingEvaluationDataset(

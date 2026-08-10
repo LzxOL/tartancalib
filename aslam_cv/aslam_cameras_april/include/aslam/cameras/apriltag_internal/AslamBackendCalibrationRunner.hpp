@@ -87,6 +87,13 @@ struct AslamBackendCalibrationOptions {
   double chordal_residual_weight = 1.0;
   bool pixel_ray_hybrid_refinement_mode = false;
   double pixel_ray_hybrid_lambda = 0.5;
+  // These weights are derived once from the pixel-committed camera before
+  // final refinement, then remain fixed throughout the LM solve.
+  bool pixel_ray_hybrid_polar_adaptive_enabled = false;
+  double pixel_ray_hybrid_lambda_min = 0.2;
+  double pixel_ray_hybrid_lambda_max = 0.8;
+  double pixel_ray_hybrid_transition_start_deg = 30.0;
+  double pixel_ray_hybrid_transition_end_deg = 70.0;
   double pixel_ray_hybrid_pixel_scale_floor = 1e-3;
   double pixel_ray_hybrid_ray_scale_floor = 1e-6;
   double pixel_ray_hybrid_huber_delta = 3.0;
@@ -286,6 +293,8 @@ struct BackendResidualTypeAssignment {
   std::string residual_model_requested;
   std::string residual_model_effective;
   bool angular_observation_geometry_success = false;
+  bool pixel_ray_hybrid_polar_adaptive = false;
+  double pixel_ray_hybrid_lambda = 0.0;
   double image_plane_weight_scale = 1.0;
   double angular_weight_scale = 0.0;
   double angular_sigma_per_pixel_rad = 0.0;

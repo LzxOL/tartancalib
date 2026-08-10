@@ -25,6 +25,7 @@
 #include <opencv2/calib3d.hpp>
 
 #include <aslam/cameras/apriltag_internal/ApriltagCanonicalModel.hpp>
+#include <aslam/cameras/apriltag_internal/AngularResidualGeometry.hpp>
 #include <aslam/cameras/apriltag_internal/DoubleSphereCameraModel.hpp>
 #include <aslam/cameras/apriltag_internal/JointReprojectionCostCore.hpp>
 #include <aslam/cameras/apriltag_internal/MultiBoardInternalMeasurementRegenerator.hpp>
@@ -6365,7 +6366,16 @@ CalibrationBenchmarkSplit Stage5Benchmark::BuildDeterministicSplit(
 
   const std::string mode =
       split_options_.mode.empty() ? "deterministic_stride" : split_options_.mode;
-  if (mode == "random_holdout_ratio" || mode == "random_ratio" ||
+  if (split_options_.all_frames_training ||
+      mode == "all_frames_training_no_holdout") {
+    split.training_frames = frames;
+    split.holdout_frames = frames;
+    split.mode = "all_frames_training_no_holdout";
+    split.holdout_ratio = 0.0;
+    split.random_seed = 0;
+    split.split_signature = "all_frames_training_no_holdout_frame_count_" +
+                            std::to_string(frames.size());
+  } else if (mode == "random_holdout_ratio" || mode == "random_ratio" ||
       mode == "random_70_30") {
     if (!(split_options_.holdout_ratio > 0.0 &&
           split_options_.holdout_ratio < 1.0)) {
@@ -6665,7 +6675,8 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
     const FrozenRound2BaselineOptions& baseline_options,
     const JointReprojectionSceneState& optimized_scene_state,
     const std::string& split_signature,
-    OuterDetectionCacheStats* cache_stats) const {
+    OuterDetectionCacheStats* cache_stats,
+    InternalRegenerationCacheStats* internal_cache_stats) const {
   CalibrationEvaluationDataset dataset;
   dataset.dataset_label = baseline_options.dataset_label;
   dataset.split_label = "holdout";
@@ -6740,12 +6751,37 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
       baseline_options.geometry_prior_rescue_accept_max_rotation_error_deg;
   detection_options.geometry_prior_rescue_accept_max_translation_error =
       baseline_options.geometry_prior_rescue_accept_max_translation_error;
+  detection_options.geometry_guided_tag_likelihood_enabled =
+      baseline_options.geometry_guided_tag_likelihood_enabled;
+  detection_options.geometry_guided_tag_likelihood_min_visible_boards =
+      baseline_options.geometry_guided_tag_likelihood_min_visible_boards;
+  detection_options.geometry_guided_tag_likelihood_max_expected_hamming =
+      baseline_options.geometry_guided_tag_likelihood_max_expected_hamming;
+  detection_options.geometry_guided_tag_likelihood_min_hamming_margin =
+      baseline_options.geometry_guided_tag_likelihood_min_hamming_margin;
+  detection_options.geometry_guided_tag_likelihood_min_contrast =
+      baseline_options.geometry_guided_tag_likelihood_min_contrast;
+  detection_options.geometry_guided_tag_likelihood_allow_single_anchor =
+      baseline_options.geometry_guided_tag_likelihood_allow_single_anchor;
+  detection_options.geometry_guided_tag_likelihood_single_anchor_max_outer_rmse =
+      baseline_options.geometry_guided_tag_likelihood_single_anchor_max_outer_rmse;
+  detection_options.geometry_guided_tag_likelihood_single_anchor_max_expected_hamming =
+      baseline_options.geometry_guided_tag_likelihood_single_anchor_max_expected_hamming;
+  detection_options.geometry_guided_tag_likelihood_single_anchor_min_hamming_margin =
+      baseline_options.geometry_guided_tag_likelihood_single_anchor_min_hamming_margin;
+  detection_options.geometry_guided_tag_likelihood_single_anchor_min_contrast =
+      baseline_options.geometry_guided_tag_likelihood_single_anchor_min_contrast;
   const MultiScaleOuterTagDetector outer_detector(config.outer_detector_config);
   const MultiBoardInternalMeasurementRegenerator regenerator(config, detection_options);
   const OuterDetectionCache detection_cache(
       config.outer_detector_config,
       OuterDetectionCacheOptions{baseline_options.enable_outer_detection_cache,
                                  baseline_options.outer_detection_cache_dir});
+  const InternalRegenerationCache internal_regeneration_cache(
+      config, detection_options,
+      InternalRegenerationCacheOptions{
+          baseline_options.enable_outer_detection_cache,
+          baseline_options.outer_detection_cache_dir});
 
   for (std::size_t frame_storage_index = 0; frame_storage_index < holdout_frames.size();
        ++frame_storage_index) {
@@ -6758,9 +6794,18 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
 
     OuterTagMultiDetectionResult outer_detection;
     std::string cache_warning;
-    if (detection_cache.Load(frame_source.image_path, &outer_detection, &cache_warning)) {
+    OuterDetectionCacheLoadSource cache_load_source =
+        OuterDetectionCacheLoadSource::None;
+    if (detection_cache.Load(frame_source.image_path, &outer_detection,
+                             &cache_warning, &cache_load_source)) {
       if (cache_stats != nullptr) {
         ++cache_stats->cache_hits;
+        if (cache_load_source == OuterDetectionCacheLoadSource::StageLayout) {
+          ++cache_stats->stage_layout_cache_hits;
+        } else if (cache_load_source ==
+                   OuterDetectionCacheLoadSource::LegacyLayout) {
+          ++cache_stats->legacy_layout_cache_hits;
+        }
       }
     } else {
       if (cache_stats != nullptr) {
@@ -6796,8 +6841,36 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
     regen_input.frame_index = frame_source.frame_index;
     regen_input.frame_label = frame_source.frame_label;
     regen_input.outer_detections = outer_detection;
-    const InternalRegenerationFrameResult regen_result =
-        regenerator.RegenerateFrame(image, regen_input, optimized_scene_state);
+    InternalRegenerationFrameResult regen_result;
+    const std::string internal_cache_state_signature =
+        InternalRegenerationCache::MakeSceneStateSignature(
+            optimized_scene_state);
+    std::string internal_cache_warning;
+    const bool internal_cache_hit = internal_regeneration_cache.Load(
+        frame_source.image_path, regen_input, internal_cache_state_signature,
+        &regen_result, &internal_cache_warning);
+    if (!internal_cache_hit) {
+      if (!internal_cache_warning.empty()) {
+        dataset.warnings.push_back(
+            "Internal regeneration cache load warning: " +
+            internal_cache_warning);
+      }
+      regen_result = regenerator.RegenerateFrame(
+          image, regen_input, optimized_scene_state);
+      if (internal_regeneration_cache.enabled() &&
+          !internal_regeneration_cache.Save(
+              frame_source.image_path, regen_input,
+              internal_cache_state_signature, regen_result,
+              &internal_cache_warning) &&
+          !internal_cache_warning.empty()) {
+        dataset.warnings.push_back(
+            "Internal regeneration cache store warning: " +
+            internal_cache_warning);
+      }
+    }
+    if (internal_cache_stats != nullptr) {
+      *internal_cache_stats = internal_regeneration_cache.stats();
+    }
     for (const std::string& warning : regen_result.warnings) {
       dataset.warnings.push_back(warning);
     }
@@ -7024,12 +7097,14 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
   const DoubleSphereCameraModel camera_model =
       DoubleSphereCameraModel::FromConfig(MakeIntermediateCameraConfig(camera));
   double total_squared_error = 0.0;
+  double total_angular_squared_error = 0.0;
   double outer_squared_error = 0.0;
   double internal_squared_error = 0.0;
   double total_squared_error_excluding_board = 0.0;
   double outer_squared_error_excluding_board = 0.0;
   double internal_squared_error_excluding_board = 0.0;
   int total_point_count = 0;
+  int total_angular_point_count = 0;
   int outer_point_count = 0;
   int internal_point_count = 0;
   int total_point_count_excluding_board = 0;
@@ -7190,6 +7265,22 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
           point_diag.residual_xy = predicted - point.image_xy;
           point_diag.residual_norm = point_diag.residual_xy.norm();
           squared_error = point_diag.residual_xy.squaredNorm();
+
+          AngularObservationGeometry observation_geometry;
+          AngularPredictionGeometry prediction_geometry;
+          if (ComputeAngularObservationGeometry(camera_model, point.image_xy,
+                                                &observation_geometry) &&
+              ComputeAngularPredictionGeometryFromPoint(
+                  T_camera_board * point.target_xyz_board, predicted,
+                  &prediction_geometry)) {
+            const Eigen::Vector2d angular_residual =
+                ComputeAngularResidualTangent(observation_geometry,
+                                              prediction_geometry);
+            if (angular_residual.allFinite()) {
+              total_angular_squared_error += angular_residual.squaredNorm();
+              ++total_angular_point_count;
+            }
+          }
         }
 
         result.point_diagnostics.push_back(point_diag);
@@ -7300,6 +7391,7 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
                       static_cast<double>(result.pose_only_refit_success_count))
           : 0.0;
   result.point_count = total_point_count;
+  result.angular_point_count = total_angular_point_count;
   result.outer_point_count = outer_point_count;
   result.internal_point_count = internal_point_count;
   result.point_count_excluding_board = total_point_count_excluding_board;
@@ -7312,6 +7404,13 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
 
   result.overall_rmse =
       std::sqrt(total_squared_error / static_cast<double>(total_point_count));
+  result.overall_angular_rmse_rad =
+      total_angular_point_count > 0
+          ? std::sqrt(total_angular_squared_error /
+                      static_cast<double>(total_angular_point_count))
+          : 0.0;
+  result.overall_angular_rmse_deg =
+      result.overall_angular_rmse_rad * kRadiansToDegrees;
   std::vector<double> residual_norms;
   residual_norms.reserve(result.point_diagnostics.size());
   for (const CameraModelRefitPointDiagnostics& point :
@@ -7721,7 +7820,12 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
             .used_internal_point_count;
   }
 
-  {
+  if (input.frontend_only) {
+    report.split.success = true;
+    report.split.mode = "frontend_only_all_frames";
+    report.split.split_signature = "frontend_only_all_frames";
+    report.split.training_frames = input.all_frames;
+  } else {
     const auto stage_start = std::chrono::steady_clock::now();
     report.split = input.external_holdout_frames.empty()
                        ? BuildDeterministicSplit(input.all_frames)
@@ -7783,6 +7887,14 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
   report.baseline_protocol_label = report.baseline_result.baseline_protocol_label;
   if (!report.baseline_result.success) {
     report.failure_reason = report.baseline_result.failure_reason;
+    return report;
+  }
+  if (input.frontend_only) {
+    report.success = true;
+    report.diagnostic_only = true;
+    report.warnings.push_back(
+        "Stage5 frontend-only mode: selection incremental BA, backend BA, "
+        "and holdout evaluation were not run.");
     return report;
   }
   if (!report.baseline_result.stage5_bundle_available) {
@@ -8404,7 +8516,8 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
     const auto stage_start = std::chrono::steady_clock::now();
     report.holdout_dataset = BuildHoldoutEvaluationDataset(
         report.split.holdout_frames, baseline_options, optimized_scene_state,
-        report.split.split_signature, &report.runtime_breakdown.holdout_detection_cache);
+        report.split.split_signature, &report.runtime_breakdown.holdout_detection_cache,
+        &report.runtime_breakdown.holdout_internal_regeneration_cache);
     report.runtime_breakdown.holdout_dataset_build_seconds =
         ElapsedSeconds(stage_start);
   }

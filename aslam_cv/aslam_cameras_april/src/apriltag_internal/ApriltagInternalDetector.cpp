@@ -1,5 +1,7 @@
 #include <aslam/cameras/apriltag_internal/ApriltagInternalDetector.hpp>
 
+#include <aslam/cameras/apriltag_internal/OuterDetectionResultUtils.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -424,27 +426,18 @@ bool UsesBorderConditionedSphereSeed(InternalProjectionMode mode) {
          mode == InternalProjectionMode::PureSphericalBoundarySeed;
 }
 
-std::string ResolvePath(const std::string& path, const std::string& reference_yaml_path) {
-  const boost::filesystem::path input_path(path);
-  if (input_path.is_absolute()) {
-    return input_path.lexically_normal().string();
-  }
-
-  const boost::filesystem::path reference_dir =
-      boost::filesystem::absolute(boost::filesystem::path(reference_yaml_path)).parent_path();
-  return (reference_dir / input_path).lexically_normal().string();
-}
-
 void ApplyCameraField(IntermediateCameraConfig* config,
                       const std::string& key,
                       const std::string& value,
-                      const std::string& reference_yaml_path) {
+                      const std::string& /*reference_yaml_path*/) {
   if (config == nullptr) {
     throw std::runtime_error("Camera config output pointer must not be null.");
   }
 
   if (key == "camera_yaml" || key == "intermediate_camera_yaml") {
-    config->camera_yaml = ResolvePath(value, reference_yaml_path);
+    // External camera-parameter files are deliberately unsupported. Camera
+    // parameters must be estimated from the observations of the active run.
+    return;
   } else if (key == "camera_model") {
     config->camera_model = Lowercase(value);
   } else if (key == "distortion_model") {
@@ -456,36 +449,6 @@ void ApplyCameraField(IntermediateCameraConfig* config,
   } else if (key == "resolution") {
     config->resolution = ParseIntList(key, value);
   }
-}
-
-IntermediateCameraConfig LoadExternalCameraConfigImpl(
-    const std::string& camera_yaml_path) {
-  std::ifstream stream(camera_yaml_path);
-  if (!stream.is_open()) {
-    throw std::runtime_error("Could not open camera config file: " + camera_yaml_path);
-  }
-
-  IntermediateCameraConfig config;
-  config.camera_yaml = camera_yaml_path;
-
-  std::string line;
-  while (std::getline(stream, line)) {
-    const std::string cleaned = Trim(RemoveInlineComment(line));
-    if (cleaned.empty()) {
-      continue;
-    }
-
-    const auto colon = cleaned.find(':');
-    if (colon == std::string::npos) {
-      continue;
-    }
-
-    const std::string key = Trim(cleaned.substr(0, colon));
-    const std::string value = Unquote(Trim(cleaned.substr(colon + 1)));
-    ApplyCameraField(&config, key, value, camera_yaml_path);
-  }
-
-  return config;
 }
 
 IntermediateCameraConfig MakeCoarseInitialCameraConfig(
@@ -640,6 +603,31 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.outer_detector_config.enable_anonymous_tag_like_geometry_rescue =
           Lowercase(value) == "1" || Lowercase(value) == "true" ||
           Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "enableCameraAwareSpherePatchRescue" ||
+               key == "enable_camera_aware_sphere_patch_rescue") {
+      config.outer_detector_config.enable_camera_aware_sphere_patch_rescue =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "cameraAwareSpherePatchMaxHamming" ||
+               key == "camera_aware_sphere_patch_max_hamming") {
+      config.outer_detector_config.camera_aware_sphere_patch_max_hamming =
+          ParseInt(key, value);
+    } else if (key == "cameraAwareSpherePatchCommitMappedCorners" ||
+               key == "camera_aware_sphere_patch_commit_mapped_corners") {
+      config.outer_detector_config.camera_aware_sphere_patch_commit_mapped_corners =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "cameraAwareSpherePatchRescueZeroDetectionFrames" ||
+               key == "camera_aware_sphere_patch_rescue_zero_detection_frames") {
+      config.outer_detector_config
+          .camera_aware_sphere_patch_rescue_zero_detection_frames =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "cameraAwareSpherePatchUseExtendedAtlas" ||
+               key == "camera_aware_sphere_patch_use_extended_atlas") {
+      config.outer_detector_config.camera_aware_sphere_patch_use_extended_atlas =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
     } else if (key == "sphereLatticeEnableSeedSearch" ||
                key == "sphere_lattice_enable_seed_search") {
       config.sphere_lattice_enable_seed_search =
@@ -664,6 +652,23 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.outer_detector_config.min_border_distance = ParseDouble(key, value);
     } else if (key == "maxScalesToTry" || key == "max_scales_to_try") {
       config.outer_detector_config.max_scales_to_try = ParseInt(key, value);
+    } else if (key == "enableAdaptiveScaleCascade" ||
+               key == "enable_adaptive_scale_cascade") {
+      config.outer_detector_config.enable_adaptive_scale_cascade =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "adaptiveCoarseScaleDivisors" ||
+               key == "adaptive_coarse_scale_divisors") {
+      config.outer_detector_config.adaptive_coarse_scale_divisors =
+          ParseDoubleList(key, value);
+    } else if (key == "adaptiveFallbackScaleDivisors" ||
+               key == "adaptive_fallback_scale_divisors") {
+      config.outer_detector_config.adaptive_fallback_scale_divisors =
+          ParseDoubleList(key, value);
+    } else if (key == "adaptiveCoarseMaxHamming" ||
+               key == "adaptive_coarse_max_hamming") {
+      config.outer_detector_config.adaptive_coarse_max_hamming =
+          ParseInt(key, value);
     } else if (key == "outerLocalContextScale" || key == "outer_local_context_scale") {
       config.outer_detector_config.outer_local_context_scale = ParseDouble(key, value);
     } else if (key == "outerCornerMarkerRatio" || key == "outer_corner_marker_ratio" ||
@@ -806,27 +811,6 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
     } else {
       ApplyCameraField(&config.intermediate_camera, key, value, yaml_path);
     }
-  }
-
-  if (!config.intermediate_camera.camera_yaml.empty()) {
-    IntermediateCameraConfig loaded =
-        LoadExternalCameraConfig(config.intermediate_camera.camera_yaml);
-    if (!config.intermediate_camera.camera_model.empty()) {
-      loaded.camera_model = config.intermediate_camera.camera_model;
-    }
-    if (!config.intermediate_camera.distortion_model.empty()) {
-      loaded.distortion_model = config.intermediate_camera.distortion_model;
-    }
-    if (!config.intermediate_camera.intrinsics.empty()) {
-      loaded.intrinsics = config.intermediate_camera.intrinsics;
-    }
-    if (!config.intermediate_camera.distortion_coeffs.empty()) {
-      loaded.distortion_coeffs = config.intermediate_camera.distortion_coeffs;
-    }
-    if (!config.intermediate_camera.resolution.empty()) {
-      loaded.resolution = config.intermediate_camera.resolution;
-    }
-    config.intermediate_camera = loaded;
   }
 
   config.tag_ids = NormalizeBoardIds(config.tag_ids, config.tag_id);
@@ -5108,10 +5092,6 @@ void PopulateInternalCornersFromVirtualPatchBoundarySeed(
 
 }  // namespace
 
-IntermediateCameraConfig LoadExternalCameraConfig(const std::string& camera_yaml_path) {
-  return LoadExternalCameraConfigImpl(camera_yaml_path);
-}
-
 const char* ToString(InternalPoseRescueMode mode) {
   switch (mode) {
     case InternalPoseRescueMode::Off:
@@ -5528,10 +5508,8 @@ ApriltagInternalMultiDetectionResult ApriltagInternalDetector::DetectMultiple(
           DetectSingleBoardFromOuter(
               gray, runtime, outer_multi_detection.detections[index], nullptr, nullptr));
     } else {
-      OuterTagDetectionResult empty_outer;
-      empty_outer.board_id = board_id;
-      empty_outer.failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
-      empty_outer.failure_reason_text = ToString(empty_outer.failure_reason);
+      const OuterTagDetectionResult empty_outer =
+          MakeMissingOuterTagDetection(board_id);
       result.detections.push_back(
           DetectSingleBoardFromOuter(gray, runtime, empty_outer, nullptr, nullptr));
     }
@@ -5574,13 +5552,11 @@ ApriltagInternalMultiDetectionResult ApriltagInternalDetector::DetectMultipleFro
   for (std::size_t index = 0; index < result.requested_board_ids.size(); ++index) {
     const int board_id = result.requested_board_ids[index];
     const BoardRuntime& runtime = RuntimeForBoardIdOrDefault(board_id);
-    OuterTagDetectionResult outer_detection;
+      OuterTagDetectionResult outer_detection;
     if (index < outer_multi_detection.detections.size()) {
       outer_detection = outer_multi_detection.detections[index];
     } else {
-      outer_detection.board_id = board_id;
-      outer_detection.failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
-      outer_detection.failure_reason_text = ToString(outer_detection.failure_reason);
+      outer_detection = MakeMissingOuterTagDetection(board_id);
     }
 
     const auto prior_it = T_camera_board_priors.find(board_id);

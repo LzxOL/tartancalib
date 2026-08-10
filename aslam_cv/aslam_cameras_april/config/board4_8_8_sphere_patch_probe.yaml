@@ -1,0 +1,14 @@
+# Diagnostic-only DS camera for local sphere-patch searches on the board4
+# capture. Values are the Stage5 provisional camera from the 000001-000005
+# initialization subset, not a fixed calibration input to the frontend.
+target_type: apriltag_internal
+tagFamily: t36h11
+tagIds: [1, 3, 4, 5]
+tagSize: 0.15625
+tagSpacing: 0.25
+blackBorderBits: 2
+resolution: [4512, 4512]
+camera_model: ds
+distortion_model: none
+intrinsics: [-0.171863418845, 0.623565681831, 1197.9781609, 1198.23940658, 2247.25978881, 2272.18311998]
+distortion_coeffs: []

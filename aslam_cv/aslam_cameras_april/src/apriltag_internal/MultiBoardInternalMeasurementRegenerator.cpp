@@ -1,5 +1,7 @@
 #include <aslam/cameras/apriltag_internal/MultiBoardInternalMeasurementRegenerator.hpp>
 
+#include <aslam/cameras/apriltag_internal/OuterDetectionResultUtils.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -49,6 +51,69 @@ void CollectVisibleBoardIds(
           frame_input.outer_detections.requested_board_ids[index], board_ids);
     }
   }
+}
+
+// A single board provides no same-frame layout consensus. It may seed
+// geometry-guided recovery only when it is a genuine, exact-ID detector
+// observation with four verified corners, rather than a prior rescue.
+bool HasDirectExactOuterAnchor(
+    const InternalRegenerationFrameInput& frame_input,
+    int board_id) {
+  if (board_id < 0) {
+    return false;
+  }
+  bool detector_anchor_valid = false;
+  for (std::size_t index = 0;
+       index < frame_input.outer_detections.requested_board_ids.size();
+       ++index) {
+    if (frame_input.outer_detections.requested_board_ids[index] != board_id ||
+        index >= frame_input.outer_detections.detections.size()) {
+      continue;
+    }
+    const OuterTagDetectionResult& detection =
+        frame_input.outer_detections.detections[index];
+    detector_anchor_valid =
+        detection.success && detection.good &&
+        !detection.used_local_patch_rescue &&
+        detection.detected_tag_id == board_id && detection.hamming == 0 &&
+        std::all_of(detection.refined_valid.begin(), detection.refined_valid.end(),
+                    [](bool valid) { return valid; });
+    break;
+  }
+  if (!detector_anchor_valid) {
+    return false;
+  }
+  for (const OuterBoardMeasurement& measurement :
+       frame_input.outer_detections.frame_measurements.board_measurements) {
+    if (measurement.board_id != board_id) {
+      continue;
+    }
+    return measurement.success && !measurement.used_local_patch_rescue &&
+           measurement.detected_tag_id == board_id &&
+           measurement.valid_refined_corner_count == 4 &&
+           std::all_of(measurement.refined_corner_valid.begin(),
+                       measurement.refined_corner_valid.end(),
+                       [](bool valid) { return valid; });
+  }
+  return false;
+}
+
+bool IsExactImageValidatedOuterMeasurement(
+    const OuterBoardMeasurement& measurement) {
+  if (!measurement.success || !measurement.used_local_patch_rescue ||
+      measurement.detected_tag_id != measurement.board_id ||
+      measurement.valid_refined_corner_count != 4) {
+    return false;
+  }
+  // The outer-corner target geometry is always reconstructed from the board
+  // configuration at the call site. The regular detector-side measurement
+  // intentionally does not carry a duplicate target-corner array, so requiring
+  // has_target_outer_corners here silently discarded exact sphere-patch
+  // recoveries before the local-frame pose refit.
+  return std::all_of(
+      measurement.refined_corner_valid.begin(),
+      measurement.refined_corner_valid.end(),
+      [](bool valid) { return valid; });
 }
 
 void AppendUniqueWarning(const std::string& warning,
@@ -223,6 +288,116 @@ QuadTopologyCheck CheckQuadTopology(
   return check;
 }
 
+struct WrongIdTopologyAssociation {
+  bool compatible = false;
+  std::array<Eigen::Vector2d, 4> ordered_corners{};
+  int cyclic_shift = 0;
+  bool reflected_order = false;
+  double normalized_corner_rmse = std::numeric_limits<double>::infinity();
+  double normalized_center_error = std::numeric_limits<double>::infinity();
+  double area_ratio = std::numeric_limits<double>::quiet_NaN();
+  std::string summary;
+};
+
+std::array<cv::Point2f, 4> ToCvCorners(
+    const std::array<Eigen::Vector2d, 4>& corners) {
+  std::array<cv::Point2f, 4> converted{};
+  for (int index = 0; index < 4; ++index) {
+    const Eigen::Vector2d& corner = corners[static_cast<std::size_t>(index)];
+    converted[static_cast<std::size_t>(index)] =
+        cv::Point2f(static_cast<float>(corner.x()),
+                    static_cast<float>(corner.y()));
+  }
+  return converted;
+}
+
+// A decoder result with the wrong ID is not evidence for every missing board.
+// Associate it to a topology-predicted board only when its image quadrilateral
+// independently agrees in position, scale, and corner ordering.  The caller
+// still performs image/code/pose validation before any observation is used.
+WrongIdTopologyAssociation AssociateWrongIdProposalToTopology(
+    const std::array<Eigen::Vector2d, 4>& topology_predicted_corners,
+    const OuterWrongIdProposal& proposal) {
+  WrongIdTopologyAssociation association;
+  const std::array<cv::Point2f, 4> predicted_cv =
+      ToCvCorners(topology_predicted_corners);
+  const std::array<cv::Point2f, 4> proposal_cv =
+      ToCvCorners(proposal.corners_original_image);
+  const QuadTopologyCheck predicted_topology = CheckQuadTopology(predicted_cv);
+  const QuadTopologyCheck proposal_topology = CheckQuadTopology(proposal_cv);
+  if (!predicted_topology.valid || !proposal_topology.valid) {
+    association.summary = "topology_invalid_quad predicted{" +
+                          predicted_topology.summary + "} proposal{" +
+                          proposal_topology.summary + "}";
+    return association;
+  }
+
+  const double predicted_scale =
+      std::sqrt(std::max(1.0, predicted_topology.area_px));
+  Eigen::Vector2d predicted_center = Eigen::Vector2d::Zero();
+  Eigen::Vector2d proposal_center = Eigen::Vector2d::Zero();
+  for (int index = 0; index < 4; ++index) {
+    predicted_center += topology_predicted_corners[static_cast<std::size_t>(index)];
+    proposal_center += proposal.corners_original_image[static_cast<std::size_t>(index)];
+  }
+  predicted_center *= 0.25;
+  proposal_center *= 0.25;
+  association.normalized_center_error =
+      (predicted_center - proposal_center).norm() / predicted_scale;
+  association.area_ratio = proposal_topology.area_px / predicted_topology.area_px;
+
+  double best_squared_error = std::numeric_limits<double>::infinity();
+  for (int reflected = 0; reflected <= 1; ++reflected) {
+    for (int shift = 0; shift < 4; ++shift) {
+      std::array<Eigen::Vector2d, 4> ordered{};
+      double squared_error = 0.0;
+      for (int index = 0; index < 4; ++index) {
+        const int proposal_index =
+            reflected == 0 ? (shift + index) % 4 : (shift - index + 4) % 4;
+        ordered[static_cast<std::size_t>(index)] =
+            proposal.corners_original_image[static_cast<std::size_t>(proposal_index)];
+        squared_error +=
+            (topology_predicted_corners[static_cast<std::size_t>(index)] -
+             ordered[static_cast<std::size_t>(index)]).squaredNorm();
+      }
+      if (squared_error < best_squared_error) {
+        best_squared_error = squared_error;
+        association.ordered_corners = ordered;
+        association.cyclic_shift = shift;
+        association.reflected_order = reflected != 0;
+      }
+    }
+  }
+  association.normalized_corner_rmse =
+      std::sqrt(best_squared_error / 4.0) / predicted_scale;
+
+  // Relative gates remain stable across image resolutions and Tag sizes. They
+  // intentionally sit well above normal scene-prediction error, while a quad
+  // belonging to a different physical board is usually separated by many Tag
+  // widths in this capture geometry.
+  constexpr double kMaxNormalizedCornerRmse = 0.18;
+  constexpr double kMaxNormalizedCenterError = 0.15;
+  constexpr double kMinAreaRatio = 0.55;
+  constexpr double kMaxAreaRatio = 1.80;
+  association.compatible =
+      association.normalized_corner_rmse <= kMaxNormalizedCornerRmse &&
+      association.normalized_center_error <= kMaxNormalizedCenterError &&
+      association.area_ratio >= kMinAreaRatio &&
+      association.area_ratio <= kMaxAreaRatio;
+  std::ostringstream stream;
+  stream << "topology_assoc compatible=" << (association.compatible ? 1 : 0)
+         << " corner_rmse_norm=" << association.normalized_corner_rmse
+         << " center_norm=" << association.normalized_center_error
+         << " area_ratio=" << association.area_ratio
+         << " cyclic_shift=" << association.cyclic_shift
+         << " reflected=" << (association.reflected_order ? 1 : 0)
+         << " proposal_id=" << proposal.detected_tag_id
+         << " proposal_hamming=" << proposal.hamming
+         << " proposal_source=" << proposal.source;
+  association.summary = stream.str();
+  return association;
+}
+
 GeometryPriorOuterSeedCandidate BuildGeometryPriorOuterSeedCandidate(
     const InternalRegenerationFrameInput& frame_input,
     int board_id,
@@ -237,6 +412,12 @@ struct LocalFramePoseRefit {
   bool success = false;
   int source_board_id = -1;
   std::vector<int> support_board_ids;
+  struct Candidate {
+    int source_board_id = -1;
+    double outer_rmse = std::numeric_limits<double>::infinity();
+    Eigen::Matrix4d T_camera_reference = Eigen::Matrix4d::Identity();
+  };
+  std::vector<Candidate> candidates;
   double outer_rmse = 0.0;
   Eigen::Matrix4d T_camera_reference = Eigen::Matrix4d::Identity();
 };
@@ -1615,7 +1796,11 @@ double ComputeFrameNormalOuterRefitRmseMedian(
   std::vector<double> rmses;
   for (const OuterBoardMeasurement& measurement :
        frame_input.outer_detections.frame_measurements.board_measurements) {
-    if (!measurement.success || measurement.used_local_patch_rescue ||
+    const bool exact_image_validated_rescue =
+        IsExactImageValidatedOuterMeasurement(measurement);
+    if (!measurement.success ||
+        (measurement.used_local_patch_rescue &&
+         !exact_image_validated_rescue) ||
         measurement.valid_refined_corner_count < 4) {
       continue;
     }
@@ -1658,7 +1843,11 @@ LocalFramePoseRefit EstimateLocalFramePoseFromVisibleBoards(
   std::vector<BoardPoseSupport> supports;
   for (const OuterBoardMeasurement& measurement :
        frame_input.outer_detections.frame_measurements.board_measurements) {
-    if (!measurement.success || measurement.used_local_patch_rescue ||
+    const bool exact_image_validated_rescue =
+        IsExactImageValidatedOuterMeasurement(measurement);
+    if (!measurement.success ||
+        (measurement.used_local_patch_rescue &&
+         !exact_image_validated_rescue) ||
         measurement.valid_refined_corner_count < 4) {
       continue;
     }
@@ -1691,6 +1880,11 @@ LocalFramePoseRefit EstimateLocalFramePoseFromVisibleBoards(
         ToIsometry3d(T_reference_board_matrix);
     const Eigen::Isometry3d T_camera_reference =
         T_camera_board * T_reference_board.inverse();
+    LocalFramePoseRefit::Candidate pose_candidate;
+    pose_candidate.source_board_id = measurement.board_id;
+    pose_candidate.outer_rmse = outer_rmse;
+    pose_candidate.T_camera_reference = T_camera_reference.matrix();
+    best.candidates.push_back(pose_candidate);
     BoardPoseSupport support;
     support.board_id = measurement.board_id;
     support.local_outer_rmse = outer_rmse;
@@ -1914,6 +2108,211 @@ OuterTagDetectionResult BuildRescuedOuterDetection(
   return detection;
 }
 
+struct GeometryGuidedTagLikelihood {
+  bool checked = false;
+  bool passed = false;
+  int expected_hamming = -1;
+  int runner_up_id = -1;
+  int runner_up_hamming = -1;
+  int hamming_margin = -1;
+  double contrast = 0.0;
+  std::string summary;
+};
+
+int MinimumRotationHamming(unsigned long long observed_code,
+                           unsigned long long candidate_code) {
+  int best = std::numeric_limits<int>::max();
+  unsigned long long rotated = observed_code;
+  for (int rotation = 0; rotation < 4; ++rotation) {
+    best = std::min(
+        best, AprilTags::TagFamily::hammingDistance(rotated, candidate_code));
+    rotated = AprilTags::TagFamily::rotate90(rotated, 6);
+  }
+  return best;
+}
+
+bool BuildModelAwareCanonicalTagPatch(
+    const cv::Mat& gray,
+    const DoubleSphereCameraModel& camera,
+    const ApriltagCanonicalModel& model,
+    const Eigen::Isometry3d& T_camera_board,
+    int pixels_per_module,
+    cv::Mat* patch,
+    double* valid_ratio) {
+  if (patch == nullptr || gray.empty() || !camera.IsValid() ||
+      pixels_per_module < 4) {
+    return false;
+  }
+  const int module_dimension = model.ModuleDimension();
+  const int patch_size = module_dimension * pixels_per_module;
+  if (patch_size <= 0) {
+    return false;
+  }
+  cv::Mat map_x(patch_size, patch_size, CV_32F, cv::Scalar(-1.0f));
+  cv::Mat map_y(patch_size, patch_size, CV_32F, cv::Scalar(-1.0f));
+  int valid_count = 0;
+  const double tag_size = model.config().tag_size;
+  for (int row = 0; row < patch_size; ++row) {
+    // Canonical image rows run top-to-bottom, while board y runs bottom-to-top.
+    const double board_y =
+        tag_size * (1.0 - (static_cast<double>(row) + 0.5) / patch_size);
+    for (int col = 0; col < patch_size; ++col) {
+      const double board_x =
+          tag_size * (static_cast<double>(col) + 0.5) / patch_size;
+      const Eigen::Vector3d point_camera =
+          T_camera_board * Eigen::Vector3d(board_x, board_y, 0.0);
+      Eigen::Vector2d image_point = Eigen::Vector2d::Zero();
+      if (!camera.vsEuclideanToKeypoint(point_camera, &image_point) ||
+          image_point.x() < 0.0 || image_point.y() < 0.0 ||
+          image_point.x() >= gray.cols - 1.0 || image_point.y() >= gray.rows - 1.0) {
+        continue;
+      }
+      map_x.at<float>(row, col) = static_cast<float>(image_point.x());
+      map_y.at<float>(row, col) = static_cast<float>(image_point.y());
+      ++valid_count;
+    }
+  }
+  if (valid_ratio != nullptr) {
+    *valid_ratio = static_cast<double>(valid_count) /
+                   static_cast<double>(patch_size * patch_size);
+  }
+  if (valid_count < static_cast<int>(0.98 * patch_size * patch_size)) {
+    return false;
+  }
+  cv::remap(gray, *patch, map_x, map_y, cv::INTER_LINEAR,
+            cv::BORDER_CONSTANT, cv::Scalar(127));
+  return !patch->empty();
+}
+
+double MeanCanonicalModule(const cv::Mat& patch,
+                           int module_x,
+                           int module_y,
+                           int module_dimension,
+                           int pixels_per_module) {
+  const int x0 = module_x * pixels_per_module + pixels_per_module / 4;
+  const int y0 = (module_dimension - 1 - module_y) * pixels_per_module +
+                 pixels_per_module / 4;
+  const int side = std::max(1, pixels_per_module / 2);
+  const cv::Rect roi(x0, y0, side, side);
+  return cv::mean(patch(roi))[0];
+}
+
+GeometryGuidedTagLikelihood EvaluateGeometryGuidedTagLikelihood(
+    const cv::Mat& gray,
+    const ApriltagInternalConfig& config,
+    const ApriltagInternalDetectionOptions& options,
+    const DoubleSphereCameraModel& camera,
+    int board_id,
+    const Eigen::Isometry3d& T_camera_board,
+    bool single_anchor) {
+  GeometryGuidedTagLikelihood result;
+  result.checked = true;
+  if (board_id < 0 ||
+      board_id >= static_cast<int>(AprilTags::tagCodes36h11.codes.size())) {
+    result.summary = "invalid_expected_tag_id";
+    return result;
+  }
+
+  ApriltagInternalConfig board_config = config;
+  board_config.tag_id = board_id;
+  const ApriltagCanonicalModel model(board_config);
+  constexpr int kPixelsPerModule = 32;
+  cv::Mat patch;
+  double valid_ratio = 0.0;
+  if (!BuildModelAwareCanonicalTagPatch(gray, camera, model, T_camera_board,
+                                         kPixelsPerModule, &patch,
+                                         &valid_ratio)) {
+    std::ostringstream stream;
+    stream << "canonical_patch_remap_failed valid_ratio=" << valid_ratio;
+    result.summary = stream.str();
+    return result;
+  }
+
+  const int code_dimension = ApriltagCanonicalModel::kCodeDimension;
+  const int border = config.black_border_bits;
+  const int module_dimension = model.ModuleDimension();
+  std::vector<double> code_values;
+  code_values.reserve(code_dimension * code_dimension);
+  for (int y = 0; y < code_dimension; ++y) {
+    for (int x = 0; x < code_dimension; ++x) {
+      code_values.push_back(MeanCanonicalModule(
+          patch, border + x, border + y, module_dimension, kPixelsPerModule));
+    }
+  }
+  std::sort(code_values.begin(), code_values.end());
+  const double low = code_values[static_cast<std::size_t>(code_values.size() / 5)];
+  const double high = code_values[static_cast<std::size_t>(
+      code_values.size() - 1 - code_values.size() / 5)];
+  // Normalize code contrast in the rectified Tag patch.  Using the full image
+  // range makes unrelated saturated lights or dark borders suppress a valid
+  // Tag's local contrast, which is exactly what happens in frame 70.
+  double patch_min = 0.0;
+  double patch_max = 0.0;
+  cv::minMaxLoc(patch, &patch_min, &patch_max);
+  const double local_dynamic_range = patch_max - patch_min;
+  result.contrast =
+      (high - low) / std::max(1.0, local_dynamic_range);
+  const double threshold = 0.5 * (low + high);
+
+  unsigned long long observed_code = 0ULL;
+  for (int y = code_dimension - 1; y >= 0; --y) {
+    for (int x = 0; x < code_dimension; ++x) {
+      const double value = MeanCanonicalModule(
+          patch, border + x, border + y, module_dimension, kPixelsPerModule);
+      observed_code <<= 1;
+      if (value > threshold) {
+        observed_code |= 1ULL;
+      }
+    }
+  }
+
+  const auto& codes = AprilTags::tagCodes36h11.codes;
+  result.expected_hamming = MinimumRotationHamming(
+      observed_code, codes[static_cast<std::size_t>(board_id)]);
+  for (std::size_t id = 0; id < codes.size(); ++id) {
+    if (static_cast<int>(id) == board_id) {
+      continue;
+    }
+    const int hamming = MinimumRotationHamming(observed_code, codes[id]);
+    if (hamming < result.runner_up_hamming || result.runner_up_id < 0) {
+      result.runner_up_hamming = hamming;
+      result.runner_up_id = static_cast<int>(id);
+    }
+  }
+  result.hamming_margin = result.runner_up_hamming - result.expected_hamming;
+  const int max_expected_hamming = single_anchor
+                                       ? options.geometry_guided_tag_likelihood_single_anchor_max_expected_hamming
+                                       : options.geometry_guided_tag_likelihood_max_expected_hamming;
+  const int min_hamming_margin = single_anchor
+                                      ? options.geometry_guided_tag_likelihood_single_anchor_min_hamming_margin
+                                      : options.geometry_guided_tag_likelihood_min_hamming_margin;
+  const double min_contrast = single_anchor
+                                  ? options.geometry_guided_tag_likelihood_single_anchor_min_contrast
+                                  : options.geometry_guided_tag_likelihood_min_contrast;
+  result.passed = result.expected_hamming <= max_expected_hamming &&
+                  result.hamming_margin >= min_hamming_margin &&
+                  result.contrast >= min_contrast;
+  std::ostringstream stream;
+  stream << "model_aware_canonical_patch"
+         << " valid_ratio=" << valid_ratio
+         << " expected_id=" << board_id
+         << " expected_hamming=" << result.expected_hamming
+         << " runner_up_id=" << result.runner_up_id
+         << " runner_up_hamming=" << result.runner_up_hamming
+         << " hamming_margin=" << result.hamming_margin
+         << " contrast=" << result.contrast
+         << " mode=" << (single_anchor ? "single_anchor" : "multi_board")
+         << " max_expected_hamming=" << max_expected_hamming
+         << " min_hamming_margin=" << min_hamming_margin
+         << " min_contrast=" << min_contrast
+         << " contrast_range=canonical_patch[" << patch_min << ","
+         << patch_max << "]"
+         << " threshold=" << threshold
+         << " passed=" << (result.passed ? 1 : 0);
+  result.summary = stream.str();
+  return result;
+}
+
 GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
     const cv::Mat& gray,
     const ApriltagInternalConfig& config,
@@ -1923,6 +2322,7 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
     const std::array<cv::Point2f, 4>& initial_corners_input,
     const Eigen::Matrix4d& T_camera_board_matrix,
     bool tag_id_validated,
+    bool single_anchor_is_direct_exact,
     const std::string& validation_source,
     GeometryPriorOuterSeedCandidate candidate,
     OuterTagDetectionResult* rescued_detection) {
@@ -1936,6 +2336,20 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
     candidate.reject_reason =
         validation_source + "_image_evidence_failed_initial_quad_topology";
     return candidate;
+  }
+  // A ray-patch decode may replace an in-bounds geometric prediction with a
+  // mapped quadrilateral that reaches outside the source image. OpenCV's
+  // cornerSubPix asserts instead of reporting this condition, so reject this
+  // candidate before any refinement. This is an evidence failure, never a
+  // reason to abort the whole frontend on an extreme-FOV frame.
+  const double subpix_border =
+      static_cast<double>(std::max(0, candidate.subpix_window_radius)) + 2.0;
+  for (const cv::Point2f& corner : initial_corners) {
+    if (!IsInsideImage(corner, gray.size(), subpix_border)) {
+      candidate.reject_reason =
+          validation_source + "_image_evidence_failed_refined_corner_near_border";
+      return candidate;
+    }
   }
   const DoubleSphereCameraModel sphere_camera =
       DoubleSphereCameraModel::FromConfig(camera_config);
@@ -2087,7 +2501,23 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
           options.geometry_prior_rescue_min_edge_support_ratio &&
       edge_metrics.mean_gradient_ratio >=
           options.geometry_prior_rescue_min_edge_gradient_ratio;
-  if (!corner_response_ok && !edge_evidence_ok) {
+  const bool multi_board_context_for_likelihood =
+      candidate.visible_boards_used.size() >=
+      static_cast<std::size_t>(std::max(
+          2, options.geometry_guided_tag_likelihood_min_visible_boards));
+  // A severely distorted but visible Tag can have weak corner response even
+  // when its code remains recoverable after model-aware rectification. Keep a
+  // deliberately weaker pre-gate for that path; the exact-ID likelihood below
+  // is still mandatory before the observation can be committed.
+  const bool weak_but_nonzero_edge_evidence =
+      edge_metrics.support_ratio >=
+          std::max(0.12, 0.33 * options.geometry_prior_rescue_min_edge_support_ratio) &&
+      edge_metrics.mean_gradient_ratio >=
+          std::max(0.005, 0.25 * options.geometry_prior_rescue_min_edge_gradient_ratio);
+  const bool allow_model_aware_precheck =
+      !tag_id_validated && options.geometry_guided_tag_likelihood_enabled &&
+      multi_board_context_for_likelihood && weak_but_nonzero_edge_evidence;
+  if (!corner_response_ok && !edge_evidence_ok && !allow_model_aware_precheck) {
     candidate.local_corner_refine_success = false;
     candidate.reject_reason =
         validation_source +
@@ -2121,7 +2551,32 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
        candidate.spherical_refine_successful_corner_count >= 4);
   const bool geometry_only_observation_edge_ok =
       tag_id_validated || edge_evidence_ok;
-  if (!tag_id_validated &&
+  const bool multi_board_context =
+      static_cast<int>(candidate.visible_boards_used.size()) >=
+      std::max(2, options.geometry_guided_tag_likelihood_min_visible_boards);
+  const bool single_anchor_context =
+      options.geometry_guided_tag_likelihood_allow_single_anchor &&
+      candidate.visible_boards_used.size() == 1u &&
+      single_anchor_is_direct_exact &&
+      candidate.frame_pose_refit_source_board_id >= 0 &&
+      std::isfinite(candidate.frame_pose_refit_outer_rmse) &&
+      candidate.frame_pose_refit_outer_rmse <=
+          options.geometry_guided_tag_likelihood_single_anchor_max_outer_rmse;
+  const bool require_model_aware_tag_likelihood =
+      !tag_id_validated &&
+      options.geometry_guided_tag_likelihood_enabled &&
+      (multi_board_context || single_anchor_context);
+  if (require_model_aware_tag_likelihood &&
+      !edge_evidence_ok && !weak_but_nonzero_edge_evidence) {
+    candidate.local_corner_refine_success = false;
+    candidate.reject_reason =
+        validation_source + "_image_evidence_failed_edge_support";
+    return candidate;
+  }
+  // The model-aware likelihood is evaluated only after a refined local pose is
+  // available below. Keep the legacy geometry-only gate intact for callers
+  // that did not opt into the new code-evidence path.
+  if (!tag_id_validated && !require_model_aware_tag_likelihood &&
       (!geometry_only_pose_refit_candidate ||
        (weak_quad_alternative && !geometry_only_strong_edge_evidence) ||
        !geometry_only_refine_ok ||
@@ -2175,6 +2630,34 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
       RotationErrorDegrees(global_pose.rotation(), local_pose.rotation());
   candidate.local_vs_global_translation_error =
       (global_pose.translation() - local_pose.translation()).norm();
+
+  if (require_model_aware_tag_likelihood) {
+    const GeometryGuidedTagLikelihood likelihood =
+        EvaluateGeometryGuidedTagLikelihood(
+            gray, config, options, sphere_camera, board_id, local_pose,
+            single_anchor_context);
+    candidate.geometry_guided_tag_likelihood_checked = likelihood.checked;
+    candidate.geometry_guided_tag_likelihood_passed = likelihood.passed;
+    candidate.geometry_guided_tag_likelihood_mode =
+        single_anchor_context ? "single_anchor" : "multi_board";
+    candidate.geometry_guided_tag_likelihood_expected_hamming =
+        likelihood.expected_hamming;
+    candidate.geometry_guided_tag_likelihood_runner_up_id =
+        likelihood.runner_up_id;
+    candidate.geometry_guided_tag_likelihood_runner_up_hamming =
+        likelihood.runner_up_hamming;
+    candidate.geometry_guided_tag_likelihood_hamming_margin =
+        likelihood.hamming_margin;
+    candidate.geometry_guided_tag_likelihood_contrast = likelihood.contrast;
+    candidate.geometry_guided_tag_likelihood_summary = likelihood.summary;
+    if (!likelihood.passed) {
+      candidate.reject_reason =
+          validation_source + "_image_evidence_rejected_tag_likelihood";
+      return candidate;
+    }
+    tag_id_validated = true;
+    candidate.tag_id_validated = true;
+  }
 
   const bool visible_board_frame_pose_consistent =
       geometry_guided_edge_quad &&
@@ -2245,9 +2728,11 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
   }
 
   candidate.accepted_as_rescued_observation = true;
-  candidate.reject_reason =
-      tag_id_validated ? "accepted_image_validated_rescued_observation"
-                       : "accepted_geometry_only_pose_refit_observation";
+  candidate.reject_reason = candidate.geometry_guided_tag_likelihood_passed
+                                ? "accepted_geometry_guided_tag_likelihood_observation"
+                                : (tag_id_validated
+                                       ? "accepted_image_validated_rescued_observation"
+                                       : "accepted_geometry_only_pose_refit_observation");
   if (!validation_source.empty() && validation_source != "primary") {
     candidate.reject_reason += "_" + validation_source;
   }
@@ -2289,11 +2774,16 @@ GeometryPriorOuterSeedCandidate EvaluateGeometryPriorOuterSeedCandidate(
     double frame_pose_refit_outer_rmse,
     double frame_normal_outer_refit_rmse_median,
     const std::string& original_failure_reason,
+    const OuterWrongIdProposal* wrong_id_proposal,
     OuterTagDetectionResult* rescued_detection) {
+  std::array<Eigen::Vector2d, 4> effective_predicted_corners = predicted_corners;
+  if (wrong_id_proposal != nullptr) {
+    effective_predicted_corners = wrong_id_proposal->corners_original_image;
+  }
   GeometryPriorOuterSeedCandidate candidate =
       BuildGeometryPriorOuterSeedCandidate(frame_input, board_id,
                                            visible_boards_used,
-                                           predicted_corners,
+                                           effective_predicted_corners,
                                            prediction_source_label,
                                            frame_pose_refit_source_board_id,
                                            frame_pose_refit_outer_rmse,
@@ -2363,10 +2853,13 @@ GeometryPriorOuterSeedCandidate EvaluateGeometryPriorOuterSeedCandidate(
   const bool tag_id_validated =
       candidate.roi_redetect_success ||
       candidate.rectified_patch_decode_success;
+  const bool single_anchor_is_direct_exact =
+      HasDirectExactOuterAnchor(frame_input, frame_pose_refit_source_board_id);
   GeometryPriorOuterSeedCandidate primary_candidate =
       FinalizeGeometryPriorOuterSeedCandidate(
           gray, config, options, camera_config, board_id, initial_corners,
-          T_camera_board_matrix, tag_id_validated, "primary", candidate,
+          T_camera_board_matrix, tag_id_validated, single_anchor_is_direct_exact,
+          "primary", candidate,
           rescued_detection);
   if (primary_candidate.accepted_as_rescued_observation || tag_id_validated) {
     return primary_candidate;
@@ -2390,7 +2883,8 @@ GeometryPriorOuterSeedCandidate EvaluateGeometryPriorOuterSeedCandidate(
     GeometryPriorOuterSeedCandidate guided_result =
         FinalizeGeometryPriorOuterSeedCandidate(
             gray, config, options, camera_config, board_id, guided_edge_corners,
-            T_camera_board_matrix, false, "geometry_guided_edge_quad",
+            T_camera_board_matrix, false, single_anchor_is_direct_exact,
+            "geometry_guided_edge_quad",
             guided_candidate, rescued_detection);
     if (guided_result.accepted_as_rescued_observation) {
       return guided_result;
@@ -2428,7 +2922,8 @@ GeometryPriorOuterSeedCandidate EvaluateGeometryPriorOuterSeedCandidate(
   GeometryPriorOuterSeedCandidate weak_result =
       FinalizeGeometryPriorOuterSeedCandidate(
           gray, config, options, camera_config, board_id, weak_quad_corners,
-          T_camera_board_matrix, false, "weak_quad_alternative",
+          T_camera_board_matrix, false, single_anchor_is_direct_exact,
+          "weak_quad_alternative",
           weak_candidate, rescued_detection);
   if (weak_result.accepted_as_rescued_observation) {
     return weak_result;
@@ -2645,9 +3140,7 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
     if (index < frame_input.outer_detections.detections.size()) {
       outer_detection = frame_input.outer_detections.detections[index];
     } else {
-      outer_detection.board_id = board_id;
-      outer_detection.failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
-      outer_detection.failure_reason_text = ToString(outer_detection.failure_reason);
+      outer_detection = MakeMissingOuterTagDetection(board_id);
     }
 
     const OuterBootstrapBoardState* board_state = FindBoardState(bootstrap_result, board_id);
@@ -2689,23 +3182,64 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
               const std::string& prediction_source_label,
               int frame_pose_refit_source_board_id,
               double frame_pose_refit_outer_rmse,
-              const std::vector<int>& visible_boards_used) {
+              const std::vector<int>& visible_boards_used,
+              const OuterWrongIdProposal* wrong_id_proposal = nullptr) {
             std::array<Eigen::Vector2d, 4> predicted_outer_corners{};
             if (!ProjectGeometryPriorOuterCorners(
                     camera_override, model, T_camera_board_prediction,
                     image.size(), &predicted_outer_corners)) {
               return;
             }
+            OuterWrongIdProposal topology_ordered_proposal;
+            const OuterWrongIdProposal* effective_wrong_id_proposal =
+                wrong_id_proposal;
+            std::string effective_prediction_source_label =
+                prediction_source_label;
+            std::string topology_association_summary;
+            if (wrong_id_proposal != nullptr) {
+              const WrongIdTopologyAssociation association =
+                  AssociateWrongIdProposalToTopology(predicted_outer_corners,
+                                                     *wrong_id_proposal);
+              topology_association_summary = association.summary;
+              if (!association.compatible) {
+                GeometryPriorOuterSeedCandidate rejected_candidate =
+                    BuildGeometryPriorOuterSeedCandidate(
+                        frame_input, board_id, visible_boards_used,
+                        predicted_outer_corners,
+                        prediction_source_label + "_topology_rejected_from" +
+                            std::to_string(wrong_id_proposal->detected_tag_id),
+                        frame_pose_refit_source_board_id,
+                        frame_pose_refit_outer_rmse,
+                        original_outer_failure_reason);
+                rejected_candidate.quad_topology_summary +=
+                    " " + topology_association_summary;
+                rejected_candidate.reject_reason =
+                    "topology_id_association_rejected";
+                result.geometry_prior_outer_seed_candidates.push_back(
+                    std::move(rejected_candidate));
+                return;
+              }
+              topology_ordered_proposal = *wrong_id_proposal;
+              topology_ordered_proposal.corners_original_image =
+                  association.ordered_corners;
+              effective_wrong_id_proposal = &topology_ordered_proposal;
+              effective_prediction_source_label += "_topology_assoc";
+            }
         OuterTagDetectionResult rescued_detection;
         GeometryPriorOuterSeedCandidate candidate =
             EvaluateGeometryPriorOuterSeedCandidate(
                 image, config_, options_, camera_override, frame_input,
                 board_id, visible_boards_used, predicted_outer_corners,
-                T_camera_board_prediction, prediction_source_label,
+                T_camera_board_prediction, effective_prediction_source_label,
                 frame_pose_refit_source_board_id, frame_pose_refit_outer_rmse,
                 frame_normal_outer_refit_rmse_median,
                 original_outer_failure_reason,
+                effective_wrong_id_proposal,
                 &rescued_detection);
+        if (!topology_association_summary.empty()) {
+          candidate.quad_topology_summary +=
+              " " + topology_association_summary;
+        }
         result.geometry_prior_outer_seed_candidates.push_back(candidate);
             if (candidate.accepted_as_rescued_observation) {
               any_candidate_accepted = true;
@@ -2718,6 +3252,17 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
           };
       evaluate_prediction(T_camera_board, result.state_source_label, -1, 0.0,
                           result.visible_board_ids);
+      if (outer_detection.failure_reason ==
+          OuterTagFailureReason::DetectionsExistButNoMatchingTagId) {
+        for (const OuterWrongIdProposal& proposal :
+             outer_detection.wrong_id_proposals) {
+          evaluate_prediction(
+              T_camera_board,
+              result.state_source_label + "_wrong_id_proposal_from" +
+                  std::to_string(proposal.detected_tag_id),
+              -1, 0.0, result.visible_board_ids, &proposal);
+        }
+      }
       if (visible_frame_refit.success && board_pose_available) {
         const Eigen::Matrix4d T_camera_board_visible_refit =
             visible_frame_refit.T_camera_reference *
@@ -2738,6 +3283,26 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
                             visible_frame_refit.source_board_id,
                             visible_frame_refit.outer_rmse,
                             visible_refit_board_ids);
+        std::vector<int> individual_refit_board_ids;
+        for (const LocalFramePoseRefit::Candidate& pose_candidate :
+             visible_frame_refit.candidates) {
+          AppendUniqueBoardId(pose_candidate.source_board_id,
+                              &individual_refit_board_ids);
+        }
+        if (individual_refit_board_ids.size() >= 2) {
+          for (const LocalFramePoseRefit::Candidate& pose_candidate :
+               visible_frame_refit.candidates) {
+            const Eigen::Matrix4d T_camera_board_individual_refit =
+                pose_candidate.T_camera_reference *
+                board_state->T_reference_board;
+            evaluate_prediction(
+                T_camera_board_individual_refit,
+                result.state_source_label + "_visible_refit_board" +
+                    std::to_string(pose_candidate.source_board_id),
+                pose_candidate.source_board_id, pose_candidate.outer_rmse,
+                individual_refit_board_ids);
+          }
+        }
       }
       if (selected_rescued_detection &&
           options_.geometry_prior_rescue_use_as_observation &&
@@ -2846,9 +3411,7 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
     if (index < frame_input.outer_detections.detections.size()) {
       outer_detection = frame_input.outer_detections.detections[index];
     } else {
-      outer_detection.board_id = board_id;
-      outer_detection.failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
-      outer_detection.failure_reason_text = ToString(outer_detection.failure_reason);
+      outer_detection = MakeMissingOuterTagDetection(board_id);
     }
 
     const JointSceneBoardState* board_state = FindBoardState(scene_state, board_id);
@@ -2890,23 +3453,64 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
               const std::string& prediction_source_label,
               int frame_pose_refit_source_board_id,
               double frame_pose_refit_outer_rmse,
-              const std::vector<int>& visible_boards_used) {
+              const std::vector<int>& visible_boards_used,
+              const OuterWrongIdProposal* wrong_id_proposal = nullptr) {
             std::array<Eigen::Vector2d, 4> predicted_outer_corners{};
             if (!ProjectGeometryPriorOuterCorners(
                     camera_override, model, T_camera_board_prediction,
                     image.size(), &predicted_outer_corners)) {
               return;
             }
+            OuterWrongIdProposal topology_ordered_proposal;
+            const OuterWrongIdProposal* effective_wrong_id_proposal =
+                wrong_id_proposal;
+            std::string effective_prediction_source_label =
+                prediction_source_label;
+            std::string topology_association_summary;
+            if (wrong_id_proposal != nullptr) {
+              const WrongIdTopologyAssociation association =
+                  AssociateWrongIdProposalToTopology(predicted_outer_corners,
+                                                     *wrong_id_proposal);
+              topology_association_summary = association.summary;
+              if (!association.compatible) {
+                GeometryPriorOuterSeedCandidate rejected_candidate =
+                    BuildGeometryPriorOuterSeedCandidate(
+                        frame_input, board_id, visible_boards_used,
+                        predicted_outer_corners,
+                        prediction_source_label + "_topology_rejected_from" +
+                            std::to_string(wrong_id_proposal->detected_tag_id),
+                        frame_pose_refit_source_board_id,
+                        frame_pose_refit_outer_rmse,
+                        original_outer_failure_reason);
+                rejected_candidate.quad_topology_summary +=
+                    " " + topology_association_summary;
+                rejected_candidate.reject_reason =
+                    "topology_id_association_rejected";
+                result.geometry_prior_outer_seed_candidates.push_back(
+                    std::move(rejected_candidate));
+                return;
+              }
+              topology_ordered_proposal = *wrong_id_proposal;
+              topology_ordered_proposal.corners_original_image =
+                  association.ordered_corners;
+              effective_wrong_id_proposal = &topology_ordered_proposal;
+              effective_prediction_source_label += "_topology_assoc";
+            }
         OuterTagDetectionResult rescued_detection;
         GeometryPriorOuterSeedCandidate candidate =
             EvaluateGeometryPriorOuterSeedCandidate(
                 image, config_, options_, camera_override, frame_input,
                 board_id, visible_boards_used, predicted_outer_corners,
-                T_camera_board_prediction, prediction_source_label,
+                T_camera_board_prediction, effective_prediction_source_label,
                 frame_pose_refit_source_board_id, frame_pose_refit_outer_rmse,
                 frame_normal_outer_refit_rmse_median,
                 original_outer_failure_reason,
+                effective_wrong_id_proposal,
                 &rescued_detection);
+        if (!topology_association_summary.empty()) {
+          candidate.quad_topology_summary +=
+              " " + topology_association_summary;
+        }
         result.geometry_prior_outer_seed_candidates.push_back(candidate);
             if (candidate.accepted_as_rescued_observation) {
               any_candidate_accepted = true;
@@ -2919,6 +3523,17 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
           };
       evaluate_prediction(T_camera_board, result.state_source_label, -1, 0.0,
                           result.visible_board_ids);
+      if (outer_detection.failure_reason ==
+          OuterTagFailureReason::DetectionsExistButNoMatchingTagId) {
+        for (const OuterWrongIdProposal& proposal :
+             outer_detection.wrong_id_proposals) {
+          evaluate_prediction(
+              T_camera_board,
+              result.state_source_label + "_wrong_id_proposal_from" +
+                  std::to_string(proposal.detected_tag_id),
+              -1, 0.0, result.visible_board_ids, &proposal);
+        }
+      }
       if (visible_frame_refit.success && board_pose_available) {
         const Eigen::Matrix4d T_camera_board_visible_refit =
             visible_frame_refit.T_camera_reference *
@@ -2939,6 +3554,26 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
                             visible_frame_refit.source_board_id,
                             visible_frame_refit.outer_rmse,
                             visible_refit_board_ids);
+        std::vector<int> individual_refit_board_ids;
+        for (const LocalFramePoseRefit::Candidate& pose_candidate :
+             visible_frame_refit.candidates) {
+          AppendUniqueBoardId(pose_candidate.source_board_id,
+                              &individual_refit_board_ids);
+        }
+        if (individual_refit_board_ids.size() >= 2) {
+          for (const LocalFramePoseRefit::Candidate& pose_candidate :
+               visible_frame_refit.candidates) {
+            const Eigen::Matrix4d T_camera_board_individual_refit =
+                pose_candidate.T_camera_reference *
+                board_state->T_reference_board;
+            evaluate_prediction(
+                T_camera_board_individual_refit,
+                result.state_source_label + "_visible_refit_board" +
+                    std::to_string(pose_candidate.source_board_id),
+                pose_candidate.source_board_id, pose_candidate.outer_rmse,
+                individual_refit_board_ids);
+          }
+        }
       }
       if (selected_rescued_detection &&
           options_.geometry_prior_rescue_use_as_observation &&

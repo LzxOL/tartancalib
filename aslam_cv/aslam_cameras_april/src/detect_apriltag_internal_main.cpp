@@ -52,6 +52,12 @@ struct CmdArgs {
   double rectified_roi_fov_deg = 44.0;
   int rectified_roi_patch_size = 800;
   int corner_radius = 2;
+  bool outer_corners_only = false;
+  bool auto_tag_ids = false;
+  bool id_discovery_only = false;
+  int id_discovery_sample_count = 12;
+  int id_discovery_min_frame_support = 2;
+  std::vector<int> tag_ids_override;
   bool outer_distortion_experiment = false;
   std::string outer_experiment_camera_yaml;
   int outer_experiment_patch_size = 640;
@@ -130,6 +136,9 @@ void PrintUsage(const char* program) {
       << " [--mode MODE] [--all] [--show] [--no-subpix]"
       << " [--no-output-images] [--no-debug-output]"
       << " [--final-corners-only] [--corner-radius N]"
+      << " [--outer-corners-only --auto-tag-ids]"
+      << " [--id-discovery-only --id-discovery-sample-count N]"
+      << " [--id-discovery-min-frame-support N] [--tag-ids ID0,ID1,...]"
       << " [--rectified-roi-demo] [--rectified-roi-patch-size N]"
       << " [--rectified-roi-fov-deg DEG]"
       << " [--rectified-roi-crop-offset-x X --rectified-roi-crop-offset-y Y]"
@@ -141,7 +150,11 @@ void PrintUsage(const char* program) {
       << " --output /tmp/apriltag_internal.png\n"
       << "  " << program
       << " --image /data/images --all --config ./config/example_apriltag_internal.yaml"
-      << " --output /tmp/apriltag_batch\n";
+      << " --output /tmp/apriltag_batch\n"
+      << "  " << program
+      << " --image /data/images --all --outer-corners-only --auto-tag-ids"
+      << " --config ./config/example_apriltag_internal.yaml"
+      << " --output /tmp/apriltag_outer_scan\n";
 }
 
 CmdArgs ParseArgs(int argc, char** argv) {
@@ -168,6 +181,35 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.no_debug_output = true;
     } else if (token == "--final-corners-only") {
       args.final_corners_only = true;
+    } else if (token == "--outer-corners-only") {
+      args.outer_corners_only = true;
+    } else if (token == "--auto-tag-ids") {
+      args.auto_tag_ids = true;
+    } else if (token == "--id-discovery-only") {
+      args.id_discovery_only = true;
+    } else if (token == "--id-discovery-sample-count" && i + 1 < argc) {
+      args.id_discovery_sample_count = std::max(1, std::stoi(argv[++i]));
+    } else if (token == "--id-discovery-min-frame-support" && i + 1 < argc) {
+      args.id_discovery_min_frame_support = std::max(1, std::stoi(argv[++i]));
+    } else if (token == "--tag-ids" && i + 1 < argc) {
+      std::stringstream stream(argv[++i]);
+      std::string value;
+      while (std::getline(stream, value, ',')) {
+        if (value.empty()) {
+          continue;
+        }
+        const int tag_id = std::stoi(value);
+        if (tag_id < 0) {
+          throw std::runtime_error("--tag-ids accepts only non-negative IDs.");
+        }
+        if (std::find(args.tag_ids_override.begin(), args.tag_ids_override.end(),
+                      tag_id) == args.tag_ids_override.end()) {
+          args.tag_ids_override.push_back(tag_id);
+        }
+      }
+      if (args.tag_ids_override.empty()) {
+        throw std::runtime_error("--tag-ids requires at least one integer ID.");
+      }
     } else if (token == "--rectified-roi-demo") {
       args.rectified_roi_demo = true;
     } else if (token == "--rectified-roi-patch-size" && i + 1 < argc) {
@@ -200,6 +242,14 @@ CmdArgs ParseArgs(int argc, char** argv) {
   if (args.outer_distortion_experiment && args.outer_experiment_camera_yaml.empty()) {
     throw std::runtime_error(
         "--outer-distortion-experiment requires --outer-experiment-camera-yaml.");
+  }
+  if (args.auto_tag_ids && !args.outer_corners_only) {
+    throw std::runtime_error(
+        "--auto-tag-ids is inspection-only; use it with --outer-corners-only.");
+  }
+  if (args.id_discovery_only && args.outer_corners_only) {
+    throw std::runtime_error(
+        "--id-discovery-only and --outer-corners-only are separate phases.");
   }
   return args;
 }
@@ -358,6 +408,282 @@ std::string JoinBoardIds(const std::vector<int>& board_ids) {
     stream << board_ids[index];
   }
   return stream.str();
+}
+
+std::string CsvField(const std::string& value) {
+  if (value.find_first_of(",\"\n\r") == std::string::npos) {
+    return value;
+  }
+  std::string escaped = "\"";
+  for (char character : value) {
+    if (character == '\"') {
+      escaped += "\"\"";
+    } else {
+      escaped += character;
+    }
+  }
+  return escaped + "\"";
+}
+
+boost::filesystem::path ResolveOuterCornerOutputRoot(const CmdArgs& args) {
+  if (!args.output_path.empty()) {
+    const boost::filesystem::path configured(args.output_path);
+    if (!configured.has_extension()) {
+      return configured;
+    }
+    const boost::filesystem::path parent =
+        configured.has_parent_path() ? configured.parent_path() : ".";
+    return parent / configured.stem();
+  }
+
+  const boost::filesystem::path input(args.image_path);
+  const boost::filesystem::path parent = boost::filesystem::is_directory(input)
+                                             ? input
+                                             : input.parent_path();
+  return parent / "apriltag_outer_corner_scan";
+}
+
+void ApplyTagIdOverride(const CmdArgs& args,
+                        ati::ApriltagInternalConfig* config) {
+  if (config == nullptr || args.tag_ids_override.empty()) {
+    return;
+  }
+  config->tag_ids = args.tag_ids_override;
+  config->tag_id = config->tag_ids.front();
+  config->outer_detector_config.tag_ids = config->tag_ids;
+  config->outer_detector_config.tag_id = config->tag_id;
+}
+
+std::vector<std::string> SelectEvenlySpacedImagePaths(
+    const std::vector<std::string>& image_paths,
+    int requested_count) {
+  if (requested_count <= 0 ||
+      static_cast<std::size_t>(requested_count) >= image_paths.size()) {
+    return image_paths;
+  }
+  std::vector<std::string> selected;
+  selected.reserve(static_cast<std::size_t>(requested_count));
+  if (requested_count == 1) {
+    selected.push_back(image_paths.front());
+    return selected;
+  }
+  for (int index = 0; index < requested_count; ++index) {
+    const double position = static_cast<double>(index) *
+                            static_cast<double>(image_paths.size() - 1) /
+                            static_cast<double>(requested_count - 1);
+    selected.push_back(image_paths[static_cast<std::size_t>(std::lround(position))]);
+  }
+  return selected;
+}
+
+int RunTagIdDiscovery(const CmdArgs& args,
+                      ati::ApriltagInternalConfig config) {
+  config.outer_detector_config.tag_ids = config.tag_ids;
+  config.outer_detector_config.tag_id = config.tag_id;
+  config.outer_detector_config.auto_discover_tag_ids = false;
+  config.outer_detector_config.enable_outer_spherical_refinement = false;
+  config.outer_detector_config.do_outer_subpix_refinement = false;
+  ati::MultiScaleOuterTagDetector detector(config.outer_detector_config);
+
+  const std::vector<std::string> all_image_paths =
+      CollectImagePaths(args.image_path, args.all);
+  const std::vector<std::string> sample_paths = SelectEvenlySpacedImagePaths(
+      all_image_paths, args.id_discovery_sample_count);
+  const boost::filesystem::path output_root = ResolveOuterCornerOutputRoot(args);
+  boost::filesystem::create_directories(output_root);
+  std::ofstream csv((output_root / "id_discovery_frames.csv").string());
+  if (!csv.is_open()) {
+    throw std::runtime_error("Failed to create ID discovery CSV output.");
+  }
+  csv << "sample_index,frame_label,image_path,discovered_tag_ids,discovered_tag_count\n";
+
+  std::map<int, int> frame_support_by_id;
+  for (std::size_t index = 0; index < sample_paths.size(); ++index) {
+    const std::string& image_path = sample_paths[index];
+    const cv::Mat image = cv::imread(image_path, cv::IMREAD_UNCHANGED);
+    if (image.empty()) {
+      throw std::runtime_error("Failed to read image: " + image_path);
+    }
+    const std::vector<int> discovered_ids = detector.DiscoverTagIds(image);
+    for (int tag_id : discovered_ids) {
+      ++frame_support_by_id[tag_id];
+    }
+    const std::string frame_label = boost::filesystem::path(image_path).stem().string();
+    csv << index << "," << CsvField(frame_label) << "," << CsvField(image_path)
+        << "," << CsvField(JoinBoardIds(discovered_ids)) << ","
+        << discovered_ids.size() << "\n";
+    std::cout << "[id-discovery] " << (index + 1) << "/" << sample_paths.size()
+              << " " << frame_label << " IDs=[" << JoinBoardIds(discovered_ids)
+              << "]\n";
+  }
+
+  std::vector<int> candidate_ids;
+  std::vector<int> confirmed_ids;
+  for (const auto& entry : frame_support_by_id) {
+    candidate_ids.push_back(entry.first);
+    if (entry.second >= args.id_discovery_min_frame_support) {
+      confirmed_ids.push_back(entry.first);
+    }
+  }
+  const boost::filesystem::path summary_path = output_root / "id_discovery_summary.txt";
+  std::ofstream summary(summary_path.string());
+  if (!summary.is_open()) {
+    throw std::runtime_error("Failed to create ID discovery summary.");
+  }
+  summary << "mode: tag_id_preflight\n"
+          << "input_image_count: " << all_image_paths.size() << "\n"
+          << "sample_image_count: " << sample_paths.size() << "\n"
+          << "minimum_frame_support_for_confirmation: "
+          << args.id_discovery_min_frame_support << "\n"
+          << "candidate_tag_ids: " << JoinBoardIds(candidate_ids) << "\n"
+          << "confirmed_tag_ids: " << JoinBoardIds(confirmed_ids) << "\n"
+          << "next_outer_corner_command_tag_ids: " << JoinBoardIds(confirmed_ids)
+          << "\n"
+          << "yaml_tagIds: [" << JoinBoardIds(confirmed_ids) << "]\n"
+          << "ba_or_camera_initialization_run: 0\n";
+  for (const auto& entry : frame_support_by_id) {
+    summary << "tag_" << entry.first << "_sample_frame_support: "
+            << entry.second << "\n";
+  }
+  std::cout << "\nID preflight complete\n"
+            << "  output: " << output_root.string() << "\n"
+            << "  candidate IDs: [" << JoinBoardIds(candidate_ids) << "]\n"
+            << "  confirmed IDs: [" << JoinBoardIds(confirmed_ids) << "]\n";
+  return confirmed_ids.empty() ? 2 : 0;
+}
+
+int RunOuterCornersOnly(const CmdArgs& args,
+                        ati::ApriltagInternalConfig config) {
+  config.outer_detector_config.tag_ids = config.tag_ids;
+  config.outer_detector_config.tag_id = config.tag_id;
+  config.outer_detector_config.auto_discover_tag_ids = args.auto_tag_ids;
+  config.outer_detector_config.enable_outer_spherical_refinement = false;
+  config.outer_detector_config.do_outer_subpix_refinement = !args.no_subpix;
+  ati::MultiScaleOuterTagDetector detector(config.outer_detector_config);
+
+  const std::vector<std::string> image_paths =
+      CollectImagePaths(args.image_path, args.all);
+  const boost::filesystem::path output_root = ResolveOuterCornerOutputRoot(args);
+  const boost::filesystem::path overlays_dir = output_root / "overlays";
+  boost::filesystem::create_directories(output_root);
+  if (!args.no_output_images) {
+    boost::filesystem::create_directories(overlays_dir);
+  }
+
+  std::ofstream frame_csv((output_root / "frame_tag_summary.csv").string());
+  std::ofstream corner_csv((output_root / "outer_corners.csv").string());
+  if (!frame_csv.is_open() || !corner_csv.is_open()) {
+    throw std::runtime_error("Failed to create outer-corner detection CSV output.");
+  }
+  frame_csv << "frame_index,frame_label,image_path,discovered_tag_ids,"
+               "successful_tag_ids,discovered_tag_count,successful_tag_count\n";
+  corner_csv << "frame_index,frame_label,image_path,board_id,detected_tag_id,"
+                "hamming,good,success,quality,valid_refined_corner_count,"
+                "adaptive_coarse_scale_attempt_count,"
+                "adaptive_fallback_scale_attempt_count,"
+                "adaptive_high_resolution_fallback_triggered,"
+                "failure_reason,x0,y0,x1,y1,x2,y2,x3,y3\n";
+
+  std::set<int> dataset_discovered_ids;
+  std::map<int, int> successful_frame_count_by_id;
+  std::map<int, int> successful_observation_count_by_id;
+  int frames_with_any_tag = 0;
+  int total_successful_observations = 0;
+  const std::vector<int> jpeg_params{cv::IMWRITE_JPEG_QUALITY, 90};
+
+  for (std::size_t frame_index = 0; frame_index < image_paths.size(); ++frame_index) {
+    const std::string& image_path = image_paths[frame_index];
+    cv::Mat image = cv::imread(image_path, cv::IMREAD_UNCHANGED);
+    if (image.empty()) {
+      throw std::runtime_error("Failed to read image: " + image_path);
+    }
+    const ati::OuterTagMultiDetectionResult result = detector.DetectMultiple(image);
+    for (int board_id : result.requested_board_ids) {
+      dataset_discovered_ids.insert(board_id);
+    }
+
+    std::vector<int> successful_ids;
+    for (const ati::OuterTagDetectionResult& detection : result.detections) {
+      if (detection.success) {
+        successful_ids.push_back(detection.board_id);
+        ++successful_observation_count_by_id[detection.board_id];
+        ++successful_frame_count_by_id[detection.board_id];
+      }
+      corner_csv << frame_index << ","
+                 << CsvField(boost::filesystem::path(image_path).stem().string()) << ","
+                 << CsvField(image_path) << ","
+                 << detection.board_id << "," << detection.detected_tag_id << ","
+                 << detection.hamming << "," << (detection.good ? 1 : 0) << ","
+                 << (detection.success ? 1 : 0) << "," << detection.quality << ","
+                 << std::count(detection.refined_valid.begin(),
+                               detection.refined_valid.end(), true) << ","
+                 << detection.adaptive_coarse_scale_attempt_count << ","
+                 << detection.adaptive_fallback_scale_attempt_count << ","
+                 << (detection.adaptive_high_resolution_fallback_triggered ? 1 : 0)
+                 << ","
+                 << CsvField(detection.failure_reason_text);
+      for (const Eigen::Vector2d& corner : detection.refined_corners_original_image) {
+        corner_csv << "," << corner.x() << "," << corner.y();
+      }
+      corner_csv << "\n";
+    }
+    std::sort(successful_ids.begin(), successful_ids.end());
+    successful_ids.erase(std::unique(successful_ids.begin(), successful_ids.end()),
+                         successful_ids.end());
+    frames_with_any_tag += successful_ids.empty() ? 0 : 1;
+    total_successful_observations += static_cast<int>(successful_ids.size());
+    const std::string frame_label = boost::filesystem::path(image_path).stem().string();
+    frame_csv << frame_index << "," << CsvField(frame_label) << ","
+              << CsvField(image_path) << ","
+              << CsvField(JoinBoardIds(result.requested_board_ids)) << ","
+              << CsvField(JoinBoardIds(successful_ids)) << ","
+              << result.requested_board_ids.size() << "," << successful_ids.size() << "\n";
+
+    if (!args.no_output_images) {
+      cv::Mat overlay = image.clone();
+      detector.DrawDetections(result, &overlay, config.enable_debug_output);
+      const boost::filesystem::path overlay_path =
+          overlays_dir / (frame_label + "_outer_corners.jpg");
+      if (!cv::imwrite(overlay_path.string(), overlay, jpeg_params)) {
+        throw std::runtime_error("Failed to write overlay: " + overlay_path.string());
+      }
+    }
+    std::cout << "[outer-corners] " << (frame_index + 1) << "/"
+              << image_paths.size() << " " << frame_label << " discovered=["
+              << JoinBoardIds(result.requested_board_ids) << "] accepted=["
+              << JoinBoardIds(successful_ids) << "]\n";
+  }
+
+  const boost::filesystem::path summary_path = output_root / "summary.txt";
+  std::ofstream summary(summary_path.string());
+  if (!summary.is_open()) {
+    throw std::runtime_error("Failed to create outer-corner detection summary.");
+  }
+  std::vector<int> all_ids(dataset_discovered_ids.begin(), dataset_discovered_ids.end());
+  summary << "mode: outer_corners_only\n"
+          << "auto_tag_ids: " << (args.auto_tag_ids ? 1 : 0) << "\n"
+          << "input_image_count: " << image_paths.size() << "\n"
+          << "frames_with_any_accepted_tag: " << frames_with_any_tag << "\n"
+          << "accepted_board_observation_count: " << total_successful_observations << "\n"
+          << "dataset_discovered_tag_ids: " << JoinBoardIds(all_ids) << "\n"
+          << "configured_tag_ids_ignored_for_auto_discovery: "
+          << (args.auto_tag_ids ? 1 : 0) << "\n"
+          << "ba_or_camera_initialization_run: 0\n"
+          << "output_overlays_enabled: " << (args.no_output_images ? 0 : 1) << "\n";
+  for (int board_id : all_ids) {
+    summary << "tag_" << board_id << "_successful_frame_count: "
+            << successful_frame_count_by_id[board_id] << "\n"
+            << "tag_" << board_id << "_successful_observation_count: "
+            << successful_observation_count_by_id[board_id] << "\n";
+  }
+
+  std::cout << "\nOuter-corner scan complete\n"
+            << "  output: " << output_root.string() << "\n"
+            << "  discovered IDs: [" << JoinBoardIds(all_ids) << "]\n"
+            << "  frames with >=1 accepted tag: " << frames_with_any_tag << "/"
+            << image_paths.size() << "\n"
+            << "  accepted board observations: " << total_successful_observations << "\n";
+  return 0;
 }
 
 std::string JoinDetectionSummaries(const std::vector<std::string>& summaries,
@@ -3074,6 +3400,7 @@ int main(int argc, char** argv) {
 
     ati::ApriltagInternalConfig config =
         ati::ApriltagInternalDetector::LoadConfig(args.config_path);
+    ApplyTagIdOverride(args, &config);
     if (!args.mode_override.empty()) {
       config.internal_projection_mode = ParseProjectionModeOrThrow(args.mode_override);
     }
@@ -3083,6 +3410,14 @@ int main(int argc, char** argv) {
     if (args.outer_distortion_experiment) {
       RunOuterDistortionExperiment(args, config);
       return 0;
+    }
+    if (args.id_discovery_only) {
+      return RunTagIdDiscovery(args, config);
+    }
+    if (args.outer_corners_only) {
+      // This inspection path deliberately stops before internal-corner
+      // generation, camera initialization, selection, and bundle adjustment.
+      return RunOuterCornersOnly(args, config);
     }
     // Respect the method configured in YAML unless --mode explicitly overrides it.
     // This entry point still fixes the outer path to the interactive default:

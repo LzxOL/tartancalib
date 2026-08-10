@@ -72,6 +72,17 @@ struct AutoCameraInitializationRefinedBasinCandidate {
   double lm_initial_rmse = std::numeric_limits<double>::infinity();
   double lm_final_rmse = std::numeric_limits<double>::infinity();
   double lm_final_robust_rmse = std::numeric_limits<double>::infinity();
+  // Diagnostics for the shared frame/board geometry pass.  The independent
+  // board-pose LM remains available as the seed, but this pass is the
+  // selection objective when it succeeds.
+  int shared_layout_constraint_used = 0;
+  int shared_layout_frame_count = 0;
+  int shared_layout_board_count = 0;
+  int shared_layout_observation_count = 0;
+  double shared_layout_initial_rmse = std::numeric_limits<double>::infinity();
+  double shared_layout_final_rmse = std::numeric_limits<double>::infinity();
+  double shared_layout_final_robust_rmse =
+      std::numeric_limits<double>::infinity();
   double combined_selection_objective =
       std::numeric_limits<double>::infinity();
   bool full_outer_health_acceptable = false;
@@ -94,6 +105,7 @@ struct AutoCameraInitializationResidual {
   std::string frame_label;
   int board_id = -1;
   double quality = 0.0;
+  bool used_local_patch_rescue = false;
   bool pose_success = false;
   double pose_fit_outer_rmse = std::numeric_limits<double>::quiet_NaN();
   std::string failure_reason;
@@ -105,6 +117,7 @@ struct AutoCameraInitializationBootstrapObservation {
   int board_id = -1;
   std::array<Eigen::Vector2d, 4> outer_corners{};
   bool used_in_lm = false;
+  bool used_local_patch_rescue = false;
   bool pose_init_success = false;
   double pose_fit_outer_rmse = std::numeric_limits<double>::quiet_NaN();
 };
@@ -245,6 +258,14 @@ struct AutoCameraInitializationResult {
   int stage5_init_incomplete_board_frame_rejected_count = 0;
   int stage5_init_observation_count_before_complete_frame_filter = 0;
   int stage5_init_observation_count_after_complete_frame_filter = 0;
+  // The complete-frame counts above are retained for compatibility and
+  // diagnostics.  Camera initialization evaluation now uses all valid outer
+  // observations, including observations from incomplete frames.
+  int stage5_init_camera_evaluation_observation_count = 0;
+  int stage5_init_all_valid_outer_observations_used = 0;
+  int stage5_init_rescued_outer_observation_count = 0;
+  int stage5_init_rescued_outer_observation_pose_gate_rejected_count = 0;
+  double stage5_init_rescued_outer_observation_lm_weight = 0.25;
   std::string stage5_init_seed_method;
   std::string stage5_init_seed_source;
   double stage5_init_omni_gamma = std::numeric_limits<double>::quiet_NaN();
@@ -296,6 +317,15 @@ struct AutoCameraInitializationResult {
   int stage5_init_multiboard_frame_objective_enabled = 0;
   int stage5_init_fixed_layout_frame_constraint_used = 0;
   int stage5_init_optimizes_layout_variables = 0;
+  int stage5_init_shared_frame_board_constraint_enabled = 0;
+  int stage5_init_shared_frame_board_constraint_used = 0;
+  int stage5_init_shared_layout_board_count = 0;
+  int stage5_init_shared_layout_frame_count = 0;
+  int stage5_init_shared_layout_observation_count = 0;
+  double stage5_init_shared_layout_initial_rmse =
+      std::numeric_limits<double>::infinity();
+  double stage5_init_shared_layout_final_rmse =
+      std::numeric_limits<double>::infinity();
   std::string stage5_init_lm_selection_objective;
   double stage5_init_lm_min_relative_objective_improvement = 0.0;
   std::string stage5_init_selection_prefilter;
@@ -484,6 +514,19 @@ struct AutoCameraInitializationOptions {
   // Only frames containing valid outer corners for every configured board may
   // contribute to automatic camera initialization.
   bool require_all_configured_boards_per_frame = true;
+  // Complete-frame filtering is kept for seed diagnostics, but valid outer
+  // observations from incomplete frames are included in camera evaluation.
+  bool include_all_valid_outer_observations_in_evaluation = true;
+  // Camera-aware patch-rescue corners are useful evidence but are not as
+  // trustworthy as ordinary subpixel-refined corners.  Gate them by their
+  // own pose-fit threshold and downweight them in independent-pose LM.
+  bool gate_rescued_outer_observations = true;
+  double rescued_outer_observation_pose_rmse_gate_pixels = 8.0;
+  double rescued_outer_observation_lm_weight = 0.25;
+  // Estimate one common board layout and one pose per frame after the
+  // independent-pose seed.  This is the actual selection pass; the older
+  // fixed-layout diagnostic remains separately controllable.
+  bool enable_shared_frame_board_constraint = true;
   // Use every directly imported control point in each observation while still
   // assigning an independent target pose to every frame-board pair.
   bool use_direct_dense_control_points = false;

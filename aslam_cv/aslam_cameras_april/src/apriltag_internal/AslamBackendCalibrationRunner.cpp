@@ -2477,6 +2477,27 @@ class CameraPixelRayHybridReprojectionError
   double invalid_projection_penalty_radians_ = 0.35;
 };
 
+double ComputeFixedPolarAdaptivePixelRayLambda(
+    const AslamBackendCalibrationOptions& options,
+    double polar_angle_deg) {
+  if (!options.pixel_ray_hybrid_polar_adaptive_enabled) {
+    return options.pixel_ray_hybrid_lambda;
+  }
+  const double normalized = std::max(
+      0.0, std::min(1.0,
+          (polar_angle_deg - options.pixel_ray_hybrid_transition_start_deg) /
+              (options.pixel_ray_hybrid_transition_end_deg -
+               options.pixel_ray_hybrid_transition_start_deg)));
+  // Cubic smoothstep provides a monotone transition with zero slope at both
+  // endpoints, without introducing a hard residual-model switch.
+  const double smoothstep = normalized * normalized * (3.0 - 2.0 * normalized);
+  return std::max(
+      0.0, std::min(1.0,
+          options.pixel_ray_hybrid_lambda_min +
+              (options.pixel_ray_hybrid_lambda_max -
+               options.pixel_ray_hybrid_lambda_min) * smoothstep));
+}
+
 template <typename GeometryT>
 class CameraChordalReprojectionError : public aslam::backend::ErrorTermFs<3> {
  public:
@@ -3818,9 +3839,14 @@ bool ExecuteBackendOptimization(
 	                  use_continuous_hybrid;
 	    const bool add_angular_primary =
 	        use_angular_residual || continuous_angular_weight > 0.0;
-	    const bool add_chordal_primary =
-	        use_chordal_residual &&
-	        result->options.chordal_residual_weight > 0.0;
+    const bool add_chordal_primary =
+        use_chordal_residual &&
+        result->options.chordal_residual_weight > 0.0;
+    const double pixel_ray_hybrid_lambda =
+        result->options.pixel_ray_hybrid_refinement_mode
+            ? ComputeFixedPolarAdaptivePixelRayLambda(
+                  result->options, observed_polar_angle_deg)
+            : 0.0;
     const bool add_angular_auxiliary =
         result->options.angular_auxiliary_enabled &&
         result->options.angular_auxiliary_weight > 0.0 &&
@@ -3897,13 +3923,18 @@ bool ExecuteBackendOptimization(
 	    }
     residual_type_assignment.angular_observation_geometry_success =
         have_angular_observation_geometry;
+    residual_type_assignment.pixel_ray_hybrid_polar_adaptive =
+        result->options.pixel_ray_hybrid_refinement_mode &&
+        result->options.pixel_ray_hybrid_polar_adaptive_enabled;
+    residual_type_assignment.pixel_ray_hybrid_lambda =
+        pixel_ray_hybrid_lambda;
     residual_type_assignment.image_plane_weight_scale =
         result->options.pixel_ray_hybrid_refinement_mode
-            ? 1.0 - result->options.pixel_ray_hybrid_lambda
+            ? 1.0 - pixel_ray_hybrid_lambda
             : (add_pixel_residual ? pixel_weight_scale : 0.0);
     residual_type_assignment.angular_weight_scale =
         result->options.pixel_ray_hybrid_refinement_mode
-            ? result->options.pixel_ray_hybrid_lambda
+            ? pixel_ray_hybrid_lambda
             : add_angular_primary
             ? angular_primary_weight_scale *
                   (use_normalized_angular ? normalized_angular_weight_scale : 1.0)
@@ -3947,7 +3978,7 @@ bool ExecuteBackendOptimization(
 	          new CameraPixelRayHybridReprojectionError<GeometryT>(
 	              observation.image_xy,
 	              inverse_covariance,
-	              result->options.pixel_ray_hybrid_lambda,
+	              pixel_ray_hybrid_lambda,
 	              result->options.pixel_ray_hybrid_huber_delta,
 	              result->options.use_huber_loss,
 	              point_camera,
@@ -4871,6 +4902,17 @@ void WriteAslamBackendCalibrationSummary(
          << (1.0 - result.options.pixel_ray_hybrid_lambda) << "\n";
   output << "pixel_ray_hybrid_ray_objective_weight: "
          << result.options.pixel_ray_hybrid_lambda << "\n";
+  output << "pixel_ray_hybrid_polar_adaptive_enabled: "
+         << (result.options.pixel_ray_hybrid_polar_adaptive_enabled ? 1 : 0)
+         << "\n";
+  output << "pixel_ray_hybrid_polar_adaptive_lambda_min: "
+         << result.options.pixel_ray_hybrid_lambda_min << "\n";
+  output << "pixel_ray_hybrid_polar_adaptive_lambda_max: "
+         << result.options.pixel_ray_hybrid_lambda_max << "\n";
+  output << "pixel_ray_hybrid_polar_adaptive_transition_start_deg: "
+         << result.options.pixel_ray_hybrid_transition_start_deg << "\n";
+  output << "pixel_ray_hybrid_polar_adaptive_transition_end_deg: "
+         << result.options.pixel_ray_hybrid_transition_end_deg << "\n";
   output << "initial_overall_image_plane_rmse: "
          << result.initial_residual.overall_image_plane_rmse << "\n";
   output << "initial_overall_angular_rmse: "
@@ -5099,7 +5141,9 @@ void WriteBackendResidualTypeAssignmentsCsv(
   std::ofstream output(path.c_str());
   output << "frame_index,frame_label,board_id,point_id,point_type,"
          << "polar_angle_deg,residual_model_requested,residual_model_effective,"
-         << "angular_observation_geometry_success,image_plane_weight_scale,"
+         << "angular_observation_geometry_success,"
+         << "pixel_ray_hybrid_polar_adaptive,pixel_ray_hybrid_lambda,"
+         << "image_plane_weight_scale,"
          << "angular_weight_scale,angular_sigma_per_pixel_rad,"
          << "normalized_angular_weight_scale,angular_auxiliary_enabled,"
          << "angular_auxiliary_normalized\n";
@@ -5114,6 +5158,8 @@ void WriteBackendResidualTypeAssignmentsCsv(
            << assignment.residual_model_requested << ","
            << assignment.residual_model_effective << ","
            << (assignment.angular_observation_geometry_success ? 1 : 0) << ","
+           << (assignment.pixel_ray_hybrid_polar_adaptive ? 1 : 0) << ","
+           << assignment.pixel_ray_hybrid_lambda << ","
            << assignment.image_plane_weight_scale << ","
            << assignment.angular_weight_scale << ","
            << assignment.angular_sigma_per_pixel_rad << ","

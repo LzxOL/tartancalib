@@ -10,6 +10,7 @@
 #include <aslam/cameras/apriltag_internal/PrecomputedObservationImporter.hpp>
 #include <aslam/cameras/apriltag_internal/Stage5Benchmark.hpp>
 #include <aslam/cameras/apriltag_internal/Stage5BackendDiagnosticWriters.hpp>
+#include <aslam/cameras/apriltag_internal/Stage5CacheManifest.hpp>
 #include <aslam/cameras/apriltag_internal/Stage5Runtime.hpp>
 
 #include <algorithm>
@@ -64,6 +65,7 @@ struct CmdArgs {
   std::string precomputed_initialization_point_scope = "all";
   bool external_holdout_self_frontend_prepass = false;
   bool stage5_holdout_evaluate_full_training_observations = false;
+  bool stage5_frontend_only = false;
   std::string output_path;
   std::string kalibr_camchain_yaml;
   std::vector<std::string> reference_intrinsics_specs;
@@ -81,6 +83,8 @@ struct CmdArgs {
   bool stage5_init_near_tie_prefer_lower_focal = false;
   double stage5_init_near_tie_relative_objective_tolerance = 0.0;
   bool stage5_camera_aware_outer_rescue = true;
+  bool stage5_camera_aware_outer_rescue_zero_detection_frames = false;
+  bool stage5_camera_aware_outer_rescue_zero_detection_frames_set = false;
   std::string experiment_tag;
   std::string cache_dir;
   bool all = false;
@@ -89,6 +93,7 @@ struct CmdArgs {
   int intrinsics_release_iteration = 3;
   int second_pass_intrinsics_release_iteration = 1;
   std::string split_mode = "random_holdout_ratio";
+  bool stage5_no_holdout = false;
   double holdout_ratio = 0.30;
   unsigned int split_seed = 1337;
   int holdout_stride = 5;
@@ -209,6 +214,11 @@ struct CmdArgs {
   std::string large_intrinsic_perturbation_reference_scene_path;
   bool large_intrinsic_perturbation_outer_only_after_application = false;
   double hybrid_pixel_ray_lambda = 0.5;
+  bool hybrid_pixel_ray_polar_adaptive = false;
+  double hybrid_pixel_ray_lambda_min = 0.2;
+  double hybrid_pixel_ray_lambda_max = 0.8;
+  double hybrid_pixel_ray_transition_start_deg = 30.0;
+  double hybrid_pixel_ray_transition_end_deg = 70.0;
   int hybrid_pixel_ray_max_iterations = 12;
   double hybrid_pixel_ray_pixel_scale_floor = 1e-3;
   double hybrid_pixel_ray_ray_scale_floor = 1e-6;
@@ -272,6 +282,16 @@ struct CmdArgs {
   double geometry_prior_rescue_accept_max_outer_rmse = 8.0;
   double geometry_prior_rescue_accept_max_rotation_error_deg = 5.0;
   double geometry_prior_rescue_accept_max_translation_error = 0.08;
+  bool geometry_guided_tag_likelihood_enabled = true;
+  int geometry_guided_tag_likelihood_min_visible_boards = 2;
+  int geometry_guided_tag_likelihood_max_expected_hamming = 6;
+  int geometry_guided_tag_likelihood_min_hamming_margin = 3;
+  double geometry_guided_tag_likelihood_min_contrast = 0.10;
+  bool geometry_guided_tag_likelihood_allow_single_anchor = false;
+  double geometry_guided_tag_likelihood_single_anchor_max_outer_rmse = 0.50;
+  int geometry_guided_tag_likelihood_single_anchor_max_expected_hamming = 2;
+  int geometry_guided_tag_likelihood_single_anchor_min_hamming_margin = 6;
+  double geometry_guided_tag_likelihood_single_anchor_min_contrast = 0.15;
   bool enable_outer_only_intermediate_calibration = false;
   bool intermediate_diagnostic_only = true;
   bool use_intermediate_for_round1_internal_regeneration = false;
@@ -531,6 +551,8 @@ struct RequestedExperimentConfig {
   ati::CameraInitializationMode camera_init_mode =
       ati::CameraInitializationMode::Auto;
   bool camera_aware_outer_rescue = true;
+  bool camera_aware_outer_rescue_zero_detection_frames = false;
+  bool camera_aware_outer_rescue_zero_detection_frames_set = false;
   bool outer_only_ablation_mode = false;
   bool include_internal_points = true;
   bool run_second_pass = true;
@@ -661,6 +683,11 @@ struct RequestedExperimentConfig {
   double backend_chordal_residual_weight = 1.0;
   bool enable_hybrid_pixel_ray_final_refinement = false;
   double hybrid_pixel_ray_lambda = 0.5;
+  bool hybrid_pixel_ray_polar_adaptive = false;
+  double hybrid_pixel_ray_lambda_min = 0.2;
+  double hybrid_pixel_ray_lambda_max = 0.8;
+  double hybrid_pixel_ray_transition_start_deg = 30.0;
+  double hybrid_pixel_ray_transition_end_deg = 70.0;
   int hybrid_pixel_ray_max_iterations = 12;
   double hybrid_pixel_ray_pixel_scale_floor = 1e-3;
   double hybrid_pixel_ray_ray_scale_floor = 1e-6;
@@ -715,6 +742,16 @@ struct RequestedExperimentConfig {
   double geometry_prior_rescue_accept_max_outer_rmse = 8.0;
   double geometry_prior_rescue_accept_max_rotation_error_deg = 5.0;
   double geometry_prior_rescue_accept_max_translation_error = 0.08;
+  bool geometry_guided_tag_likelihood_enabled = true;
+  int geometry_guided_tag_likelihood_min_visible_boards = 2;
+  int geometry_guided_tag_likelihood_max_expected_hamming = 6;
+  int geometry_guided_tag_likelihood_min_hamming_margin = 3;
+  double geometry_guided_tag_likelihood_min_contrast = 0.10;
+  bool geometry_guided_tag_likelihood_allow_single_anchor = false;
+  double geometry_guided_tag_likelihood_single_anchor_max_outer_rmse = 0.50;
+  int geometry_guided_tag_likelihood_single_anchor_max_expected_hamming = 2;
+  int geometry_guided_tag_likelihood_single_anchor_min_hamming_margin = 6;
+  double geometry_guided_tag_likelihood_single_anchor_min_contrast = 0.15;
   bool enable_outer_only_intermediate_calibration = false;
   bool intermediate_diagnostic_only = true;
   bool use_intermediate_for_round1_internal_regeneration = false;
@@ -1365,9 +1402,21 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
   }
   if (config.enable_hybrid_pixel_ray_final_refinement) {
     std::ostringstream hybrid_tag;
-    hybrid_tag << "pixel_ray_refine_l"
-               << static_cast<int>(
-                      std::lround(100.0 * config.hybrid_pixel_ray_lambda));
+    if (config.hybrid_pixel_ray_polar_adaptive) {
+      hybrid_tag << "pixel_ray_adaptive_l"
+                 << static_cast<int>(std::lround(
+                        100.0 * config.hybrid_pixel_ray_lambda_min))
+                 << "to" << static_cast<int>(std::lround(
+                        100.0 * config.hybrid_pixel_ray_lambda_max))
+                 << "_theta" << static_cast<int>(std::lround(
+                        config.hybrid_pixel_ray_transition_start_deg))
+                 << "to" << static_cast<int>(std::lround(
+                        config.hybrid_pixel_ray_transition_end_deg));
+    } else {
+      hybrid_tag << "pixel_ray_refine_l"
+                 << static_cast<int>(std::lround(
+                        100.0 * config.hybrid_pixel_ray_lambda));
+    }
     parts.push_back(hybrid_tag.str());
   }
 	  if (!config.backend_optimize_board_poses) {
@@ -1426,6 +1475,10 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
           args.stage5_init_selection_scorer);
   config.camera_aware_outer_rescue =
       args.stage5_camera_aware_outer_rescue;
+  config.camera_aware_outer_rescue_zero_detection_frames =
+      args.stage5_camera_aware_outer_rescue_zero_detection_frames;
+  config.camera_aware_outer_rescue_zero_detection_frames_set =
+      args.stage5_camera_aware_outer_rescue_zero_detection_frames_set;
   config.outer_only_ablation_mode = !args.include_internal_points;
   config.include_internal_points = args.include_internal_points;
   config.run_second_pass = !args.disable_second_pass;
@@ -1640,6 +1693,26 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.geometry_prior_rescue_accept_max_rotation_error_deg;
   config.geometry_prior_rescue_accept_max_translation_error =
       args.geometry_prior_rescue_accept_max_translation_error;
+  config.geometry_guided_tag_likelihood_enabled =
+      args.geometry_guided_tag_likelihood_enabled;
+  config.geometry_guided_tag_likelihood_min_visible_boards =
+      args.geometry_guided_tag_likelihood_min_visible_boards;
+  config.geometry_guided_tag_likelihood_max_expected_hamming =
+      args.geometry_guided_tag_likelihood_max_expected_hamming;
+  config.geometry_guided_tag_likelihood_min_hamming_margin =
+      args.geometry_guided_tag_likelihood_min_hamming_margin;
+  config.geometry_guided_tag_likelihood_min_contrast =
+      args.geometry_guided_tag_likelihood_min_contrast;
+  config.geometry_guided_tag_likelihood_allow_single_anchor =
+      args.geometry_guided_tag_likelihood_allow_single_anchor;
+  config.geometry_guided_tag_likelihood_single_anchor_max_outer_rmse =
+      args.geometry_guided_tag_likelihood_single_anchor_max_outer_rmse;
+  config.geometry_guided_tag_likelihood_single_anchor_max_expected_hamming =
+      args.geometry_guided_tag_likelihood_single_anchor_max_expected_hamming;
+  config.geometry_guided_tag_likelihood_single_anchor_min_hamming_margin =
+      args.geometry_guided_tag_likelihood_single_anchor_min_hamming_margin;
+  config.geometry_guided_tag_likelihood_single_anchor_min_contrast =
+      args.geometry_guided_tag_likelihood_single_anchor_min_contrast;
   config.enable_outer_only_intermediate_calibration =
       args.enable_outer_only_intermediate_calibration;
   config.intermediate_diagnostic_only =
@@ -1761,6 +1834,14 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
   config.enable_hybrid_pixel_ray_final_refinement =
       args.enable_hybrid_pixel_ray_final_refinement;
   config.hybrid_pixel_ray_lambda = args.hybrid_pixel_ray_lambda;
+  config.hybrid_pixel_ray_polar_adaptive =
+      args.hybrid_pixel_ray_polar_adaptive;
+  config.hybrid_pixel_ray_lambda_min = args.hybrid_pixel_ray_lambda_min;
+  config.hybrid_pixel_ray_lambda_max = args.hybrid_pixel_ray_lambda_max;
+  config.hybrid_pixel_ray_transition_start_deg =
+      args.hybrid_pixel_ray_transition_start_deg;
+  config.hybrid_pixel_ray_transition_end_deg =
+      args.hybrid_pixel_ray_transition_end_deg;
   config.hybrid_pixel_ray_max_iterations =
       args.hybrid_pixel_ray_max_iterations;
   config.hybrid_pixel_ray_pixel_scale_floor =
@@ -1961,6 +2042,15 @@ void PrintUsage(const char* program) {
       << "                                      For external --test-image evaluation,\n"
       << "                                      build test observations from a frozen\n"
       << "                                      frontend prepass on the test set itself.\n"
+      << "  --stage5-frontend-only               Run detection, initialization, rescue, and\n"
+      << "                                      observation regeneration on all frames; skip\n"
+      << "                                      selection incremental BA and backend evaluation.\n"
+      << "  --stage5-enable-camera-aware-sphere-patch-zero-detection\n"
+      << "                                      Run the full-view sphere-patch atlas for raw\n"
+      << "                                      zero-detection frames; exact-ID/Hamming-0 only.\n"
+      << "  --stage5-enable-geometry-guided-tag-likelihood-single-anchor\n"
+      << "                                      Allow a direct exact-ID single Tag to seed\n"
+      << "                                      stricter geometry-guided recovery.\n"
       << "  --config PATH                        AprilTag-internal config YAML.\n"
       << "  --kalibr-camchain PATH               Kalibr reference camchain for comparison.\n"
       << "  --reference-intrinsics-yaml LABEL:PATH\n"
@@ -2011,6 +2101,8 @@ void PrintUsage(const char* program) {
       << "  --split-seed N                       Random split seed; default 1337.\n"
       << "  --holdout-stride N --holdout-offset N\n"
       << "                                      Legacy deterministic split controls.\n"
+      << "  --stage5-no-holdout                 Use all frames for training;\n"
+      << "                                      evaluation is on the same frames.\n"
       << "  --all                                Run the full Stage5 pipeline.\n\n"
       << "Baseline controls:\n"
       << "  --include-internal-points 0|1        Internal/outer-only ablation.\n"
@@ -2091,6 +2183,11 @@ void PrintUsage(const char* program) {
 	      << "Optional post-selection refinement:\n"
 	      << "  --stage5-enable-hybrid-pixel-ray-final-refinement\n"
 	      << "  --stage5-hybrid-pixel-ray-lambda L (default 0.5)\n"
+	      << "  --stage5-hybrid-pixel-ray-polar-adaptive\n"
+	      << "  --stage5-hybrid-pixel-ray-lambda-min L (default 0.2)\n"
+	      << "  --stage5-hybrid-pixel-ray-lambda-max L (default 0.8)\n"
+	      << "  --stage5-hybrid-pixel-ray-transition-start-deg D (default 30)\n"
+	      << "  --stage5-hybrid-pixel-ray-transition-end-deg D (default 70)\n"
 	      << "  --stage5-hybrid-pixel-ray-max-iterations N (default 12)\n"
 	      << "  --stage5-hybrid-pixel-ray-pixel-scale-floor S (default 1e-3)\n"
       << "  --stage5-hybrid-pixel-ray-ray-scale-floor S (default 1e-6)\n\n"
@@ -2157,6 +2254,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.precomputed_initialization_point_scope = argv[++i];
     } else if (token == "--stage5-external-holdout-self-frontend-prepass") {
       args.external_holdout_self_frontend_prepass = true;
+    } else if (token == "--stage5-frontend-only") {
+      args.stage5_frontend_only = true;
     } else if (token ==
                "--stage5-holdout-evaluate-full-training-observations") {
       args.stage5_holdout_evaluate_full_training_observations = true;
@@ -2643,6 +2742,20 @@ CmdArgs ParseArgs(int argc, char** argv) {
     } else if (token == "--stage5-hybrid-pixel-ray-lambda" &&
                i + 1 < argc) {
       args.hybrid_pixel_ray_lambda = std::stod(argv[++i]);
+    } else if (token == "--stage5-hybrid-pixel-ray-polar-adaptive") {
+      args.hybrid_pixel_ray_polar_adaptive = true;
+    } else if (token == "--stage5-hybrid-pixel-ray-lambda-min" &&
+               i + 1 < argc) {
+      args.hybrid_pixel_ray_lambda_min = std::stod(argv[++i]);
+    } else if (token == "--stage5-hybrid-pixel-ray-lambda-max" &&
+               i + 1 < argc) {
+      args.hybrid_pixel_ray_lambda_max = std::stod(argv[++i]);
+    } else if (token == "--stage5-hybrid-pixel-ray-transition-start-deg" &&
+               i + 1 < argc) {
+      args.hybrid_pixel_ray_transition_start_deg = std::stod(argv[++i]);
+    } else if (token == "--stage5-hybrid-pixel-ray-transition-end-deg" &&
+               i + 1 < argc) {
+      args.hybrid_pixel_ray_transition_end_deg = std::stod(argv[++i]);
     } else if (token == "--stage5-hybrid-pixel-ray-max-iterations" &&
                i + 1 < argc) {
       args.hybrid_pixel_ray_max_iterations = std::stoi(argv[++i]);
@@ -2881,6 +2994,64 @@ CmdArgs ParseArgs(int argc, char** argv) {
                i + 1 < argc) {
       args.geometry_prior_rescue_accept_max_translation_error =
           std::stod(argv[++i]);
+    } else if (token == "--stage5-enable-geometry-guided-tag-likelihood") {
+      args.geometry_guided_tag_likelihood_enabled = true;
+    } else if (token == "--stage5-disable-geometry-guided-tag-likelihood") {
+      args.geometry_guided_tag_likelihood_enabled = false;
+    } else if (token ==
+                   "--stage5-geometry-guided-tag-likelihood-min-visible-boards" &&
+               i + 1 < argc) {
+      args.geometry_guided_tag_likelihood_min_visible_boards =
+          std::stoi(argv[++i]);
+    } else if (token ==
+                   "--stage5-geometry-guided-tag-likelihood-max-expected-hamming" &&
+               i + 1 < argc) {
+      args.geometry_guided_tag_likelihood_max_expected_hamming =
+          std::stoi(argv[++i]);
+    } else if (token ==
+                   "--stage5-geometry-guided-tag-likelihood-min-hamming-margin" &&
+               i + 1 < argc) {
+      args.geometry_guided_tag_likelihood_min_hamming_margin =
+          std::stoi(argv[++i]);
+    } else if (token ==
+                   "--stage5-geometry-guided-tag-likelihood-min-contrast" &&
+               i + 1 < argc) {
+      args.geometry_guided_tag_likelihood_min_contrast =
+          std::stod(argv[++i]);
+    } else if (token ==
+               "--stage5-enable-camera-aware-sphere-patch-zero-detection") {
+      args.stage5_camera_aware_outer_rescue_zero_detection_frames = true;
+      args.stage5_camera_aware_outer_rescue_zero_detection_frames_set = true;
+    } else if (token ==
+               "--stage5-disable-camera-aware-sphere-patch-zero-detection") {
+      args.stage5_camera_aware_outer_rescue_zero_detection_frames = false;
+      args.stage5_camera_aware_outer_rescue_zero_detection_frames_set = true;
+    } else if (token ==
+                   "--stage5-enable-geometry-guided-tag-likelihood-single-anchor") {
+      args.geometry_guided_tag_likelihood_allow_single_anchor = true;
+    } else if (token ==
+                   "--stage5-disable-geometry-guided-tag-likelihood-single-anchor") {
+      args.geometry_guided_tag_likelihood_allow_single_anchor = false;
+    } else if (token ==
+                   "--stage5-geometry-guided-tag-likelihood-single-anchor-max-outer-rmse" &&
+               i + 1 < argc) {
+      args.geometry_guided_tag_likelihood_single_anchor_max_outer_rmse =
+          std::stod(argv[++i]);
+    } else if (token ==
+                   "--stage5-geometry-guided-tag-likelihood-single-anchor-max-expected-hamming" &&
+               i + 1 < argc) {
+      args.geometry_guided_tag_likelihood_single_anchor_max_expected_hamming =
+          std::stoi(argv[++i]);
+    } else if (token ==
+                   "--stage5-geometry-guided-tag-likelihood-single-anchor-min-hamming-margin" &&
+               i + 1 < argc) {
+      args.geometry_guided_tag_likelihood_single_anchor_min_hamming_margin =
+          std::stoi(argv[++i]);
+    } else if (token ==
+                   "--stage5-geometry-guided-tag-likelihood-single-anchor-min-contrast" &&
+               i + 1 < argc) {
+      args.geometry_guided_tag_likelihood_single_anchor_min_contrast =
+          std::stod(argv[++i]);
     } else if (token ==
                "--stage5-enable-outer-only-intermediate-calibration") {
       args.enable_outer_only_intermediate_calibration = true;
@@ -3106,6 +3277,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.multiboard_rigidity_use_outer_points = std::stoi(argv[++i]) != 0;
     } else if (token == "--all") {
       args.all = true;
+    } else if (token == "--stage5-no-holdout") {
+      args.stage5_no_holdout = true;
     } else if (token == "--reference-board-id" && i + 1 < argc) {
       args.reference_board_id = std::stoi(argv[++i]);
     } else if (token == "--intrinsics-release-iteration" && i + 1 < argc) {
@@ -3289,7 +3462,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
       }
     }
   }
-  if (args.split_mode != "random_holdout_ratio" &&
+  if (!args.stage5_no_holdout &&
+      args.split_mode != "random_holdout_ratio" &&
       args.split_mode != "random_ratio" &&
       args.split_mode != "random_70_30" &&
       args.split_mode != "deterministic_stride" &&
@@ -3297,7 +3471,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
     throw std::runtime_error(
         "--split-mode must be random_holdout_ratio or deterministic_stride.");
   }
-  if (!(args.holdout_ratio > 0.0 && args.holdout_ratio < 1.0)) {
+  if (!args.stage5_no_holdout &&
+      !(args.holdout_ratio > 0.0 && args.holdout_ratio < 1.0)) {
     throw std::runtime_error("--holdout-ratio must be in (0, 1).");
   }
   return args;
@@ -4102,6 +4277,11 @@ void WriteEvaluationSummary(const std::string& path,
                  : "pose_only_refit_success_count: ")
          << evaluation.pose_only_refit_success_count << "\n";
   output << "overall_rmse: " << evaluation.overall_rmse << "\n";
+  output << "overall_angular_rmse_rad: "
+         << evaluation.overall_angular_rmse_rad << "\n";
+  output << "overall_angular_rmse_deg: "
+         << evaluation.overall_angular_rmse_deg << "\n";
+  output << "angular_point_count: " << evaluation.angular_point_count << "\n";
   output << "p95_reprojection_error: "
          << evaluation.p95_reprojection_error << "\n";
   if (evaluation.uniform_control_point_mode) {
@@ -5168,6 +5348,13 @@ void WriteCameraAwareOuterRescueArtifacts(
            << rescue.attempted_frame_count << "\n";
     output << "stage5_camera_aware_outer_rescue_attempted_board_observation_count: "
            << rescue.attempted_board_observation_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_zero_detection_atlas_enabled: "
+           << (rescue.zero_detection_atlas_enabled ? 1 : 0) << "\n";
+    output << "stage5_camera_aware_outer_rescue_zero_detection_frame_count: "
+           << rescue.zero_detection_frame_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_zero_detection_atlas_attempted_board_observation_count: "
+           << rescue.zero_detection_atlas_attempted_board_observation_count
+           << "\n";
     output << "stage5_camera_aware_outer_rescue_rescued_board_observation_count: "
            << rescue.rescued_board_observation_count << "\n";
     output << "stage5_camera_aware_outer_rescue_final_success_count: "
@@ -5285,6 +5472,12 @@ void WriteExperimentConfigSummary(
          << ati::ToString(requested.camera_init_mode) << "\n";
   output << "requested_stage5_camera_aware_outer_rescue: "
          << (requested.camera_aware_outer_rescue ? 1 : 0) << "\n";
+  output << "requested_stage5_camera_aware_outer_rescue_zero_detection_frames: "
+         << (requested.camera_aware_outer_rescue_zero_detection_frames ? 1 : 0)
+         << "\n";
+  output << "requested_geometry_guided_tag_likelihood_single_anchor: "
+         << (requested.geometry_guided_tag_likelihood_allow_single_anchor ? 1 : 0)
+         << "\n";
   output << "requested_outer_only_ablation_mode: "
          << (requested.outer_only_ablation_mode ? 1 : 0) << "\n";
   output << "requested_strict_outer_only_ablation: "
@@ -5635,6 +5828,16 @@ void WriteExperimentConfigSummary(
          << "\n";
   output << "requested_stage5_hybrid_pixel_ray_lambda: "
          << requested.hybrid_pixel_ray_lambda << "\n";
+  output << "requested_stage5_hybrid_pixel_ray_polar_adaptive: "
+         << (requested.hybrid_pixel_ray_polar_adaptive ? 1 : 0) << "\n";
+  output << "requested_stage5_hybrid_pixel_ray_lambda_min: "
+         << requested.hybrid_pixel_ray_lambda_min << "\n";
+  output << "requested_stage5_hybrid_pixel_ray_lambda_max: "
+         << requested.hybrid_pixel_ray_lambda_max << "\n";
+  output << "requested_stage5_hybrid_pixel_ray_transition_start_deg: "
+         << requested.hybrid_pixel_ray_transition_start_deg << "\n";
+  output << "requested_stage5_hybrid_pixel_ray_transition_end_deg: "
+         << requested.hybrid_pixel_ray_transition_end_deg << "\n";
   output << "requested_stage5_hybrid_pixel_ray_max_iterations: "
          << requested.hybrid_pixel_ray_max_iterations << "\n";
   output << "requested_stage5_hybrid_pixel_ray_pixel_scale_floor: "
@@ -8032,6 +8235,114 @@ void WriteBackendDiagnosticArtifacts(const fs::path& output_dir,
   }
 }
 
+struct PixelRayHybridLambdaBinAccumulator {
+  int count = 0;
+  double sum = 0.0;
+  double min = std::numeric_limits<double>::infinity();
+  double max = -std::numeric_limits<double>::infinity();
+
+  void Add(double value) {
+    if (!std::isfinite(value)) {
+      return;
+    }
+    ++count;
+    sum += value;
+    min = std::min(min, value);
+    max = std::max(max, value);
+  }
+};
+
+void WritePixelRayHybridAdaptiveDiagnostics(
+    const fs::path& output_dir,
+    const ati::AslamBackendCalibrationResult& backend_result,
+    const ati::AngularResidualDiagnosticsResult& angular_diagnostics,
+    const ati::CameraModelRefitEvaluationResult& holdout_evaluation) {
+  std::ofstream observations(
+      (output_dir / "hybrid_pixel_ray_adaptive_observations.csv").string().c_str());
+  observations << "frame_index,frame_label,board_id,point_id,point_type,"
+               << "pre_refinement_polar_angle_deg,lambda_i,"
+               << "polar_adaptive_enabled\n";
+  for (const ati::BackendResidualTypeAssignment& assignment :
+       backend_result.residual_type_assignments) {
+    if (assignment.residual_model_effective !=
+        "pixel_ray_hybrid_final_refinement") {
+      continue;
+    }
+    observations << assignment.frame_index << ","
+                 << assignment.frame_label << ","
+                 << assignment.board_id << ","
+                 << assignment.point_id << ","
+                 << ati::ToString(assignment.point_type) << ","
+                 << assignment.polar_angle_deg << ","
+                 << assignment.pixel_ray_hybrid_lambda << ","
+                 << (assignment.pixel_ray_hybrid_polar_adaptive ? 1 : 0)
+                 << "\n";
+  }
+
+  const std::vector<double>& edges =
+      backend_result.options.angular_residual_bin_edges_deg;
+  std::vector<PixelRayHybridLambdaBinAccumulator> lambda_bins;
+  if (edges.size() >= 2) {
+    lambda_bins.resize(edges.size() - 1);
+    for (const ati::BackendResidualTypeAssignment& assignment :
+         backend_result.residual_type_assignments) {
+      if (assignment.residual_model_effective !=
+              "pixel_ray_hybrid_final_refinement" ||
+          !std::isfinite(assignment.polar_angle_deg)) {
+        continue;
+      }
+      for (std::size_t index = 0; index + 1 < edges.size(); ++index) {
+        const bool last_bin = index + 2 == edges.size();
+        if (assignment.polar_angle_deg >= edges[index] &&
+            (assignment.polar_angle_deg < edges[index + 1] ||
+             (last_bin && assignment.polar_angle_deg <= edges[index + 1]))) {
+          lambda_bins[index].Add(assignment.pixel_ray_hybrid_lambda);
+          break;
+        }
+      }
+    }
+  }
+
+  std::ofstream bins(
+      (output_dir / "hybrid_pixel_ray_adaptive_bin_summary.csv").string().c_str());
+  bins << "bin_min_deg,bin_max_deg,pre_refinement_observation_count,"
+       << "lambda_min,lambda_mean,lambda_max,"
+       << "final_training_pixel_rmse_px,final_training_angular_rmse_rad\n";
+  const std::size_t bin_count = std::min(lambda_bins.size(),
+                                         angular_diagnostics.all_points_bins.size());
+  for (std::size_t index = 0; index < bin_count; ++index) {
+    const PixelRayHybridLambdaBinAccumulator& lambda_bin = lambda_bins[index];
+    const ati::AngularResidualBinStatistics& residual_bin =
+        angular_diagnostics.all_points_bins[index];
+    bins << residual_bin.bin_min_deg << "," << residual_bin.bin_max_deg << ","
+         << lambda_bin.count << ","
+         << (lambda_bin.count > 0 ? lambda_bin.min : 0.0) << ","
+         << (lambda_bin.count > 0
+                 ? lambda_bin.sum / static_cast<double>(lambda_bin.count)
+                 : 0.0)
+         << "," << (lambda_bin.count > 0 ? lambda_bin.max : 0.0) << ","
+         << residual_bin.image_plane_rmse << "," << residual_bin.rmse << "\n";
+  }
+
+  std::ofstream heldout(
+      (output_dir / "hybrid_pixel_ray_adaptive_heldout_metrics.csv").string().c_str());
+  heldout << "polar_adaptive_enabled,lambda_min,lambda_max,"
+          << "transition_start_deg,transition_end_deg,"
+          << "heldout_multiboard_rmse_px,heldout_angular_rmse_rad,"
+          << "heldout_angular_rmse_deg,heldout_angular_point_count\n";
+  heldout << (backend_result.options.pixel_ray_hybrid_polar_adaptive_enabled
+                  ? 1
+                  : 0)
+          << "," << backend_result.options.pixel_ray_hybrid_lambda_min
+          << "," << backend_result.options.pixel_ray_hybrid_lambda_max
+          << "," << backend_result.options.pixel_ray_hybrid_transition_start_deg
+          << "," << backend_result.options.pixel_ray_hybrid_transition_end_deg
+          << "," << holdout_evaluation.overall_rmse
+          << "," << holdout_evaluation.overall_angular_rmse_rad
+          << "," << holdout_evaluation.overall_angular_rmse_deg
+          << "," << holdout_evaluation.angular_point_count << "\n";
+}
+
 void PrintProgress(const std::string& message) {
   std::cout << "[stage5_backend] " << message << std::endl;
 }
@@ -8097,6 +8408,32 @@ void ValidateBackendResidualConfiguration(
         config.hybrid_pixel_ray_lambda > 1.0) {
       throw std::runtime_error(
           "--stage5-hybrid-pixel-ray-lambda must be in [0, 1].");
+    }
+    const bool valid_adaptive_lambdas =
+        std::isfinite(config.hybrid_pixel_ray_lambda_min) &&
+        std::isfinite(config.hybrid_pixel_ray_lambda_max) &&
+        config.hybrid_pixel_ray_lambda_min >= 0.0 &&
+        config.hybrid_pixel_ray_lambda_min <= 1.0 &&
+        config.hybrid_pixel_ray_lambda_max >= 0.0 &&
+        config.hybrid_pixel_ray_lambda_max <= 1.0 &&
+        config.hybrid_pixel_ray_lambda_min <=
+            config.hybrid_pixel_ray_lambda_max;
+    if (!valid_adaptive_lambdas) {
+      throw std::runtime_error(
+          "Polar-adaptive Hybrid lambda limits must satisfy "
+          "0 <= lambda_min <= lambda_max <= 1.");
+    }
+    const bool valid_adaptive_transition =
+        std::isfinite(config.hybrid_pixel_ray_transition_start_deg) &&
+        std::isfinite(config.hybrid_pixel_ray_transition_end_deg) &&
+        config.hybrid_pixel_ray_transition_start_deg >= 0.0 &&
+        config.hybrid_pixel_ray_transition_end_deg <= 180.0 &&
+        config.hybrid_pixel_ray_transition_end_deg >
+            config.hybrid_pixel_ray_transition_start_deg;
+    if (!valid_adaptive_transition) {
+      throw std::runtime_error(
+          "Polar-adaptive Hybrid transition angles must satisfy "
+          "0 <= start < end <= 180 degrees.");
     }
     if (config.hybrid_pixel_ray_max_iterations <= 0) {
       throw std::runtime_error(
@@ -8242,6 +8579,15 @@ int main(int argc, char** argv) {
     runtime_summary.runtime_mode = args.runtime_mode;
     runtime_summary.cache_dir =
         args.cache_dir.empty() ? "result/.stage5_backend_cache" : args.cache_dir;
+    runtime_summary.cache_layout_version = ati::Stage5CacheLayoutVersion();
+    if (!use_precomputed) {
+      const ati::Stage5DatasetCacheIdentity cache_dataset_identity =
+          ati::MakeStage5DatasetCacheIdentity(args.image_path);
+      runtime_summary.cache_dataset_label =
+          cache_dataset_identity.dataset_label;
+      runtime_summary.cache_dataset_image_root =
+          cache_dataset_identity.absolute_image_root;
+    }
     runtime_summary.cache_enabled = !use_precomputed;
     const std::string dataset_label = InferDatasetLabel(args);
     std::vector<std::string> image_paths;
@@ -8471,6 +8817,11 @@ int main(int argc, char** argv) {
     baseline_options.config = ati::ApriltagInternalDetector::LoadConfig(args.config_path);
     ApplyStage5ModelFamily(requested_config.models,
                            &baseline_options.config);
+    if (requested_config.camera_aware_outer_rescue_zero_detection_frames_set) {
+      baseline_options.config.outer_detector_config
+          .camera_aware_sphere_patch_rescue_zero_detection_frames =
+          requested_config.camera_aware_outer_rescue_zero_detection_frames;
+    }
     if (!use_precomputed &&
         !precomputed_initialization_auxiliary_sessions.empty()) {
       const std::vector<int>& resolution =
@@ -8542,6 +8893,7 @@ int main(int argc, char** argv) {
           auxiliary.bootstrap_frames.begin(), auxiliary.bootstrap_frames.end());
     }
     baseline_options.reference_board_id = args.reference_board_id;
+    baseline_options.frontend_only = args.stage5_frontend_only;
     baseline_options.outer_only_ablation_mode =
         requested_config.outer_only_ablation_mode;
     baseline_options.include_internal_points =
@@ -8641,6 +8993,26 @@ int main(int argc, char** argv) {
         requested_config.geometry_prior_rescue_accept_max_rotation_error_deg;
     baseline_options.geometry_prior_rescue_accept_max_translation_error =
         requested_config.geometry_prior_rescue_accept_max_translation_error;
+    baseline_options.geometry_guided_tag_likelihood_enabled =
+        requested_config.geometry_guided_tag_likelihood_enabled;
+    baseline_options.geometry_guided_tag_likelihood_min_visible_boards =
+        requested_config.geometry_guided_tag_likelihood_min_visible_boards;
+    baseline_options.geometry_guided_tag_likelihood_max_expected_hamming =
+        requested_config.geometry_guided_tag_likelihood_max_expected_hamming;
+    baseline_options.geometry_guided_tag_likelihood_min_hamming_margin =
+        requested_config.geometry_guided_tag_likelihood_min_hamming_margin;
+    baseline_options.geometry_guided_tag_likelihood_min_contrast =
+        requested_config.geometry_guided_tag_likelihood_min_contrast;
+    baseline_options.geometry_guided_tag_likelihood_allow_single_anchor =
+        requested_config.geometry_guided_tag_likelihood_allow_single_anchor;
+    baseline_options.geometry_guided_tag_likelihood_single_anchor_max_outer_rmse =
+        requested_config.geometry_guided_tag_likelihood_single_anchor_max_outer_rmse;
+    baseline_options.geometry_guided_tag_likelihood_single_anchor_max_expected_hamming =
+        requested_config.geometry_guided_tag_likelihood_single_anchor_max_expected_hamming;
+    baseline_options.geometry_guided_tag_likelihood_single_anchor_min_hamming_margin =
+        requested_config.geometry_guided_tag_likelihood_single_anchor_min_hamming_margin;
+    baseline_options.geometry_guided_tag_likelihood_single_anchor_min_contrast =
+        requested_config.geometry_guided_tag_likelihood_single_anchor_min_contrast;
     baseline_options.enable_outer_only_intermediate_calibration =
         requested_config.enable_outer_only_intermediate_calibration;
     baseline_options.intermediate_diagnostic_only =
@@ -8684,7 +9056,10 @@ int main(int argc, char** argv) {
         requested_config.backend_optimize_board_poses;
 
     ati::CalibrationBenchmarkSplitOptions split_options;
-    split_options.mode = args.split_mode;
+    split_options.mode = args.stage5_no_holdout
+                             ? "all_frames_training_no_holdout"
+                             : args.split_mode;
+    split_options.all_frames_training = args.stage5_no_holdout;
     split_options.holdout_ratio = args.holdout_ratio;
     split_options.random_seed = args.split_seed;
     split_options.holdout_stride = args.holdout_stride;
@@ -8693,16 +9068,23 @@ int main(int argc, char** argv) {
     ati::CalibrationBenchmarkSplit preview_split;
     {
       const auto stage_start = std::chrono::steady_clock::now();
-      preview_split = external_holdout_frames.empty()
-                          ? benchmark.BuildDeterministicSplit(all_frames)
-                          : benchmark.BuildExternalHoldoutSplit(
-                                all_frames,
-                                external_holdout_frames,
-                                use_precomputed
-                                    ? fs::path(args.precomputed_holdout_observations_dir)
-                                          .filename()
-                                          .string()
-                                    : fs::path(args.test_image_path).stem().string());
+      if (args.stage5_frontend_only) {
+        preview_split.success = true;
+        preview_split.mode = "frontend_only_all_frames";
+        preview_split.split_signature = "frontend_only_all_frames";
+        preview_split.training_frames = all_frames;
+      } else {
+        preview_split = external_holdout_frames.empty()
+                            ? benchmark.BuildDeterministicSplit(all_frames)
+                            : benchmark.BuildExternalHoldoutSplit(
+                                  all_frames,
+                                  external_holdout_frames,
+                                  use_precomputed
+                                      ? fs::path(args.precomputed_holdout_observations_dir)
+                                            .filename()
+                                            .string()
+                                      : fs::path(args.test_image_path).stem().string());
+      }
       AddRuntimeStage(&runtime_summary, "split_preview", ElapsedSeconds(stage_start),
                       false);
     }
@@ -8739,6 +9121,7 @@ int main(int argc, char** argv) {
     ati::Stage5BenchmarkInput benchmark_input;
     benchmark_input.all_frames = all_frames;
     benchmark_input.external_holdout_frames = external_holdout_frames;
+    benchmark_input.frontend_only = args.stage5_frontend_only;
     benchmark_input.use_precomputed_training_measurements = use_precomputed;
     benchmark_input.precomputed_training_measurements = precomputed_training;
     benchmark_input.use_precomputed_holdout_measurements =
@@ -9181,10 +9564,32 @@ int main(int argc, char** argv) {
         report.baseline_result.runtime_breakdown.training_detection_cache.cache_hits;
     runtime_summary.training_detection_cache_misses =
         report.baseline_result.runtime_breakdown.training_detection_cache.cache_misses;
+    runtime_summary.training_detection_stage_layout_cache_hits =
+        report.baseline_result.runtime_breakdown.training_detection_cache
+            .stage_layout_cache_hits;
+    runtime_summary.training_detection_legacy_layout_cache_hits =
+        report.baseline_result.runtime_breakdown.training_detection_cache
+            .legacy_layout_cache_hits;
+    runtime_summary.training_internal_regeneration_cache_hits =
+        report.baseline_result.runtime_breakdown
+            .training_internal_regeneration_cache.cache_hits;
+    runtime_summary.training_internal_regeneration_cache_misses =
+        report.baseline_result.runtime_breakdown
+            .training_internal_regeneration_cache.cache_misses;
     runtime_summary.holdout_detection_cache_hits =
         report.runtime_breakdown.holdout_detection_cache.cache_hits;
     runtime_summary.holdout_detection_cache_misses =
         report.runtime_breakdown.holdout_detection_cache.cache_misses;
+    runtime_summary.holdout_detection_stage_layout_cache_hits =
+        report.runtime_breakdown.holdout_detection_cache
+            .stage_layout_cache_hits;
+    runtime_summary.holdout_detection_legacy_layout_cache_hits =
+        report.runtime_breakdown.holdout_detection_cache
+            .legacy_layout_cache_hits;
+    runtime_summary.holdout_internal_regeneration_cache_hits =
+        report.runtime_breakdown.holdout_internal_regeneration_cache.cache_hits;
+    runtime_summary.holdout_internal_regeneration_cache_misses =
+        report.runtime_breakdown.holdout_internal_regeneration_cache.cache_misses;
     runtime_summary.round1_regeneration_attempted_internal_corners =
         report.baseline_result.runtime_breakdown
             .round1_regeneration_attempted_internal_corners;
@@ -9389,6 +9794,78 @@ int main(int argc, char** argv) {
                     report.runtime_breakdown.diagnostic_compare_seconds,
                     args.runtime_mode == ati::Stage5RuntimeMode::Fast);
     PrintProgress("writing Stage 5 benchmark artifacts...");
+
+    if (args.stage5_frontend_only) {
+      ati::WriteStage5BenchmarkProtocolSummary(
+          (output_dir / "benchmark_protocol_summary.txt").string(), report);
+      ati::WriteAutoCameraInitializationSummary(
+          (output_dir / "auto_camera_initialization_summary.txt").string(),
+          report.baseline_result.auto_camera_initialization);
+      ati::WriteAutoCameraInitializationCandidatesCsv(
+          (output_dir / "auto_camera_initialization_candidates.csv").string(),
+          report.baseline_result.auto_camera_initialization);
+      ati::WriteAutoCameraInitializationOuterResidualsCsv(
+          (output_dir / "auto_camera_initialization_outer_residuals.csv").string(),
+          report.baseline_result.auto_camera_initialization);
+      ati::WriteAutoCameraInitializationBootstrapViewsCsv(
+          (output_dir / "auto_camera_initialization_bootstrap_views.csv").string(),
+          report.baseline_result.auto_camera_initialization);
+      WriteCameraAwareOuterRescueArtifacts(output_dir, report.baseline_result);
+      ati::WriteInternalRegenerationDiagnostics(output_dir, report);
+      ati::WriteFrameBoardObservationFlowDiagnostics(
+          output_dir, report, all_frames_for_lookup, nullptr, nullptr);
+      if (requested_config.enable_geometry_prior_outer_seed) {
+        ati::WriteGeometryPriorOuterSeedDiagnostics(output_dir, report);
+      }
+      if (requested_config.use_intermediate_for_full_frontend_regeneration) {
+        ati::WriteIntermediateFrontendRegenerationSummary(output_dir, report);
+      }
+      if (requested_config.export_internal_seed_step_overlays) {
+        ati::WriteInternalSeedStepOverlays(output_dir, report,
+                                           all_frames_for_lookup);
+      }
+
+      std::ofstream summary((output_dir / "stage5_frontend_only_summary.txt")
+                                .string()
+                                .c_str());
+      summary << "stage5_frontend_only: 1\n";
+      summary << "selection_incremental_ba_run: 0\n";
+      summary << "backend_optimization_run: 0\n";
+      summary << "holdout_evaluation_run: 0\n";
+      summary << "frontend_input_frame_count: "
+              << report.split.training_frames.size() << "\n";
+      summary << "reference_board_id: "
+              << report.baseline_result.reference_board_id << "\n";
+      summary << "round1_frame_count: "
+              << report.baseline_result.round1.measurement_result.used_frame_count
+              << "\n";
+      summary << "round1_board_observation_count: "
+              << report.baseline_result.round1.measurement_result
+                     .used_board_observation_count
+              << "\n";
+      summary << "round1_outer_point_count: "
+              << report.baseline_result.round1.measurement_result
+                     .used_outer_point_count
+              << "\n";
+      summary << "round1_internal_point_count: "
+              << report.baseline_result.round1.measurement_result
+                     .used_internal_point_count
+              << "\n";
+      summary << "camera_aware_outer_rescue_requested: "
+              << (report.baseline_result.camera_aware_outer_rescue.requested ? 1 : 0)
+              << "\n";
+      summary << "camera_aware_outer_rescue_count: "
+              << report.baseline_result.camera_aware_outer_rescue
+                     .rescued_board_observation_count
+              << "\n";
+      summary << "initialization_camera_family: "
+              << report.baseline_result.auto_camera_initialization.selected_camera
+                     .NormalizedFamilyString()
+              << "\n";
+      write_runtime_summary();
+      PrintProgress("Stage5 frontend-only completed; no selection or backend BA ran.");
+      return report.success ? 0 : 1;
+    }
 
     if (report.baseline_result.stage5_round1_bundle.success) {
       ati::WriteCalibrationStateBundleSummary(
@@ -9993,6 +10470,16 @@ int main(int argc, char** argv) {
         hybrid_options.pixel_ray_hybrid_refinement_mode = true;
         hybrid_options.pixel_ray_hybrid_lambda =
             requested_config.hybrid_pixel_ray_lambda;
+        hybrid_options.pixel_ray_hybrid_polar_adaptive_enabled =
+            requested_config.hybrid_pixel_ray_polar_adaptive;
+        hybrid_options.pixel_ray_hybrid_lambda_min =
+            requested_config.hybrid_pixel_ray_lambda_min;
+        hybrid_options.pixel_ray_hybrid_lambda_max =
+            requested_config.hybrid_pixel_ray_lambda_max;
+        hybrid_options.pixel_ray_hybrid_transition_start_deg =
+            requested_config.hybrid_pixel_ray_transition_start_deg;
+        hybrid_options.pixel_ray_hybrid_transition_end_deg =
+            requested_config.hybrid_pixel_ray_transition_end_deg;
         hybrid_options.pixel_ray_hybrid_pixel_scale_floor =
             requested_config.hybrid_pixel_ray_pixel_scale_floor;
         hybrid_options.pixel_ray_hybrid_ray_scale_floor =
@@ -10065,6 +10552,19 @@ int main(int argc, char** argv) {
                      << (committed ? 1 : 0) << "\n";
       hybrid_summary << "stage5_hybrid_pixel_ray_lambda: "
                      << requested_config.hybrid_pixel_ray_lambda << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_polar_adaptive_enabled: "
+                     << (requested_config.hybrid_pixel_ray_polar_adaptive ? 1 : 0)
+                     << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_lambda_min: "
+                     << requested_config.hybrid_pixel_ray_lambda_min << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_lambda_max: "
+                     << requested_config.hybrid_pixel_ray_lambda_max << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_transition_start_deg: "
+                     << requested_config.hybrid_pixel_ray_transition_start_deg
+                     << "\n";
+      hybrid_summary << "stage5_hybrid_pixel_ray_transition_end_deg: "
+                     << requested_config.hybrid_pixel_ray_transition_end_deg
+                     << "\n";
       hybrid_summary << "stage5_hybrid_pixel_ray_residual_dimension: 4\n";
       hybrid_summary << "stage5_hybrid_pixel_ray_scale_source: "
                      << (enabled ? "pixel_committed_training_state"
@@ -10254,6 +10754,18 @@ int main(int argc, char** argv) {
       ati::WriteAngularResidualPointSelectionCsv(
           (output_dir / "angular_residual_point_selection.csv").string(),
           backend_result.optimized_residual);
+    }
+    if (requested_config.enable_hybrid_pixel_ray_final_refinement) {
+      // This diagnostic is always emitted for Pixel-Ray final refinement, even
+      // when the optional general polar diagnostic is disabled.
+      const ati::AngularResidualDiagnosticOptions angular_options{
+          true, requested_config.angular_residual_bin_edges_deg};
+      const ati::AngularResidualDiagnosticsResult angular_diagnostics =
+          ati::EvaluateAngularResidualDiagnostics(
+              backend_result.optimized_residual, angular_options);
+      WritePixelRayHybridAdaptiveDiagnostics(
+          output_dir, backend_result, angular_diagnostics,
+          backend_holdout_evaluation);
     }
     if (backend_result.options.multi_board_consistency_weighting &&
         backend_result.options.consistency_dump_weight_summary) {
