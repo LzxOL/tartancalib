@@ -1065,55 +1065,6 @@ bool PassesBorderCheck(const std::array<cv::Point2f, 4>& corners, const cv::Size
   return true;
 }
 
-bool PassesRefinedCornerEdgeSupportCheck(
-    const cv::Mat& gray,
-    const std::array<cv::Point2f, 4>& refined_corners,
-    int corner_index,
-    const OuterCornerVerificationDebugInfo& debug,
-    std::string* failure_reason) {
-  if (corner_index < 0 || corner_index >= 4) {
-    if (failure_reason != nullptr) {
-      *failure_reason = "subpix_edge_support:index";
-    }
-    return false;
-  }
-  const int prev_index = (corner_index + 3) % 4;
-  const int next_index = (corner_index + 1) % 4;
-  const cv::Point2f corner = refined_corners[static_cast<std::size_t>(corner_index)];
-  const cv::Point2f prev_edge =
-      refined_corners[static_cast<std::size_t>(prev_index)] - corner;
-  const cv::Point2f next_edge =
-      refined_corners[static_cast<std::size_t>(next_index)] - corner;
-  const double prev_length = Norm(prev_edge);
-  const double next_length = Norm(next_edge);
-  const cv::Point2f quad_center = ComputeQuadCenter(refined_corners);
-  const std::vector<cv::Point2f> prev_support =
-      CollectCornerMarkerEdgeSupportPoints(
-          gray, corner, prev_edge, prev_length, quad_center,
-          debug.corner_marker_width, debug.verification_roi_radius);
-  const std::vector<cv::Point2f> next_support =
-      CollectCornerMarkerEdgeSupportPoints(
-          gray, corner, next_edge, next_length, quad_center,
-          debug.corner_marker_width, debug.verification_roi_radius);
-  const ImageLineCornerRefinement line_check =
-      RefineCornerByImageLineSupportIntersection(prev_support, next_support);
-  if (!line_check.success || line_check.quality < kOuterLineMinQuality) {
-    if (failure_reason != nullptr) {
-      std::ostringstream stream;
-      stream << "subpix_edge_support:" << line_check.failure_reason
-             << ":q=" << std::fixed << std::setprecision(2)
-             << line_check.quality
-             << ":support=(" << line_check.prev_line.support_count
-             << "," << line_check.next_line.support_count << ")"
-             << ":res=(" << line_check.prev_line.rms_residual
-             << "," << line_check.next_line.rms_residual << ")";
-      *failure_reason = stream.str();
-    }
-    return false;
-  }
-  return true;
-}
-
 bool PassesRefinedCornerResponseCheck(
     const cv::Mat& gray,
     const cv::Point2f& refined_corner,
@@ -2408,6 +2359,43 @@ double ComputeCornerLocalScale(const std::array<cv::Point2f, 4>& corners, int co
   return std::min(Norm(prev_edge), Norm(next_edge));
 }
 
+// Camera-aware patch rescue returns mapped outer corners directly, bypassing
+// RefineCoarseCandidate where normal detections gather edge support. Rebuild
+// that image-evidence payload from the committed corners before the result is
+// handed to the internal sphere-border lattice.
+void PopulateRescuedCornerMarkerEdgeSupports(
+    const cv::Mat& gray,
+    const std::array<cv::Point2f, 4>& committed_corners,
+    const MultiScaleOuterTagDetectorConfig& config,
+    std::array<OuterCornerVerificationDebugInfo, 4>* verification_debug) {
+  if (verification_debug == nullptr) {
+    throw std::runtime_error(
+        "PopulateRescuedCornerMarkerEdgeSupports requires a valid output pointer.");
+  }
+  const cv::Point2f quad_center = ComputeQuadCenter(committed_corners);
+  for (int index = 0; index < 4; ++index) {
+    OuterCornerVerificationDebugInfo debug =
+        BuildCoarseOnlyDebugInfo(index, committed_corners, gray.size(), config);
+    const int prev_index = (index + 3) % 4;
+    const int next_index = (index + 1) % 4;
+    const cv::Point2f corner = committed_corners[static_cast<std::size_t>(index)];
+    const cv::Point2f prev_edge =
+        committed_corners[static_cast<std::size_t>(prev_index)] - corner;
+    const cv::Point2f next_edge =
+        committed_corners[static_cast<std::size_t>(next_index)] - corner;
+    debug.prev_marker_support_points = CollectCornerMarkerEdgeSupportPoints(
+        gray, corner, prev_edge, Norm(prev_edge), quad_center,
+        debug.corner_marker_width, debug.verification_roi_radius);
+    debug.next_marker_support_points = CollectCornerMarkerEdgeSupportPoints(
+        gray, corner, next_edge, Norm(next_edge), quad_center,
+        debug.corner_marker_width, debug.verification_roi_radius);
+    debug.refined_valid = true;
+    debug.verification_passed = true;
+    debug.failure_reason = "camera_aware_patch_rescue_edge_support";
+    (*verification_debug)[static_cast<std::size_t>(index)] = std::move(debug);
+  }
+}
+
 cv::Mat MaybeBlur(const cv::Mat& image, const MultiScaleOuterTagDetectorConfig& config) {
   if (!config.blur_before_detect) {
     return image;
@@ -2971,24 +2959,20 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
     } else if (refined_valid &&
         debug.close_edge_subpix_boost_applied &&
         debug.subpix_applied) {
-      std::string support_failure_reason;
-      const bool edge_support_ok = PassesRefinedCornerEdgeSupportCheck(
-              gray_original, refined_candidate.refined_original, index, debug,
-              &support_failure_reason);
       std::string response_diagnostic;
       const bool response_ok = PassesRefinedCornerResponseCheck(
           gray_original,
           refined_candidate.refined_original[static_cast<std::size_t>(index)],
           debug.subpix_window_radius,
           &response_diagnostic);
-      // A strong corner response alone is insufficient: a large adaptive
-      // window can converge to a different image corner. The refined point
-      // must also be supported by the two marker edges of this decoded tag.
-      if (!edge_support_ok || !response_ok) {
+      // Do not reject a distorted close-edge corner solely because a local
+      // straight-line fit is weak. The image is governed by a wide-angle
+      // camera model, so the two marker edges need not remain straight in
+      // pixel coordinates. Keep the independent corner-response check and
+      // the subpixel rollback guard as the actual acceptance conditions.
+      if (!response_ok) {
         refined_valid = false;
-        debug.failure_reason = edge_support_ok
-                                   ? response_diagnostic
-                                   : support_failure_reason + ";" + response_diagnostic;
+        debug.failure_reason = response_diagnostic;
       }
     }
     debug.refined_valid = refined_valid;
@@ -3778,6 +3762,9 @@ OuterTagDetectionResult FinalizeOuterTagDetection(
     result.hamming = reference_it->detection.hammingDistance;
     result.good = reference_it->detection.good;
     result.quality = 1.0;
+    PopulateRescuedCornerMarkerEdgeSupports(
+        gray_original, reference_it->original_corners, config,
+        &result.corner_verification_debug);
     for (int index = 0; index < 4; ++index) {
       const std::size_t corner_index = static_cast<std::size_t>(index);
       result.coarse_corners_scaled_image[corner_index] =
@@ -3787,14 +3774,15 @@ OuterTagDetectionResult FinalizeOuterTagDetection(
       result.refined_corners_original_image[corner_index] =
           ToEigen(reference_it->original_corners[corner_index]);
       result.refined_valid[corner_index] = true;
-      result.corner_verification_debug[corner_index].coarse_corner =
-          reference_it->original_corners[corner_index];
-      result.corner_verification_debug[corner_index].verified_corner =
-          reference_it->original_corners[corner_index];
-      result.corner_verification_debug[corner_index].subpix_corner =
-          reference_it->original_corners[corner_index];
-      result.corner_verification_debug[corner_index].refined_valid = true;
-      result.corner_verification_debug[corner_index].verification_passed = true;
+      OuterCornerVerificationDebugInfo& debug =
+          result.corner_verification_debug[corner_index];
+      debug.corner_index = index;
+      debug.coarse_corner = reference_it->original_corners[corner_index];
+      debug.verified_corner = reference_it->original_corners[corner_index];
+      debug.subpix_corner = reference_it->original_corners[corner_index];
+      debug.spherical_corner = reference_it->original_corners[corner_index];
+      debug.refined_valid = true;
+      debug.verification_passed = true;
     }
     result.success = true;
     result.failure_reason = OuterTagFailureReason::None;

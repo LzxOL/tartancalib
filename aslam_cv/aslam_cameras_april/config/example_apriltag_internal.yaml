@@ -58,3 +58,6 @@ enable_anonymous_tag_like_geometry_rescue: false
 enable_camera_aware_sphere_patch_rescue: true
 camera_aware_sphere_patch_max_hamming: 0
 camera_aware_sphere_patch_commit_mapped_corners: true
+# Keep a recovery path for frames where the direct detector decodes no tag.
+# The rescue still accepts only exact requested-ID / Hamming-0 decodes.
+camera_aware_sphere_patch_rescue_zero_detection_frames: true

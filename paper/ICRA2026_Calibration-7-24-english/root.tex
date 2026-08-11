@@ -175,34 +175,115 @@ Our main contributions are summarized as follows:
 \setlength{\itemsep}{1pt}
 \setlength{\parskip}{0pt}
 \setlength{\parsep}{0pt}
-\item We present an open-source, easy-to-deploy, and flexible multi-board
-calibration system for wide-angle central cameras.
-\item To address insufficient spatial coverage of calibration observations
- and unreliable feature refinement, we propose a distributed multi-board 
- design based on single AprilTags, together with an intermediate-model-ass
- isted internal lattice-point refinement method. On the evaluated sequence,
-  the distributed design improves occupied-grid coverage by $14.6$ percentage points under the same frame--board budget.
-\item We conduct a controlled analysis that isolates the contribution
-of recovered internal lattice observations under an identical Outer4
-initialization. The results show that local observation densification
-provides complementary constraints for more faithful estimation of the
-wide-angle projection model.
+\item We present an open-source, easy-to-deploy, and flexible distributed multi-board
+calibration framework for wide-angle central cameras. The proposed framework
+provides broader image-domain coverage, improving occupied-grid coverage
+by $14.6\%$ with the same number of frame--board observations.
+
+\item We augment the distributed multi-board Outer4 observations with
+internal lattice points, providing denser constraints within each local
+board region, and demonstrate that local densification improves the
+accuracy and stability of wide-angle projection model estimation.
 \end{itemize}
 
 Tests on several datasets and camera models cover reprojection error, ablations,
 cross-backend calibration, and held-out pose estimation. The results show
 reliable calibration and competitive accuracy.
 
-\section{}
+\section{Related Work}
 
-\subsection{Selecting a Template (Heading 2)}
+\subsection{Wide-Angle Camera Models and Calibration}
 
-First, confirm that you have the correct template for your paper size. This template has been tailored for output on the US-letter paper size. 
-It may be used for A4 paper size if the paper size setting is suitably modified.
+Accurate wide-angle calibration requires an imaging model that remains
+valid over a large angular range. Existing models for fisheye and central
+omnidirectional cameras can be broadly divided into compact parametric
+models and more flexible generic models. Representative parametric
+models include the Field-of-View (FOV), Kannala--Brandt (KB), unified
+and extended unified camera models, and the Double Sphere (DS) model
+\cite{devernay2001straight,
+      kannala2006generic,
+      mei2007single,
+      khomutenko2016enhanced,
+      usenko2018double}.
+These models describe nonlinear wide-angle projection with a small
+number of parameters and are therefore convenient for estimation and
+downstream applications. Generic models instead introduce more degrees
+of freedom to represent complex lens characteristics more accurately
+\cite{scaramuzza2006flexible,
+      schops2020having,
+      ramalingam2017unifying}.
+Their flexibility, however, increases the need for informative
+calibration observations.
 
-\subsection{Maintaining the Integrity of the Specifications}
+Several calibration frameworks have been developed to estimate these
+models in practice. OpenCV provides standard fisheye calibration and
+image rectification interfaces
+\cite{bradski2000opencv,opencvFisheyeDocs}, whereas OCamCalib estimates
+a polynomial model for central omnidirectional cameras from planar
+checkerboard observations
+\cite{scaramuzza2006toolbox}.
+Kalibr supports different projection and distortion models, calibration
+targets, and multi-camera intrinsic and extrinsic estimation within a
+unified toolchain
+\cite{rehder2016extending}.
+BabelCalib first estimates a back-projection model and then regresses the
+desired forward-projection model within a robust estimation framework,
+improving initialization across different central camera models
+\cite{lochman2021babelcalib}.
+Together, these frameworks improve model support, initialization, and
+optimization reliability. Wide-angle calibration nevertheless still
+depends on observations that constrain the camera model across the image
+domain, motivating our focus on observation construction rather than a
+new camera model or solver.
 
-The template is used to format your paper and style the text. All margins, column widths, line spaces, and text fonts are prescribed; please do not alter them. You may note peculiarities. For example, the head margin in this template measures proportionately more than is customary. This measurement and others are deliberate, using specifications that anticipate your paper as one part of the entire proceedings, and not as an independent document. Please do not revise any of the current designations
+
+\subsection{Calibration Targets and Observation Construction}
+
+Target-based camera calibration commonly uses planar patterns such as
+checkerboards, dot grids, and coded fiducial markers.
+Checkerboards and dot grids provide regularly arranged control points
+\cite{zhang2000flexible,heikkila2000circular}, whereas coded fiducials
+such as AprilTag and ArUco encode the identity of individual markers,
+facilitating detection and association when the target is only partially
+visible
+\cite{olson2011apriltag,garridojurado2014automatic}.
+Other target patterns have also been developed to improve feature
+localization. For example, Deltille Grid uses triangular tiling and local
+polynomial surface fitting to obtain accurate feature locations
+\cite{ha2017deltille}.
+For wide-angle cameras, however, severe peripheral distortion can still
+degrade target detection and subpixel localization.
+
+TartanCalib addresses this problem by using an intermediate camera model
+to reproject an AprilTag grid and refine peripheral features
+\cite{duisterhof2022tartancalib}.
+CO-Calib studies a complementary aspect of observation quality and shows
+that limited radial support can couple focal scale with fisheye
+projection-shape parameters during intrinsic initialization
+\cite{liu2026observation}.
+Together, these works identify two important requirements for
+wide-angle calibration: reliable local measurements and informative
+radial support.
+
+
+\subsection{Multi-Board Calibration}
+
+Multi-board calibration commonly uses several coded targets to strengthen
+geometric connections across camera and target observations. MC-Calib
+combines multiple fiducial-based patterns with staged refinement to
+estimate camera and board poses
+\cite{rameau2022mccalib}, while BabelCalib supports calibration targets
+composed of multiple planar boards within a robust central-camera
+calibration framework
+\cite{lochman2021babelcalib}.
+
+These methods demonstrate the benefit of enriching the geometric
+constraints supplied to calibration, but do not explicitly use board
+placement to shape the radial distribution of observations. Our
+framework treats this placement as part of observation construction:
+uniquely coded distributed boards provide broad radial support, while
+internal lattice points increase the observation density within each
+local board region.
 
 \section{Method}
 
@@ -314,17 +395,18 @@ reprojection errors. Let $\mathcal{S}$ denote the retained frame--board
 pairs. We then jointly refine the camera parameters and temporary poses:
 \begin{equation}
 \begin{aligned}
-&\boldsymbol{\theta}^{*},
-\left\{
-\widetilde{\mathbf{T}}^{*}_{C_tB_b}
-\right\}
-\\
-&\quad =
+\left(
+\boldsymbol{\theta}^{*},
+\left\{\widetilde{\mathbf{T}}^{*}_{C_tB_b}\right\}
+\right)
+&=
 \operatorname*{arg\,min}_{
 \boldsymbol{\theta},
 \{\widetilde{\mathbf{T}}_{C_tB_b}\}}
 \sum_{(t,b)\in\mathcal{S}}
 \sum_{j\in\mathcal{C}^{\mathrm{out}}_{t,b}}
+\\[-1pt]
+&\quad
 \rho\!\left(
 \left\|
 \mathbf{r}^{\mathrm{out}}_{t,b,j}
@@ -758,7 +840,45 @@ to our multi-board calibration setup, we estimate their camera
 intrinsics using standard checkerboard-based calibration procedures.
 The resulting intrinsics are then evaluated alongside ours on the same
 held-out multi-board pose-estimation task and are reported as reference
-baselines 
+baselines.
+
+\subsection{Cross-Backend Validation}
+
+To assess the cross-backend applicability of our observation
+construction, we export the same Outer4+Internal 2D--3D
+correspondences produced by our front end to BabelCalib and estimate
+the Double Sphere (DS) and Kannala--Brandt (KB) models. The resulting
+calibrations are compared with those obtained using the corresponding
+models in our pipeline. As shown in Table~\ref{tab:cross_backend}, both
+backends achieve comparable reprojection RMSEs on the held-out
+multi-board and checkerboard datasets for both camera models, with all
+configurations producing valid calibration results. These results show
+that the constructed observations can be effectively used by different
+calibration backends and remain applicable to different wide-angle
+projection models.
+
+\begin{table}[t]
+  \centering
+  \caption{Cross-backend evaluation on the held-out multi-board and
+  checkerboard datasets. Lower is better.}
+  \label{tab:cross_backend}
+  \small
+  \setlength{\tabcolsep}{3.5pt}
+  \renewcommand{\arraystretch}{1.08}
+  \begin{tabular}{@{}llcc@{}}
+    \toprule
+    \multirow{2}{*}{Camera}
+    & \multirow{2}{*}{Model}
+    & \multicolumn{2}{c}{Reproj.Err. [px] } \\
+    \cmidrule(lr){3-4}
+    & & Multi-board & Checkerboard \\
+    \midrule
+    Action Pro & DS & -- & -- \\
+    Alvium U-2040m & DS & 0.7047 & 0.5816 \\
+    Alvium U-2040m & KB & 0.7031 & 0.5815 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
 
 \section{CONCLUSIONS}
 

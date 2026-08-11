@@ -2554,6 +2554,26 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
   const bool multi_board_context =
       static_cast<int>(candidate.visible_boards_used.size()) >=
       std::max(2, options.geometry_guided_tag_likelihood_min_visible_boards);
+  // This is the topology-identity path: existing boards define a unique
+  // rigid pose for this frame, so the missing board ID comes from its known
+  // place in the rig rather than from a distorted payload decode. Require a
+  // locally observed quadrilateral and a good refit; pure projected corners
+  // never qualify. We intentionally keep this separate from wrong-ID
+  // proposal association: no other board's quad is relabelled here.
+  const bool topology_identity_context =
+      geometry_only_pose_refit_candidate &&
+      candidate.visible_boards_used.size() >= 2u &&
+      candidate.prediction_source_label.find("visible_refit") !=
+          std::string::npos &&
+      candidate.frame_pose_refit_source_board_id >= 0 &&
+      std::isfinite(candidate.frame_pose_refit_outer_rmse) &&
+      candidate.frame_pose_refit_outer_rmse <=
+          options.geometry_prior_rescue_accept_max_outer_rmse &&
+      candidate.edge_support_ratio >=
+          std::max(0.35, 0.75 * options.geometry_prior_rescue_min_edge_support_ratio) &&
+      candidate.mean_edge_gradient_ratio >=
+          options.geometry_prior_rescue_min_edge_gradient_ratio &&
+      max_displacement <= candidate.adaptive_max_corner_displacement_px;
   const bool single_anchor_context =
       options.geometry_guided_tag_likelihood_allow_single_anchor &&
       candidate.visible_boards_used.size() == 1u &&
@@ -2565,7 +2585,8 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
   const bool require_model_aware_tag_likelihood =
       !tag_id_validated &&
       options.geometry_guided_tag_likelihood_enabled &&
-      (multi_board_context || single_anchor_context);
+      (multi_board_context || single_anchor_context) &&
+      !topology_identity_context;
   if (require_model_aware_tag_likelihood &&
       !edge_evidence_ok && !weak_but_nonzero_edge_evidence) {
     candidate.local_corner_refine_success = false;
@@ -2577,6 +2598,7 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
   // available below. Keep the legacy geometry-only gate intact for callers
   // that did not opt into the new code-evidence path.
   if (!tag_id_validated && !require_model_aware_tag_likelihood &&
+      !topology_identity_context &&
       (!geometry_only_pose_refit_candidate ||
        (weak_quad_alternative && !geometry_only_strong_edge_evidence) ||
        !geometry_only_refine_ok ||
@@ -2685,7 +2707,7 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
           accept_max_outer_rmse,
           candidate.frame_normal_outer_refit_rmse_median + 1.0);
     } else {
-      if (!multi_board_context_high_confidence) {
+      if (!multi_board_context_high_confidence && !topology_identity_context) {
         accept_max_outer_rmse = std::min(
             accept_max_outer_rmse,
             std::max(1.5, candidate.frame_normal_outer_refit_rmse_median + 0.75));
@@ -2728,11 +2750,13 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
   }
 
   candidate.accepted_as_rescued_observation = true;
-  candidate.reject_reason = candidate.geometry_guided_tag_likelihood_passed
-                                ? "accepted_geometry_guided_tag_likelihood_observation"
-                                : (tag_id_validated
-                                       ? "accepted_image_validated_rescued_observation"
-                                       : "accepted_geometry_only_pose_refit_observation");
+  candidate.reject_reason = topology_identity_context
+                                ? "accepted_topology_identity_geometry_observation"
+                                : (candidate.geometry_guided_tag_likelihood_passed
+                                       ? "accepted_geometry_guided_tag_likelihood_observation"
+                                       : (tag_id_validated
+                                              ? "accepted_image_validated_rescued_observation"
+                                              : "accepted_geometry_only_pose_refit_observation"));
   if (!validation_source.empty() && validation_source != "primary") {
     candidate.reject_reason += "_" + validation_source;
   }
@@ -2740,7 +2764,10 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
     std::ostringstream summary;
     summary << "geometry_guided_refine"
             << " validation="
-            << (tag_id_validated ? "tag_or_context_id" : "geometry_only")
+            << (tag_id_validated ? "tag_or_context_id"
+                                 : (topology_identity_context
+                                        ? "topology_identity"
+                                        : "geometry_only"))
             << " source=" << validation_source
             << " max_disp=" << max_displacement
             << " min_corner_response_ratio=" << min_response_ratio

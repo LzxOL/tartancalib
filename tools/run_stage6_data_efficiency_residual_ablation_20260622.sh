@@ -45,10 +45,8 @@ run_case() {
     --test-right-image "${HOLDOUT_RIGHT}" \
     --left-config "${LEFT_CONFIG}" \
     --right-config "${RIGHT_CONFIG}" \
-    --left-intrinsics "${LEFT_INTRINSICS}" \
-    --right-intrinsics "${RIGHT_INTRINSICS}" \
-    --stereo-reference-camchain "${STEREO_REF}" \
-    --output "${out}" \
+  --models ds-none \
+  --output "${out}" \
     --cache-dir "${cache}" \
     --stage6-training-pair-sample-count "${budget}" \
     --stage6-training-pair-sample-seed "${SEED}" \

@@ -639,7 +639,11 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
       }
       bool internal_regeneration_failed_for_board = false;
       std::string internal_regeneration_failure_detail;
-      if (!options_.include_outer_when_internal_failed &&
+      const bool reject_entire_board_observation =
+          regenerated_measurement != nullptr &&
+          regenerated_measurement->detection.reject_entire_board_observation;
+      if ((reject_entire_board_observation ||
+           !options_.include_outer_when_internal_failed) &&
           outer_measurement != nullptr && outer_measurement->success) {
         if (regenerated_measurement == nullptr) {
           internal_regeneration_failed_for_board = true;
@@ -708,6 +712,7 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
               point.rejection_detail = detail.str();
             }
           } else if (internal_regeneration_failed_for_board &&
+                     !reject_entire_board_observation &&
                      !(options_.include_rescued_outer_when_internal_failed &&
                        outer_measurement->used_local_patch_rescue)) {
             point.rejection_reason_code =
@@ -716,6 +721,7 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
           } else {
             point.used_in_solver = true;
             if (internal_regeneration_failed_for_board &&
+                !reject_entire_board_observation &&
                 outer_measurement->used_local_patch_rescue) {
               point.rejection_detail =
                   "rescued outer retained despite internal regeneration failure: " +
@@ -761,7 +767,8 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
             if (board_level_reason != JointRejectionReasonCode::None) {
               point.rejection_reason_code = board_level_reason;
               point.rejection_detail = board_level_detail;
-            } else if (!options_.include_outer_when_internal_failed &&
+            } else if ((reject_entire_board_observation ||
+                        !options_.include_outer_when_internal_failed) &&
                        !detection.success) {
               point.rejection_reason_code =
                   JointRejectionReasonCode::InternalRegenerationFailed;

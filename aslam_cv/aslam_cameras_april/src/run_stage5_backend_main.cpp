@@ -43,7 +43,7 @@ namespace fs = boost::filesystem;
 std::string MatrixToCsv(const Eigen::Matrix4d& matrix);
 
 constexpr const char kFrozenBaselineLabel[] =
-    "stage5_backend_auto_v2_camera_aware_outer";
+    "stage5_backend_frozen_v3_recovery_cache";
 
 enum class IntrinsicsReleaseMode {
   Delayed,
@@ -83,8 +83,12 @@ struct CmdArgs {
   bool stage5_init_near_tie_prefer_lower_focal = false;
   double stage5_init_near_tie_relative_objective_tolerance = 0.0;
   bool stage5_camera_aware_outer_rescue = true;
-  bool stage5_camera_aware_outer_rescue_zero_detection_frames = false;
-  bool stage5_camera_aware_outer_rescue_zero_detection_frames_set = false;
+  bool stage5_camera_aware_outer_rescue_zero_detection_frames = true;
+  bool stage5_camera_aware_outer_rescue_zero_detection_frames_set = true;
+  // Explicitly select the frozen recovery bundle used by the canonical
+  // baseline command. This keeps future default changes from silently
+  // disabling a recovery algorithm that has already been validated.
+  bool stage5_enable_frozen_recovery_baseline = false;
   std::string experiment_tag;
   std::string cache_dir;
   bool all = false;
@@ -270,7 +274,7 @@ struct CmdArgs {
   bool geometry_prior_rescue_diagnostic_only = false;
   bool geometry_prior_rescue_use_as_observation = true;
   bool geometry_prior_rescue_keep_outer_on_internal_failure = false;
-  bool geometry_prior_rescue_allow_geometry_only_pose_refit = false;
+  bool geometry_prior_rescue_allow_geometry_only_pose_refit = true;
   int geometry_prior_rescue_subpix_window_radius = 0;
   double geometry_prior_rescue_max_corner_displacement_px = 0.0;
   double geometry_prior_rescue_min_corner_response_ratio = 0.03;
@@ -551,8 +555,9 @@ struct RequestedExperimentConfig {
   ati::CameraInitializationMode camera_init_mode =
       ati::CameraInitializationMode::Auto;
   bool camera_aware_outer_rescue = true;
-  bool camera_aware_outer_rescue_zero_detection_frames = false;
-  bool camera_aware_outer_rescue_zero_detection_frames_set = false;
+  bool camera_aware_outer_rescue_zero_detection_frames = true;
+  bool camera_aware_outer_rescue_zero_detection_frames_set = true;
+  bool frozen_recovery_baseline_preset = false;
   bool outer_only_ablation_mode = false;
   bool include_internal_points = true;
   bool run_second_pass = true;
@@ -730,7 +735,7 @@ struct RequestedExperimentConfig {
   bool geometry_prior_rescue_diagnostic_only = false;
   bool geometry_prior_rescue_use_as_observation = true;
   bool geometry_prior_rescue_keep_outer_on_internal_failure = false;
-  bool geometry_prior_rescue_allow_geometry_only_pose_refit = false;
+  bool geometry_prior_rescue_allow_geometry_only_pose_refit = true;
   int geometry_prior_rescue_subpix_window_radius = 0;
   double geometry_prior_rescue_max_corner_displacement_px = 0.0;
   double geometry_prior_rescue_min_corner_response_ratio = 0.03;
@@ -1049,6 +1054,8 @@ std::vector<double> ParseCommaSeparatedDoubles(const std::string& values_str,
 
 bool HasAblationOverrides(const RequestedExperimentConfig& config) {
   return config.camera_init_mode != ati::CameraInitializationMode::Auto ||
+         !config.camera_aware_outer_rescue ||
+         !config.camera_aware_outer_rescue_zero_detection_frames ||
          config.outer_only_ablation_mode ||
          !config.include_internal_points ||
          !config.run_second_pass ||
@@ -1089,12 +1096,11 @@ bool HasAblationOverrides(const RequestedExperimentConfig& config) {
          config.enable_multi_board_consistency_diagnostics ||
          config.enable_multiboard_rigidity_diagnostics ||
          config.internal_blur_filter_mode != ati::InternalBlurFilterMode::Off ||
-         config.internal_pose_rescue_mode != ati::InternalPoseRescueMode::Off ||
+         config.internal_pose_rescue_mode != ati::InternalPoseRescueMode::Enabled ||
          !config.enable_geometry_prior_outer_seed ||
          config.geometry_prior_rescue_diagnostic_only ||
          !config.geometry_prior_rescue_use_as_observation ||
          config.geometry_prior_rescue_keep_outer_on_internal_failure ||
-         !config.geometry_prior_rescue_allow_geometry_only_pose_refit ||
          !config.geometry_prior_rescue_enable_spherical_refine ||
          config.enable_outer_only_intermediate_calibration ||
          config.internal_blur_board_weight_mode !=
@@ -1169,9 +1175,15 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
     parts.push_back("internal_blur_filter_" +
                     std::string(ati::ToString(config.internal_blur_filter_mode)));
   }
-  if (config.internal_pose_rescue_mode != ati::InternalPoseRescueMode::Off) {
+  if (config.internal_pose_rescue_mode != ati::InternalPoseRescueMode::Enabled) {
     parts.push_back("internal_pose_rescue_" +
                     std::string(ati::ToString(config.internal_pose_rescue_mode)));
+  }
+  if (!config.camera_aware_outer_rescue) {
+    parts.push_back("no_camera_aware_outer_rescue");
+  }
+  if (!config.camera_aware_outer_rescue_zero_detection_frames) {
+    parts.push_back("no_zero_detection_atlas");
   }
   if (!config.enable_geometry_prior_outer_seed) {
     parts.push_back("no_geometry_prior_outer_seed");
@@ -1186,7 +1198,7 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
     parts.push_back("geometry_prior_rescue_no_spherical_refine");
   }
   if (!config.geometry_prior_rescue_allow_geometry_only_pose_refit) {
-    parts.push_back("geometry_prior_rescue_no_geometry_only_pose_refit");
+    parts.push_back("no_topology_identity_rescue");
   }
   if (config.geometry_prior_rescue_keep_outer_on_internal_failure) {
     parts.push_back("geometry_prior_rescue_outer_fallback");
@@ -1713,6 +1725,23 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.geometry_guided_tag_likelihood_single_anchor_min_hamming_margin;
   config.geometry_guided_tag_likelihood_single_anchor_min_contrast =
       args.geometry_guided_tag_likelihood_single_anchor_min_contrast;
+
+  if (args.stage5_enable_frozen_recovery_baseline) {
+    // Keep the canonical baseline recovery bundle explicit and centralized.
+    // The topology identity branch is still image- and pose-validated; this
+    // preset only prevents one of its prerequisite stages from being omitted.
+    config.frozen_recovery_baseline_preset = true;
+    config.camera_aware_outer_rescue = true;
+    config.camera_aware_outer_rescue_zero_detection_frames = true;
+    config.camera_aware_outer_rescue_zero_detection_frames_set = true;
+    config.enable_geometry_prior_outer_seed = true;
+    config.geometry_prior_rescue_diagnostic_only = false;
+    config.geometry_prior_rescue_use_as_observation = true;
+    config.geometry_prior_rescue_keep_outer_on_internal_failure = false;
+    config.geometry_prior_rescue_allow_geometry_only_pose_refit = true;
+    config.geometry_prior_rescue_enable_spherical_refine = true;
+  }
+
   config.enable_outer_only_intermediate_calibration =
       args.enable_outer_only_intermediate_calibration;
   config.intermediate_diagnostic_only =
@@ -2091,6 +2120,11 @@ void PrintUsage(const char* program) {
       << "                                      outer-tag rescue; enabled by default.\n"
       << "  --stage5-disable-camera-aware-outer-rescue\n"
       << "                                      Disable it for detector ablation.\n"
+      << "  --stage5-enable-frozen-recovery-baseline\n"
+      << "                                      Force the canonical recovery bundle:\n"
+      << "                                      camera-aware rescue, zero-detection atlas,\n"
+      << "                                      geometry-prior observation, spherical\n"
+      << "                                      refinement, and topology identity rescue.\n"
       << "  --output PATH                        Output directory.\n"
       << "  --runtime-mode research|fast         Runtime preset.\n"
       << "  --cache-dir PATH                     Optional frontend cache directory.\n"
@@ -2298,6 +2332,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.stage5_camera_aware_outer_rescue = true;
     } else if (token == "--stage5-disable-camera-aware-outer-rescue") {
       args.stage5_camera_aware_outer_rescue = false;
+    } else if (token == "--stage5-enable-frozen-recovery-baseline") {
+      args.stage5_enable_frozen_recovery_baseline = true;
     } else if (token == "--kalibr-training-split-signature" && i + 1 < argc) {
       args.kalibr_training_split_signature = argv[++i];
     } else if (token == "--camera-init-mode" && i + 1 < argc) {
@@ -5355,6 +5391,22 @@ void WriteCameraAwareOuterRescueArtifacts(
     output << "stage5_camera_aware_outer_rescue_zero_detection_atlas_attempted_board_observation_count: "
            << rescue.zero_detection_atlas_attempted_board_observation_count
            << "\n";
+    output << "stage5_camera_aware_outer_rescue_worker_count: "
+           << rescue.worker_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_direct_layout_geometry_gate_enabled: "
+           << (rescue.direct_layout_geometry_gate_enabled ? 1 : 0) << "\n";
+    output << "stage5_camera_aware_outer_rescue_direct_layout_geometry_gate_available: "
+           << (rescue.direct_layout_geometry_gate_available ? 1 : 0) << "\n";
+    output << "stage5_camera_aware_outer_rescue_direct_layout_geometry_gate_max_rmse_px: "
+           << rescue.direct_layout_geometry_gate_max_rmse_px << "\n";
+    output << "stage5_camera_aware_outer_rescue_direct_layout_geometry_gate_evaluated_count: "
+           << rescue.direct_layout_geometry_gate_evaluated_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_direct_layout_geometry_gate_accepted_count: "
+           << rescue.direct_layout_geometry_gate_accepted_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_direct_layout_geometry_gate_rejected_count: "
+           << rescue.direct_layout_geometry_gate_rejected_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_direct_layout_geometry_gate_not_evaluable_count: "
+           << rescue.direct_layout_geometry_gate_not_evaluable_count << "\n";
     output << "stage5_camera_aware_outer_rescue_rescued_board_observation_count: "
            << rescue.rescued_board_observation_count << "\n";
     output << "stage5_camera_aware_outer_rescue_final_success_count: "
@@ -5475,6 +5527,8 @@ void WriteExperimentConfigSummary(
   output << "requested_stage5_camera_aware_outer_rescue_zero_detection_frames: "
          << (requested.camera_aware_outer_rescue_zero_detection_frames ? 1 : 0)
          << "\n";
+  output << "requested_frozen_recovery_baseline_preset: "
+         << (requested.frozen_recovery_baseline_preset ? 1 : 0) << "\n";
   output << "requested_geometry_guided_tag_likelihood_single_anchor: "
          << (requested.geometry_guided_tag_likelihood_allow_single_anchor ? 1 : 0)
          << "\n";

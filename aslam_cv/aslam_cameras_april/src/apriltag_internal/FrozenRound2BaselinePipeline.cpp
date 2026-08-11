@@ -3,6 +3,7 @@
 #include <aslam/cameras/apriltag_internal/BoardDetectionPipeline.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -10,11 +11,13 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 
 #include <opencv2/imgcodecs.hpp>
 
 #include <aslam/cameras/apriltag_internal/ApriltagInternalDetector.hpp>
+#include <aslam/cameras/apriltag_internal/DoubleSphereCameraModel.hpp>
 #include <aslam/cameras/apriltag_internal/JointMeasurementSelection.hpp>
 #include <aslam/cameras/apriltag_internal/JointReprojectionCostCore.hpp>
 #include <aslam/cameras/apriltag_internal/JointReprojectionMeasurementBuilder.hpp>
@@ -195,6 +198,116 @@ OuterRefineCameraConfig BuildOuterRefineCameraConfig(
   return config;
 }
 
+const OuterBootstrapFrameState* FindBootstrapFrameState(
+    const OuterBootstrapResult& result,
+    int frame_index) {
+  const auto it = std::find_if(
+      result.frames.begin(), result.frames.end(),
+      [frame_index](const OuterBootstrapFrameState& frame) {
+        return frame.frame_index == frame_index;
+      });
+  return it == result.frames.end() ? nullptr : &(*it);
+}
+
+const OuterBootstrapBoardState* FindBootstrapBoardState(
+    const OuterBootstrapResult& result,
+    int board_id) {
+  const auto it = std::find_if(
+      result.boards.begin(), result.boards.end(),
+      [board_id](const OuterBootstrapBoardState& board) {
+        return board.board_id == board_id;
+      });
+  return it == result.boards.end() ? nullptr : &(*it);
+}
+
+std::vector<OuterBootstrapFrameInput> BuildDirectOuterBootstrapFrames(
+    const std::vector<OuterBootstrapFrameInput>& frames) {
+  std::vector<OuterBootstrapFrameInput> direct_frames;
+  direct_frames.reserve(frames.size());
+  for (const OuterBootstrapFrameInput& frame : frames) {
+    OuterBootstrapFrameInput direct_frame = frame;
+    direct_frame.measurements.board_measurements.clear();
+    for (const OuterBoardMeasurement& measurement :
+         frame.measurements.board_measurements) {
+      // A camera-aware patch result is the object being validated. Do not let
+      // an older cached patch result establish the independent reference rig.
+      if (measurement.success && !measurement.used_local_patch_rescue) {
+        direct_frame.measurements.board_measurements.push_back(measurement);
+      }
+    }
+    if (!direct_frame.measurements.board_measurements.empty()) {
+      direct_frames.push_back(std::move(direct_frame));
+    }
+  }
+  return direct_frames;
+}
+
+struct DirectLayoutRescueValidation {
+  bool evaluable = false;
+  double reprojection_rmse_px = std::numeric_limits<double>::infinity();
+};
+
+DirectLayoutRescueValidation ValidatePatchRescueAgainstDirectLayout(
+    const OuterBootstrapResult& direct_layout,
+    const OuterBootstrapCameraIntrinsics& camera,
+    int frame_index,
+    const OuterBoardMeasurement& measurement) {
+  DirectLayoutRescueValidation validation;
+  if (!direct_layout.success || !measurement.success ||
+      !measurement.has_target_outer_corners || !camera.IsValid()) {
+    return validation;
+  }
+  const OuterBootstrapFrameState* frame =
+      FindBootstrapFrameState(direct_layout, frame_index);
+  if (frame == nullptr || !frame->initialized) {
+    return validation;
+  }
+
+  Eigen::Matrix4d T_reference_board = Eigen::Matrix4d::Identity();
+  if (measurement.board_id != direct_layout.reference_board_id) {
+    const OuterBootstrapBoardState* board =
+        FindBootstrapBoardState(direct_layout, measurement.board_id);
+    if (board == nullptr || !board->initialized) {
+      return validation;
+    }
+    T_reference_board = board->T_reference_board;
+  }
+
+  DoubleSphereCameraModel camera_model;
+  try {
+    camera_model = DoubleSphereCameraModel::FromConfig(
+        MakeIntermediateCameraConfig(camera));
+  } catch (const std::exception&) {
+    return validation;
+  }
+
+  double squared_error_sum = 0.0;
+  for (std::size_t corner_index = 0; corner_index < 4; ++corner_index) {
+    if (!measurement.refined_corner_valid[corner_index] ||
+        !measurement.target_outer_corners_board[corner_index].allFinite() ||
+        !measurement.refined_outer_corners_original_image[corner_index].allFinite()) {
+      return validation;
+    }
+    const Eigen::Vector4d point_board(
+        measurement.target_outer_corners_board[corner_index].x(),
+        measurement.target_outer_corners_board[corner_index].y(),
+        measurement.target_outer_corners_board[corner_index].z(), 1.0);
+    const Eigen::Vector4d point_camera_h =
+        frame->T_camera_reference * (T_reference_board * point_board);
+    Eigen::Vector2d predicted = Eigen::Vector2d::Zero();
+    if (!camera_model.vsEuclideanToKeypoint(point_camera_h.head<3>(),
+                                             &predicted)) {
+      return validation;
+    }
+    const Eigen::Vector2d residual =
+        predicted - measurement.refined_outer_corners_original_image[corner_index];
+    squared_error_sum += residual.squaredNorm();
+  }
+  validation.evaluable = true;
+  validation.reprojection_rmse_px = std::sqrt(squared_error_sum / 4.0);
+  return validation;
+}
+
 const OuterTagDetectionResult* FindDetectionByBoardId(
     const OuterTagMultiDetectionResult& detections,
     int board_id) {
@@ -292,6 +405,7 @@ void RunCameraAwareOuterRescue(
     const ApriltagInternalConfig& config,
     const OuterBootstrapCameraIntrinsics& provisional_camera,
     int max_hamming,
+    int requested_worker_count,
     std::vector<OuterBootstrapFrameInput>* bootstrap_frames,
     std::vector<InternalRegenerationFrameInput>* regeneration_inputs,
     CameraAwareOuterRescueSummary* summary) {
@@ -313,6 +427,7 @@ void RunCameraAwareOuterRescue(
   summary->max_hamming = std::max(0, max_hamming);
   summary->frame_count = static_cast<int>(frame_sources.size());
   summary->provisional_camera = provisional_camera;
+  summary->direct_layout_geometry_gate_enabled = true;
 
   MultiScaleOuterTagDetectorConfig rescue_config =
       config.outer_detector_config;
@@ -335,8 +450,15 @@ void RunCameraAwareOuterRescue(
     summary->patch_plan =
         "dense_5x5_fov56_plus_wide_3x3_fov72_plus_extended_boundary_atlas";
   }
-  const MultiScaleOuterTagDetector rescue_detector(rescue_config);
-
+  struct RescueAttempt {
+    std::size_t frame_index = 0;
+    bool baseline_has_zero_detections = false;
+    std::vector<int> missing_board_ids;
+    bool image_read_success = false;
+    OuterTagMultiDetectionResult rescued;
+  };
+  std::vector<RescueAttempt> attempts;
+  attempts.reserve(frame_sources.size());
   for (std::size_t frame_index = 0; frame_index < frame_sources.size();
        ++frame_index) {
     const OuterTagMultiDetectionResult& baseline =
@@ -368,29 +490,108 @@ void RunCameraAwareOuterRescue(
     ++summary->attempted_frame_count;
     summary->attempted_board_observation_count +=
         static_cast<int>(missing_board_ids.size());
-    const cv::Mat image =
-        cv::imread(frame_sources[frame_index].image_path,
-                   cv::IMREAD_UNCHANGED);
-    if (image.empty()) {
+    RescueAttempt attempt;
+    attempt.frame_index = frame_index;
+    attempt.baseline_has_zero_detections = baseline_has_zero_detections;
+    attempt.missing_board_ids = std::move(missing_board_ids);
+    attempts.push_back(std::move(attempt));
+  }
+
+  // Build the rig only from direct full-image detections before accepting any
+  // sphere-patch recovery. A patch can decode the expected ID exactly while
+  // still map a heavily distorted quadrilateral to the wrong image location.
+  // In a frame that already has a direct board, the fixed rig provides an
+  // independent prediction for that missing board and rejects such a mapping.
+  const std::vector<OuterBootstrapFrameInput> direct_layout_frames =
+      BuildDirectOuterBootstrapFrames(*bootstrap_frames);
+  OuterBootstrapResult direct_layout;
+  if (!direct_layout_frames.empty()) {
+    OuterBootstrapOptions direct_layout_options;
+    direct_layout_options.reference_board_id =
+        config.tag_ids.empty() ? config.tag_id : config.tag_ids.front();
+    direct_layout_options.initial_camera = provisional_camera;
+    direct_layout_options.max_coordinate_descent_iterations = 0;
+    direct_layout_options.min_detection_quality =
+        config.outer_detector_config.min_detection_quality;
+    const MultiBoardOuterBootstrap direct_layout_bootstrap(
+        config, direct_layout_options);
+    direct_layout = direct_layout_bootstrap.Solve(direct_layout_frames);
+    summary->direct_layout_geometry_gate_available = direct_layout.success;
+    if (!direct_layout.success) {
+      AppendUniqueWarning(
+          "Camera-aware rescue direct-layout geometry gate unavailable: " +
+              direct_layout.failure_reason,
+          &summary->warnings);
+    }
+  }
+
+  // Local sphere-patch recovery is purely frame-local but was previously run
+  // serially. A zero-decode frame can evaluate 185 patches and four detector
+  // variants per patch. Give each worker an independent detector, retain every
+  // patch/variant, then merge in original frame order below. This changes only
+  // throughput; candidate ranking and accepted corners remain byte-for-byte
+  // governed by the existing per-frame detector logic.
+  const unsigned int hardware_workers = std::thread::hardware_concurrency();
+  const std::size_t automatic_worker_count = std::max<std::size_t>(
+      1, std::min<std::size_t>(4, hardware_workers == 0 ? 1 : hardware_workers));
+  const std::size_t requested_workers = requested_worker_count > 0
+      ? static_cast<std::size_t>(requested_worker_count)
+      : automatic_worker_count;
+  const std::size_t worker_count = std::min<std::size_t>(
+      attempts.size(), std::max<std::size_t>(1, requested_workers));
+  summary->worker_count = static_cast<int>(worker_count == 0 ? 1 : worker_count);
+  if (!attempts.empty()) {
+    std::atomic<std::size_t> next_attempt(0);
+    const auto detect_attempts = [&]() {
+      const MultiScaleOuterTagDetector rescue_detector(rescue_config);
+      for (;;) {
+        const std::size_t attempt_index = next_attempt.fetch_add(1);
+        if (attempt_index >= attempts.size()) {
+          return;
+        }
+        RescueAttempt& attempt = attempts[attempt_index];
+        const cv::Mat image = cv::imread(
+            frame_sources[attempt.frame_index].image_path, cv::IMREAD_UNCHANGED);
+        if (image.empty()) {
+          continue;
+        }
+        attempt.rescued = rescue_detector.DetectMultiple(image);
+        attempt.image_read_success = true;
+      }
+    };
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+      workers.emplace_back(detect_attempts);
+    }
+    for (std::thread& worker : workers) {
+      worker.join();
+    }
+  }
+
+  // Preserve the previous observable order for warnings, records, and
+  // committed detections. This also keeps any downstream tie handling fully
+  // deterministic despite parallel image decoding above.
+  for (const RescueAttempt& attempt : attempts) {
+    const std::size_t frame_index = attempt.frame_index;
+    if (!attempt.image_read_success) {
       AppendUniqueWarning(
           "Camera-aware outer rescue failed to read image: " +
               frame_sources[frame_index].image_path,
           &summary->warnings);
       continue;
     }
-
-    const OuterTagMultiDetectionResult rescued =
-        rescue_detector.DetectMultiple(image);
+    const OuterTagMultiDetectionResult& rescued = attempt.rescued;
     OuterTagMultiDetectionResult* committed =
         &(*regeneration_inputs)[frame_index].outer_detections;
-    for (int board_id : missing_board_ids) {
+    for (int board_id : attempt.missing_board_ids) {
       const OuterTagDetectionResult* rescue_detection =
           FindDetectionByBoardId(rescued, board_id);
       const OuterBoardMeasurement* rescue_measurement =
           FindMeasurementByBoardId(rescued, board_id);
       const OuterTagDetectionResult* baseline_detection =
-          FindDetectionByBoardId(baseline, board_id);
-      if (baseline_has_zero_detections && rescue_detection != nullptr &&
+          FindDetectionByBoardId(*committed, board_id);
+      if (attempt.baseline_has_zero_detections && rescue_detection != nullptr &&
           rescue_detection->attempted_local_patch_rescue) {
         ++summary->zero_detection_atlas_attempted_board_observation_count;
       }
@@ -403,6 +604,25 @@ void RunCameraAwareOuterRescue(
           rescue_detection->hamming < 0 ||
           rescue_detection->hamming > summary->max_hamming) {
         continue;
+      }
+
+      const DirectLayoutRescueValidation geometry_validation =
+          ValidatePatchRescueAgainstDirectLayout(
+              direct_layout, provisional_camera,
+              frame_sources[frame_index].frame_index, *rescue_measurement);
+      if (geometry_validation.evaluable) {
+        ++summary->direct_layout_geometry_gate_evaluated_count;
+        if (geometry_validation.reprojection_rmse_px >
+            summary->direct_layout_geometry_gate_max_rmse_px) {
+          ++summary->direct_layout_geometry_gate_rejected_count;
+          continue;
+        }
+        ++summary->direct_layout_geometry_gate_accepted_count;
+      } else {
+        // Zero-detection frames have no direct same-frame anchor. Preserve the
+        // existing exact-ID recovery path for them; a later global bootstrap
+        // remains responsible for rejecting inconsistent observations.
+        ++summary->direct_layout_geometry_gate_not_evaluable_count;
       }
 
       const std::string baseline_failure_reason =
@@ -1359,6 +1579,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       RunCameraAwareOuterRescue(
           frame_sources, config, provisional_camera,
           options_.camera_aware_outer_rescue_max_hamming,
+          options_.camera_aware_outer_rescue_worker_count,
           &bootstrap_frames, &regeneration_inputs,
           &result.camera_aware_outer_rescue);
       result.runtime_breakdown.camera_aware_outer_rescue_seconds =

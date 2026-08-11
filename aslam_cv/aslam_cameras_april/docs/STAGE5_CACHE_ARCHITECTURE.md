@@ -53,6 +53,11 @@ Stage5 的缓存必须以“结果的真实依赖关系”为边界，而不能�
 `--cache-dir`。算法差异通过根目录内部的 stage/config hash 区分，不需要再
 为每个实验创建新的 cache 目录。
 
+冻结的 Stage5 baseline 在提供 `--cache-dir` 时，始终同时启用两类可复用
+artifact：`outer_detection_final` 与 `internal_refinement`。它们共享同一个
+数据集所有权 manifest，但各自根据语义配置和上游状态签名分层；修改内点
+算法只会新建 internal 层，已有外角结果继续复用。
+
 ## 为什么尚未把当前外角结果直接拆为 raw/refine/rescue 三份
 
 现有 `MultiScaleOuterTagDetector` 在一次 detector 调用中完成多尺度解码、

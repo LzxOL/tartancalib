@@ -75,7 +75,7 @@ std::vector<FrozenRound2BaselineFrameSource> BuildFrameSources(
 
 StereoCameraFixedCalibration ToStereoCameraFixedCalibration(
     const IntermediateCameraConfig& config,
-    const std::string& source_yaml_path) {
+    const std::string& source_label) {
   OuterBootstrapCameraIntrinsics intrinsics;
   intrinsics.camera_model = config.camera_model;
   intrinsics.distortion_model = config.distortion_model;
@@ -92,7 +92,7 @@ StereoCameraFixedCalibration ToStereoCameraFixedCalibration(
   calibration.intrinsics = config.intrinsics;
   calibration.distortion_coeffs = config.distortion_coeffs;
   calibration.resolution = config.resolution;
-  calibration.source_yaml_path = source_yaml_path;
+  calibration.source_label = source_label;
   return calibration;
 }
 

@@ -64,7 +64,7 @@ IntermediateCameraConfig MakeCameraConfig(
   config.intrinsics = calibration.intrinsics;
   config.distortion_coeffs = calibration.distortion_coeffs;
   config.resolution = calibration.resolution;
-  config.camera_yaml = calibration.source_yaml_path;
+  config.camera_yaml.clear();
   return config;
 }
 

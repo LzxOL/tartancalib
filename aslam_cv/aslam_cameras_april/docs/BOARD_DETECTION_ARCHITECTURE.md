@@ -38,6 +38,30 @@
 | `ApriltagInternalDetector.hpp/.cpp` | 单板内角点生成及 homography、sphere、virtual-patch 策略 | 将三种内角点生成策略改为内部策略模块，保持当前分支顺序 |
 | `BoardDetectionPipeline.hpp/.cpp` | 上层阶段门面：统一“外板检测”和“板测量恢复”入口 | 逐步承接阶段状态和结果汇总，但不复制检测算法 |
 | `OuterDetectionResultUtils.hpp` | 构造缺失板的统一失败结果 | 继续集中结果归一化的小型无状态工具 |
+
+## 外板恢复机制与边界
+
+`BoardDetectionPipeline` 只负责组织调用；以下机制仍由其原有实现负责，
+不能把“缺失结果占位”误认为恢复算法。
+
+1. **自适应多尺度解码**：先在低分辨率尺度搜索，必要时回退到更高
+   分辨率尺度；它是第一层外板恢复，适用于标签大小变化。
+2. **Stage5 camera-aware sphere-patch rescue**：完成 provisional DS 相机
+   初始化后，对缺失的已知 tag ID 做球面 patch 重解码，并只提交
+   exact-ID / Hamming-0 的结果。对整帧无直接解码的情况，
+   `camera_aware_sphere_patch_rescue_zero_detection_frames` 默认开启，确保
+   不会因“零初检”而跳过恢复。
+3. **扩展 atlas**：`camera_aware_sphere_patch_use_extended_atlas` 是更昂贵的
+   数据集级加强项，增加边界和宽视场 patch；本 four-board 数据集显式开启。
+4. **外四角 refinement 保护**：close-edge window boost、cornerSubPix 和
+   unstable-rollback guard 改善或拒绝已解码标签的外角；它们不能凭空解码
+   一个缺失 tag。
+5. **geometry-prior / internal pose rescue**：依赖 bootstrap 或已有可见板，
+   用于恢复姿态、外框种子和内点；它们不替代外层 exact-ID 解码，也不能
+   恢复整帧零外板。
+
+`enable_anonymous_tag_like_geometry_rescue` 保持关闭：该策略缺少稳定 ID
+约束，在多板 rig 中可能把板身份分配错误，不能作为标定默认恢复路径。
 | `FrozenRound2BaselinePipeline.cpp` | Stage5 前端完整编排、缓存、bootstrap、两轮 regeneration 和后端衔接 | 继续减少算法细节，只保留阶段调度和 runtime 汇总 |
 | `Stage5BackendDiagnosticWriters.cpp` / `run_stage5_backend_main.cpp` | 诊断文件、CSV、overlay 和命令行流程 | 后续把 artifact writer 从主程序继续下沉 |
 

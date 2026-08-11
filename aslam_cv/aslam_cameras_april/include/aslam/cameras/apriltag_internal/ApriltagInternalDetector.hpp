@@ -185,6 +185,10 @@ struct ApriltagInternalRuntimeBreakdown {
 
 struct ApriltagInternalDetectionResult {
   bool success = false;
+  // This failure also invalidates the outer observation: a border-conditioned
+  // lattice had no image-derived boundary model, so its projected-only
+  // fallback must not reach calibration.
+  bool reject_entire_board_observation = false;
   bool tag_detected = false;
   int board_id = -1;
   cv::Size image_size;

@@ -1,0 +1,52 @@
+# Action Pro5 fov155 dataset-specific Stage5 frontend configuration.
+# The source images are native 7296x5472 Mono8 images and contain the fixed
+# four-board topology with board/tag IDs 1, 3, 4, and 5.
+target_type: apriltag_internal
+tagFamily: t36h11
+tagIds: [1, 3, 4, 5]
+tagSize: 0.15625
+tagSpacing: 0.25
+blackBorderBits: 2
+minVisiblePoints: 12
+canonical_pixels_per_module: 24
+refinement_window_radius: 0
+internal_subpix_window_scale: 0.5
+internal_subpix_window_min: 4
+internal_subpix_window_max: 16
+max_subpix_displacement2: 0.0
+internal_subpix_displacement_scale: 0.25
+max_internal_subpix_displacement: 6.0
+enable_debug_output: true
+internal_projection_mode: sphere_border_lattice
+enable_internal_structure_correction_after_ss: true
+camera_initialization_mode: auto
+resolution: [7296, 5472]
+
+outer_local_context_scale: 0.05
+enable_outer_spherical_refinement: false
+do_outer_subpix_refinement: true
+outer_subpix_scale: 0.3
+outer_subpix_window_max: 0
+enable_close_edge_outer_subpix_boost: true
+close_edge_outer_subpix_area_ratio: 0.012
+close_edge_outer_subpix_min_polar_deg: 40.0
+close_edge_outer_subpix_full_polar_deg: 78.0
+close_edge_outer_subpix_border_ratio: 0.25
+close_edge_outer_subpix_multiplier: 1.1
+close_edge_outer_subpix_max_multiplier: 1.8
+outer_refine_gate_scale: 0.025
+outer_refine_gate_min: 6.0
+enable_adaptive_scale_cascade: true
+adaptive_coarse_scale_divisors: [4.5, 3.5, 2.5]
+adaptive_fallback_scale_divisors: [2.0, 1.5, 1.0]
+adaptive_coarse_max_hamming: 0
+enable_anonymous_tag_like_geometry_rescue: false
+enable_camera_aware_sphere_patch_rescue: true
+camera_aware_sphere_patch_max_hamming: 0
+camera_aware_sphere_patch_commit_mapped_corners: true
+# Attempt the model-aware full-view atlas even when the raw detector found no
+# tag in a frame. Only exact-ID / Hamming-0 patch decodes are committed.
+camera_aware_sphere_patch_rescue_zero_detection_frames: true
+# Keep the wider atlas because this Action Pro5 sequence has strong fisheye
+# deformation toward the image boundary.
+camera_aware_sphere_patch_use_extended_atlas: true

@@ -15,7 +15,6 @@
 #include <iostream>
 #include <map>
 #include <random>
-#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -44,13 +43,9 @@ struct CmdArgs {
   std::string test_right_image_path;
   std::string left_config_path;
   std::string right_config_path;
-  std::string left_intrinsics_path;
-  std::string right_intrinsics_path;
   std::string output_path;
   std::string cache_dir;
-  std::string stereo_reference_camchain_path;
-  std::string stereo_reference_left_intrinsics_path;
-  std::string stereo_reference_right_intrinsics_path;
+  std::string stage6_models = "ds-none";
   std::string stage6_stereo_measurement_source = "all_valid";
   std::string stage6_frame_pairing_mode = "exact_timestamp";
   double stage6_frame_pairing_max_delta_ms = 250.0;
@@ -91,7 +86,7 @@ struct CmdArgs {
   double stage6_spherical_covariance_damping = 1e-8;
   double stage6_spherical_min_sigma_rad = 1e-5;
   double stage6_spherical_max_whitening_weight = 1e5;
-  bool stage6_spherical_use_normalize_jacobian = false;
+  bool stage6_spherical_use_normalize_jacobian = true;
   std::string stage6_rig_param_mode = "cam0_reference";
   double stage6_rig_camera_prior_translation_weight = 1e-6;
   double stage6_rig_camera_prior_rotation_weight = 1e-6;
@@ -177,6 +172,7 @@ struct CmdArgs {
       0.01;
   double stage6_persistent_incremental_projection_prior_principal_sigma_px =
       5.0;
+  double stage6_persistent_incremental_distortion_prior_sigma = 0.02;
   int stage6_adaptive_joint_projection_min_training_pairs = 8;
   int stage6_adaptive_joint_projection_min_shared_pair_boards = 20;
   int stage6_adaptive_joint_projection_min_distinct_boards = 3;
@@ -345,12 +341,9 @@ void PrintUsage(const char* program) {
       << " --left-image DIR --right-image DIR"
       << " [--test-left-image DIR --test-right-image DIR]"
       << " --left-config YAML --right-config YAML"
-      << " --left-intrinsics YAML --right-intrinsics YAML"
+      << " [--models ds-none|pinhole-equi|kb|eucm-none|omni-none|omni-radtan]"
       << " --output OUTPUT_DIR"
       << " [--cache-dir PATH]"
-      << " [--stereo-reference-camchain YAML]"
-      << " [--stereo-reference-left-intrinsics YAML]"
-      << " [--stereo-reference-right-intrinsics YAML]"
       << " [--stage6-stereo-measurement-source backend_selected_only|all_valid]"
       << " [--stage6-frame-pairing-mode exact_timestamp|frame_index]"
       << " [--stage6-frame-pairing-max-delta-ms X]"
@@ -426,6 +419,7 @@ void PrintUsage(const char* program) {
       << " [--stage6-persistent-incremental-projection-prior-shape-sigma X]"
       << " [--stage6-persistent-incremental-projection-prior-focal-relative-sigma X]"
       << " [--stage6-persistent-incremental-projection-prior-principal-sigma-px X]"
+      << " [--stage6-persistent-incremental-distortion-prior-sigma X]"
       << " [--stage6-adaptive-joint-projection-min-training-pairs N]"
       << " [--stage6-adaptive-joint-projection-min-shared-pair-boards N]"
       << " [--stage6-adaptive-joint-projection-min-distinct-boards N]"
@@ -519,9 +513,11 @@ void ApplyStage6BaMode(CmdArgs* args, const std::string& mode) {
                    return static_cast<char>(std::tolower(ch));
                  });
   args->stage6_ba_mode = normalized;
-  args->stage6_fixed_intrinsics_for_spherical = true;
+  // Match Stage5 angular BA: projection updates recompute observed bearings
+  // from the active camera model within the tangent-plane residual.
+  args->stage6_fixed_intrinsics_for_spherical = false;
   args->stage6_spherical_uncertainty_mode = "none";
-  args->stage6_spherical_use_normalize_jacobian = false;
+  args->stage6_spherical_use_normalize_jacobian = true;
   if (normalized == "pixel") {
     args->stage6_final_ba_residual_mode = "pixel";
     args->stage6_selection_ba_residual_mode = "pixel";
@@ -565,22 +561,12 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.left_config_path = argv[++i];
     } else if (token == "--right-config" && i + 1 < argc) {
       args.right_config_path = argv[++i];
-    } else if (token == "--left-intrinsics" && i + 1 < argc) {
-      args.left_intrinsics_path = argv[++i];
-    } else if (token == "--right-intrinsics" && i + 1 < argc) {
-      args.right_intrinsics_path = argv[++i];
+    } else if (token == "--models" && i + 1 < argc) {
+      args.stage6_models = argv[++i];
     } else if (token == "--output" && i + 1 < argc) {
       args.output_path = argv[++i];
     } else if (token == "--cache-dir" && i + 1 < argc) {
       args.cache_dir = argv[++i];
-    } else if (token == "--stereo-reference-camchain" && i + 1 < argc) {
-      args.stereo_reference_camchain_path = argv[++i];
-    } else if (token == "--stereo-reference-left-intrinsics" &&
-               i + 1 < argc) {
-      args.stereo_reference_left_intrinsics_path = argv[++i];
-    } else if (token == "--stereo-reference-right-intrinsics" &&
-               i + 1 < argc) {
-      args.stereo_reference_right_intrinsics_path = argv[++i];
     } else if (token == "--stage6-stereo-measurement-source" && i + 1 < argc) {
       args.stage6_stereo_measurement_source = argv[++i];
     } else if (token == "--stage6-frame-pairing-mode" && i + 1 < argc) {
@@ -984,6 +970,11 @@ CmdArgs ParseArgs(int argc, char** argv) {
         i + 1 < argc) {
       args.stage6_persistent_incremental_projection_prior_principal_sigma_px =
           std::stod(argv[++i]);
+    } else if (token ==
+                   "--stage6-persistent-incremental-distortion-prior-sigma" &&
+               i + 1 < argc) {
+      args.stage6_persistent_incremental_distortion_prior_sigma =
+          std::stod(argv[++i]);
     } else if (
         token == "--stage6-adaptive-joint-projection-min-training-pairs" &&
         i + 1 < argc) {
@@ -1250,21 +1241,11 @@ CmdArgs ParseArgs(int argc, char** argv) {
     throw std::runtime_error(
         "--test-left-image and --test-right-image must be provided together.");
   }
-  const bool has_reference_left =
-      !args.stereo_reference_left_intrinsics_path.empty();
-  const bool has_reference_right =
-      !args.stereo_reference_right_intrinsics_path.empty();
-  if (has_reference_left != has_reference_right) {
-    throw std::runtime_error(
-        "--stereo-reference-left-intrinsics and "
-        "--stereo-reference-right-intrinsics must be provided together.");
-  }
   if (args.left_image_path.empty() || args.right_image_path.empty() ||
       args.left_config_path.empty() || args.right_config_path.empty() ||
-      args.left_intrinsics_path.empty() || args.right_intrinsics_path.empty() ||
       args.output_path.empty()) {
     throw std::runtime_error(
-        "All left/right image/config/intrinsics paths and --output are required.");
+        "All left/right image/config paths and --output are required.");
   }
   return args;
 }
@@ -1323,228 +1304,6 @@ void EnsureDirectoryExists(const fs::path& directory) {
   if (!directory.empty()) {
     fs::create_directories(directory);
   }
-}
-
-double RotationAngleDegrees(const Eigen::Matrix3d& rotation) {
-  const double trace = std::max(-1.0, std::min(3.0, rotation.trace()));
-  const double cos_theta = std::max(-1.0, std::min(1.0, 0.5 * (trace - 1.0)));
-  return std::acos(cos_theta) * 180.0 / M_PI;
-}
-
-struct StereoReferenceComparison {
-  bool success = false;
-  std::string reference_camchain_path;
-  Eigen::Matrix4d reference_T_cam1_cam0 = Eigen::Matrix4d::Identity();
-  double rotation_delta_deg = std::numeric_limits<double>::infinity();
-  double translation_delta_m = std::numeric_limits<double>::infinity();
-  double baseline_length_reference = 0.0;
-  double baseline_length_estimated = 0.0;
-  double baseline_length_delta_m = std::numeric_limits<double>::infinity();
-  std::string failure_reason;
-};
-
-StereoReferenceComparison CompareAgainstStereoReference(
-    const std::string& camchain_path,
-    const Eigen::Matrix4d& estimated_T_cam1_cam0) {
-  StereoReferenceComparison comparison;
-  comparison.reference_camchain_path = camchain_path;
-  if (camchain_path.empty()) {
-    comparison.failure_reason = "missing_reference_camchain";
-    return comparison;
-  }
-  std::ifstream input(camchain_path.c_str());
-  if (!input.is_open()) {
-    comparison.failure_reason = "failed_to_open_reference_camchain: " +
-                                camchain_path;
-    return comparison;
-  }
-  std::vector<std::string> lines;
-  std::string line;
-  while (std::getline(input, line)) {
-    lines.push_back(line);
-  }
-  std::vector<std::vector<double> > rows;
-  bool in_cam1 = false;
-  bool found_transform = false;
-  const std::regex number_regex(
-      "[-+]?(?:\\d*\\.\\d+|\\d+)(?:[eE][-+]?\\d+)?");
-  for (std::size_t index = 0; index < lines.size(); ++index) {
-    std::string stripped = lines[index];
-    const std::size_t comment = stripped.find('#');
-    if (comment != std::string::npos) {
-      stripped = stripped.substr(0, comment);
-    }
-    if (stripped.find("cam1:") != std::string::npos &&
-        stripped.find_first_not_of(" \t") == stripped.find("cam1:")) {
-      in_cam1 = true;
-      continue;
-    }
-    if (in_cam1 && stripped.find_first_not_of(" \t") == 0 &&
-        stripped.find("cam") == 0 && stripped.find("cam1:") == std::string::npos) {
-      in_cam1 = false;
-    }
-    if (!in_cam1 || stripped.find("T_cn_cnm1") == std::string::npos) {
-      continue;
-    }
-    found_transform = true;
-    for (std::size_t row_index = index + 1;
-         row_index < lines.size() && rows.size() < 4; ++row_index) {
-      std::vector<double> values;
-      const std::string row_line = lines[row_index];
-      for (std::sregex_iterator it(row_line.begin(), row_line.end(),
-                                   number_regex),
-           end;
-           it != end; ++it) {
-        values.push_back(std::stod(it->str()));
-      }
-      if (values.size() == 4) {
-        rows.push_back(values);
-      }
-    }
-    break;
-  }
-  if (!found_transform || rows.size() != 4) {
-    comparison.failure_reason =
-        "reference_camchain_missing_valid_cam1_T_cn_cnm1";
-    return comparison;
-  }
-  Eigen::Matrix4d reference = Eigen::Matrix4d::Identity();
-  for (int r = 0; r < 4; ++r) {
-    for (int c = 0; c < 4; ++c) {
-      reference(r, c) = rows[static_cast<std::size_t>(r)]
-                            [static_cast<std::size_t>(c)];
-    }
-  }
-  comparison.reference_T_cam1_cam0 = reference;
-  const Eigen::Matrix3d delta_rotation =
-      reference.block<3, 3>(0, 0).transpose() *
-      estimated_T_cam1_cam0.block<3, 3>(0, 0);
-  comparison.rotation_delta_deg = RotationAngleDegrees(delta_rotation);
-  comparison.translation_delta_m =
-      (reference.block<3, 1>(0, 3) - estimated_T_cam1_cam0.block<3, 1>(0, 3))
-          .norm();
-  comparison.baseline_length_reference = reference.block<3, 1>(0, 3).norm();
-  comparison.baseline_length_estimated =
-      estimated_T_cam1_cam0.block<3, 1>(0, 3).norm();
-  comparison.baseline_length_delta_m =
-      std::abs(comparison.baseline_length_reference -
-               comparison.baseline_length_estimated);
-  comparison.success = true;
-  return comparison;
-}
-
-void WriteStereoReferenceComparison(const std::string& path,
-                                    const StereoReferenceComparison& comparison) {
-  std::ofstream output(path.c_str());
-  output << "success: " << (comparison.success ? 1 : 0) << "\n";
-  output << "failure_reason: " << comparison.failure_reason << "\n";
-  output << "reference_camchain_path: " << comparison.reference_camchain_path
-         << "\n";
-  output << "rotation_delta_deg: " << comparison.rotation_delta_deg << "\n";
-  output << "translation_delta_m: " << comparison.translation_delta_m << "\n";
-  output << "baseline_length_reference: "
-         << comparison.baseline_length_reference << "\n";
-  output << "baseline_length_estimated: "
-         << comparison.baseline_length_estimated << "\n";
-  output << "baseline_length_delta_m: "
-         << comparison.baseline_length_delta_m << "\n";
-  output << "reference_translation_xyz: ["
-         << comparison.reference_T_cam1_cam0(0, 3) << ", "
-         << comparison.reference_T_cam1_cam0(1, 3) << ", "
-         << comparison.reference_T_cam1_cam0(2, 3) << "]\n";
-}
-
-void WriteStereoReferenceHoldoutSummary(
-    const std::string& path,
-    const StereoReferenceComparison& comparison,
-    const ati::StereoResidualSummary& ours_extrinsic_only,
-    const ati::StereoResidualSummary& reference_extrinsic_only) {
-  std::ofstream output(path.c_str());
-  output << "success: "
-         << (comparison.success && reference_extrinsic_only.success ? 1 : 0)
-         << "\n";
-  output << "failure_reason: "
-         << (comparison.success ? reference_extrinsic_only.failure_reason
-                                : comparison.failure_reason)
-         << "\n";
-  output << "reference_camchain_path: " << comparison.reference_camchain_path
-         << "\n";
-  output << "comparison_metric: extrinsic_only_holdout\n";
-  output << "ours_extrinsic_only_holdout_total_stereo_rmse: "
-         << ours_extrinsic_only.total_stereo_rmse << "\n";
-  output << "reference_extrinsic_only_holdout_total_stereo_rmse: "
-         << reference_extrinsic_only.total_stereo_rmse << "\n";
-  output << "ours_minus_reference_extrinsic_only_holdout_total_stereo_rmse: "
-         << (ours_extrinsic_only.total_stereo_rmse -
-             reference_extrinsic_only.total_stereo_rmse) << "\n";
-  output << "ours_extrinsic_only_holdout_cam0_rmse: "
-         << ours_extrinsic_only.cam0_rmse << "\n";
-  output << "reference_extrinsic_only_holdout_cam0_rmse: "
-         << reference_extrinsic_only.cam0_rmse << "\n";
-  output << "ours_extrinsic_only_holdout_cam1_rmse: "
-         << ours_extrinsic_only.cam1_rmse << "\n";
-  output << "reference_extrinsic_only_holdout_cam1_rmse: "
-         << reference_extrinsic_only.cam1_rmse << "\n";
-  output << "ours_extrinsic_only_holdout_outer_only_rmse: "
-         << ours_extrinsic_only.outer_only_rmse << "\n";
-  output << "reference_extrinsic_only_holdout_outer_only_rmse: "
-         << reference_extrinsic_only.outer_only_rmse << "\n";
-  output << "ours_extrinsic_only_holdout_internal_only_rmse: "
-         << ours_extrinsic_only.internal_only_rmse << "\n";
-  output << "reference_extrinsic_only_holdout_internal_only_rmse: "
-         << reference_extrinsic_only.internal_only_rmse << "\n";
-  output << "extrinsic_only_holdout_used_pair_count: "
-         << ours_extrinsic_only.used_pair_count << "\n";
-  output << "reference_extrinsic_only_holdout_used_pair_count: "
-         << reference_extrinsic_only.used_pair_count << "\n";
-  output << "extrinsic_only_holdout_mode: local_stereo_board_pose_refit\n";
-}
-
-void WriteStereoFullReferenceHoldoutSummary(
-    const std::string& path,
-    const StereoReferenceComparison& comparison,
-    const std::string& reference_left_intrinsics_path,
-    const std::string& reference_right_intrinsics_path,
-    const ati::StereoResidualSummary& ours,
-    const ati::StereoResidualSummary& reference_full) {
-  std::ofstream output(path.c_str());
-  output << "success: "
-         << (comparison.success && reference_full.success ? 1 : 0) << "\n";
-  output << "failure_reason: "
-         << (comparison.success ? reference_full.failure_reason
-                                : comparison.failure_reason)
-         << "\n";
-  output << "reference_camchain_path: " << comparison.reference_camchain_path
-         << "\n";
-  output << "reference_left_intrinsics_path: "
-         << reference_left_intrinsics_path << "\n";
-  output << "reference_right_intrinsics_path: "
-         << reference_right_intrinsics_path << "\n";
-  output << "comparison_metric: full_camera_frozen_measurement_holdout\n";
-  output << "measurements_reused_without_redetection: 1\n";
-  output << "ours_holdout_total_stereo_rmse: "
-         << ours.total_stereo_rmse << "\n";
-  output << "reference_full_holdout_total_stereo_rmse: "
-         << reference_full.total_stereo_rmse << "\n";
-  output << "ours_minus_reference_full_holdout_total_stereo_rmse: "
-         << (ours.total_stereo_rmse - reference_full.total_stereo_rmse) << "\n";
-  output << "ours_holdout_cam0_rmse: " << ours.cam0_rmse << "\n";
-  output << "reference_full_holdout_cam0_rmse: "
-         << reference_full.cam0_rmse << "\n";
-  output << "ours_holdout_cam1_rmse: " << ours.cam1_rmse << "\n";
-  output << "reference_full_holdout_cam1_rmse: "
-         << reference_full.cam1_rmse << "\n";
-  output << "ours_holdout_outer_only_rmse: " << ours.outer_only_rmse << "\n";
-  output << "reference_full_holdout_outer_only_rmse: "
-         << reference_full.outer_only_rmse << "\n";
-  output << "ours_holdout_internal_only_rmse: "
-         << ours.internal_only_rmse << "\n";
-  output << "reference_full_holdout_internal_only_rmse: "
-         << reference_full.internal_only_rmse << "\n";
-  output << "ours_holdout_used_pair_count: " << ours.used_pair_count << "\n";
-  output << "reference_full_holdout_used_pair_count: "
-         << reference_full.used_pair_count << "\n";
-  output << "holdout_mode: local_stereo_board_pose_refit\n";
 }
 
 void WriteStereoResidualPerBoardCsv(
@@ -1966,49 +1725,81 @@ ati::StereoMeasurementDataset ApplyStage6BoardMaskingAblation(
   return masked;
 }
 
-MonocularFrontendBundleResult RunFixedIntrinsicsMonocularFrontend(
+std::string NormalizeStage6ModelFamily(std::string model) {
+  std::transform(model.begin(), model.end(), model.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  if (model == "ds" || model == "double_sphere" || model == "double-sphere" ||
+      model == "ds-none") {
+    return "ds-none";
+  }
+  if (model == "kb" || model == "kannala-brandt" ||
+      model == "kannala_brandt" || model == "pinhole-equi") {
+    return "pinhole-equi";
+  }
+  if (model == "eucm" || model == "eucm-none") {
+    return "eucm-none";
+  }
+  if (model == "mei" || model == "ucm" || model == "omni" ||
+      model == "omni-none" || model == "omni_none") {
+    return "omni-none";
+  }
+  if (model == "omni-radtan" || model == "omni_radtan" ||
+      model == "mei-radtan") {
+    return "omni-radtan";
+  }
+  throw std::runtime_error(
+      "Unsupported --models value: " + model +
+      " (supported: ds-none, pinhole-equi/kb, eucm-none, omni-none, omni-radtan)");
+}
+
+void ApplyStage6ModelFamily(const std::string& model_family,
+                            ati::ApriltagInternalConfig* config) {
+  if (config == nullptr) {
+    throw std::runtime_error("ApplyStage6ModelFamily requires a valid config pointer.");
+  }
+  ati::IntermediateCameraConfig camera;
+  camera.resolution = config->intermediate_camera.resolution;
+  const std::string family = NormalizeStage6ModelFamily(model_family);
+  if (family == "ds-none") {
+    camera.camera_model = "ds";
+    camera.distortion_model = "none";
+  } else if (family == "pinhole-equi") {
+    camera.camera_model = "pinhole";
+    camera.distortion_model = "equi";
+  } else if (family == "eucm-none") {
+    camera.camera_model = "eucm";
+    camera.distortion_model = "none";
+  } else if (family == "omni-none") {
+    camera.camera_model = "omni";
+    camera.distortion_model = "none";
+  } else {
+    camera.camera_model = "omni";
+    camera.distortion_model = "radtan";
+  }
+  config->intermediate_camera = camera;
+  config->camera_initialization_mode = ati::CameraInitializationMode::Auto;
+}
+
+MonocularFrontendBundleResult RunAutoMonocularFrontend(
     const std::string& config_path,
-    const std::string& intrinsics_path,
     const std::vector<std::string>& image_paths,
     const std::string& dataset_label,
     const std::string& cache_dir,
     const CmdArgs& args) {
   ati::ApriltagInternalConfig config = ati::ApriltagInternalDetector::LoadConfig(config_path);
-  const ati::IntermediateCameraConfig fixed_intrinsics =
-      ati::LoadExternalCameraConfig(intrinsics_path);
-  if (!fixed_intrinsics.IsConfigured()) {
-    throw std::runtime_error(
-        "Stage6 fixed-intrinsics frontend requires a complete camera model in " +
-        intrinsics_path);
-  }
-  config.intermediate_camera = fixed_intrinsics;
-  config.camera_initialization_mode = ati::CameraInitializationMode::Manual;
-
-  ati::OuterBootstrapCameraIntrinsics explicit_initial_camera;
-  explicit_initial_camera.camera_model = fixed_intrinsics.camera_model;
-  explicit_initial_camera.distortion_model = fixed_intrinsics.distortion_model;
-  explicit_initial_camera.SetIntrinsicsVector(fixed_intrinsics.intrinsics);
-  explicit_initial_camera.SetDistortionVector(fixed_intrinsics.distortion_coeffs);
-  if (fixed_intrinsics.resolution.size() == 2) {
-    explicit_initial_camera.resolution =
-        cv::Size(fixed_intrinsics.resolution[0],
-                 fixed_intrinsics.resolution[1]);
-  }
+  ApplyStage6ModelFamily(args.stage6_models, &config);
 
   ati::FrozenRound2BaselineOptions options;
   options.config = config;
-  options.use_explicit_initial_camera = true;
-  options.explicit_initial_camera = explicit_initial_camera;
-  options.explicit_initial_camera_source_label =
-      "stage6_explicit_fixed_intrinsics";
-  options.optimize_intrinsics = false;
+  options.use_explicit_initial_camera = false;
+  options.optimize_intrinsics = true;
   options.run_second_pass = true;
   options.strict_board_observation_acceptance = true;
   options.enable_board_pose_fit_gate = false;
   options.enable_residual_sanity_gate = true;
   options.dataset_label = dataset_label;
-  options.source_pipeline_label = "stage6_fixed_intrinsics_frontend";
-  options.baseline_protocol_label = "stage6_fixed_intrinsics_frontend";
+  options.source_pipeline_label = "stage6_auto_monocular_frontend";
+  options.baseline_protocol_label = "stage6_auto_monocular_frontend";
   options.training_split_signature = "stereo_all_pairs";
   options.enable_outer_detection_cache = !cache_dir.empty();
   options.outer_detection_cache_dir = cache_dir;
@@ -2051,7 +1842,7 @@ MonocularFrontendBundleResult RunFixedIntrinsicsMonocularFrontend(
   if (!result.success || !result.stage5_bundle_available ||
       !result.final_stage5_bundle.IsReadyForBackend()) {
     throw std::runtime_error(
-        "Failed to build fixed-intrinsics monocular frontend bundle for " +
+        "Failed to build automatic monocular frontend bundle for " +
         dataset_label + ": " + result.failure_reason);
   }
   MonocularFrontendBundleResult frontend_result;
@@ -2086,7 +1877,7 @@ void WriteStage6GeometryPriorDiagnostics(
   report.success = frontend_result.baseline_result.success;
   report.diagnostic_only = true;
   report.dataset_label = frontend_label;
-  report.baseline_protocol_label = "stage6_fixed_intrinsics_frontend";
+  report.baseline_protocol_label = "stage6_auto_monocular_frontend";
   report.split_signature = "stage6_monocular_frontend";
   report.baseline_result = frontend_result.baseline_result;
 
@@ -2097,23 +1888,17 @@ void WriteStage6GeometryPriorDiagnostics(
 }
 
 ati::StereoCameraFixedCalibration ToStereoCalibration(
-    const ati::IntermediateCameraConfig& config,
-    const std::string& source_yaml_path) {
-  ati::OuterBootstrapCameraIntrinsics intrinsics;
-  intrinsics.camera_model = config.camera_model;
-  intrinsics.distortion_model = config.distortion_model;
-  intrinsics.SetIntrinsicsVector(config.intrinsics);
-  intrinsics.SetDistortionVector(config.distortion_coeffs);
-  intrinsics.resolution = cv::Size(config.resolution[0], config.resolution[1]);
+    const ati::OuterBootstrapCameraIntrinsics& intrinsics,
+    const std::string& source_label) {
 
   ati::StereoCameraFixedCalibration calibration;
   calibration.camera_model_family = intrinsics.NormalizedFamilyString();
   calibration.camera_model = intrinsics.NormalizedCameraModel();
   calibration.distortion_model = intrinsics.NormalizedDistortionModel();
-  calibration.intrinsics = config.intrinsics;
-  calibration.distortion_coeffs = config.distortion_coeffs;
-  calibration.resolution = config.resolution;
-  calibration.source_yaml_path = source_yaml_path;
+  calibration.intrinsics = intrinsics.IntrinsicsVector();
+  calibration.distortion_coeffs = intrinsics.DistortionVector();
+  calibration.resolution = {intrinsics.resolution.width, intrinsics.resolution.height};
+  calibration.source_label = source_label;
   return calibration;
 }
 
@@ -2423,22 +2208,22 @@ int main(int argc, char** argv) {
     }
     std::cout << "[Stage6] outer detection cache: " << cache_dir << std::endl;
 
-    std::cout << "[Stage6] building fixed-intrinsics monocular frontend for cam0..."
+    std::cout << "[Stage6] building automatic monocular frontend for cam0..."
               << std::endl;
     const MonocularFrontendBundleResult left_frontend =
-        RunFixedIntrinsicsMonocularFrontend(
-            args.left_config_path, args.left_intrinsics_path, left_image_paths,
+        RunAutoMonocularFrontend(
+            args.left_config_path, left_image_paths,
             "stage6_left_monocular_frontend", cache_dir, args);
     WriteStage6GeometryPriorDiagnostics(
         output_dir, "train_cam0", left_frontend, args);
     const ati::CalibrationStateBundle& left_bundle = left_frontend.bundle;
     std::cout << "[Stage6] cam0 frontend ready." << std::endl;
 
-    std::cout << "[Stage6] building fixed-intrinsics monocular frontend for cam1..."
+    std::cout << "[Stage6] building automatic monocular frontend for cam1..."
               << std::endl;
     const MonocularFrontendBundleResult right_frontend =
-        RunFixedIntrinsicsMonocularFrontend(
-            args.right_config_path, args.right_intrinsics_path, right_image_paths,
+        RunAutoMonocularFrontend(
+            args.right_config_path, right_image_paths,
             "stage6_right_monocular_frontend", cache_dir, args);
     WriteStage6GeometryPriorDiagnostics(
         output_dir, "train_cam1", right_frontend, args);
@@ -2450,19 +2235,19 @@ int main(int argc, char** argv) {
     if (use_cross_dataset_holdout) {
       const CmdArgs holdout_args = MakeHoldoutFrontendArgs(args);
       std::cout
-          << "[Stage6] building fixed-intrinsics monocular frontend for holdout cam0..."
+          << "[Stage6] building automatic monocular frontend for holdout cam0..."
           << std::endl;
-      test_left_frontend = RunFixedIntrinsicsMonocularFrontend(
-          args.left_config_path, args.left_intrinsics_path, test_left_image_paths,
+      test_left_frontend = RunAutoMonocularFrontend(
+          args.left_config_path, test_left_image_paths,
           "stage6_left_monocular_holdout_frontend", cache_dir, holdout_args);
       WriteStage6GeometryPriorDiagnostics(
           output_dir, "holdout_cam0", test_left_frontend, holdout_args);
       std::cout << "[Stage6] holdout cam0 frontend ready." << std::endl;
       std::cout
-          << "[Stage6] building fixed-intrinsics monocular frontend for holdout cam1..."
+          << "[Stage6] building automatic monocular frontend for holdout cam1..."
           << std::endl;
-      test_right_frontend = RunFixedIntrinsicsMonocularFrontend(
-          args.right_config_path, args.right_intrinsics_path, test_right_image_paths,
+      test_right_frontend = RunAutoMonocularFrontend(
+          args.right_config_path, test_right_image_paths,
           "stage6_right_monocular_holdout_frontend", cache_dir, holdout_args);
       WriteStage6GeometryPriorDiagnostics(
           output_dir, "holdout_cam1", test_right_frontend, holdout_args);
@@ -2481,8 +2266,6 @@ int main(int argc, char** argv) {
     problem_input.right_image_path = args.right_image_path;
     problem_input.left_config_path = args.left_config_path;
     problem_input.right_config_path = args.right_config_path;
-    problem_input.left_intrinsics_path = args.left_intrinsics_path;
-    problem_input.right_intrinsics_path = args.right_intrinsics_path;
     problem_input.split_signature = use_cross_dataset_holdout
                                         ? "cross_dataset_holdout"
                                         : "deterministic_stride_" +
@@ -2596,12 +2379,10 @@ int main(int argc, char** argv) {
     problem_input.initial_scene.cam0_is_reference = true;
     problem_input.initial_scene.gauge_fixed_board_id =
         left_bundle.scene_state.reference_board_id;
-    problem_input.initial_scene.cam0 =
-        ToStereoCalibration(ati::LoadExternalCameraConfig(args.left_intrinsics_path),
-                            args.left_intrinsics_path);
-    problem_input.initial_scene.cam1 =
-        ToStereoCalibration(ati::LoadExternalCameraConfig(args.right_intrinsics_path),
-                            args.right_intrinsics_path);
+    problem_input.initial_scene.cam0 = ToStereoCalibration(
+        left_bundle.scene_state.camera, "stage6_auto_left_monocular_frontend");
+    problem_input.initial_scene.cam1 = ToStereoCalibration(
+        right_bundle.scene_state.camera, "stage6_auto_right_monocular_frontend");
     problem_input.solver_options.reference_board_id =
         left_bundle.scene_state.reference_board_id;
     problem_input.solver_options.max_iterations =
@@ -2843,6 +2624,8 @@ int main(int argc, char** argv) {
     problem_input.solver_options
         .persistent_incremental_projection_prior_principal_sigma_px =
         args.stage6_persistent_incremental_projection_prior_principal_sigma_px;
+    problem_input.solver_options.persistent_incremental_distortion_prior_sigma =
+        args.stage6_persistent_incremental_distortion_prior_sigma;
     problem_input.solver_options.adaptive_joint_projection_min_training_pairs =
         args.stage6_adaptive_joint_projection_min_training_pairs;
     problem_input.solver_options
@@ -3011,89 +2794,14 @@ int main(int argc, char** argv) {
     if (result.success) {
       ati::WriteStereoExtrinsicYaml(
           (output_dir / "stereo_extrinsic.yaml").string(), result);
+      ati::WriteStereoFinalCameraYaml(
+          (output_dir / "stereo_final_left_intrinsics.yaml").string(),
+          result, 0);
+      ati::WriteStereoFinalCameraYaml(
+          (output_dir / "stereo_final_right_intrinsics.yaml").string(),
+          result, 1);
       ati::WriteStereoExtrinsicSummary(
           (output_dir / "stereo_extrinsic_summary.txt").string(), result);
-    }
-    if (result.success && !args.stereo_reference_camchain_path.empty()) {
-      const StereoReferenceComparison reference_comparison =
-          CompareAgainstStereoReference(args.stereo_reference_camchain_path,
-                                        result.optimized_scene.T_cam1_cam0);
-      WriteStereoReferenceComparison(
-          (output_dir / "stereo_reference_comparison.txt").string(),
-          reference_comparison);
-      if (reference_comparison.success) {
-        ati::StereoSceneState reference_scene = result.optimized_scene;
-        reference_scene.T_cam1_cam0 =
-            reference_comparison.reference_T_cam1_cam0;
-        ati::StereoResidualEvaluator reference_extrinsic_only_holdout_evaluator(
-            ati::StereoResidualEvaluationOptions{
-                false,
-                problem_input.solver_options.pair_pose_refit_mode,
-                problem_input.solver_options.symmetric_refit_max_iterations,
-                problem_input.solver_options.symmetric_refit_step,
-                true});
-        const ati::StereoResidualSummary
-            reference_extrinsic_only_holdout_summary =
-                reference_extrinsic_only_holdout_evaluator.Evaluate(
-                    problem_input.measurement_dataset, reference_scene,
-                    std::set<int>(
-                        problem_input.measurement_dataset.holdout_pair_indices.begin(),
-                        problem_input.measurement_dataset.holdout_pair_indices.end()),
-                    "reference_holdout_extrinsic_only");
-        WriteStereoReferenceHoldoutSummary(
-            (output_dir / "stereo_reference_holdout_summary.txt").string(),
-            reference_comparison,
-            result.holdout_extrinsic_only_residual_summary,
-            reference_extrinsic_only_holdout_summary);
-        WriteStereoResidualPerBoardCsv(
-            (output_dir /
-             "stereo_reference_extrinsic_only_per_board_residuals.csv")
-                .string(),
-            "reference_holdout_extrinsic_only",
-            reference_extrinsic_only_holdout_summary);
-        if (!args.stereo_reference_left_intrinsics_path.empty() &&
-            !args.stereo_reference_right_intrinsics_path.empty()) {
-          ati::StereoSceneState full_reference_scene = reference_scene;
-          full_reference_scene.cam0 = ToStereoCalibration(
-              ati::LoadExternalCameraConfig(
-                  args.stereo_reference_left_intrinsics_path),
-              args.stereo_reference_left_intrinsics_path);
-          full_reference_scene.cam1 = ToStereoCalibration(
-              ati::LoadExternalCameraConfig(
-                  args.stereo_reference_right_intrinsics_path),
-              args.stereo_reference_right_intrinsics_path);
-          const ati::StereoResidualSummary full_reference_holdout_summary =
-              reference_extrinsic_only_holdout_evaluator.Evaluate(
-                  problem_input.measurement_dataset, full_reference_scene,
-                  std::set<int>(
-                      problem_input.measurement_dataset.holdout_pair_indices.begin(),
-                      problem_input.measurement_dataset.holdout_pair_indices.end()),
-                  "reference_holdout_full_camera");
-          WriteStereoFullReferenceHoldoutSummary(
-              (output_dir / "stereo_reference_full_holdout_summary.txt").string(),
-              reference_comparison,
-              args.stereo_reference_left_intrinsics_path,
-              args.stereo_reference_right_intrinsics_path,
-              result.holdout_extrinsic_only_residual_summary,
-              full_reference_holdout_summary);
-          WriteStereoResidualPerBoardCsv(
-              (output_dir /
-               "stereo_reference_full_per_board_residuals.csv")
-                  .string(),
-              "reference_holdout_full_camera",
-              full_reference_holdout_summary);
-        }
-        if (problem_input.solver_options.export_stereo_reprojection_visualizations) {
-          ati::WriteStereoExtrinsicOnlyTopBadPairBoardVisualizations(
-              (output_dir / "stereo_reprojection_visualizations" /
-               "reference_holdout_extrinsic_only_top_bad_pair_boards")
-                  .string(),
-              result,
-              reference_scene,
-              "reference_holdout_extrinsic_only_top_bad_pair_boards",
-              problem_input.solver_options.stereo_visualization_top_k);
-        }
-      }
     }
     if (result.success) {
       ati::WriteStereoReprojectionSummary(

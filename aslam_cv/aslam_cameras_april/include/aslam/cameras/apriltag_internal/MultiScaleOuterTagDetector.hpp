@@ -91,9 +91,12 @@ struct MultiScaleOuterTagDetectorConfig {
   int camera_aware_sphere_patch_max_hamming = 0;
   bool camera_aware_sphere_patch_commit_mapped_corners = true;
   // A full-view patch atlas is substantially more expensive for a frame with
-  // no initial detections. Keep that recovery tier explicit: a recovered tag
-  // is still required to be an exact requested-ID decode before it is used.
-  bool camera_aware_sphere_patch_rescue_zero_detection_frames = false;
+  // no initial detections. It is enabled by default because otherwise a frame
+  // with visible, strongly distorted boards but no direct AprilTag decode has
+  // no recovery path at all. A recovered tag is still required to be an exact
+  // requested-ID decode before it is used. Set this false only for an explicit
+  // runtime/cost ablation.
+  bool camera_aware_sphere_patch_rescue_zero_detection_frames = true;
   bool camera_aware_sphere_patch_use_extended_atlas = false;
   OuterRefineCameraConfig refine_camera;
 

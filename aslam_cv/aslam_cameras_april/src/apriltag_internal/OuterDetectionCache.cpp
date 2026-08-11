@@ -17,9 +17,9 @@ namespace {
 namespace fs = boost::filesystem;
 
 constexpr const char kCacheFormatVersion[] =
-    "outer_detection_cache_v4_subpix_edge_support_contract";
+    "outer_detection_cache_v6_patch_rescue_edge_support";
 constexpr const char kOuterDetectionStageImplementationVersion[] =
-    "outer_detection_final_v1";
+    "outer_detection_final_v3_patch_rescue_edge_support";
 
 std::uint64_t HashBytes(const std::string& text) {
   std::uint64_t hash = 1469598103934665603ull;

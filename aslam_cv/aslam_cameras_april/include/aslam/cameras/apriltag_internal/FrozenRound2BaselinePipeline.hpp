@@ -147,6 +147,20 @@ struct CameraAwareOuterRescueSummary {
   bool zero_detection_atlas_enabled = false;
   int zero_detection_frame_count = 0;
   int zero_detection_atlas_attempted_board_observation_count = 0;
+  // Number of independent frame-level rescue workers used for this run.  The
+  // final merge remains ordered by frame index, so this is performance-only.
+  int worker_count = 1;
+  // A local patch's exact tag decode is necessary but not sufficient when
+  // other direct boards in the same frame establish a reliable rig pose.
+  // These counters describe the cross-board reprojection gate applied before
+  // a patch result is allowed to affect camera initialization or internals.
+  bool direct_layout_geometry_gate_enabled = false;
+  bool direct_layout_geometry_gate_available = false;
+  double direct_layout_geometry_gate_max_rmse_px = 25.0;
+  int direct_layout_geometry_gate_evaluated_count = 0;
+  int direct_layout_geometry_gate_accepted_count = 0;
+  int direct_layout_geometry_gate_rejected_count = 0;
+  int direct_layout_geometry_gate_not_evaluable_count = 0;
   int rescued_board_observation_count = 0;
   int final_success_count = 0;
   int final_all_boards_frame_count = 0;
@@ -208,9 +222,15 @@ struct FrozenRound2BaselineOptions {
   double checkerboard_initialization_huber_delta_pixels = 1.5;
   bool precomputed_initialization_use_all_points = false;
   std::string precomputed_initialization_point_scope = "all";
-  bool enable_camera_aware_outer_rescue = false;
+  // Frozen baseline: recover missing exact-ID outer tags after provisional
+  // camera initialization. The zero-detection atlas policy lives in
+  // config.outer_detector_config and defaults to enabled.
+  bool enable_camera_aware_outer_rescue = true;
   bool rerun_camera_initialization_after_outer_rescue = true;
   int camera_aware_outer_rescue_max_hamming = 0;
+  // Zero selects a bounded automatic worker count.  Each worker owns its
+  // AprilTag detector; therefore no detector state is shared across frames.
+  int camera_aware_outer_rescue_worker_count = 0;
   // Auxiliary sessions participate only in camera initialization. Their
   // frame-board observations retain independent poses and never enter the
   // primary session's layout, selection, or backend problem.
@@ -225,11 +245,17 @@ struct FrozenRound2BaselineOptions {
       InternalPoseRescueMode::Enabled;
   double internal_pose_rescue_max_ray_angle_deg = 88.0;
   double internal_pose_rescue_accept_max_outer_rmse = 8.0;
-  bool enable_geometry_prior_outer_seed = false;
-  bool geometry_prior_rescue_diagnostic_only = true;
-  bool geometry_prior_rescue_use_as_observation = false;
+  // Frozen baseline: image-validated geometry-prior candidates may restore a
+  // missing board when a bootstrap/scene pose prior exists. Pure projection is
+  // still never committed without the existing image and pose checks.
+  bool enable_geometry_prior_outer_seed = true;
+  bool geometry_prior_rescue_diagnostic_only = false;
+  bool geometry_prior_rescue_use_as_observation = true;
   bool geometry_prior_rescue_keep_outer_on_internal_failure = false;
-  bool geometry_prior_rescue_allow_geometry_only_pose_refit = false;
+  // A missing board can be identified by the rigid multi-board topology even
+  // when its distorted AprilTag payload is not decodable. This remains gated
+  // by independently visible boards, local image geometry, and pose refit.
+  bool geometry_prior_rescue_allow_geometry_only_pose_refit = true;
   // 0 means adapt from the predicted board pixel scale, positive forces a
   // fixed radius, and negative disables geometry-prior subpixel refinement.
   int geometry_prior_rescue_subpix_window_radius = 0;
@@ -237,7 +263,7 @@ struct FrozenRound2BaselineOptions {
   // starts farther from the true corner than normal decoded-tag refinement.
   double geometry_prior_rescue_max_corner_displacement_px = 0.0;
   double geometry_prior_rescue_min_corner_response_ratio = 0.03;
-  bool geometry_prior_rescue_enable_spherical_refine = false;
+  bool geometry_prior_rescue_enable_spherical_refine = true;
   int geometry_prior_rescue_edge_sample_count = 80;
   int geometry_prior_rescue_edge_search_half_width_px = 6;
   double geometry_prior_rescue_min_edge_support_ratio = 0.45;
@@ -267,15 +293,17 @@ struct FrozenRound2BaselineOptions {
   int intermediate_min_visible_boards = 1;
   std::string dataset_label;
   std::string training_split_signature = "all_frames";
-  std::string baseline_protocol_label = "frozen_round2_v2_kalibr_corner_filter";
+  std::string baseline_protocol_label = "frozen_round2_v3_recovery_cache";
   std::string source_pipeline_label = "frozen_round2_baseline";
+  // When enabled, this single dataset-owned root writes/reads both the
+  // stage-scoped outer-detection artifacts and internal-regeneration artifacts.
   bool enable_outer_detection_cache = false;
   std::string outer_detection_cache_dir;
 };
 
 struct FrozenRound2BaselineResult {
   bool success = false;
-  std::string baseline_protocol_label = "frozen_round2_v2_kalibr_corner_filter";
+  std::string baseline_protocol_label = "frozen_round2_v3_recovery_cache";
   std::string dataset_label;
   std::string training_split_signature = "all_frames";
   int reference_board_id = 1;

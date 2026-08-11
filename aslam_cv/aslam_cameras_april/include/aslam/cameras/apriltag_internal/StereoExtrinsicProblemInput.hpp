@@ -130,7 +130,9 @@ struct StereoCameraFixedCalibration {
   std::vector<double> intrinsics;
   std::vector<double> distortion_coeffs;
   std::vector<int> resolution;
-  std::string source_yaml_path;
+  // Provenance for an in-process camera seed. This is intentionally a label,
+  // never a path to externally calibrated intrinsics.
+  std::string source_label;
 
   bool IsValid() const {
     return !camera_model_family.empty() &&
@@ -286,7 +288,9 @@ struct StereoExtrinsicSolverOptions {
   double spherical_covariance_damping = 1e-8;
   double spherical_min_sigma_rad = 1e-5;
   double spherical_max_whitening_weight = 1e5;
-  bool spherical_use_normalize_jacobian = false;
+  // Tangent-plane residuals differentiate the normalized predicted bearing.
+  // This is immaterial for pixel mode and required for a consistent angular BA.
+  bool spherical_use_normalize_jacobian = true;
   StereoRigParamMode rig_param_mode = StereoRigParamMode::Cam0Reference;
   double rig_camera_prior_translation_weight = 1e-6;
   double rig_camera_prior_rotation_weight = 1e-6;
@@ -398,6 +402,9 @@ struct StereoExtrinsicSolverOptions {
   double persistent_incremental_projection_prior_shape_sigma = 0.01;
   double persistent_incremental_projection_prior_focal_relative_sigma = 0.01;
   double persistent_incremental_projection_prior_principal_sigma_px = 5.0;
+  // Distortion parameters are regularized around the in-process monocular
+  // seed whenever the selected joint-intrinsics policy enables them.
+  double persistent_incremental_distortion_prior_sigma = 0.02;
   int adaptive_joint_projection_min_training_pairs = 8;
   int adaptive_joint_projection_min_shared_pair_boards = 20;
   int adaptive_joint_projection_min_distinct_boards = 3;
@@ -603,8 +610,6 @@ struct StereoExtrinsicProblemInput {
   std::string right_image_path;
   std::string left_config_path;
   std::string right_config_path;
-  std::string left_intrinsics_path;
-  std::string right_intrinsics_path;
   std::string split_signature;
   std::string measurement_source_mode;
   StereoMeasurementDataset measurement_dataset;
@@ -1013,11 +1018,16 @@ struct StereoPairBoardTrialSelectionSummary {
   bool incremental_estimator_enabled = false;
   bool persistent_incremental_estimator_used = false;
   std::string persistent_incremental_information_group;
+  // Names the residual units used by persistent selection diagnostics. This
+  // avoids reporting tangent-plane radians under a misleading pixel-RMSE label.
+  std::string persistent_incremental_residual_metric_name;
   std::string persistent_pose_structure;
   std::string requested_intrinsics_mode;
   std::string effective_intrinsics_mode;
   bool projection_intrinsics_active = false;
   bool projection_prior_enabled = false;
+  bool distortion_intrinsics_active = false;
+  bool distortion_prior_enabled = false;
   std::string projection_release_reason;
   int projection_policy_training_pair_count = 0;
   int projection_policy_shared_pair_board_count = 0;
@@ -1026,6 +1036,7 @@ struct StereoPairBoardTrialSelectionSummary {
   double projection_prior_shape_sigma = 0.0;
   double projection_prior_focal_relative_sigma = 0.0;
   double projection_prior_principal_sigma_px = 0.0;
+  double distortion_prior_sigma = 0.0;
   int persistent_incremental_seed_batch_count = 0;
   int persistent_incremental_seed_pair_count = 0;
   int persistent_incremental_seed_pair_board_count = 0;
@@ -1207,6 +1218,11 @@ StereoFrontendImagePairSelection SelectStereoFrontendImagePairs(
 
 void WriteStereoExtrinsicYaml(const std::string& path,
                               const StereoExtrinsicCalibrationResult& result);
+// Exports the optimized in-process camera calibration in the canonical
+// single-camera cam0 YAML shape. camera_index is 0 for left and 1 for right.
+void WriteStereoFinalCameraYaml(const std::string& path,
+                                const StereoExtrinsicCalibrationResult& result,
+                                int camera_index);
 void WriteStereoExtrinsicSummary(const std::string& path,
                                  const StereoExtrinsicCalibrationResult& result);
 void WriteStereoReprojectionSummary(const std::string& path,

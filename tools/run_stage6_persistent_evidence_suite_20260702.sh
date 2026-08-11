@@ -31,10 +31,8 @@ run_stage6_common() {
     --test-right-image "${holdout_dataset}/right" \
     --left-config "${LEFT_CONFIG}" \
     --right-config "${RIGHT_CONFIG}" \
-    --left-intrinsics "${LEFT_INTRINSICS}" \
-    --right-intrinsics "${RIGHT_INTRINSICS}" \
-    --stereo-reference-camchain "${REFERENCE_CAMCHAIN}" \
-    --output "${output_dir}" \
+  --models ds-none \
+  --output "${output_dir}" \
     --cache-dir "${cache_dir}" \
     --stage6-solver-mode global_sparse_ba \
     --stage6-skip-final-global-ba \
@@ -84,9 +82,7 @@ run_stage6_common \
   --test-right-image "${DATA_144928_CLEAR}/right" \
   --left-config "${LEFT_CONFIG}" \
   --right-config "${RIGHT_CONFIG}" \
-  --left-intrinsics "${LEFT_INTRINSICS}" \
-  --right-intrinsics "${RIGHT_INTRINSICS}" \
-  --stereo-reference-camchain "${REFERENCE_CAMCHAIN}" \
+  --models ds-none \
   --output "${OUT_ROOT}/stage6_persistent_incremental_rejection_smoke_${TAG}_1444190clear_to_144928clear" \
   --cache-dir "${CACHE_ROOT}/.stage6_persistent_incremental_metricclean_smoke_${TAG}_cache" \
   --stage6-solver-mode global_sparse_ba \
@@ -107,12 +103,12 @@ python3 tools/summarize_stage6_stereo_experiments.py \
   "${OUT_ROOT}/stage6_persistent_incremental_rejection_smoke_${TAG}_1444190clear_to_144928clear" \
   --output-dir "${SUMMARY_DIR}"
 
-python3 tools/verify_stage6_persistent_outputs.py --require-reference --write-report \
+python3 tools/verify_stage6_persistent_outputs.py --write-report \
   "${OUT_ROOT}/stage6_persistent_incremental_ref_cross_clean_${TAG}_1444190clear_to_144928clear" \
   "${OUT_ROOT}/stage6_persistent_incremental_reverse_ref_cross_${TAG}_144928clear_to_1444190clear"
 
 python3 tools/verify_stage6_persistent_outputs.py \
-  --require-reference \
+  \
   --require-rejection \
   --write-report \
   "${OUT_ROOT}/stage6_persistent_incremental_rejection_smoke_${TAG}_1444190clear_to_144928clear"

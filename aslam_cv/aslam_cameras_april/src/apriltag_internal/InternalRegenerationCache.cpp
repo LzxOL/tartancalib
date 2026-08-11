@@ -20,9 +20,9 @@ namespace {
 namespace fs = boost::filesystem;
 
 constexpr const char kCacheFormatVersion[] =
-    "internal_regeneration_cache_v1_measurements";
+    "internal_regeneration_cache_v2_require_border_model";
 constexpr const char kStageImplementationVersion[] =
-    "internal_refinement_v1";
+    "internal_refinement_v2_require_border_model";
 constexpr const char kArtifactSchemaVersion[] =
     "internal_regeneration_frame_v1";
 
@@ -439,6 +439,8 @@ void WriteDetection(cv::FileStorage* storage,
                     const ApriltagInternalDetectionResult& detection) {
   *storage << "{";
   *storage << "success" << (detection.success ? 1 : 0);
+  *storage << "reject_entire_board_observation"
+           << (detection.reject_entire_board_observation ? 1 : 0);
   *storage << "tag_detected" << (detection.tag_detected ? 1 : 0);
   *storage << "board_id" << detection.board_id;
   *storage << "image_width" << detection.image_size.width;
@@ -534,6 +536,8 @@ void ReadDetection(const cv::FileNode& node,
     return;
   }
   detection->success = ReadScalar<int>(node, "success", 0) != 0;
+  detection->reject_entire_board_observation =
+      ReadScalar<int>(node, "reject_entire_board_observation", 0) != 0;
   detection->tag_detected = ReadScalar<int>(node, "tag_detected", 0) != 0;
   detection->board_id = ReadScalar<int>(node, "board_id", -1);
   detection->image_size.width = ReadScalar<int>(node, "image_width", 0);

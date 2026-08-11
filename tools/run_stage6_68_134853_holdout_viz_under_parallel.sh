@@ -23,10 +23,8 @@ rm -f "${EXIT_FILE}"
     --test-right-image image/datatset_5_1/stereo_dataset_20260430_134853/right \
     --left-config aslam_cv/aslam_cameras_april/config/example_apriltag_internal.yaml \
     --right-config aslam_cv/aslam_cameras_april/config/example_apriltag_internal.yaml \
-    --left-intrinsics config/mono_fisheye_calib_3_25_left-camchain.yaml \
-    --right-intrinsics config/mono_fisheye_calib_3_25_right-camchain.yaml \
-    --stereo-reference-camchain config/stereo_4_2-3-camchain.yaml \
-    --output "${OUTPUT_DIR}" \
+  --models ds-none \
+  --output "${OUTPUT_DIR}" \
     --cache-dir result/.stage6_stereo_cache_clean_144419_to_134853 \
     --stage6-stereo-measurement-source all_valid \
     --stage6-export-pair-board-consistency-audit \

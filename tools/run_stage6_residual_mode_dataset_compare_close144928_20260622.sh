@@ -38,10 +38,8 @@ run_case() {
     --test-right-image "${HOLDOUT_RIGHT}" \
     --left-config "${LEFT_CONFIG}" \
     --right-config "${RIGHT_CONFIG}" \
-    --left-intrinsics "${LEFT_INTRINSICS}" \
-    --right-intrinsics "${RIGHT_INTRINSICS}" \
-    --stereo-reference-camchain "${STEREO_REF}" \
-    --output "${out}" \
+  --models ds-none \
+  --output "${out}" \
     --cache-dir "${cache}" \
     "${residual_args[@]}" \
     > "${out}/run.log" 2>&1

@@ -2845,12 +2845,22 @@ bool ProjectRayOntoBoundaryPlane(const Eigen::Vector3d& plane_normal,
 
 bool BuildBoardSphereBoundaryModel(const DoubleSphereCameraModel& camera,
                                    const OuterTagDetectionResult& outer_detection,
-                                   BoardSphereBoundaryModel* boundary_model) {
+                                   BoardSphereBoundaryModel* boundary_model,
+                                   std::string* failure_reason = nullptr) {
   if (boundary_model == nullptr) {
     throw std::runtime_error("BuildBoardSphereBoundaryModel requires a valid output pointer.");
   }
 
   *boundary_model = BoardSphereBoundaryModel{};
+  if (failure_reason != nullptr) {
+    failure_reason->clear();
+  }
+  const auto fail = [failure_reason](const std::string& reason) {
+    if (failure_reason != nullptr) {
+      *failure_reason = reason;
+    }
+    return false;
+  };
   for (int corner_index = 0; corner_index < 4; ++corner_index) {
     const Eigen::Vector2d& outer_corner =
         outer_detection.refined_corners_original_image[static_cast<std::size_t>(corner_index)];
@@ -2858,7 +2868,8 @@ bool BuildBoardSphereBoundaryModel(const DoubleSphereCameraModel& camera,
                                   cv::Point2f(static_cast<float>(outer_corner.x()),
                                               static_cast<float>(outer_corner.y())),
                                   &boundary_model->outer_corner_rays[static_cast<std::size_t>(corner_index)])) {
-      return false;
+      return fail("outer_corner_" + std::to_string(corner_index) +
+                  " cannot be unprojected");
     }
   }
 
@@ -2868,10 +2879,14 @@ bool BuildBoardSphereBoundaryModel(const DoubleSphereCameraModel& camera,
     BoardBoundaryEdgeModel& edge = boundary_model->edges[static_cast<std::size_t>(edge_index)];
     edge.support_points = CollectBoardEdgeSupportPoints(outer_detection, edge_index);
     if (!UnprojectSupportPointsToRays(camera, edge.support_points, &edge.support_rays)) {
-      return false;
+      return fail("edge_" + std::to_string(edge_index) +
+                  " support rays unavailable (support_points=" +
+                  std::to_string(edge.support_points.size()) + ")");
     }
     if (!FitBoundaryPlaneToRays(edge.support_rays, &edge.plane_normal, &edge.rms_residual)) {
-      return false;
+      return fail("edge_" + std::to_string(edge_index) +
+                  " cannot fit boundary plane (support_rays=" +
+                  std::to_string(edge.support_rays.size()) + ")");
     }
     if (!ProjectRayOntoBoundaryPlane(
             edge.plane_normal,
@@ -2881,7 +2896,8 @@ bool BuildBoardSphereBoundaryModel(const DoubleSphereCameraModel& camera,
             edge.plane_normal,
             boundary_model->outer_corner_rays[static_cast<std::size_t>(edge_end_corner[edge_index])],
             &edge.end_ray)) {
-      return false;
+      return fail("edge_" + std::to_string(edge_index) +
+                  " cannot project outer corners onto boundary plane");
     }
     edge.valid = true;
   }
@@ -2906,15 +2922,12 @@ void StoreBoardBoundaryDebugCurves(const BoardSphereBoundaryModel& boundary_mode
   result->border_edge_valid = {{false, false, false, false}};
   result->border_edge_rms_residual = {{0.0, 0.0, 0.0, 0.0}};
   result->border_edge_support_count = {{0, 0, 0, 0}};
+  result->border_edge_support_ray_count = {{0, 0, 0, 0}};
   for (std::size_t edge_index = 0; edge_index < result->border_curves_image.size(); ++edge_index) {
     result->border_support_points[edge_index].clear();
     result->border_curves_image[edge_index].clear();
     result->border_curves_ray[edge_index].clear();
   }
-  if (!boundary_model.valid) {
-    return;
-  }
-
   for (int edge_index = 0; edge_index < 4; ++edge_index) {
     const BoardBoundaryEdgeModel& edge =
         boundary_model.edges[static_cast<std::size_t>(edge_index)];
@@ -2922,7 +2935,13 @@ void StoreBoardBoundaryDebugCurves(const BoardSphereBoundaryModel& boundary_mode
     result->border_edge_rms_residual[static_cast<std::size_t>(edge_index)] = edge.rms_residual;
     result->border_edge_support_count[static_cast<std::size_t>(edge_index)] =
         static_cast<int>(edge.support_points.size());
+    result->border_edge_support_ray_count[static_cast<std::size_t>(edge_index)] =
+        static_cast<int>(edge.support_rays.size());
     result->border_support_points[static_cast<std::size_t>(edge_index)] = edge.support_points;
+
+    if (!boundary_model.valid || !edge.valid) {
+      continue;
+    }
 
     std::vector<cv::Point2f>& image_curve =
         result->border_curves_image[static_cast<std::size_t>(edge_index)];
@@ -2950,7 +2969,7 @@ void StoreBoardBoundaryDebugCurves(const BoardSphereBoundaryModel& boundary_mode
     }
   }
 
-  result->border_boundary_model_valid = true;
+  result->border_boundary_model_valid = boundary_model.valid;
 }
 
 bool SampleBoundaryEdgeRay(const BoardSphereBoundaryModel& boundary_model,
@@ -3881,16 +3900,28 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
 
   BoardSphereBoundaryModel boundary_model;
   bool has_boundary_model = false;
+  std::string boundary_model_failure_reason;
   if (use_border_conditioned_seed) {
     const auto boundary_start = std::chrono::steady_clock::now();
     has_boundary_model =
-        BuildBoardSphereBoundaryModel(camera, outer_detection, &boundary_model);
+        BuildBoardSphereBoundaryModel(camera, outer_detection, &boundary_model,
+                                      &boundary_model_failure_reason);
     if (runtime_breakdown != nullptr) {
       runtime_breakdown->boundary_model_seconds += ElapsedSeconds(boundary_start);
       runtime_breakdown->boundary_model_build_count += 1;
     }
   }
+  result->border_boundary_model_failure_reason = boundary_model_failure_reason;
   StoreBoardBoundaryDebugCurves(boundary_model, camera, result);
+  if (use_border_conditioned_seed && !has_boundary_model) {
+    result->reject_entire_board_observation = true;
+    result->failure_reason =
+        "sphere_border_lattice_boundary_model_unavailable: " +
+        (boundary_model_failure_reason.empty()
+             ? std::string("missing image-derived edge support")
+             : boundary_model_failure_reason);
+    return;
+  }
 
   InternalStructureCorrectionModel structure_correction;
   if (options.enable_internal_structure_correction_after_ss &&
@@ -5410,6 +5441,10 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
                                                    InternalProjectionMode::SphereRayRefine,
                                                &result.runtime_breakdown,
                                                &result);
+      if (result.reject_entire_board_observation) {
+        result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
+        return result;
+      }
     } else {
       cv::Mat rvec;
       cv::Mat tvec;
