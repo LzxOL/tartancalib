@@ -35,7 +35,8 @@ void AppendUniqueWarning(const std::string& warning,
 std::string MakeCameraAwareRescueSignatureImpl(
     const OuterBootstrapCameraIntrinsics& camera,
     const MultiScaleOuterTagDetectorConfig& config,
-    int max_hamming) {
+    int max_hamming,
+    int reference_board_id) {
   std::ostringstream stream;
   stream << std::setprecision(17)
          << "camera_aware_outer_rescue_v6_robust_missing_board_recovery|family="
@@ -45,7 +46,8 @@ std::string MakeCameraAwareRescueSignatureImpl(
   for (double value : camera.CombinedParameterVector()) {
     stream << value << ",";
   }
-  stream << "|max_hamming=" << max_hamming
+  stream << "|reference_board_id=" << reference_board_id
+         << "|max_hamming=" << max_hamming
          << "|patch_size=640"
          << "|zero_detection="
          << (config.camera_aware_sphere_patch_rescue_zero_detection_frames ? 1 : 0)
@@ -349,14 +351,17 @@ Eigen::Vector2d AverageOuterCorner(const OuterTagDetectionResult& detection) {
 std::string MakeCameraAwareRescueSignature(
     const OuterBootstrapCameraIntrinsics& camera,
     const MultiScaleOuterTagDetectorConfig& config,
-    int max_hamming) {
-  return MakeCameraAwareRescueSignatureImpl(camera, config, max_hamming);
+    int max_hamming,
+    int reference_board_id) {
+  return MakeCameraAwareRescueSignatureImpl(
+      camera, config, max_hamming, reference_board_id);
 }
 
 void RunCameraAwareOuterRescue(
     const std::vector<FrozenRound2BaselineFrameSource>& frame_sources,
     const ApriltagInternalConfig& config,
     const OuterBootstrapCameraIntrinsics& provisional_camera,
+    int reference_board_id,
     int max_hamming,
     int requested_worker_count,
     std::vector<OuterBootstrapFrameInput>* bootstrap_frames,
@@ -406,7 +411,8 @@ void RunCameraAwareOuterRescue(
         "dense_5x5_fov56_plus_wide_3x3_fov72_plus_extended_boundary_atlas";
   }
   const std::string rescue_signature = MakeCameraAwareRescueSignature(
-      provisional_camera, rescue_config, summary->max_hamming);
+      provisional_camera, rescue_config, summary->max_hamming,
+      reference_board_id);
   if (rescue_cache != nullptr && rescue_cache->enabled() &&
       !frame_sources.empty()) {
     std::string cache_warning;
@@ -551,8 +557,7 @@ void RunCameraAwareOuterRescue(
   OuterBootstrapResult direct_layout;
   if (!direct_layout_frames.empty()) {
     OuterBootstrapOptions direct_layout_options;
-    direct_layout_options.reference_board_id =
-        config.tag_ids.empty() ? config.tag_id : config.tag_ids.front();
+    direct_layout_options.reference_board_id = reference_board_id;
     direct_layout_options.initial_camera = provisional_camera;
     direct_layout_options.max_coordinate_descent_iterations = 0;
     direct_layout_options.min_detection_quality =

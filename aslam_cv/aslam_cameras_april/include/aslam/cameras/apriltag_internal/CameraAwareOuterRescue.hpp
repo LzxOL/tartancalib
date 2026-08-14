@@ -14,7 +14,8 @@ namespace apriltag_internal {
 std::string MakeCameraAwareRescueSignature(
     const OuterBootstrapCameraIntrinsics& camera,
     const MultiScaleOuterTagDetectorConfig& config,
-    int max_hamming);
+    int max_hamming,
+    int reference_board_id);
 
 // Runs the frozen camera-aware outer-board recovery stage.  The implementation
 // owns patch detection, direct-layout validation, deterministic merging, and
@@ -24,6 +25,7 @@ void RunCameraAwareOuterRescue(
     const std::vector<FrozenRound2BaselineFrameSource>& frame_sources,
     const ApriltagInternalConfig& config,
     const OuterBootstrapCameraIntrinsics& provisional_camera,
+    int reference_board_id,
     int max_hamming,
     int requested_worker_count,
     std::vector<OuterBootstrapFrameInput>* bootstrap_frames,

@@ -4951,8 +4951,7 @@ void WriteCloseEdgeOuterPoseDiagnostics(
           const ati::CameraModelRefitEvaluationResult& evaluation) {
         for (const ati::CameraModelRefitBoardObservationDiagnostics& board :
              evaluation.board_observation_diagnostics) {
-          if (!board.pose_only_refit_success ||
-              (board.board_id != 4 && board.board_id != 5)) {
+          if (!board.pose_only_refit_success) {
             continue;
           }
           std::vector<Eigen::Vector2d> outer_observed;
@@ -5032,8 +5031,8 @@ void WriteCloseEdgeOuterPoseDiagnostics(
       (output_dir / "close_edge_outer_pose_diagnostics_summary.txt")
           .string()
           .c_str());
-  summary << "purpose: diagnose close-distance edge board4/board5 holdout "
-          << "failures by decomposing outer-corner pose-only refit residuals.\n";
+  summary << "purpose: diagnose close-distance edge-board holdout failures by "
+          << "decomposing outer-corner pose-only refit residuals.\n";
   summary << "methods: frontend_initial, backend_final, kalibr_reference\n";
   summary << "board_csv: "
           << (output_dir / "close_edge_outer_pose_board_diagnostics.csv")

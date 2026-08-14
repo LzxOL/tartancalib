@@ -1211,6 +1211,12 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
                                   options_.progress_report_interval_frames);
 
   ApriltagInternalConfig config = NormalizeConfig(options_.config);
+  if (std::find(config.tag_ids.begin(), config.tag_ids.end(),
+                options_.reference_board_id) == config.tag_ids.end()) {
+    result.failure_reason =
+        "Configured reference_board_id is absent from the explicit tag_ids topology.";
+    return result;
+  }
   config.outer_detector_config.enable_robust_missing_board_recovery =
       options_.enable_robust_missing_board_recovery;
   if (options_.enable_camera_aware_outer_rescue) {
@@ -1497,12 +1503,13 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
               options_.outer_detection_cache_dir,
               Stage5CacheStage::OuterRescue,
               MakeCameraAwareRescueSignature(
-                  provisional_camera, rescue_cache_config,
-                  options_.camera_aware_outer_rescue_max_hamming)});
+              provisional_camera, rescue_cache_config,
+                  options_.camera_aware_outer_rescue_max_hamming,
+                  options_.reference_board_id)});
       const auto rescue_start = std::chrono::steady_clock::now();
       progress.StageStart("camera_aware_outer_rescue", frame_sources.size());
       RunCameraAwareOuterRescue(
-          frame_sources, config, provisional_camera,
+          frame_sources, config, provisional_camera, options_.reference_board_id,
           options_.camera_aware_outer_rescue_max_hamming,
           options_.camera_aware_outer_rescue_worker_count,
           &bootstrap_frames, &regeneration_inputs,
@@ -2157,6 +2164,12 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::RunPrecomputed(
   }
 
   const ApriltagInternalConfig config = NormalizeConfig(options_.config);
+  if (std::find(config.tag_ids.begin(), config.tag_ids.end(),
+                options_.reference_board_id) == config.tag_ids.end()) {
+    result.failure_reason =
+        "Configured reference_board_id is absent from the explicit tag_ids topology.";
+    return result;
+  }
   OuterBootstrapOptions bootstrap_options = MakeBootstrapOptions(config, options_);
 
   AutoCameraInitializationOptions initialization_options;
