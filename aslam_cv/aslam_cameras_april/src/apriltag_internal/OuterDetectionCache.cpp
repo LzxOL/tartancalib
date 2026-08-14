@@ -2,6 +2,7 @@
 #include <aslam/cameras/apriltag_internal/Stage5CacheManifest.hpp>
 
 #include <array>
+#include <cstdio>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -17,9 +18,11 @@ namespace {
 namespace fs = boost::filesystem;
 
 constexpr const char kCacheFormatVersion[] =
-    "outer_detection_cache_v6_patch_rescue_edge_support";
+    "outer_detection_cache_v9_stage_separated";
 constexpr const char kOuterDetectionStageImplementationVersion[] =
-    "outer_detection_final_v3_patch_rescue_edge_support";
+    "outer_detection_final_v6_stage_separated";
+constexpr const char kOuterRescueStageImplementationVersion[] =
+    "outer_rescue_v1_signature_keyed";
 
 std::uint64_t HashBytes(const std::string& text) {
   std::uint64_t hash = 1469598103934665603ull;
@@ -70,6 +73,8 @@ std::string MakeConfigSignature(const MultiScaleOuterTagDetectorConfig& config) 
          << "|blur_sigma=" << config.blur_sigma
          << "|enable_camera_aware_sphere_patch_rescue="
          << (config.enable_camera_aware_sphere_patch_rescue ? 1 : 0)
+         << "|enable_robust_missing_board_recovery="
+         << (config.enable_robust_missing_board_recovery ? 1 : 0)
          << "|camera_aware_sphere_patch_max_hamming="
          << config.camera_aware_sphere_patch_max_hamming
          << "|camera_aware_sphere_patch_commit_mapped_corners="
@@ -145,11 +150,13 @@ std::string AbsoluteNormalizedPath(const std::string& image_path) {
 
 std::uint64_t MakeImageKey(const std::string& absolute_image_path,
                            std::uintmax_t file_size,
-                           std::time_t file_mtime) {
+                           std::time_t file_mtime,
+                           const std::string& cache_key_suffix) {
   std::ostringstream stream;
   stream << absolute_image_path
          << "|size=" << file_size
-         << "|mtime=" << static_cast<long long>(file_mtime);
+         << "|mtime=" << static_cast<long long>(file_mtime)
+         << "|stage_key=" << cache_key_suffix;
   return HashBytes(stream.str());
 }
 
@@ -157,24 +164,33 @@ fs::path LegacyCacheFilePath(const OuterDetectionCacheOptions& options,
                              const std::string& detector_config_hash,
                              const std::string& absolute_image_path,
                              std::uintmax_t file_size,
-                             std::time_t file_mtime) {
+                             std::time_t file_mtime,
+                             const std::string& cache_key_suffix) {
   const std::uint64_t image_key =
-      MakeImageKey(absolute_image_path, file_size, file_mtime);
+      MakeImageKey(absolute_image_path, file_size, file_mtime, cache_key_suffix);
   return fs::path(options.cache_dir) / detector_config_hash /
          (HashToHex(image_key) + ".yml");
 }
 
 fs::path StageCacheFilePath(const OuterDetectionCacheOptions& options,
-                            const std::string& detector_config_hash,
-                            const std::string& absolute_image_path,
-                            std::uintmax_t file_size,
-                            std::time_t file_mtime) {
+                             const std::string& detector_config_hash,
+                             const std::string& absolute_image_path,
+                             std::uintmax_t file_size,
+                             std::time_t file_mtime,
+                             Stage5CacheStage stage,
+                             const std::string& cache_key_suffix) {
   const std::uint64_t image_key =
-      MakeImageKey(absolute_image_path, file_size, file_mtime);
+      MakeImageKey(absolute_image_path, file_size, file_mtime, cache_key_suffix);
   const Stage5CacheManifest manifest(options.cache_dir);
   return fs::path(manifest.StageDirectory(
-             Stage5CacheStage::OuterDetectionFinal, detector_config_hash)) /
+             stage, detector_config_hash)) /
          (HashToHex(image_key) + ".yml");
+}
+
+const char* StageImplementationVersion(Stage5CacheStage stage) {
+  return stage == Stage5CacheStage::OuterRescue
+             ? kOuterRescueStageImplementationVersion
+             : kOuterDetectionStageImplementationVersion;
 }
 
 void WriteVector2dArray(cv::FileStorage* storage,
@@ -592,6 +608,17 @@ void WriteDetection(cv::FileStorage* storage,
            << (detection.used_local_patch_rescue ? 1 : 0);
   *storage << "local_patch_rescue_summary" << detection.local_patch_rescue_summary;
   *storage << "quality" << detection.quality;
+  *storage << "board_quad_consistency_checked"
+           << (detection.board_quad_consistency_checked ? 1 : 0);
+  *storage << "board_quad_consistency_passed"
+           << (detection.board_quad_consistency_passed ? 1 : 0);
+  *storage << "board_quad_worst_corner_index"
+           << detection.board_quad_worst_corner_index;
+  *storage << "board_quad_worst_corner_displacement_px"
+           << detection.board_quad_worst_corner_displacement_px;
+  *storage << "board_quad_area_ratio" << detection.board_quad_area_ratio;
+  *storage << "board_quad_consistency_diagnostic"
+           << detection.board_quad_consistency_diagnostic;
   *storage << "failure_reason" << static_cast<int>(detection.failure_reason);
   *storage << "failure_reason_text" << detection.failure_reason_text;
   WriteVector2dArray(storage, "coarse_corners_scaled_image",
@@ -630,6 +657,22 @@ OuterTagDetectionResult ReadDetection(const cv::FileNode& node) {
   detection.local_patch_rescue_summary =
       static_cast<std::string>(node["local_patch_rescue_summary"]);
   detection.quality = static_cast<double>(node["quality"]);
+  detection.board_quad_consistency_checked =
+      !node["board_quad_consistency_checked"].empty() &&
+      static_cast<int>(node["board_quad_consistency_checked"]) != 0;
+  detection.board_quad_consistency_passed =
+      !node["board_quad_consistency_passed"].empty() &&
+      static_cast<int>(node["board_quad_consistency_passed"]) != 0;
+  if (!node["board_quad_worst_corner_index"].empty()) {
+    detection.board_quad_worst_corner_index =
+        static_cast<int>(node["board_quad_worst_corner_index"]);
+    detection.board_quad_worst_corner_displacement_px =
+        static_cast<double>(node["board_quad_worst_corner_displacement_px"]);
+    detection.board_quad_area_ratio =
+        static_cast<double>(node["board_quad_area_ratio"]);
+    detection.board_quad_consistency_diagnostic =
+        static_cast<std::string>(node["board_quad_consistency_diagnostic"]);
+  }
   detection.failure_reason =
       static_cast<OuterTagFailureReason>(static_cast<int>(node["failure_reason"]));
   detection.failure_reason_text =
@@ -690,6 +733,42 @@ bool OuterDetectionCache::enabled() const {
   return options_.enabled && !options_.cache_dir.empty();
 }
 
+bool OuterDetectionCache::PrepareForDataset(
+    const std::string& image_path, std::string* warning) const {
+  if (warning != nullptr) {
+    warning->clear();
+  }
+  if (!enabled()) {
+    return true;
+  }
+  Stage5CacheManifest manifest(options_.cache_dir);
+  std::string manifest_warning;
+  if (!manifest.EnsureDatasetManifest(
+          MakeStage5DatasetCacheIdentity(image_path), &manifest_warning)) {
+    if (warning != nullptr) {
+      *warning = manifest_warning;
+    }
+    return false;
+  }
+  const Stage5CacheManifestEntry entry{
+      options_.stage,
+      StageImplementationVersion(options_.stage),
+      kCacheFormatVersion,
+      detector_config_hash_,
+      std::vector<std::string>(),
+      options_.stage == Stage5CacheStage::OuterRescue
+          ? "camera-aware outer rescue result keyed by rescue signature"
+          : "outer direct detection result"};
+  if (!manifest.EnsureStageManifest(entry, &manifest_warning)) {
+    if (warning != nullptr) {
+      *warning = manifest_warning;
+    }
+    return false;
+  }
+  manifests_prepared_ = true;
+  return true;
+}
+
 const std::string& OuterDetectionCache::cache_dir() const {
   return options_.cache_dir;
 }
@@ -714,7 +793,7 @@ bool OuterDetectionCache::Load(const std::string& image_path,
 
   const Stage5CacheManifest cache_manifest(options_.cache_dir);
   std::string dataset_warning;
-  if (!cache_manifest.EnsureDatasetManifest(
+  if (!manifests_prepared_ && !cache_manifest.EnsureDatasetManifest(
           MakeStage5DatasetCacheIdentity(image_path), &dataset_warning)) {
     if (warning != nullptr) {
       *warning = dataset_warning;
@@ -733,11 +812,16 @@ bool OuterDetectionCache::Load(const std::string& image_path,
   // expensive outer-detection cache without being rewritten.
   const std::array<fs::path, 2> cache_paths{{
       StageCacheFilePath(options_, detector_config_hash_, absolute_image_path,
-                         file_size, file_mtime),
+                         file_size, file_mtime, options_.stage,
+                         options_.cache_key_suffix),
       LegacyCacheFilePath(options_, detector_config_hash_, absolute_image_path,
-                          file_size, file_mtime)}};
+                          file_size, file_mtime, options_.cache_key_suffix)}};
   std::string last_failure;
-  for (std::size_t cache_index = 0; cache_index < cache_paths.size();
+  const std::size_t cache_path_count =
+      options_.stage == Stage5CacheStage::OuterDetectionFinal
+          ? cache_paths.size()
+          : 1;
+  for (std::size_t cache_index = 0; cache_index < cache_path_count;
        ++cache_index) {
     const fs::path& cache_path = cache_paths[cache_index];
     if (!fs::exists(cache_path)) {
@@ -768,6 +852,10 @@ bool OuterDetectionCache::Load(const std::string& image_path,
     }
 
     OuterTagMultiDetectionResult cached_detection;
+    cached_detection.camera_aware_rescue_attempted =
+        static_cast<int>(storage["camera_aware_rescue_attempted"]) != 0;
+    cached_detection.camera_aware_rescue_signature =
+        static_cast<std::string>(storage["camera_aware_rescue_signature"]);
     const cv::FileNode image_size = storage["image_size"];
     if (image_size.size() >= 2) {
       cached_detection.image_size.width = static_cast<int>(image_size[0]);
@@ -815,7 +903,7 @@ bool OuterDetectionCache::Save(const std::string& image_path,
   try {
     const Stage5CacheManifest manifest(options_.cache_dir);
     std::string dataset_warning;
-    if (!manifest.EnsureDatasetManifest(
+    if (!manifests_prepared_ && !manifest.EnsureDatasetManifest(
             MakeStage5DatasetCacheIdentity(image_path), &dataset_warning)) {
       if (warning != nullptr) {
         *warning = dataset_warning;
@@ -825,14 +913,14 @@ bool OuterDetectionCache::Save(const std::string& image_path,
     const CachedOuterDetectionRecord record =
         MakeRecord(image_path, detector_config_hash_, detection_result);
     const Stage5CacheManifestEntry manifest_entry{
-        Stage5CacheStage::OuterDetectionFinal,
-        kOuterDetectionStageImplementationVersion,
+        options_.stage,
+        StageImplementationVersion(options_.stage),
         kCacheFormatVersion,
         detector_config_hash_,
         std::vector<std::string>(),
-        MakeConfigSignature(config_)};
+        MakeConfigSignature(config_) + "|stage_key=" + options_.cache_key_suffix};
     std::string manifest_warning;
-    if (!manifest.EnsureStageManifest(manifest_entry, &manifest_warning)) {
+    if (!manifests_prepared_ && !manifest.EnsureStageManifest(manifest_entry, &manifest_warning)) {
       if (warning != nullptr) {
         *warning = "Failed to initialize outer detection cache manifest: " +
                    manifest_warning;
@@ -848,7 +936,9 @@ bool OuterDetectionCache::Save(const std::string& image_path,
         detector_config_hash_,
         record.absolute_image_path,
         record.image_file_size,
-        record.image_mtime);
+        record.image_mtime,
+        options_.stage,
+        options_.cache_key_suffix);
     fs::create_directories(cache_path.parent_path());
     const fs::path temporary_path = cache_path.string() + ".tmp.yml";
     {
@@ -867,6 +957,10 @@ bool OuterDetectionCache::Save(const std::string& image_path,
               << static_cast<std::int64_t>(record.image_file_size);
       storage << "image_mtime" << static_cast<long long>(record.image_mtime);
       storage << "detector_config_hash" << record.detector_config_hash;
+      storage << "camera_aware_rescue_attempted"
+              << (record.detection_result.camera_aware_rescue_attempted ? 1 : 0);
+      storage << "camera_aware_rescue_signature"
+              << record.detection_result.camera_aware_rescue_signature;
       storage << "image_size"
               << "[" << record.detection_result.image_size.width
               << record.detection_result.image_size.height << "]";
@@ -882,10 +976,20 @@ bool OuterDetectionCache::Save(const std::string& image_path,
       }
       storage << "]";
     }
-    if (fs::exists(cache_path)) {
-      fs::remove(temporary_path);
-    } else {
-      fs::rename(temporary_path, cache_path);
+    // A rescue pass may improve an existing outer result for the same image.
+    // Replace the cache file atomically so local cache rewrites take effect;
+    // previously this branch discarded the improved result whenever the old
+    // file already existed.
+    if (std::rename(temporary_path.string().c_str(),
+                    cache_path.string().c_str()) != 0) {
+      if (warning != nullptr) {
+        *warning = "Failed to replace outer detection cache: " +
+                   cache_path.string();
+      }
+      if (fs::exists(temporary_path)) {
+        fs::remove(temporary_path);
+      }
+      return false;
     }
     return true;
   } catch (const std::exception& error) {

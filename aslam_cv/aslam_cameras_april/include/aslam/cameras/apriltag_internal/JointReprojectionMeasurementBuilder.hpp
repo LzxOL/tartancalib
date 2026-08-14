@@ -46,6 +46,11 @@ struct JointMeasurementBuildOptions {
   double filter_internal_corner_quality_relaxation_px = 1.0;
   double filter_internal_corner_adaptive_min_threshold_px = 1.0;
   bool enable_internal_observation_quality_weighting = false;
+  // Robust missing-board recovery keeps image-refined internal observations
+  // in the solver instead of applying the legacy outer-only-pose outlier
+  // deletion pass. The detector-level validity and topology checks remain
+  // active; this only removes a duplicated, model-mismatch-prone hard gate.
+  bool robust_missing_board_recovery = false;
   double internal_observation_low_quality_quantile = 0.2;
   double internal_observation_min_weight = 0.25;
   double internal_observation_quality_exponent = 1.0;

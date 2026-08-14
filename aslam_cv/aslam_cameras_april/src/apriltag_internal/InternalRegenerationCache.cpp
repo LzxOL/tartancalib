@@ -20,9 +20,9 @@ namespace {
 namespace fs = boost::filesystem;
 
 constexpr const char kCacheFormatVersion[] =
-    "internal_regeneration_cache_v2_require_border_model";
+      "internal_regeneration_cache_v27_multi_missing_topology_assignment";
 constexpr const char kStageImplementationVersion[] =
-    "internal_refinement_v2_require_border_model";
+      "internal_refinement_v27_multi_missing_topology_assignment";
 constexpr const char kArtifactSchemaVersion[] =
     "internal_regeneration_frame_v1";
 
@@ -385,6 +385,7 @@ void WriteInternalCornerDebug(cv::FileStorage* storage,
   *storage << "bypass_seed_filters" << (debug.bypass_seed_filters ? 1 : 0);
   *storage << "original_seed_filter_success" << (debug.original_seed_filter_success ? 1 : 0);
   *storage << "original_seed_filter_would_reject" << (debug.original_seed_filter_would_reject ? 1 : 0);
+  *storage << "image_refinement_applied" << (debug.image_refinement_applied ? 1 : 0);
   *storage << "valid" << (debug.valid ? 1 : 0);
   *storage << "image_evidence_valid" << (debug.image_evidence_valid ? 1 : 0);
   *storage << "}";
@@ -430,6 +431,7 @@ InternalCornerDebugInfo ReadInternalCornerDebug(const cv::FileNode& node) {
   debug.bypass_seed_filters = static_cast<int>(node["bypass_seed_filters"]) != 0;
   debug.original_seed_filter_success = static_cast<int>(node["original_seed_filter_success"]) != 0;
   debug.original_seed_filter_would_reject = static_cast<int>(node["original_seed_filter_would_reject"]) != 0;
+  debug.image_refinement_applied = static_cast<int>(node["image_refinement_applied"]) != 0;
   debug.valid = static_cast<int>(node["valid"]) != 0;
   debug.image_evidence_valid = static_cast<int>(node["image_evidence_valid"]) != 0;
   return debug;
@@ -802,6 +804,8 @@ std::string MakeInternalConfigSignature(
   AppendVector(&stream, "intermediate_intrinsics", config.intermediate_camera.intrinsics);
   AppendVector(&stream, "intermediate_distortion", config.intermediate_camera.distortion_coeffs);
   AppendVector(&stream, "intermediate_resolution", config.intermediate_camera.resolution);
+  AppendBool(&stream, "outer_enable_robust_missing_board_recovery",
+             config.outer_detector_config.enable_robust_missing_board_recovery);
 
   AppendBool(&stream, "do_subpix_refinement", options.do_subpix_refinement);
   AppendScalar(&stream, "options_max_subpix_displacement2", options.max_subpix_displacement2);
@@ -870,6 +874,40 @@ InternalRegenerationCache::InternalRegenerationCache(
 
 bool InternalRegenerationCache::enabled() const {
   return options_.enabled && !options_.cache_dir.empty();
+}
+
+bool InternalRegenerationCache::PrepareForDataset(
+    const std::string& image_path, std::string* warning) const {
+  if (warning != nullptr) {
+    warning->clear();
+  }
+  if (!enabled()) {
+    return true;
+  }
+  Stage5CacheManifest manifest(options_.cache_dir);
+  std::string manifest_warning;
+  if (!manifest.EnsureDatasetManifest(
+          MakeStage5DatasetCacheIdentity(image_path), &manifest_warning)) {
+    if (warning != nullptr) {
+      *warning = manifest_warning;
+    }
+    return false;
+  }
+  const Stage5CacheManifestEntry entry{
+      Stage5CacheStage::InternalRefinement,
+      kStageImplementationVersion,
+      kArtifactSchemaVersion,
+      semantic_config_hash_,
+      {"outer_detection_final"},
+      "internal regeneration result; per-record parent=outer-result+state"};
+  if (!manifest.EnsureStageManifest(entry, &manifest_warning)) {
+    if (warning != nullptr) {
+      *warning = manifest_warning;
+    }
+    return false;
+  }
+  manifests_prepared_ = true;
+  return true;
 }
 
 const std::string& InternalRegenerationCache::cache_dir() const {
@@ -967,7 +1005,7 @@ bool InternalRegenerationCache::Load(
         MakeStage5DatasetCacheIdentity(image_path);
     Stage5CacheManifest manifest(options_.cache_dir);
     std::string manifest_warning;
-    if (!manifest.EnsureDatasetManifest(identity, &manifest_warning)) {
+    if (!manifests_prepared_ && !manifest.EnsureDatasetManifest(identity, &manifest_warning)) {
       if (warning != nullptr) *warning = manifest_warning;
       ++stats_.load_failures;
       return false;
@@ -980,7 +1018,7 @@ bool InternalRegenerationCache::Load(
     entry.parent_artifact_hashes = {"outer_detection_final"};
     entry.semantic_config_description =
         "internal regeneration result; per-record parent=outer-result+state";
-    if (!manifest.EnsureStageManifest(entry, &manifest_warning)) {
+    if (!manifests_prepared_ && !manifest.EnsureStageManifest(entry, &manifest_warning)) {
       if (warning != nullptr) *warning = manifest_warning;
       ++stats_.load_failures;
       return false;
@@ -1056,7 +1094,7 @@ bool InternalRegenerationCache::Save(
         MakeStage5DatasetCacheIdentity(image_path);
     Stage5CacheManifest manifest(options_.cache_dir);
     std::string manifest_warning;
-    if (!manifest.EnsureDatasetManifest(identity, &manifest_warning)) {
+    if (!manifests_prepared_ && !manifest.EnsureDatasetManifest(identity, &manifest_warning)) {
       if (warning != nullptr) *warning = manifest_warning;
       ++stats_.store_failures;
       return false;
@@ -1069,7 +1107,7 @@ bool InternalRegenerationCache::Save(
     entry.parent_artifact_hashes = {"outer_detection_final"};
     entry.semantic_config_description =
         "internal regeneration result; per-record parent=outer-result+state";
-    if (!manifest.EnsureStageManifest(entry, &manifest_warning)) {
+    if (!manifests_prepared_ && !manifest.EnsureStageManifest(entry, &manifest_warning)) {
       if (warning != nullptr) *warning = manifest_warning;
       ++stats_.store_failures;
       return false;

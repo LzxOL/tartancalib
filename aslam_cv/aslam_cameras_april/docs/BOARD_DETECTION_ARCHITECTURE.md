@@ -2,6 +2,12 @@
 
 本文档描述板检测前端当前已经存在的真实数据流，并约束后续重构的边界。重构的首要不变量是：不改变现有检测顺序、阈值、恢复触发条件、结果字段和诊断输出含义。
 
+本套完整 board/tag 补救、恢复和几何优化逻辑的统一名称是
+**Frozen Stage5 Board Rescue Recovery Stack（FS5-BRRS，Stage5 冻结式
+Board Rescue Recovery Stack）**。后续提到 `FS5-BRRS`、`Stage5 frozen board
+rescue` 或 `baseline board rescue recovery`，均指本文档列出的完整处理栈，
+而不是某一个单独的 detector 分支。
+
 ## 当前数据流
 
 ```text
@@ -14,10 +20,14 @@
        -> camera-aware sphere-patch / zero-detection / geometry rescue
        -> OuterTagDetectionResult
   -> MultiBoardOuterBootstrap
-       -> 根据有效外板建立相机和板姿态初值
+       -> 根据有效外板建立 provisional 相机和板姿态初值
+  -> CameraAwareOuterRescue
+       -> provisional-camera patch recovery
+       -> direct-layout geometry gate
+       -> deterministic frame-order commit and rescue statistics
   -> MultiBoardInternalMeasurementRegenerator
-       -> 几何先验外角点恢复（漏检板）
-       -> 图像证据、拓扑、tag likelihood 和姿态一致性检查
+       -> 几何先验外角点恢复模块（漏检板）
+       -> 姿态先验选择、候选排序和结果提交
        -> ApriltagInternalDetector
             -> homography / pinhole bootstrap patch
             -> sphere lattice / sphere ray refine
@@ -30,14 +40,20 @@
 
 ## 文件职责
 
-| 文件 | 当前职责 | 后续拆分方向 |
+| 文件 | 当前职责 | 维护边界 |
 | --- | --- | --- |
-| `MultiScaleOuterTagDetector.hpp/.cpp` | 外层 tag 解码、多尺度候选、外角点 refinement、融合和 camera-aware 恢复 | 保留公共结果类型；将候选几何、亚像素验证、恢复策略逐步移到内部模块 |
+| `MultiScaleOuterTagDetector.hpp/.cpp` | 外层 tag 解码、多尺度候选、外角点 refinement、融合和 camera-aware 恢复 | 保留外层 detector 的图像级处理；Stage5 的 provisional-camera rescue 不回灌到此处 |
 | `MultiBoardOuterBootstrap.hpp/.cpp` | 使用外板观测估计初始相机、板姿态和可见板状态 | 保持为 bootstrap 阶段，不承载单板检测算法 |
-| `MultiBoardInternalMeasurementRegenerator.hpp/.cpp` | 按帧/按板编排恢复、几何先验候选评估和内角点检测调用 | 拆成 frame orchestration、geometry-prior rescue、result finalization 三层 |
-| `ApriltagInternalDetector.hpp/.cpp` | 单板内角点生成及 homography、sphere、virtual-patch 策略 | 将三种内角点生成策略改为内部策略模块，保持当前分支顺序 |
+| `CameraAwareOuterRescue.hpp/.cpp` | Stage5 provisional camera 之后的 camera-aware patch rescue、zero-detection atlas、direct-layout 几何门控和确定性合并 | 保持为独立的外板恢复模块；不承载内点生成 |
+| `GeometryPriorTopology.hpp/.cpp` | 四边形拓扑有效性、面积/中心/角点顺序归一化，以及 wrong-ID proposal 与几何先验的关联 | 只提供几何关联工具，不直接决定最终观测是否进入标定 |
+| `GeometryPriorOuterRecovery.hpp/.cpp` | 几何先验外角投影、ROI/ray-patch 图像证据、corner refinement、tag likelihood、姿态一致性和候选最终评估 | 保持为无状态候选评估模块，不负责帧级调度和候选选择 |
+| `MultiBoardInternalMeasurementRegenerator.hpp/.cpp` | 按帧/按板编排姿态先验、候选排序提交和内角点检测调用 | 继续保持 frame orchestration 与 result finalization；不重新实现几何恢复细节 |
+| `ApriltagInternalDetector.hpp/.cpp` | 单板内角点生成及 homography、sphere、virtual-patch 策略 | 保持单板内点生成策略及其原有分支顺序；统一结果校验已下沉到 `InternalPointResultValidation` |
+| `InternalPointResultValidation.hpp/.cpp` | 内点结果的拓扑归属、重复点抑制、越界修正和计数重算 | 作为所有内点生成策略之后的统一结果校验层 |
 | `BoardDetectionPipeline.hpp/.cpp` | 上层阶段门面：统一“外板检测”和“板测量恢复”入口 | 逐步承接阶段状态和结果汇总，但不复制检测算法 |
 | `OuterDetectionResultUtils.hpp` | 构造缺失板的统一失败结果 | 继续集中结果归一化的小型无状态工具 |
+| `FrozenRound2BaselinePipeline.cpp` | Stage5 前端完整编排、缓存、bootstrap、两轮 regeneration 和后端衔接 | 只保留阶段调度和 runtime 汇总 |
+| `Stage5BackendDiagnosticWriters.cpp` / `run_stage5_backend_main.cpp` | 诊断文件、CSV、overlay 和命令行流程 | 保持产物字段和路径兼容 |
 
 ## 外板恢复机制与边界
 
@@ -62,8 +78,25 @@
 
 `enable_anonymous_tag_like_geometry_rescue` 保持关闭：该策略缺少稳定 ID
 约束，在多板 rig 中可能把板身份分配错误，不能作为标定默认恢复路径。
-| `FrozenRound2BaselinePipeline.cpp` | Stage5 前端完整编排、缓存、bootstrap、两轮 regeneration 和后端衔接 | 继续减少算法细节，只保留阶段调度和 runtime 汇总 |
-| `Stage5BackendDiagnosticWriters.cpp` / `run_stage5_backend_main.cpp` | 诊断文件、CSV、overlay 和命令行流程 | 后续把 artifact writer 从主程序继续下沉 |
+
+## 当前内点与姿态恢复机制
+
+这些机制仍然由 `ApriltagInternalDetector` 按原有分支顺序执行，统一结果
+校验由 `InternalPointResultValidation` 收口：
+
+1. 外四角或姿态先验提供 homography / pinhole bootstrap seed；
+2. DS sphere-lattice、sphere-ray refine、border-conditioned seed 和
+   virtual-patch seed，按 projection mode 选择；
+3. 当标准外四角不足以稳定求姿态时，使用 internal pose rescue，并由射线角度、
+   外角 RMSE 和姿态质量条件共同限制；
+4. `force_internal_seed_from_prediction`、结构修正和 image-evidence/subpixel
+   refinement 只负责生成或修正内点，不会创建缺失的外板；
+5. 所有策略完成后统一执行拓扑归属、重复 refined corner 抑制、图像边界检查和
+   corner count 重算；内点失败时是否保留已经确认的外四角由 measurement builder
+   的既有策略决定。
+
+因此 recovery 模块负责“候选恢复和姿态先验”，detector 负责“单板内点数值
+生成”，validation 模块负责“结果一致性”；三者不会互相复制接受条件。
 
 ## 结果层次
 
@@ -79,14 +112,34 @@
 - 新增 `BoardDetectionPipeline`，将上层调用明确为外层检测阶段和板测量恢复阶段。
 - Stage5 冻结流程、multi-board regeneration 工具和 joint measurement prep 工具已使用该阶段门面。
 - 重复的缺失板结果构造已集中到 `OuterDetectionResultUtils.hpp`。
+- 将 Stage5 camera-aware outer rescue 从 `FrozenRound2BaselinePipeline.cpp` 移到
+  `CameraAwareOuterRescue`，保留原有 patch、direct-layout gate、并行 worker
+  和确定性合并顺序。
+- 将 geometry-prior 使用的四边形拓扑检查和 wrong-ID proposal 关联移到
+  `GeometryPriorTopology`，保留原有相对阈值和调用时机。
+- 将 geometry-prior 外角恢复的投影、局部图像证据、亚像素、tag likelihood、
+  姿态一致性和候选评估移到 `GeometryPriorOuterRecovery`，主编排文件只保留
+  预测来源、候选排序和最终提交。
+- 将内点结果的统一拓扑/重复点校验移到 `InternalPointResultValidation`，
+  homography、sphere 和 virtual-patch 的生成分支及其顺序保持不变。
 - 没有改变任何检测阈值、恢复条件、算法顺序或结果字段。
 
-## 后续小步重构顺序
+## 当前重构边界与验证要求
 
-1. 在 `MultiBoardInternalMeasurementRegenerator.cpp` 内先提取不改变签名的 frame context 和 per-board finalization 函数。
-2. 将 geometry-prior outer rescue 的纯候选评估移动到独立内部模块；恢复器只负责调用、候选排序和提交策略。
-3. 将 `ApriltagInternalDetector.cpp` 中的内角点生成分支分别移到 homography、sphere-lattice、virtual-patch 内部实现文件。
-4. 将 `MultiScaleOuterTagDetector.cpp` 中的恢复算法和 visualization 分离。
-5. 最后整理 `run_stage5_backend_main.cpp` 的诊断写出函数，并保持 CSV 字段和已有产物路径兼容。
+本轮结构整理已经完成到“阶段编排 / 外板恢复 / 几何先验候选 / 内点结果校验”四个职责层：
 
-每一步都必须通过：编译、frame61（亚像素回退保护）、frame70（顶端板恢复）以及完整 109 帧数据集回归后才能继续下一步。
+1. `FrozenRound2BaselinePipeline` 只编排 Stage5 阶段和诊断输出；camera-aware
+   外板恢复由 `CameraAwareOuterRescue` 承担。
+2. `MultiBoardInternalMeasurementRegenerator` 只负责编排帧级姿态先验、候选
+   排序、板级提交和内点 detector 调用；几何先验外角恢复由
+   `GeometryPriorOuterRecovery` 承担。
+3. `ApriltagInternalDetector` 保留 homography、pinhole bootstrap、sphere
+   lattice 和 virtual-patch 的数值生成分支。它们共享大量相同的图像证据、DS
+   投影、边界模型和运行时状态；继续拆成多个文件会扩大接口面并提高行为漂移
+   风险，因此本轮不做机械拆分。
+4. 所有内点生成分支完成后统一经过 `InternalPointResultValidation`，避免每个
+   策略重复维护拓扑归属、重复点抑制、越界处理和计数重算。
+
+后续任何算法变更都必须保留当前阶段顺序、阈值、结果字段和诊断产物，并至少
+通过编译、frame61（亚像素回退保护）、frame70（顶端板恢复）以及完整 109 帧
+数据集回归。

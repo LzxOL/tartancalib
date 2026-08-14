@@ -62,7 +62,14 @@ struct GeometryPriorOuterSeedCandidate {
   double spherical_refine_min_support_count = 0.0;
   double spherical_refine_max_residual = 0.0;
   std::string spherical_refine_failure_summary;
+  // Both distances are diagnostic only: a locally observed edge quad may
+  // legitimately correct a coarse prediction or image-space seed by many
+  // pixels. Image evidence, quad topology, ID likelihood, and pose consistency
+  // decide whether the refined observation is accepted.
   double max_corner_displacement_px = 0.0;
+  double max_refinement_displacement_px = 0.0;
+  // Legacy diagnostic column retained for artifact-schema compatibility. No
+  // displacement threshold participates in acceptance.
   double adaptive_max_corner_displacement_px =
       std::numeric_limits<double>::quiet_NaN();
   double min_corner_response_ratio = 0.0;

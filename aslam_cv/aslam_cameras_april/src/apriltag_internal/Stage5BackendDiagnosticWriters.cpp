@@ -1076,7 +1076,8 @@ void DrawGeometryPriorSeedCandidate(
         << " | " << (candidate.accepted_as_rescued_observation ? "ACCEPT" : "REJECT")
         << " | outer_rmse=" << std::fixed << std::setprecision(2)
         << candidate.outer_reprojection_rmse
-        << " | disp=" << candidate.max_corner_displacement_px
+        << " | pred_disp=" << candidate.max_corner_displacement_px
+        << " | refine_disp=" << candidate.max_refinement_displacement_px
         << "/" << candidate.adaptive_max_corner_displacement_px
         << " | subpix=" << candidate.subpix_window_radius
         << " | scale=" << candidate.local_corner_scale_px
@@ -1204,7 +1205,8 @@ void WriteGeometryPriorOuterSeedDiagnostics(
       << "spherical_refine_min_support_count,"
       << "spherical_refine_max_residual,"
       << "spherical_refine_failure_summary,"
-      << "max_corner_displacement_px,adaptive_max_corner_displacement_px,"
+      << "max_corner_displacement_px,max_refinement_displacement_px,"
+      << "adaptive_max_corner_displacement_px,"
       << "min_corner_response_ratio,edge_support_ratio,"
       << "mean_edge_gradient_ratio,rectified_patch_checked,"
       << "rectified_patch_decode_success,rectified_patch_detected_tag_id,"
@@ -1325,6 +1327,7 @@ void WriteGeometryPriorOuterSeedDiagnostics(
                 << candidate.spherical_refine_max_residual << ","
                 << CsvEscape(candidate.spherical_refine_failure_summary) << ","
                 << candidate.max_corner_displacement_px << ","
+                << candidate.max_refinement_displacement_px << ","
                 << candidate.adaptive_max_corner_displacement_px << ","
                 << candidate.min_corner_response_ratio << ","
                 << candidate.edge_support_ratio << ","
@@ -1430,16 +1433,7 @@ void WriteGeometryPriorOuterSeedDiagnostics(
   summary << "quad_topology_guard_enabled: 1\n";
   summary << "visible_frame_refit_mode: robust_multi_board_consensus\n";
   summary << "visible_frame_refit_outlier_policy: local_outer_rmse_lt_3px_then_board_median_mad_consensus\n";
-  summary << "corner_displacement_guard_mode: "
-          << (report.baseline_result.effective_options
-                          .geometry_prior_rescue_max_corner_displacement_px < 0.0
-                  ? "disabled_debug"
-                  : (report.baseline_result.effective_options
-                                 .geometry_prior_rescue_max_corner_displacement_px ==
-                             0.0
-                         ? "scale_adaptive"
-                         : "fixed_px"))
-          << "\n";
+  summary << "corner_displacement_guard_mode: diagnostic_only\n";
   summary << "normal_detected_outer_observation_count: "
           << normal_detected_outer_count << "\n";
   summary << "geometry_prior_seed_count: " << geometry_prior_seed_count
@@ -2533,6 +2527,22 @@ cv::Scalar InternalPointFilterColor(
       ati::JointRejectionReasonCode::InternalRegenerationFailed) {
     return cv::Scalar(220, 0, 220);
   }
+  // A frame pose can be unavailable even when an internal corner was
+  // successfully regenerated. Keep that state visibly distinct from a
+  // frontend-invalid corner, otherwise this diagnostic suggests a detector
+  // failure where the bootstrap scene is actually the limiting stage.
+  if (point.rejection_reason_code ==
+      ati::JointRejectionReasonCode::FrameNotInitialized) {
+    return cv::Scalar(255, 180, 40);
+  }
+  // The point can be frontend-valid yet excluded by a board/scene-level
+  // condition (for example reference connectivity or a missing board pose).
+  // Render that state in blue instead of the ambiguous gray fallback so a
+  // valid detected corner is not mistaken for a frontend-invalid result.
+  if (point.rejection_reason_code !=
+      ati::JointRejectionReasonCode::InternalPointInvalid) {
+    return cv::Scalar(255, 120, 40);
+  }
   return cv::Scalar(170, 170, 170);
 }
 
@@ -2629,13 +2639,13 @@ void DrawInternalPointFilterOverlay(
   cv::putText(*output, "Internal point filter overlay",
               cv::Point(16, 30), cv::FONT_HERSHEY_SIMPLEX, 0.58,
               cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-  cv::putText(*output, "green=solver-ready internal  red=invalid  orange=local geometry outlier",
+  cv::putText(*output, "green=solver-ready  red=frontend-invalid  orange=local geometry outlier",
               cv::Point(16, 54), cv::FONT_HERSHEY_SIMPLEX, 0.42,
               cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-  cv::putText(*output, "magenta=regen failed  gray=other rejected  cyan cross=outer corners  label q=quality",
+  cv::putText(*output, "blue=frontend-valid, frame pose unavailable  magenta=regen failed  gray=other rejected",
               cv::Point(16, 76), cv::FONT_HERSHEY_SIMPLEX, 0.42,
               cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-  cv::putText(*output, "cyan boxes=outer subpix window; boost=1 means polar close-edge window enlarged.",
+  cv::putText(*output, "cyan cross=outer corners; cyan boxes=outer subpix window; boost=1 means enlarged window.",
               cv::Point(16, 98), cv::FONT_HERSHEY_SIMPLEX, 0.42,
               cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
 
@@ -2649,6 +2659,7 @@ void DrawInternalPointFilterOverlay(
     int invalid_internal = 0;
     int outlier_internal = 0;
     int regen_failed_internal = 0;
+    int frame_pose_unavailable_internal = 0;
     int other_rejected_internal = 0;
     cv::Point2f board_center(0.0f, 0.0f);
     std::vector<cv::Point> outer_polygon;
@@ -2681,6 +2692,9 @@ void DrawInternalPointFilterOverlay(
       } else if (point.rejection_reason_code ==
                  ati::JointRejectionReasonCode::InternalRegenerationFailed) {
         ++regen_failed_internal;
+      } else if (point.rejection_reason_code ==
+                 ati::JointRejectionReasonCode::FrameNotInitialized) {
+        ++frame_pose_unavailable_internal;
       } else {
         ++other_rejected_internal;
       }
@@ -2804,6 +2818,7 @@ void DrawInternalPointFilterOverlay(
             << " invalid=" << invalid_internal
             << " outlier=" << outlier_internal
             << " regen_fail=" << regen_failed_internal
+            << " frame_pose_unavailable=" << frame_pose_unavailable_internal
             << " other=" << other_rejected_internal
             << " boost=" << (outer_subpix_boost ? 1 : 0)
             << " polar=" << std::fixed << std::setprecision(1)
@@ -2828,6 +2843,7 @@ void DrawInternalPointFilterOverlay(
             << used_internal << " invalid=" << invalid_internal
             << " outlier=" << outlier_internal
             << " regen_failed=" << regen_failed_internal
+            << " frame_pose_unavailable=" << frame_pose_unavailable_internal
             << " other=" << other_rejected_internal;
       if (!board->points.empty()) {
         const int frame_index = board->points.front().frame_index;
@@ -5622,7 +5638,17 @@ void WriteFrameBoardObservationFlowDiagnostics(
         continue;
       }
       ++internal_filter_board_count;
-      if (internal_used < internal_total) {
+      // Keep every board with a complete outer observation in this overlay.
+      // This diagnostic is also used to inspect outer detections; limiting it
+      // to boards with rejected internal points silently hid healthy boards.
+      int observed_outer = 0;
+      for (const ati::JointPointObservation& point : board.points) {
+        if (point.point_type == ati::JointPointType::Outer &&
+            point.image_xy.allFinite()) {
+          ++observed_outer;
+        }
+      }
+      if (observed_outer == 4 || internal_used < internal_total) {
         ++internal_filter_partial_board_count;
         internal_filter_boards_by_frame[frame.frame_index].push_back(&board);
       }

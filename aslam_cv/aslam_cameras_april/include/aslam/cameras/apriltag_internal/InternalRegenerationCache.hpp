@@ -39,6 +39,9 @@ class InternalRegenerationCache {
   const std::string& cache_dir() const;
   const std::string& semantic_config_hash() const;
 
+  bool PrepareForDataset(const std::string& image_path,
+                         std::string* warning) const;
+
   bool Load(const std::string& image_path,
             const InternalRegenerationFrameInput& frame_input,
             const std::string& state_signature,
@@ -64,6 +67,7 @@ class InternalRegenerationCache {
   ApriltagInternalDetectionOptions detection_options_;
   InternalRegenerationCacheOptions options_;
   std::string semantic_config_hash_;
+  mutable bool manifests_prepared_ = false;
   mutable InternalRegenerationCacheStats stats_;
 };
 

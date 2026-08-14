@@ -6,6 +6,7 @@
 #include <string>
 
 #include <aslam/cameras/apriltag_internal/MultiScaleOuterTagDetector.hpp>
+#include <aslam/cameras/apriltag_internal/Stage5CacheManifest.hpp>
 
 namespace aslam {
 namespace cameras {
@@ -14,6 +15,10 @@ namespace apriltag_internal {
 struct OuterDetectionCacheOptions {
   bool enabled = false;
   std::string cache_dir;
+  Stage5CacheStage stage = Stage5CacheStage::OuterDetectionFinal;
+  // Optional stage-local key material. Rescue results include the exact
+  // provisional-camera signature so they cannot overwrite raw detections.
+  std::string cache_key_suffix;
 };
 
 struct CachedOuterDetectionRecord {
@@ -49,6 +54,9 @@ class OuterDetectionCache {
   const std::string& cache_dir() const;
   const std::string& detector_config_hash() const;
 
+  bool PrepareForDataset(const std::string& image_path,
+                         std::string* warning) const;
+
   bool Load(const std::string& image_path,
             OuterTagMultiDetectionResult* detection_result,
             std::string* warning,
@@ -61,6 +69,7 @@ class OuterDetectionCache {
   MultiScaleOuterTagDetectorConfig config_;
   OuterDetectionCacheOptions options_;
   std::string detector_config_hash_;
+  mutable bool manifests_prepared_ = false;
 };
 
 }  // namespace apriltag_internal

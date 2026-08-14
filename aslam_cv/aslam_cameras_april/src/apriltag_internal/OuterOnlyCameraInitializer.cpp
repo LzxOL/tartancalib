@@ -1,6 +1,7 @@
 #include <aslam/cameras/apriltag_internal/OuterOnlyCameraInitializer.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -11,6 +12,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1281,7 +1283,8 @@ AutoCameraInitializationCandidate EvaluateCandidateOnObservations(
     const OuterBootstrapCameraIntrinsics& camera,
     const std::string& source_label,
     const std::string& evaluation_scope,
-    const std::vector<OuterObservationRecord>& observations) {
+    const std::vector<OuterObservationRecord>& observations,
+    double rescued_observation_weight = 1.0) {
   AutoCameraInitializationCandidate candidate;
   candidate.source_label = source_label;
   candidate.evaluation_scope = evaluation_scope;
@@ -1293,7 +1296,8 @@ AutoCameraInitializationCandidate EvaluateCandidateOnObservations(
     return candidate;
   }
 
-  double total_squared_rmse = 0.0;
+  double total_weighted_squared_rmse = 0.0;
+  double successful_observation_weight = 0.0;
   std::set<int> successful_frames;
   std::set<int> successful_boards;
   std::map<int, std::vector<std::pair<int, Eigen::Isometry3d>>>
@@ -1310,7 +1314,13 @@ AutoCameraInitializationCandidate EvaluateCandidateOnObservations(
       continue;
     }
     ++candidate.pose_success_count;
-    total_squared_rmse += observation_rmse * observation_rmse;
+    const double observation_weight =
+        observation.used_local_patch_rescue
+            ? std::max(0.0, rescued_observation_weight)
+            : 1.0;
+    total_weighted_squared_rmse +=
+        observation_weight * observation_rmse * observation_rmse;
+    successful_observation_weight += observation_weight;
     successful_frames.insert(observation.frame_index);
     successful_boards.insert(observation.board_id);
     successful_poses_by_frame[observation.frame_index].push_back(
@@ -1324,10 +1334,10 @@ AutoCameraInitializationCandidate EvaluateCandidateOnObservations(
         static_cast<double>(candidate.pose_success_count) /
         static_cast<double>(candidate.observation_count);
   }
-  if (candidate.pose_success_count > 0) {
+  if (candidate.pose_success_count > 0 && successful_observation_weight > 0.0) {
     candidate.mean_observation_rmse =
-        std::sqrt(total_squared_rmse /
-                  static_cast<double>(candidate.pose_success_count));
+        std::sqrt(total_weighted_squared_rmse /
+                  successful_observation_weight);
     candidate.valid = true;
   } else {
     candidate.failure_reason = "no outer pose fits succeeded";
@@ -1468,10 +1478,12 @@ double ParameterFallbackStep(const std::string& label,
 
 OuterBootstrapCameraIntrinsics RefineCandidateCamera(
     const OuterBootstrapCameraIntrinsics& initial_camera,
-    const std::vector<OuterObservationRecord>& observations) {
+    const std::vector<OuterObservationRecord>& observations,
+    double rescued_observation_weight) {
   OuterBootstrapCameraIntrinsics best = initial_camera;
   AutoCameraInitializationCandidate best_eval =
-      EvaluateCandidateOnObservations(best, "auto_grid_refined", "full", observations);
+      EvaluateCandidateOnObservations(best, "auto_grid_refined", "full",
+                                      observations, rescued_observation_weight);
   double best_objective = CandidateObjective(best_eval);
   if (!std::isfinite(best_objective)) {
     return initial_camera;
@@ -1501,7 +1513,9 @@ OuterBootstrapCameraIntrinsics RefineCandidateCamera(
           continue;
         }
         const AutoCameraInitializationCandidate candidate_eval =
-            EvaluateCandidateOnObservations(candidate, "auto_grid_refined", "full", observations);
+            EvaluateCandidateOnObservations(candidate, "auto_grid_refined", "full",
+                                            observations,
+                                            rescued_observation_weight);
         const double candidate_objective = CandidateObjective(candidate_eval);
         if (candidate_objective + 1e-9 < best_objective) {
           best = candidate;
@@ -2110,6 +2124,18 @@ double PrincipalAwareInformationScore(
          principal_analysis.log_pseudodeterminant;
 }
 
+std::size_t ChooseSelectionWorkerCount(std::size_t candidate_count) {
+  if (candidate_count == 0) {
+    return 0;
+  }
+  const unsigned int hardware_workers = std::thread::hardware_concurrency();
+  const std::size_t usable_workers =
+      hardware_workers > 1 ? static_cast<std::size_t>(hardware_workers - 1) : 1;
+  return std::max<std::size_t>(
+      1, std::min<std::size_t>(candidate_count,
+                               std::min<std::size_t>(usable_workers, 8)));
+}
+
 CameraInformationResult ComputeCameraInformationForObservation(
     const OuterBootstrapCameraIntrinsics& camera,
     const OuterObservationRecord& observation,
@@ -2395,64 +2421,101 @@ std::vector<OuterObservationRecord> SelectKalibrOuterLmObservations(
         coverage_complete
             ? std::max(1e-6, 1e-6 * best_observed_information_gain)
             : 0.0;
+
+    struct CandidateEvaluation {
+      bool usable = false;
+      int new_token_count = 0;
+      double information_gain = 0.0;
+      double score = -std::numeric_limits<double>::infinity();
+    };
+    std::vector<CandidateEvaluation> evaluations(candidates.size());
+    std::atomic<std::size_t> next_candidate(0);
+    const auto evaluate_candidates = [&]() {
+      for (;;) {
+        const std::size_t index = next_candidate.fetch_add(1);
+        if (index >= candidates.size()) {
+          return;
+        }
+        if (selected_indices.count(static_cast<int>(index)) > 0) {
+          continue;
+        }
+        const ObservationCandidate& candidate = candidates[index];
+        if (!candidate.pose_success || candidate.camera_information.rows() == 0) {
+          continue;
+        }
+
+        int new_token_count = 0;
+        for (const std::string& token : candidate.tokens) {
+          if (covered_tokens.count(token) == 0) {
+            ++new_token_count;
+          }
+        }
+        double spacing_bonus = 0.0;
+        if (!selected_frames.empty() && max_frame_index > min_frame_index) {
+          int min_spacing = std::numeric_limits<int>::max();
+          for (int frame_index : selected_frames) {
+            min_spacing = std::min(
+                min_spacing,
+                std::abs(candidate.observation->frame_index - frame_index));
+          }
+          spacing_bonus =
+              static_cast<double>(min_spacing) /
+              static_cast<double>(std::max(1, max_frame_index - min_frame_index));
+        }
+        const Eigen::MatrixXd candidate_total_information =
+            selected_information + candidate.camera_information;
+        const double candidate_information_score =
+            scorer == AutoCameraInitializationSelectionScorer::LegacyFixedPose
+                ? SafeLogDet(candidate_total_information)
+                : PrincipalAwareInformationScore(camera,
+                                                 candidate_total_information);
+        const double information_gain =
+            std::isfinite(candidate_information_score) &&
+                    std::isfinite(current_information_score)
+                ? candidate_information_score - current_information_score
+                : 0.0;
+        evaluations[index].usable = true;
+        evaluations[index].new_token_count = new_token_count;
+        evaluations[index].information_gain = information_gain;
+        evaluations[index].score =
+            static_cast<double>(new_token_count) * 10.0 +
+            0.2 * std::max(0.0, information_gain) + spacing_bonus +
+            1e-6 * candidate.quality_score;
+      }
+    };
+    const std::size_t selection_worker_count =
+        ChooseSelectionWorkerCount(candidates.size());
+    std::vector<std::thread> selection_workers;
+    selection_workers.reserve(selection_worker_count);
+    for (std::size_t worker_index = 0;
+         worker_index < selection_worker_count; ++worker_index) {
+      selection_workers.emplace_back(evaluate_candidates);
+    }
+    for (std::thread& worker : selection_workers) {
+      worker.join();
+    }
+
     int best_index = -1;
     double best_score = -std::numeric_limits<double>::infinity();
     int best_new_token_count = 0;
     double best_information_gain = -std::numeric_limits<double>::infinity();
     for (std::size_t index = 0; index < candidates.size(); ++index) {
-      if (selected_indices.count(static_cast<int>(index)) > 0) {
+      const CandidateEvaluation& evaluation = evaluations[index];
+      if (!evaluation.usable) {
         continue;
       }
-      const ObservationCandidate& candidate = candidates[index];
-      if (!candidate.pose_success || candidate.camera_information.rows() == 0) {
-        continue;
-      }
-      int new_token_count = 0;
-      for (const std::string& token : candidate.tokens) {
-        if (covered_tokens.count(token) == 0) {
-          ++new_token_count;
-        }
-      }
-      double spacing_bonus = 0.0;
-      if (!selected_frames.empty() && max_frame_index > min_frame_index) {
-        int min_spacing = std::numeric_limits<int>::max();
-        for (int frame_index : selected_frames) {
-          min_spacing = std::min(
-              min_spacing,
-              std::abs(candidate.observation->frame_index - frame_index));
-        }
-        spacing_bonus =
-            static_cast<double>(min_spacing) /
-            static_cast<double>(std::max(1, max_frame_index - min_frame_index));
-      }
-      const Eigen::MatrixXd candidate_total_information =
-          selected_information + candidate.camera_information;
-      const double candidate_information_score =
-          scorer == AutoCameraInitializationSelectionScorer::LegacyFixedPose
-              ? SafeLogDet(candidate_total_information)
-              : PrincipalAwareInformationScore(camera,
-                                               candidate_total_information);
-      const double information_gain =
-          std::isfinite(candidate_information_score) &&
-                  std::isfinite(current_information_score)
-              ? candidate_information_score - current_information_score
-              : 0.0;
       best_observed_information_gain =
           std::max(best_observed_information_gain,
-                   std::max(0.0, information_gain));
+                   std::max(0.0, evaluation.information_gain));
       if (coverage_complete &&
-          information_gain < min_useful_information_gain) {
+          evaluation.information_gain < min_useful_information_gain) {
         continue;
       }
-      const double score =
-          static_cast<double>(new_token_count) * 10.0 +
-          0.2 * std::max(0.0, information_gain) +
-          spacing_bonus + 1e-6 * candidate.quality_score;
-      if (score > best_score) {
-        best_score = score;
+      if (evaluation.score > best_score) {
+        best_score = evaluation.score;
         best_index = static_cast<int>(index);
-        best_new_token_count = new_token_count;
-        best_information_gain = information_gain;
+        best_new_token_count = evaluation.new_token_count;
+        best_information_gain = evaluation.information_gain;
       }
     }
     if (best_index < 0) {
@@ -2617,11 +2680,15 @@ std::vector<OuterBootstrapFrameInput> FilterFramesForSelectedObservations(
 BootstrapLayout BuildBootstrapLayoutFromCamera(
     const OuterBootstrapCameraIntrinsics& camera,
     const std::vector<OuterBootstrapFrameInput>& frames,
-    const ApriltagInternalConfig& config) {
+    const ApriltagInternalConfig& config,
+    int reference_board_id) {
   BootstrapLayout layout;
   OuterBootstrapOptions bootstrap_options;
-  bootstrap_options.reference_board_id =
-      config.tag_ids.empty() ? config.tag_id : config.tag_ids.front();
+  bootstrap_options.reference_board_id = reference_board_id;
+  if (bootstrap_options.reference_board_id < 0) {
+    bootstrap_options.reference_board_id =
+        config.tag_ids.empty() ? config.tag_id : config.tag_ids.front();
+  }
   if (bootstrap_options.reference_board_id < 0) {
     bootstrap_options.reference_board_id = 1;
   }
@@ -2786,14 +2853,16 @@ AutoCameraInitializationCandidate EvaluateCandidateWithMultiBoardLayout(
     const OuterBootstrapCameraIntrinsics& camera,
     const std::vector<OuterBootstrapFrameInput>& frames,
     const ApriltagInternalConfig& config,
-    int total_observation_count) {
+    int total_observation_count,
+    int reference_board_id) {
   AutoCameraInitializationCandidate candidate;
   candidate.source_label = "auto_grid_multiboard_layout";
   candidate.evaluation_scope = "layout_full";
   candidate.camera = camera;
   candidate.observation_count = total_observation_count;
   const BootstrapLayout layout =
-      BuildBootstrapLayoutFromCamera(camera, frames, config);
+      BuildBootstrapLayoutFromCamera(camera, frames, config,
+                                     reference_board_id);
   if (!layout.success || !std::isfinite(layout.global_rmse) ||
       layout.used_board_observation_count <= 0) {
     candidate.valid = false;
@@ -2857,11 +2926,12 @@ OuterBootstrapCameraIntrinsics RefineKalibrLikeSeedWithLayoutObjective(
     const std::vector<OuterBootstrapFrameInput>& frames,
     const ApriltagInternalConfig& config,
     int total_observation_count,
+    int reference_board_id,
     std::vector<std::string>* warnings) {
   OuterBootstrapCameraIntrinsics best = initial_camera;
   AutoCameraInitializationCandidate best_eval =
       EvaluateCandidateWithMultiBoardLayout(
-          best, frames, config, total_observation_count);
+          best, frames, config, total_observation_count, reference_board_id);
   double best_objective = LayoutSeedObjective(best_eval);
   if (!std::isfinite(best_objective)) {
     AppendUniqueWarning(
@@ -2901,7 +2971,8 @@ OuterBootstrapCameraIntrinsics RefineKalibrLikeSeedWithLayoutObjective(
         }
         const AutoCameraInitializationCandidate candidate_eval =
             EvaluateCandidateWithMultiBoardLayout(
-                candidate, frames, config, total_observation_count);
+                candidate, frames, config, total_observation_count,
+                reference_board_id);
         const double candidate_objective = LayoutSeedObjective(candidate_eval);
         if (std::isfinite(candidate_objective) &&
             candidate_objective + 1e-6 < best_objective) {
@@ -4027,7 +4098,7 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrOuterLm(
     const std::set<std::string>& additional_fixed_camera_labels = {},
     const std::map<std::pair<int, int>, double>* observation_weights =
         nullptr,
-    double rescued_observation_lm_weight = 0.25) {
+    double rescued_observation_lm_weight = 1.0) {
   KalibrOuterLmRefinementResult result;
   result.camera = initial_camera;
   result.robust_loss_delta_pixels =
@@ -4925,6 +4996,7 @@ void PopulateFixedLayoutDiagnostic(
     const std::vector<OuterBootstrapFrameInput>& frames,
     const std::vector<OuterObservationRecord>& observations,
     const ApriltagInternalConfig& config,
+    int reference_board_id,
     double robust_loss_delta_pixels,
     bool enable_principal_profile,
     double principal_profile_radius_px,
@@ -4938,7 +5010,8 @@ void PopulateFixedLayoutDiagnostic(
       "multiboard_outer_bootstrap_at_selected_camera_then_frozen";
 
   const BootstrapLayout layout =
-      BuildBootstrapLayoutFromCamera(selected_camera, frames, config);
+      BuildBootstrapLayoutFromCamera(selected_camera, frames, config,
+                                     reference_board_id);
   result->stage5_init_fixed_layout_diagnostic_layout_success =
       layout.success ? 1 : 0;
   result->stage5_init_fixed_layout_diagnostic_board_count =
@@ -5766,6 +5839,7 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
       options_.enable_shared_frame_board_constraint ? 1 : 0;
   result.stage5_init_rescued_outer_observation_lm_weight =
       options_.rescued_outer_observation_lm_weight;
+  result.stage5_init_reference_board_id = options_.reference_board_id;
   result.stage5_init_kb_focal_source = "not_applicable";
   result.stage5_init_kb_row_circle_focal_available = 0;
   result.stage5_init_kb_zero_distortion_seed = 0;
@@ -5989,7 +6063,8 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
                                 : "No valid outer observations with four refined corners were available for automatic camera initialization.";
   } else {
     const std::vector<OuterObservationRecord> sampled_observations =
-        SampleObservations(all_observations, options_.max_candidate_observations);
+        SampleObservations(all_observations,
+                           options_.max_candidate_observations);
     result.sampled_observation_count =
         static_cast<int>(sampled_observations.size());
 
@@ -6078,7 +6153,8 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
     }
     for (AutoCameraInitializationCandidate& candidate : candidates) {
       candidate = EvaluateCandidateOnObservations(
-          candidate.camera, candidate.source_label, "sampled", sampled_observations);
+          candidate.camera, candidate.source_label, "sampled",
+          sampled_observations, 1.0);
     }
 
     std::sort(candidates.begin(), candidates.end(), CandidateIsBetter);
@@ -6103,12 +6179,15 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
           options_.refine_mode ==
               AutoCameraInitializationRefineMode::CoordinateSearch) {
         const OuterBootstrapCameraIntrinsics refined_camera =
-            RefineCandidateCamera(best_candidate.camera, all_observations);
+            RefineCandidateCamera(
+                best_candidate.camera, all_observations,
+                options_.rescued_outer_observation_lm_weight);
         const AutoCameraInitializationCandidate refined_eval =
             EvaluateCandidateOnObservations(refined_camera,
                                             "auto_grid_refined",
                                             "full",
-                                            all_observations);
+                                            all_observations,
+                                            options_.rescued_outer_observation_lm_weight);
         if (CandidateObjective(refined_eval) + 1e-9 <
             CandidateObjective(best_candidate)) {
           best_candidate = refined_eval;
@@ -6425,7 +6504,8 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
             // camera is used for basin selection; the board layout itself is
             // not committed to the later Stage5 backend.
             shared_layout = BuildBootstrapLayoutFromCamera(
-                selection_refined.camera, frames, config_);
+                selection_refined.camera, frames, config_,
+                options_.reference_board_id);
             if (shared_layout.success &&
                 !shared_layout.T_reference_board_by_id.empty()) {
               const std::vector<KalibrOuterLmFrameView> shared_frame_views =
@@ -6485,7 +6565,8 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
               EvaluateCandidateOnObservations(selection_refined.camera,
 	                                              lm_source_label,
 	                                              "full",
-	                                              all_observations);
+	                                              all_observations,
+	                                              options_.rescued_outer_observation_lm_weight);
 	          const double seed_objective = CandidateObjective(seed_candidate);
 	          const double refined_objective = CandidateObjective(refined_eval);
 	          const double lm_selection_objective =
@@ -7115,6 +7196,7 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
                                   frames,
                                   all_observations,
                                   config_,
+                                  options_.reference_board_id,
                                   options_.use_direct_dense_control_points
                                       ? options_.dense_grid_lm_huber_delta_pixels
                                       : 0.0,
@@ -7556,6 +7638,8 @@ void WriteAutoCameraInitializationSummary(
          << result.stage5_init_pose_fit_outlier_rejected_count << "\n";
   output << "stage5_init_rescued_outer_observation_count: "
          << result.stage5_init_rescued_outer_observation_count << "\n";
+  output << "stage5_init_reference_board_id: "
+         << result.stage5_init_reference_board_id << "\n";
   output << "stage5_init_rescued_outer_observation_pose_gate_rejected_count: "
          << result.stage5_init_rescued_outer_observation_pose_gate_rejected_count
          << "\n";

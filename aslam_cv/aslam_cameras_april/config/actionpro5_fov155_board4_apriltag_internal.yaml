@@ -12,7 +12,8 @@ canonical_pixels_per_module: 24
 refinement_window_radius: 0
 internal_subpix_window_scale: 0.5
 internal_subpix_window_min: 4
-internal_subpix_window_max: 16
+# 0 means no absolute cap: use half of the locally projected module size.
+internal_subpix_window_max: 0
 max_subpix_displacement2: 0.0
 internal_subpix_displacement_scale: 0.25
 max_internal_subpix_displacement: 6.0
@@ -22,6 +23,11 @@ enable_internal_structure_correction_after_ss: true
 camera_initialization_mode: auto
 resolution: [7296, 5472]
 
+# Action Pro5 frames can contain a fully visible tag whose refined corner lies
+# exactly on the sensor boundary.  The generic 4 px margin falsely rejects
+# that case before outer-corner and internal-point validation.  Coordinates
+# outside the image remain invalid, so genuinely cropped boards are unchanged.
+min_border_distance: 0.0
 outer_local_context_scale: 0.05
 enable_outer_spherical_refinement: false
 do_outer_subpix_refinement: true

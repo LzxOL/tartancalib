@@ -43,6 +43,35 @@ struct OuterRefineCameraConfig {
   }
 };
 
+// Read-only remap data for the fixed camera-aware sphere-patch atlas.  The
+// data depends only on the provisional camera and image geometry, so it can
+// safely be shared by the rescue workers of one run.
+struct CameraAwareSpherePatchAtlasEntry {
+  std::string label;
+  cv::Point2f center_image{};
+  Eigen::Vector3d center_ray = Eigen::Vector3d::Zero();
+  Eigen::Vector3d tangent_x = Eigen::Vector3d::Zero();
+  Eigen::Vector3d tangent_y = Eigen::Vector3d::Zero();
+  double fov_deg = 0.0;
+  bool zero_detection_fine = false;
+  cv::Mat map_x;
+  cv::Mat map_y;
+};
+
+struct CameraAwareSpherePatchAtlas {
+  cv::Size image_size;
+  int patch_size = 0;
+  double cx = 0.0;
+  double cy = 0.0;
+  std::vector<CameraAwareSpherePatchAtlasEntry> entries;
+};
+
+std::shared_ptr<const CameraAwareSpherePatchAtlas>
+BuildCameraAwareSpherePatchAtlas(const OuterRefineCameraConfig& camera_config,
+                                 const cv::Size& image_size,
+                                 bool use_extended_atlas,
+                                 bool include_zero_detection_fine_atlas);
+
 struct MultiScaleOuterTagDetectorConfig {
   int tag_id = 1;
   std::vector<int> tag_ids;
@@ -98,6 +127,15 @@ struct MultiScaleOuterTagDetectorConfig {
   // runtime/cost ablation.
   bool camera_aware_sphere_patch_rescue_zero_detection_frames = true;
   bool camera_aware_sphere_patch_use_extended_atlas = false;
+  // Robust recovery keeps a decoded quad that is visible in the image even
+  // when it is closer than min_border_distance.  The final submission still
+  // requires finite, in-image corners and the same quad/refinement checks.
+  // This is deliberately opt-in so legacy direct detection remains unchanged.
+  bool enable_robust_missing_board_recovery = false;
+  std::shared_ptr<const CameraAwareSpherePatchAtlas>
+      camera_aware_sphere_patch_atlas;
+  std::shared_ptr<const CameraAwareSpherePatchAtlas>
+      camera_aware_sphere_patch_zero_detection_atlas;
   OuterRefineCameraConfig refine_camera;
 
   // Legacy compatibility fields. Old YAML keys may still populate these,
@@ -122,6 +160,15 @@ struct MultiScaleOuterTagDetectorConfig {
   int outer_corner_branch_search_max = 12;
   double outer_corner_min_direction_score = 0.35;
   double outer_corner_min_layout_score = 0.20;
+};
+
+// A focused DS sphere-patch hypothesis.  It is used only to guide where a
+// local patch is rendered; accepting a result still requires a normal exact
+// AprilTag decode for the requested board ID.
+struct CameraAwareSpherePatchSeed {
+  std::string label;
+  Eigen::Vector2d center_image = Eigen::Vector2d::Zero();
+  double fov_deg = 86.0;
 };
 
 struct OuterCornerScaleObservationDebugInfo {
@@ -244,6 +291,11 @@ struct OuterSphericalCornerRefinementDebug {
 
 struct OuterSphericalQuadRefinementResult {
   bool success = false;
+  // True only when all four shared edge planes were fit jointly and the
+  // complete ordered quad was obtained from adjacent plane intersections.
+  // Per-corner fallback may populate diagnostics but must not masquerade as
+  // an atomic joint-quad result in geometry-prior recovery.
+  bool joint_fit_success = false;
   std::array<cv::Point2f, 4> refined_corners{};
   std::array<OuterSphericalCornerRefinementDebug, 4> corner_debug{};
   double max_displacement_px = 0.0;
@@ -297,6 +349,12 @@ struct OuterTagDetectionResult {
   std::array<Eigen::Vector2d, 4> refined_corners_original_image{};
   std::array<bool, 4> refined_valid{{false, false, false, false}};
   double quality = 0.0;
+  bool board_quad_consistency_checked = false;
+  bool board_quad_consistency_passed = false;
+  int board_quad_worst_corner_index = -1;
+  double board_quad_worst_corner_displacement_px = 0.0;
+  double board_quad_area_ratio = 0.0;
+  std::string board_quad_consistency_diagnostic;
   OuterTagFailureReason failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
   std::string failure_reason_text;
   std::vector<int> successful_scale_longest_sides;
@@ -355,6 +413,11 @@ struct OuterTagMultiDetectionResult {
   std::vector<int> requested_board_ids;
   std::vector<OuterTagDetectionResult> detections;
   OuterFrameMeasurementResult frame_measurements;
+  // Set only after the camera-aware rescue stage has examined this frame with
+  // the recorded provisional-camera signature.  It lets the next run reuse
+  // an unchanged failed rescue instead of rescanning the atlas indefinitely.
+  bool camera_aware_rescue_attempted = false;
+  std::string camera_aware_rescue_signature;
 
   bool AnySuccess() const {
     return frame_measurements.AnySuccess();
@@ -378,6 +441,10 @@ class MultiScaleOuterTagDetector {
   std::vector<int> DiscoverTagIds(const cv::Mat& image) const;
   std::vector<OuterTagDetectionResult> DetectMultiple(
       const cv::Mat& image, const std::vector<int>& requested_tag_ids) const;
+  OuterTagDetectionResult DetectTargetedSpherePatch(
+      const cv::Mat& image,
+      int expected_tag_id,
+      const std::vector<CameraAwareSpherePatchSeed>& seeds) const;
   void DrawDetection(const OuterTagDetectionResult& detection,
                      cv::Mat* output_image,
                      bool draw_debug) const;

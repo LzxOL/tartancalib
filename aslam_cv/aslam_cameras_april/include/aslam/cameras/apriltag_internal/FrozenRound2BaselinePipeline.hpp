@@ -1,7 +1,6 @@
 #ifndef ASLAM_CAMERAS_APRILTAG_INTERNAL_FROZEN_ROUND2_BASELINE_PIPELINE_HPP
 #define ASLAM_CAMERAS_APRILTAG_INTERNAL_FROZEN_ROUND2_BASELINE_PIPELINE_HPP
 
-#include <array>
 #include <string>
 #include <vector>
 
@@ -10,16 +9,11 @@
 #include <aslam/cameras/apriltag_internal/MultiBoardInternalMeasurementRegenerator.hpp>
 #include <aslam/cameras/apriltag_internal/OuterDetectionCache.hpp>
 #include <aslam/cameras/apriltag_internal/OuterOnlyCameraInitializer.hpp>
+#include <aslam/cameras/apriltag_internal/Stage5RecoveryTypes.hpp>
 
 namespace aslam {
 namespace cameras {
 namespace apriltag_internal {
-
-struct FrozenRound2BaselineFrameSource {
-  int frame_index = -1;
-  std::string frame_label;
-  std::string image_path;
-};
 
 struct JointMeasurementBuildValidationSummary {
   bool success = false;
@@ -118,65 +112,14 @@ struct FrozenRound2BaselineRuntimeBreakdown {
   double round2_optimization_intrinsics_update_seconds = 0.0;
 };
 
-struct CameraAwareOuterRescueRecord {
-  int frame_index = -1;
-  std::string frame_label;
-  int board_id = -1;
-  std::string baseline_failure_reason;
-  std::string rescue_summary;
-  int hamming = -1;
-  std::array<Eigen::Vector2d, 4> committed_corners{};
-};
-
-struct CameraAwareOuterRescueSummary {
-  bool requested = false;
-  bool enabled = false;
-  bool camera_family_supported = false;
-  std::string camera_source = "unavailable";
-  int uses_yaml_intrinsics = 0;
-  int uses_kalibr_camchain_intrinsics = 0;
-  int patch_size = 640;
-  std::string patch_plan = "dense_5x5_fov56_plus_wide_3x3_fov72";
-  int max_hamming = 0;
-  int frame_count = 0;
-  int requested_board_observation_count = 0;
-  int baseline_success_count = 0;
-  int baseline_all_boards_frame_count = 0;
-  int attempted_frame_count = 0;
-  int attempted_board_observation_count = 0;
-  bool zero_detection_atlas_enabled = false;
-  int zero_detection_frame_count = 0;
-  int zero_detection_atlas_attempted_board_observation_count = 0;
-  // Number of independent frame-level rescue workers used for this run.  The
-  // final merge remains ordered by frame index, so this is performance-only.
-  int worker_count = 1;
-  // A local patch's exact tag decode is necessary but not sufficient when
-  // other direct boards in the same frame establish a reliable rig pose.
-  // These counters describe the cross-board reprojection gate applied before
-  // a patch result is allowed to affect camera initialization or internals.
-  bool direct_layout_geometry_gate_enabled = false;
-  bool direct_layout_geometry_gate_available = false;
-  double direct_layout_geometry_gate_max_rmse_px = 25.0;
-  int direct_layout_geometry_gate_evaluated_count = 0;
-  int direct_layout_geometry_gate_accepted_count = 0;
-  int direct_layout_geometry_gate_rejected_count = 0;
-  int direct_layout_geometry_gate_not_evaluable_count = 0;
-  int rescued_board_observation_count = 0;
-  int final_success_count = 0;
-  int final_all_boards_frame_count = 0;
-  bool camera_initialization_rerun = false;
-  bool camera_initialization_rerun_success = false;
-  OuterBootstrapCameraIntrinsics provisional_camera;
-  OuterBootstrapCameraIntrinsics final_initialization_camera;
-  double runtime_seconds = 0.0;
-  std::string skip_reason;
-  std::vector<CameraAwareOuterRescueRecord> records;
-  std::vector<std::string> warnings;
-};
-
 struct FrozenRound2BaselineOptions {
   ApriltagInternalConfig config;
   int reference_board_id = 1;
+  // Optional live progress reporting. Disabled by default so the frozen
+  // baseline's numerical path and normal stdout remain unchanged.
+  bool enable_progress_reporting = false;
+  std::string progress_log_path;
+  int progress_report_interval_frames = 1;
   // Complete detection/initialization/recovery and build frontend
   // observations, then stop before selection or any persistent backend BA.
   bool frontend_only = false;
@@ -226,6 +169,10 @@ struct FrozenRound2BaselineOptions {
   // camera initialization. The zero-detection atlas policy lives in
   // config.outer_detector_config and defaults to enabled.
   bool enable_camera_aware_outer_rescue = true;
+  // Enables the multi-evidence missing-board path.  Direct exact-ID
+  // detections remain unchanged; this flag only relaxes recovery-specific
+  // visibility/refinement and boundary-model failure handling.
+  bool enable_robust_missing_board_recovery = false;
   bool rerun_camera_initialization_after_outer_rescue = true;
   int camera_aware_outer_rescue_max_hamming = 0;
   // Zero selects a bounded automatic worker count.  Each worker owns its
@@ -263,6 +210,8 @@ struct FrozenRound2BaselineOptions {
   // starts farther from the true corner than normal decoded-tag refinement.
   double geometry_prior_rescue_max_corner_displacement_px = 0.0;
   double geometry_prior_rescue_min_corner_response_ratio = 0.03;
+  // Also enables the DS spherical edge-support bridge for recovered boards;
+  // the existing spherical-refine disable flag ablates both together.
   bool geometry_prior_rescue_enable_spherical_refine = true;
   int geometry_prior_rescue_edge_sample_count = 80;
   int geometry_prior_rescue_edge_search_half_width_px = 6;

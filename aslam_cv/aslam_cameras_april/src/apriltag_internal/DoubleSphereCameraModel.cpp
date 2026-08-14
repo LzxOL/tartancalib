@@ -434,7 +434,9 @@ bool DoubleSphereCameraModel::estimateTransformation(
     const std::vector<cv::Point3f>& object_points,
     const std::vector<cv::Point2f>& image_points,
     cv::Mat* rvec,
-    cv::Mat* tvec) const {
+    cv::Mat* tvec,
+    const cv::Mat* initial_rvec,
+    const cv::Mat* initial_tvec) const {
   if (rvec == nullptr || tvec == nullptr) {
     throw std::runtime_error("estimateTransformation requires valid output pointers.");
   }
@@ -599,6 +601,80 @@ bool DoubleSphereCameraModel::estimateTransformation(
             << t_camera_object.x(), t_camera_object.y(), t_camera_object.z());
         return true;
       };
+
+  // A persistent scene pose is useful as a local optimizer seed for a
+  // camera-aware rescued quad, but it must never bypass the current image
+  // measurement.  Convert the seed into the tangent camera frame used by
+  // solvePnP, refine it with the current four rays, and let the same camera
+  // reprojection objective decide whether it is usable.
+  if (initial_rvec != nullptr && initial_tvec != nullptr &&
+      !initial_rvec->empty() && !initial_tvec->empty()) {
+    cv::Mat initial_rotation_cv;
+    cv::Rodrigues(*initial_rvec, initial_rotation_cv);
+    cv::Mat initial_rotation64;
+    cv::Mat initial_translation64;
+    initial_rotation_cv.convertTo(initial_rotation64, CV_64F);
+    initial_tvec->convertTo(initial_translation64, CV_64F);
+    if (initial_rotation64.rows == 3 && initial_rotation64.cols == 3 &&
+        initial_translation64.total() == 3u) {
+      Eigen::Matrix3d initial_rotation = Eigen::Matrix3d::Zero();
+      for (int row = 0; row < 3; ++row) {
+        for (int column = 0; column < 3; ++column) {
+          initial_rotation(row, column) = initial_rotation64.at<double>(row, column);
+        }
+      }
+      const Eigen::Vector3d initial_translation(
+          initial_translation64.at<double>(0, 0),
+          initial_translation64.at<double>(1, 0),
+          initial_translation64.at<double>(2, 0));
+      const Eigen::Matrix3d tangent_rotation =
+          R_tangent_camera * initial_rotation;
+      const Eigen::Vector3d tangent_translation =
+          R_tangent_camera * initial_translation;
+      if (tangent_rotation.allFinite() && tangent_translation.allFinite() &&
+          tangent_translation.z() > 0.0) {
+        cv::Mat tangent_rotation_cv(3, 3, CV_64F);
+        for (int row = 0; row < 3; ++row) {
+          for (int column = 0; column < 3; ++column) {
+            tangent_rotation_cv.at<double>(row, column) =
+                tangent_rotation(row, column);
+          }
+        }
+        cv::Mat seed_rvec;
+        cv::Rodrigues(tangent_rotation_cv, seed_rvec);
+        cv::Mat seed_tvec = (cv::Mat_<double>(3, 1)
+            << tangent_translation.x(), tangent_translation.y(),
+               tangent_translation.z());
+        cv::Mat refined_seed_rvec = seed_rvec.clone();
+        cv::Mat refined_seed_tvec = seed_tvec.clone();
+        bool refined = false;
+        try {
+          refined = cv::solvePnP(filtered_object_points,
+                                 normalized_points,
+                                 identity_camera,
+                                 dist_coeffs,
+                                 refined_seed_rvec,
+                                 refined_seed_tvec,
+                                 true,
+                                 cv::SOLVEPNP_ITERATIVE);
+        } catch (const cv::Exception&) {
+          refined = false;
+        }
+        cv::Mat candidate_rvec;
+        cv::Mat candidate_tvec;
+        if (refined) {
+          tangent_pose_to_camera(refined_seed_rvec,
+                                 refined_seed_tvec,
+                                 &candidate_rvec,
+                                 &candidate_tvec);
+        } else {
+          candidate_rvec = *initial_rvec;
+          candidate_tvec = *initial_tvec;
+        }
+        evaluate_candidate(candidate_rvec, candidate_tvec);
+      }
+    }
+  }
 
   std::vector<cv::Mat> candidate_rvecs;
   std::vector<cv::Mat> candidate_tvecs;

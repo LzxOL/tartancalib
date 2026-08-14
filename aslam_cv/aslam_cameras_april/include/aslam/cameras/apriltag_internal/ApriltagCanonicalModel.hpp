@@ -64,7 +64,8 @@ struct ApriltagInternalConfig {
   int refinement_window_radius = 0;
   double internal_subpix_window_scale = 0.5;
   int internal_subpix_window_min = 4;
-  int internal_subpix_window_max = 16;
+  // Zero keeps the window geometry-scaled without an absolute pixel cap.
+  int internal_subpix_window_max = 0;
   double max_subpix_displacement2 = 0.0;
   double internal_subpix_displacement_scale = 0.25;
   double max_internal_subpix_displacement = 6.0;

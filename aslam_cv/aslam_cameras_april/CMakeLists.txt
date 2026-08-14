@@ -41,8 +41,12 @@ add_library(${PROJECT_NAME}
   src/apriltag_internal/AngularResidualGeometry.cpp
   src/apriltag_internal/AslamBackendCalibrationRunner.cpp
   src/apriltag_internal/BoardDetectionPipeline.cpp
+  src/apriltag_internal/CameraAwareOuterRescue.cpp
   src/apriltag_internal/CalibrationStateBundle.cpp
   src/apriltag_internal/DoubleSphereCameraModel.cpp
+  src/apriltag_internal/GeometryPriorTopology.cpp
+  src/apriltag_internal/GeometryPriorOuterRecovery.cpp
+  src/apriltag_internal/InternalPointResultValidation.cpp
   src/apriltag_internal/FrozenRound2BaselinePipeline.cpp
   src/apriltag_internal/JointMeasurementCuration.cpp
   src/apriltag_internal/JointMeasurementSelection.cpp

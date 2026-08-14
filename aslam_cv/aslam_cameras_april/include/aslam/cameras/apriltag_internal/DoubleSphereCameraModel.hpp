@@ -33,7 +33,9 @@ class DoubleSphereCameraModel {
   bool estimateTransformation(const std::vector<cv::Point3f>& object_points,
                               const std::vector<cv::Point2f>& image_points,
                               cv::Mat* rvec,
-                              cv::Mat* tvec) const;
+                              cv::Mat* tvec,
+                              const cv::Mat* initial_rvec = nullptr,
+                              const cv::Mat* initial_tvec = nullptr) const;
 
  private:
   bool isValid(const Eigen::Vector2d& keypoint) const;

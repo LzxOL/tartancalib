@@ -12,7 +12,8 @@ canonical_pixels_per_module: 24
 refinement_window_radius: 0
 internal_subpix_window_scale: 0.5
 internal_subpix_window_min: 4
-internal_subpix_window_max: 16
+# 0 means no absolute cap: use half of the locally projected module size.
+internal_subpix_window_max: 0
 max_subpix_displacement2: 0.0
 internal_subpix_displacement_scale: 0.25
 max_internal_subpix_displacement: 6.0

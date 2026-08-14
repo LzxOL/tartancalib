@@ -1,5 +1,7 @@
 #include <aslam/cameras/apriltag_internal/FrozenRound2BaselinePipeline.hpp>
 
+#include <aslam/cameras/apriltag_internal/CameraAwareOuterRescue.hpp>
+
 #include <aslam/cameras/apriltag_internal/BoardDetectionPipeline.hpp>
 
 #include <algorithm>
@@ -7,8 +9,13 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <map>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -17,19 +24,115 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <aslam/cameras/apriltag_internal/ApriltagInternalDetector.hpp>
-#include <aslam/cameras/apriltag_internal/DoubleSphereCameraModel.hpp>
 #include <aslam/cameras/apriltag_internal/JointMeasurementSelection.hpp>
 #include <aslam/cameras/apriltag_internal/JointReprojectionCostCore.hpp>
 #include <aslam/cameras/apriltag_internal/JointReprojectionMeasurementBuilder.hpp>
 #include <aslam/cameras/apriltag_internal/JointReprojectionOptimizer.hpp>
 #include <aslam/cameras/apriltag_internal/JointReprojectionResidualEvaluator.hpp>
 #include <aslam/cameras/apriltag_internal/MultiBoardOuterBootstrap.hpp>
-#include <aslam/cameras/apriltag_internal/MultiScaleOuterTagDetector.hpp>
 
 namespace aslam {
 namespace cameras {
 namespace apriltag_internal {
 namespace {
+
+class Stage5ProgressReporter {
+ public:
+  Stage5ProgressReporter(bool enabled, const std::string& log_path,
+                         int interval_frames)
+      : enabled_(enabled),
+        interval_frames_(std::max(1, interval_frames)),
+        start_time_(std::chrono::steady_clock::now()) {
+    if (enabled_ && !log_path.empty()) {
+      log_.open(log_path.c_str(), std::ios::out | std::ios::app);
+    }
+  }
+
+  void StageStart(const std::string& stage, std::size_t total) {
+    if (!enabled_) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    stage_completed_[stage] = 0;
+    ReportUnlocked(stage, 0, total, "started");
+  }
+
+  void StageEnd(const std::string& stage, std::size_t total,
+                const std::string& detail) {
+    if (!enabled_) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = stage_completed_.find(stage);
+    const std::size_t completed =
+        it == stage_completed_.end() || it->second == 0 ? total : it->second;
+    ReportUnlocked(stage, completed, total, detail);
+  }
+
+  void FrameDone(const std::string& stage, std::size_t total,
+                 const std::string& detail) {
+    if (!enabled_) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::size_t completed = ++stage_completed_[stage];
+    if (completed != total &&
+        completed % static_cast<std::size_t>(interval_frames_) != 0) {
+      return;
+    }
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start_time_).count();
+    const double rate = completed > 0 ? static_cast<double>(completed) / elapsed : 0.0;
+    const double eta = rate > 0.0 && total >= completed
+                           ? static_cast<double>(total - completed) / rate
+                           : 0.0;
+    std::ostringstream message;
+    message << "stage=" << stage << " completed=" << completed << "/" << total
+            << " percent=" << std::fixed << std::setprecision(1)
+            << (total > 0 ? 100.0 * static_cast<double>(completed) /
+                                  static_cast<double>(total)
+                            : 100.0)
+            << " elapsed_s=" << std::setprecision(1) << elapsed
+            << " eta_s=" << eta;
+    if (!detail.empty()) {
+      message << " " << detail;
+    }
+    WriteLocked(message.str());
+  }
+
+ private:
+  // StageStart/StageEnd already hold mutex_. Avoid recursive locking here.
+  void ReportUnlocked(const std::string& stage, std::size_t completed,
+                      std::size_t total, const std::string& detail) {
+    std::ostringstream message;
+    message << "stage=" << stage << " completed=" << completed << "/" << total;
+    if (total > 0) {
+      message << " percent=" << std::fixed << std::setprecision(1)
+              << (100.0 * static_cast<double>(completed) /
+                  static_cast<double>(total));
+    }
+    if (!detail.empty()) {
+      message << " " << detail;
+    }
+    WriteLocked(message.str());
+  }
+
+  void WriteLocked(const std::string& message) {
+    const std::string line = "[stage5_progress] " + message;
+    std::cout << line << std::endl;
+    if (log_.is_open()) {
+      log_ << line << "\n";
+      log_.flush();
+    }
+  }
+
+  bool enabled_ = false;
+  int interval_frames_ = 1;
+  std::chrono::steady_clock::time_point start_time_;
+  std::mutex mutex_;
+  std::map<std::string, std::size_t> stage_completed_;
+  std::ofstream log_;
+};
 
 double ElapsedSeconds(const std::chrono::steady_clock::time_point& start_time) {
   return std::chrono::duration_cast<std::chrono::duration<double> >(
@@ -83,6 +186,267 @@ void AccumulateRegenerationRuntime(
   if (subpix_seconds != nullptr) {
     *subpix_seconds += frame_runtime.subpix_seconds;
   }
+}
+
+// Internal regeneration is independent per frame.  Keep the worker count
+// bounded because each worker owns a large decoded image and the regenerator
+// also performs OpenCV operations.  The final merge remains frame-ordered, so
+// parallel execution does not change the observable result ordering.
+std::size_t ChooseRegenerationWorkerCount(std::size_t frame_count) {
+  if (frame_count == 0) {
+    return 0;
+  }
+  const unsigned int hardware_workers = std::thread::hardware_concurrency();
+  const std::size_t usable_workers =
+      hardware_workers > 1 ? static_cast<std::size_t>(hardware_workers - 1) : 1;
+  return std::max<std::size_t>(
+      1, std::min<std::size_t>(frame_count, std::min<std::size_t>(usable_workers, 8)));
+}
+
+struct ParallelRegenerationOutput {
+  std::vector<InternalRegenerationFrameResult> regeneration_results;
+  std::vector<std::vector<std::string> > frame_warnings;
+  std::string failure_reason;
+};
+
+using RegenerateFrameFunction = std::function<InternalRegenerationFrameResult(
+    BoardDetectionPipeline&, const cv::Mat&, const InternalRegenerationFrameInput&)>;
+
+ParallelRegenerationOutput RegenerateFramesInParallel(
+    const std::vector<FrozenRound2BaselineFrameSource>& frame_sources,
+    const std::vector<InternalRegenerationFrameInput>& regeneration_inputs,
+    const ApriltagInternalConfig& config,
+    const ApriltagInternalDetectionOptions& detection_options,
+    const InternalRegenerationCache& internal_regeneration_cache,
+    const std::string& regeneration_state_signature,
+    Stage5ProgressReporter* progress,
+    const RegenerateFrameFunction& regenerate_frame) {
+  ParallelRegenerationOutput output;
+  if (frame_sources.size() != regeneration_inputs.size()) {
+    output.failure_reason =
+        "Parallel internal regeneration received mismatched frame/input counts.";
+    return output;
+  }
+
+  const std::size_t frame_count = frame_sources.size();
+  if (progress != nullptr) {
+    progress->StageStart("internal_regeneration", frame_count);
+  }
+  output.regeneration_results.resize(frame_count);
+  output.frame_warnings.resize(frame_count);
+  if (frame_count == 0) {
+    return output;
+  }
+
+  // Cache reads are immutable after stage preparation. Only artifact writes
+  // need serialization because OpenCV FileStorage writes through temp files.
+  std::mutex cache_mutex;
+  std::mutex error_mutex;
+  std::atomic<std::size_t> next_frame{0};
+  std::string first_error;
+  const std::size_t worker_count = ChooseRegenerationWorkerCount(frame_count);
+  std::vector<std::thread> workers;
+  workers.reserve(worker_count);
+
+  const auto worker = [&]() {
+    // Detector/regenerator state is not shared between workers.  This avoids
+    // introducing locks into the existing board recovery implementation.
+    BoardDetectionPipeline worker_pipeline(config, detection_options);
+    for (;;) {
+      const std::size_t frame_index = next_frame.fetch_add(1);
+      if (frame_index >= frame_count) {
+        break;
+      }
+
+      try {
+        InternalRegenerationFrameResult regeneration_result;
+        std::string internal_cache_warning;
+        bool internal_cache_hit = false;
+        internal_cache_hit = internal_regeneration_cache.Load(
+            frame_sources[frame_index].image_path,
+            regeneration_inputs[frame_index], regeneration_state_signature,
+            &regeneration_result, &internal_cache_warning);
+        if (!internal_cache_hit) {
+          if (!internal_cache_warning.empty()) {
+            AppendUniqueWarning(
+                "Internal regeneration cache load warning: " +
+                    internal_cache_warning,
+                &output.frame_warnings[frame_index]);
+          }
+          const cv::Mat image = cv::imread(
+              frame_sources[frame_index].image_path, cv::IMREAD_UNCHANGED);
+          if (image.empty()) {
+            throw std::runtime_error("Failed to read image: " +
+                                     frame_sources[frame_index].image_path);
+          }
+          regeneration_result = regenerate_frame(
+              worker_pipeline, image, regeneration_inputs[frame_index]);
+          internal_cache_warning.clear();
+          if (internal_regeneration_cache.enabled()) {
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            if (!internal_regeneration_cache.Save(
+                    frame_sources[frame_index].image_path,
+                    regeneration_inputs[frame_index], regeneration_state_signature,
+                    regeneration_result, &internal_cache_warning) &&
+                !internal_cache_warning.empty()) {
+              AppendUniqueWarning(
+                  "Internal regeneration cache store warning: " +
+                      internal_cache_warning,
+                  &output.frame_warnings[frame_index]);
+            }
+          }
+        }
+        const int successful_boards = regeneration_result.SuccessfulBoardCount();
+        const int valid_internal = regeneration_result.ValidInternalCornerCount();
+        output.regeneration_results[frame_index] = std::move(regeneration_result);
+        if (progress != nullptr) {
+          progress->FrameDone(
+              "internal_regeneration", frame_count,
+              "frame=" + frame_sources[frame_index].frame_label +
+                  " boards=" + std::to_string(successful_boards) +
+                  " valid_internal=" + std::to_string(valid_internal));
+        }
+      } catch (const std::exception& exception) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        if (first_error.empty()) {
+          first_error = "Parallel internal regeneration failed at frame " +
+                        std::to_string(frame_sources[frame_index].frame_index) +
+                        ": " + exception.what();
+        }
+      }
+    }
+  };
+
+  for (std::size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+    workers.emplace_back(worker);
+  }
+  for (std::thread& worker_thread : workers) {
+    worker_thread.join();
+  }
+  output.failure_reason = first_error;
+  if (progress != nullptr) {
+    progress->StageEnd("internal_regeneration", frame_count,
+                       first_error.empty() ? "finished" : "failed");
+  }
+  return output;
+}
+
+struct ParallelOuterDetectionOutput {
+  std::vector<OuterTagMultiDetectionResult> detections;
+  std::vector<OuterDetectionCacheLoadSource> cache_sources;
+  std::vector<unsigned char> cache_hits;
+  std::vector<unsigned char> cache_load_failures;
+  std::vector<unsigned char> cache_store_failures;
+  std::vector<std::vector<std::string> > frame_warnings;
+  std::string failure_reason;
+};
+
+ParallelOuterDetectionOutput DetectOuterFramesInParallel(
+    const std::vector<FrozenRound2BaselineFrameSource>& frame_sources,
+    const ApriltagInternalConfig& config,
+    const ApriltagInternalDetectionOptions& detection_options,
+    const OuterDetectionCache& detection_cache,
+    Stage5ProgressReporter* progress) {
+  ParallelOuterDetectionOutput output;
+  const std::size_t frame_count = frame_sources.size();
+  if (progress != nullptr) {
+    progress->StageStart("outer_detection", frame_count);
+  }
+  output.detections.resize(frame_count);
+  output.cache_sources.resize(frame_count, OuterDetectionCacheLoadSource::None);
+  output.cache_hits.resize(frame_count, 0);
+  output.cache_load_failures.resize(frame_count, 0);
+  output.cache_store_failures.resize(frame_count, 0);
+  output.frame_warnings.resize(frame_count);
+  if (frame_count == 0) {
+    return output;
+  }
+
+  std::mutex cache_mutex;
+  std::mutex error_mutex;
+  std::atomic<std::size_t> next_frame{0};
+  std::string first_error;
+  const std::size_t worker_count = ChooseRegenerationWorkerCount(frame_count);
+  std::vector<std::thread> workers;
+  workers.reserve(worker_count);
+  const auto worker = [&]() {
+    BoardDetectionPipeline worker_pipeline(config, detection_options);
+    for (;;) {
+      const std::size_t frame_index = next_frame.fetch_add(1);
+      if (frame_index >= frame_count) {
+        break;
+      }
+      try {
+        OuterTagMultiDetectionResult outer_detections;
+        std::string cache_warning;
+        OuterDetectionCacheLoadSource cache_source =
+            OuterDetectionCacheLoadSource::None;
+        bool cache_hit = false;
+        cache_hit = detection_cache.Load(
+            frame_sources[frame_index].image_path, &outer_detections,
+            &cache_warning, &cache_source);
+        if (cache_hit) {
+          output.cache_hits[frame_index] = 1;
+          output.cache_sources[frame_index] = cache_source;
+        } else {
+          if (!cache_warning.empty()) {
+            output.cache_load_failures[frame_index] = 1;
+            AppendUniqueWarning(
+                "Outer detection cache load warning: " + cache_warning,
+                &output.frame_warnings[frame_index]);
+          }
+          const cv::Mat image = cv::imread(
+              frame_sources[frame_index].image_path, cv::IMREAD_UNCHANGED);
+          if (image.empty()) {
+            throw std::runtime_error("Failed to read image: " +
+                                     frame_sources[frame_index].image_path);
+          }
+          outer_detections = worker_pipeline.DetectOuter(image);
+          cache_warning.clear();
+          if (detection_cache.enabled()) {
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            if (!detection_cache.Save(frame_sources[frame_index].image_path,
+                                      outer_detections, &cache_warning) &&
+                !cache_warning.empty()) {
+              output.cache_store_failures[frame_index] = 1;
+              AppendUniqueWarning(
+                  "Outer detection cache store warning: " + cache_warning,
+                  &output.frame_warnings[frame_index]);
+            }
+          }
+        }
+        const int successful_boards = outer_detections.SuccessfulBoardCount();
+        output.detections[frame_index] = std::move(outer_detections);
+        if (progress != nullptr) {
+          progress->FrameDone(
+              "outer_detection", frame_count,
+              "frame=" + frame_sources[frame_index].frame_label +
+                  " boards=" + std::to_string(successful_boards) +
+                  (cache_hit ? " source=cache" : " source=detector"));
+        }
+      } catch (const std::exception& exception) {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        if (first_error.empty()) {
+          first_error = "Parallel outer detection failed at frame " +
+                        std::to_string(frame_sources[frame_index].frame_index) +
+                        ": " + exception.what();
+        }
+      }
+    }
+  };
+
+  for (std::size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+    workers.emplace_back(worker);
+  }
+  for (std::thread& worker_thread : workers) {
+    worker_thread.join();
+  }
+  output.failure_reason = first_error;
+  if (progress != nullptr) {
+    progress->StageEnd("outer_detection", frame_count,
+                       first_error.empty() ? "finished" : "failed");
+  }
+  return output;
 }
 
 std::vector<int> NormalizeBoardIds(const std::vector<int>& configured_ids,
@@ -185,476 +549,6 @@ void SetBootstrapInitFromIntrinsics(const OuterBootstrapCameraIntrinsics& intrin
       intrinsics.cu - 0.5 * static_cast<double>(intrinsics.resolution.width);
   options->init_cv_offset =
       intrinsics.cv - 0.5 * static_cast<double>(intrinsics.resolution.height);
-}
-
-OuterRefineCameraConfig BuildOuterRefineCameraConfig(
-    const OuterBootstrapCameraIntrinsics& camera) {
-  OuterRefineCameraConfig config;
-  config.camera_model = camera.NormalizedCameraModel();
-  config.distortion_model = camera.NormalizedDistortionModel();
-  config.intrinsics = camera.IntrinsicsVector();
-  config.distortion_coeffs = camera.DistortionVector();
-  config.resolution = {camera.resolution.width, camera.resolution.height};
-  return config;
-}
-
-const OuterBootstrapFrameState* FindBootstrapFrameState(
-    const OuterBootstrapResult& result,
-    int frame_index) {
-  const auto it = std::find_if(
-      result.frames.begin(), result.frames.end(),
-      [frame_index](const OuterBootstrapFrameState& frame) {
-        return frame.frame_index == frame_index;
-      });
-  return it == result.frames.end() ? nullptr : &(*it);
-}
-
-const OuterBootstrapBoardState* FindBootstrapBoardState(
-    const OuterBootstrapResult& result,
-    int board_id) {
-  const auto it = std::find_if(
-      result.boards.begin(), result.boards.end(),
-      [board_id](const OuterBootstrapBoardState& board) {
-        return board.board_id == board_id;
-      });
-  return it == result.boards.end() ? nullptr : &(*it);
-}
-
-std::vector<OuterBootstrapFrameInput> BuildDirectOuterBootstrapFrames(
-    const std::vector<OuterBootstrapFrameInput>& frames) {
-  std::vector<OuterBootstrapFrameInput> direct_frames;
-  direct_frames.reserve(frames.size());
-  for (const OuterBootstrapFrameInput& frame : frames) {
-    OuterBootstrapFrameInput direct_frame = frame;
-    direct_frame.measurements.board_measurements.clear();
-    for (const OuterBoardMeasurement& measurement :
-         frame.measurements.board_measurements) {
-      // A camera-aware patch result is the object being validated. Do not let
-      // an older cached patch result establish the independent reference rig.
-      if (measurement.success && !measurement.used_local_patch_rescue) {
-        direct_frame.measurements.board_measurements.push_back(measurement);
-      }
-    }
-    if (!direct_frame.measurements.board_measurements.empty()) {
-      direct_frames.push_back(std::move(direct_frame));
-    }
-  }
-  return direct_frames;
-}
-
-struct DirectLayoutRescueValidation {
-  bool evaluable = false;
-  double reprojection_rmse_px = std::numeric_limits<double>::infinity();
-};
-
-DirectLayoutRescueValidation ValidatePatchRescueAgainstDirectLayout(
-    const OuterBootstrapResult& direct_layout,
-    const OuterBootstrapCameraIntrinsics& camera,
-    int frame_index,
-    const OuterBoardMeasurement& measurement) {
-  DirectLayoutRescueValidation validation;
-  if (!direct_layout.success || !measurement.success ||
-      !measurement.has_target_outer_corners || !camera.IsValid()) {
-    return validation;
-  }
-  const OuterBootstrapFrameState* frame =
-      FindBootstrapFrameState(direct_layout, frame_index);
-  if (frame == nullptr || !frame->initialized) {
-    return validation;
-  }
-
-  Eigen::Matrix4d T_reference_board = Eigen::Matrix4d::Identity();
-  if (measurement.board_id != direct_layout.reference_board_id) {
-    const OuterBootstrapBoardState* board =
-        FindBootstrapBoardState(direct_layout, measurement.board_id);
-    if (board == nullptr || !board->initialized) {
-      return validation;
-    }
-    T_reference_board = board->T_reference_board;
-  }
-
-  DoubleSphereCameraModel camera_model;
-  try {
-    camera_model = DoubleSphereCameraModel::FromConfig(
-        MakeIntermediateCameraConfig(camera));
-  } catch (const std::exception&) {
-    return validation;
-  }
-
-  double squared_error_sum = 0.0;
-  for (std::size_t corner_index = 0; corner_index < 4; ++corner_index) {
-    if (!measurement.refined_corner_valid[corner_index] ||
-        !measurement.target_outer_corners_board[corner_index].allFinite() ||
-        !measurement.refined_outer_corners_original_image[corner_index].allFinite()) {
-      return validation;
-    }
-    const Eigen::Vector4d point_board(
-        measurement.target_outer_corners_board[corner_index].x(),
-        measurement.target_outer_corners_board[corner_index].y(),
-        measurement.target_outer_corners_board[corner_index].z(), 1.0);
-    const Eigen::Vector4d point_camera_h =
-        frame->T_camera_reference * (T_reference_board * point_board);
-    Eigen::Vector2d predicted = Eigen::Vector2d::Zero();
-    if (!camera_model.vsEuclideanToKeypoint(point_camera_h.head<3>(),
-                                             &predicted)) {
-      return validation;
-    }
-    const Eigen::Vector2d residual =
-        predicted - measurement.refined_outer_corners_original_image[corner_index];
-    squared_error_sum += residual.squaredNorm();
-  }
-  validation.evaluable = true;
-  validation.reprojection_rmse_px = std::sqrt(squared_error_sum / 4.0);
-  return validation;
-}
-
-const OuterTagDetectionResult* FindDetectionByBoardId(
-    const OuterTagMultiDetectionResult& detections,
-    int board_id) {
-  const auto it = std::find_if(
-      detections.detections.begin(), detections.detections.end(),
-      [board_id](const OuterTagDetectionResult& detection) {
-        return detection.board_id == board_id;
-      });
-  return it == detections.detections.end() ? nullptr : &(*it);
-}
-
-const OuterBoardMeasurement* FindMeasurementByBoardId(
-    const OuterTagMultiDetectionResult& detections,
-    int board_id) {
-  const auto& measurements = detections.frame_measurements.board_measurements;
-  const auto it = std::find_if(
-      measurements.begin(), measurements.end(),
-      [board_id](const OuterBoardMeasurement& measurement) {
-        return measurement.board_id == board_id;
-      });
-  return it == measurements.end() ? nullptr : &(*it);
-}
-
-void ReplaceDetectionByBoardId(
-    const OuterTagDetectionResult& replacement,
-    OuterTagMultiDetectionResult* detections) {
-  if (detections == nullptr) {
-    return;
-  }
-  for (OuterTagDetectionResult& detection : detections->detections) {
-    if (detection.board_id == replacement.board_id) {
-      detection = replacement;
-      return;
-    }
-  }
-}
-
-// Keep decoder outputs as untrusted proposals until the regenerator validates
-// them against the expected ID, image evidence, and the frame pose.  In
-// particular, this must not alter success, corners, or the failure reason.
-void MergeWrongIdProposalsByBoardId(
-    const OuterTagDetectionResult& rescue_detection,
-    OuterTagMultiDetectionResult* detections) {
-  if (detections == nullptr || rescue_detection.wrong_id_proposals.empty()) {
-    return;
-  }
-  for (OuterTagDetectionResult& detection : detections->detections) {
-    if (detection.board_id != rescue_detection.board_id) {
-      continue;
-    }
-    for (const OuterWrongIdProposal& proposal :
-         rescue_detection.wrong_id_proposals) {
-      const auto existing = std::find_if(
-          detection.wrong_id_proposals.begin(),
-          detection.wrong_id_proposals.end(),
-          [&proposal](const OuterWrongIdProposal& candidate) {
-            return candidate.detected_tag_id == proposal.detected_tag_id &&
-                   candidate.source == proposal.source;
-          });
-      const bool proposal_is_better =
-          existing == detection.wrong_id_proposals.end() ||
-          proposal.hamming < existing->hamming ||
-          (proposal.hamming == existing->hamming &&
-           proposal.area_px > existing->area_px);
-      if (!proposal_is_better) {
-        continue;
-      }
-      if (existing == detection.wrong_id_proposals.end()) {
-        detection.wrong_id_proposals.push_back(proposal);
-      } else {
-        *existing = proposal;
-      }
-    }
-    return;
-  }
-}
-
-void ReplaceMeasurementByBoardId(
-    const OuterBoardMeasurement& replacement,
-    OuterTagMultiDetectionResult* detections) {
-  if (detections == nullptr) {
-    return;
-  }
-  for (OuterBoardMeasurement& measurement :
-       detections->frame_measurements.board_measurements) {
-    if (measurement.board_id == replacement.board_id) {
-      measurement = replacement;
-      return;
-    }
-  }
-}
-
-void RunCameraAwareOuterRescue(
-    const std::vector<FrozenRound2BaselineFrameSource>& frame_sources,
-    const ApriltagInternalConfig& config,
-    const OuterBootstrapCameraIntrinsics& provisional_camera,
-    int max_hamming,
-    int requested_worker_count,
-    std::vector<OuterBootstrapFrameInput>* bootstrap_frames,
-    std::vector<InternalRegenerationFrameInput>* regeneration_inputs,
-    CameraAwareOuterRescueSummary* summary) {
-  if (bootstrap_frames == nullptr || regeneration_inputs == nullptr ||
-      summary == nullptr) {
-    throw std::runtime_error(
-        "RunCameraAwareOuterRescue requires valid output pointers.");
-  }
-  if (frame_sources.size() != bootstrap_frames->size() ||
-      frame_sources.size() != regeneration_inputs->size()) {
-    throw std::runtime_error(
-        "Camera-aware outer rescue input vectors have inconsistent sizes.");
-  }
-
-  summary->enabled = true;
-  summary->camera_family_supported = true;
-  summary->camera_source =
-      "stage5_provisional_outer_only_camera_initialization";
-  summary->max_hamming = std::max(0, max_hamming);
-  summary->frame_count = static_cast<int>(frame_sources.size());
-  summary->provisional_camera = provisional_camera;
-  summary->direct_layout_geometry_gate_enabled = true;
-
-  MultiScaleOuterTagDetectorConfig rescue_config =
-      config.outer_detector_config;
-  rescue_config.refine_camera =
-      BuildOuterRefineCameraConfig(provisional_camera);
-  rescue_config.enable_camera_aware_sphere_patch_rescue = true;
-  rescue_config.camera_aware_sphere_patch_max_hamming =
-      summary->max_hamming;
-  rescue_config.camera_aware_sphere_patch_commit_mapped_corners = true;
-  summary->zero_detection_atlas_enabled =
-      rescue_config.camera_aware_sphere_patch_rescue_zero_detection_frames;
-  if (summary->zero_detection_atlas_enabled &&
-      rescue_config.camera_aware_sphere_patch_use_extended_atlas) {
-    summary->patch_plan =
-        "dense_5x5_fov56_plus_wide_3x3_fov72_plus_extended_boundary_atlas_plus_zero_fine_9x9_fov42";
-  } else if (summary->zero_detection_atlas_enabled) {
-    summary->patch_plan =
-        "dense_5x5_fov56_plus_wide_3x3_fov72_plus_zero_fine_9x9_fov42";
-  } else if (rescue_config.camera_aware_sphere_patch_use_extended_atlas) {
-    summary->patch_plan =
-        "dense_5x5_fov56_plus_wide_3x3_fov72_plus_extended_boundary_atlas";
-  }
-  struct RescueAttempt {
-    std::size_t frame_index = 0;
-    bool baseline_has_zero_detections = false;
-    std::vector<int> missing_board_ids;
-    bool image_read_success = false;
-    OuterTagMultiDetectionResult rescued;
-  };
-  std::vector<RescueAttempt> attempts;
-  attempts.reserve(frame_sources.size());
-  for (std::size_t frame_index = 0; frame_index < frame_sources.size();
-       ++frame_index) {
-    const OuterTagMultiDetectionResult& baseline =
-        (*regeneration_inputs)[frame_index].outer_detections;
-    summary->requested_board_observation_count +=
-        static_cast<int>(baseline.frame_measurements.board_measurements.size());
-    summary->baseline_success_count += baseline.SuccessfulBoardCount();
-    if (baseline.SuccessfulBoardCount() ==
-        static_cast<int>(baseline.requested_board_ids.size())) {
-      ++summary->baseline_all_boards_frame_count;
-    }
-    const bool baseline_has_zero_detections =
-        baseline.SuccessfulBoardCount() == 0;
-    if (baseline_has_zero_detections) {
-      ++summary->zero_detection_frame_count;
-    }
-
-    std::vector<int> missing_board_ids;
-    for (const OuterBoardMeasurement& measurement :
-         baseline.frame_measurements.board_measurements) {
-      if (!measurement.success) {
-        missing_board_ids.push_back(measurement.board_id);
-      }
-    }
-    if (missing_board_ids.empty()) {
-      continue;
-    }
-
-    ++summary->attempted_frame_count;
-    summary->attempted_board_observation_count +=
-        static_cast<int>(missing_board_ids.size());
-    RescueAttempt attempt;
-    attempt.frame_index = frame_index;
-    attempt.baseline_has_zero_detections = baseline_has_zero_detections;
-    attempt.missing_board_ids = std::move(missing_board_ids);
-    attempts.push_back(std::move(attempt));
-  }
-
-  // Build the rig only from direct full-image detections before accepting any
-  // sphere-patch recovery. A patch can decode the expected ID exactly while
-  // still map a heavily distorted quadrilateral to the wrong image location.
-  // In a frame that already has a direct board, the fixed rig provides an
-  // independent prediction for that missing board and rejects such a mapping.
-  const std::vector<OuterBootstrapFrameInput> direct_layout_frames =
-      BuildDirectOuterBootstrapFrames(*bootstrap_frames);
-  OuterBootstrapResult direct_layout;
-  if (!direct_layout_frames.empty()) {
-    OuterBootstrapOptions direct_layout_options;
-    direct_layout_options.reference_board_id =
-        config.tag_ids.empty() ? config.tag_id : config.tag_ids.front();
-    direct_layout_options.initial_camera = provisional_camera;
-    direct_layout_options.max_coordinate_descent_iterations = 0;
-    direct_layout_options.min_detection_quality =
-        config.outer_detector_config.min_detection_quality;
-    const MultiBoardOuterBootstrap direct_layout_bootstrap(
-        config, direct_layout_options);
-    direct_layout = direct_layout_bootstrap.Solve(direct_layout_frames);
-    summary->direct_layout_geometry_gate_available = direct_layout.success;
-    if (!direct_layout.success) {
-      AppendUniqueWarning(
-          "Camera-aware rescue direct-layout geometry gate unavailable: " +
-              direct_layout.failure_reason,
-          &summary->warnings);
-    }
-  }
-
-  // Local sphere-patch recovery is purely frame-local but was previously run
-  // serially. A zero-decode frame can evaluate 185 patches and four detector
-  // variants per patch. Give each worker an independent detector, retain every
-  // patch/variant, then merge in original frame order below. This changes only
-  // throughput; candidate ranking and accepted corners remain byte-for-byte
-  // governed by the existing per-frame detector logic.
-  const unsigned int hardware_workers = std::thread::hardware_concurrency();
-  const std::size_t automatic_worker_count = std::max<std::size_t>(
-      1, std::min<std::size_t>(4, hardware_workers == 0 ? 1 : hardware_workers));
-  const std::size_t requested_workers = requested_worker_count > 0
-      ? static_cast<std::size_t>(requested_worker_count)
-      : automatic_worker_count;
-  const std::size_t worker_count = std::min<std::size_t>(
-      attempts.size(), std::max<std::size_t>(1, requested_workers));
-  summary->worker_count = static_cast<int>(worker_count == 0 ? 1 : worker_count);
-  if (!attempts.empty()) {
-    std::atomic<std::size_t> next_attempt(0);
-    const auto detect_attempts = [&]() {
-      const MultiScaleOuterTagDetector rescue_detector(rescue_config);
-      for (;;) {
-        const std::size_t attempt_index = next_attempt.fetch_add(1);
-        if (attempt_index >= attempts.size()) {
-          return;
-        }
-        RescueAttempt& attempt = attempts[attempt_index];
-        const cv::Mat image = cv::imread(
-            frame_sources[attempt.frame_index].image_path, cv::IMREAD_UNCHANGED);
-        if (image.empty()) {
-          continue;
-        }
-        attempt.rescued = rescue_detector.DetectMultiple(image);
-        attempt.image_read_success = true;
-      }
-    };
-    std::vector<std::thread> workers;
-    workers.reserve(worker_count);
-    for (std::size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
-      workers.emplace_back(detect_attempts);
-    }
-    for (std::thread& worker : workers) {
-      worker.join();
-    }
-  }
-
-  // Preserve the previous observable order for warnings, records, and
-  // committed detections. This also keeps any downstream tie handling fully
-  // deterministic despite parallel image decoding above.
-  for (const RescueAttempt& attempt : attempts) {
-    const std::size_t frame_index = attempt.frame_index;
-    if (!attempt.image_read_success) {
-      AppendUniqueWarning(
-          "Camera-aware outer rescue failed to read image: " +
-              frame_sources[frame_index].image_path,
-          &summary->warnings);
-      continue;
-    }
-    const OuterTagMultiDetectionResult& rescued = attempt.rescued;
-    OuterTagMultiDetectionResult* committed =
-        &(*regeneration_inputs)[frame_index].outer_detections;
-    for (int board_id : attempt.missing_board_ids) {
-      const OuterTagDetectionResult* rescue_detection =
-          FindDetectionByBoardId(rescued, board_id);
-      const OuterBoardMeasurement* rescue_measurement =
-          FindMeasurementByBoardId(rescued, board_id);
-      const OuterTagDetectionResult* baseline_detection =
-          FindDetectionByBoardId(*committed, board_id);
-      if (attempt.baseline_has_zero_detections && rescue_detection != nullptr &&
-          rescue_detection->attempted_local_patch_rescue) {
-        ++summary->zero_detection_atlas_attempted_board_observation_count;
-      }
-      if (rescue_detection != nullptr) {
-        MergeWrongIdProposalsByBoardId(*rescue_detection, committed);
-      }
-      if (rescue_detection == nullptr || rescue_measurement == nullptr ||
-          !rescue_detection->success ||
-          !rescue_detection->used_local_patch_rescue ||
-          rescue_detection->hamming < 0 ||
-          rescue_detection->hamming > summary->max_hamming) {
-        continue;
-      }
-
-      const DirectLayoutRescueValidation geometry_validation =
-          ValidatePatchRescueAgainstDirectLayout(
-              direct_layout, provisional_camera,
-              frame_sources[frame_index].frame_index, *rescue_measurement);
-      if (geometry_validation.evaluable) {
-        ++summary->direct_layout_geometry_gate_evaluated_count;
-        if (geometry_validation.reprojection_rmse_px >
-            summary->direct_layout_geometry_gate_max_rmse_px) {
-          ++summary->direct_layout_geometry_gate_rejected_count;
-          continue;
-        }
-        ++summary->direct_layout_geometry_gate_accepted_count;
-      } else {
-        // Zero-detection frames have no direct same-frame anchor. Preserve the
-        // existing exact-ID recovery path for them; a later global bootstrap
-        // remains responsible for rejecting inconsistent observations.
-        ++summary->direct_layout_geometry_gate_not_evaluable_count;
-      }
-
-      const std::string baseline_failure_reason =
-          baseline_detection != nullptr
-              ? baseline_detection->failure_reason_text
-              : "missing_detector_result";
-      ReplaceDetectionByBoardId(*rescue_detection, committed);
-      ReplaceMeasurementByBoardId(*rescue_measurement, committed);
-      CameraAwareOuterRescueRecord record;
-      record.frame_index = frame_sources[frame_index].frame_index;
-      record.frame_label = frame_sources[frame_index].frame_label;
-      record.board_id = board_id;
-      record.baseline_failure_reason = baseline_failure_reason;
-      record.rescue_summary = rescue_detection->local_patch_rescue_summary;
-      record.hamming = rescue_detection->hamming;
-      record.committed_corners =
-          rescue_detection->refined_corners_original_image;
-      summary->records.push_back(record);
-      ++summary->rescued_board_observation_count;
-    }
-    (*bootstrap_frames)[frame_index].measurements =
-        committed->frame_measurements;
-  }
-
-  for (const InternalRegenerationFrameInput& input : *regeneration_inputs) {
-    const OuterTagMultiDetectionResult& final_detection = input.outer_detections;
-    summary->final_success_count += final_detection.SuccessfulBoardCount();
-    if (final_detection.SuccessfulBoardCount() ==
-        static_cast<int>(final_detection.requested_board_ids.size())) {
-      ++summary->final_all_boards_frame_count;
-    }
-  }
 }
 
 std::set<std::tuple<int, int, int, int, int> > BuildSolverSignatureSet(
@@ -1312,7 +1206,13 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
     return result;
   }
 
+  Stage5ProgressReporter progress(options_.enable_progress_reporting,
+                                  options_.progress_log_path,
+                                  options_.progress_report_interval_frames);
+
   ApriltagInternalConfig config = NormalizeConfig(options_.config);
+  config.outer_detector_config.enable_robust_missing_board_recovery =
+      options_.enable_robust_missing_board_recovery;
   if (options_.enable_camera_aware_outer_rescue) {
     // The first detection pass must remain independent of YAML/camchain
     // intrinsics. A camera is injected only after outer-only initialization.
@@ -1382,7 +1282,6 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   detection_options.geometry_guided_tag_likelihood_single_anchor_min_contrast =
       options_.geometry_guided_tag_likelihood_single_anchor_min_contrast;
   OuterBootstrapOptions bootstrap_options = MakeBootstrapOptions(config, options_);
-  const BoardDetectionPipeline board_detection_pipeline(config, detection_options);
   JointMeasurementBuildOptions build_options;
   build_options.reference_board_id = options_.reference_board_id;
   build_options.include_internal_points = options_.include_internal_points;
@@ -1391,6 +1290,8 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       !options_.strict_board_observation_acceptance;
   build_options.include_rescued_outer_when_internal_failed =
       options_.geometry_prior_rescue_keep_outer_on_internal_failure;
+  build_options.robust_missing_board_recovery =
+      options_.enable_robust_missing_board_recovery;
   build_options.enable_internal_observation_quality_weighting =
       options_.enable_internal_observation_quality_weighting;
   build_options.internal_observation_low_quality_quantile =
@@ -1444,53 +1345,55 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       InternalRegenerationCacheOptions{options_.enable_outer_detection_cache,
                                         options_.outer_detection_cache_dir});
 
+  if (!frame_sources.empty() && options_.enable_outer_detection_cache) {
+    std::string cache_warning;
+    if (!detection_cache.PrepareForDataset(frame_sources.front().image_path,
+                                           &cache_warning) ||
+        !internal_regeneration_cache.PrepareForDataset(
+            frame_sources.front().image_path, &cache_warning)) {
+      AppendUniqueWarning("Cache manifest preparation warning: " +
+                              cache_warning,
+                          &result.warnings);
+    }
+  }
+
   std::vector<OuterBootstrapFrameInput> bootstrap_frames;
   std::vector<InternalRegenerationFrameInput> regeneration_inputs;
   bootstrap_frames.reserve(frame_sources.size());
   regeneration_inputs.reserve(frame_sources.size());
   {
     const auto stage_start = std::chrono::steady_clock::now();
-    for (const FrozenRound2BaselineFrameSource& frame_source : frame_sources) {
-      const cv::Mat image = cv::imread(frame_source.image_path, cv::IMREAD_UNCHANGED);
-      if (image.empty()) {
-        result.failure_reason = "Failed to read image: " + frame_source.image_path;
-        return result;
-      }
-
-      OuterTagMultiDetectionResult outer_detections;
-      std::string cache_warning;
-      OuterDetectionCacheLoadSource cache_load_source =
-          OuterDetectionCacheLoadSource::None;
-      if (detection_cache.Load(frame_source.image_path, &outer_detections,
-                               &cache_warning, &cache_load_source)) {
+    const ParallelOuterDetectionOutput parallel_output =
+        DetectOuterFramesInParallel(frame_sources, config, detection_options,
+                                    detection_cache, &progress);
+    if (!parallel_output.failure_reason.empty()) {
+      result.failure_reason = parallel_output.failure_reason;
+      return result;
+    }
+    for (std::size_t frame_index = 0; frame_index < frame_sources.size(); ++frame_index) {
+      const FrozenRound2BaselineFrameSource& frame_source =
+          frame_sources[frame_index];
+      AppendWarnings(parallel_output.frame_warnings[frame_index], &result.warnings);
+      if (parallel_output.cache_hits[frame_index] != 0) {
         ++result.runtime_breakdown.training_detection_cache.cache_hits;
-        if (cache_load_source == OuterDetectionCacheLoadSource::StageLayout) {
-          ++result.runtime_breakdown.training_detection_cache
-                .stage_layout_cache_hits;
-        } else if (cache_load_source ==
+        if (parallel_output.cache_sources[frame_index] ==
+            OuterDetectionCacheLoadSource::StageLayout) {
+          ++result.runtime_breakdown.training_detection_cache.stage_layout_cache_hits;
+        } else if (parallel_output.cache_sources[frame_index] ==
                    OuterDetectionCacheLoadSource::LegacyLayout) {
-          ++result.runtime_breakdown.training_detection_cache
-                .legacy_layout_cache_hits;
+          ++result.runtime_breakdown.training_detection_cache.legacy_layout_cache_hits;
         }
       } else {
         ++result.runtime_breakdown.training_detection_cache.cache_misses;
-        if (!cache_warning.empty()) {
+        if (parallel_output.cache_load_failures[frame_index] != 0) {
           ++result.runtime_breakdown.training_detection_cache.load_failures;
-          AppendUniqueWarning("Outer detection cache load warning: " + cache_warning,
-                              &result.warnings);
         }
-        outer_detections = board_detection_pipeline.DetectOuter(image);
-        if (detection_cache.enabled() &&
-            !detection_cache.Save(frame_source.image_path, outer_detections,
-                                  &cache_warning)) {
+        if (parallel_output.cache_store_failures[frame_index] != 0) {
           ++result.runtime_breakdown.training_detection_cache.store_failures;
-          if (!cache_warning.empty()) {
-            AppendUniqueWarning("Outer detection cache store warning: " + cache_warning,
-                                &result.warnings);
-          }
         }
       }
-
+      const OuterTagMultiDetectionResult& outer_detections =
+          parallel_output.detections[frame_index];
       OuterBootstrapFrameInput bootstrap_input;
       bootstrap_input.frame_index = frame_source.frame_index;
       bootstrap_input.frame_label = frame_source.frame_label;
@@ -1509,6 +1412,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
   AutoCameraInitializationOptions initialization_options;
   initialization_options.mode = config.camera_initialization_mode;
+  initialization_options.reference_board_id = options_.reference_board_id;
   initialization_options.refine_mode = options_.camera_initialization_refine_mode;
   initialization_options.selection_scorer =
       options_.camera_initialization_selection_scorer;
@@ -1548,10 +1452,14 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   const OuterOnlyCameraInitializer camera_initializer(config, initialization_options);
   {
     const auto stage_start = std::chrono::steady_clock::now();
+    progress.StageStart("camera_initialization", 1);
     result.auto_camera_initialization =
         camera_initializer.Initialize(camera_initialization_frames);
     result.runtime_breakdown.auto_camera_initialization_seconds =
         ElapsedSeconds(stage_start);
+    progress.StageEnd("camera_initialization", 1,
+                      result.auto_camera_initialization.success ? "finished"
+                                                                : "failed");
   }
   if (!result.auto_camera_initialization.success) {
     result.failure_reason = result.auto_camera_initialization.failure_reason.empty()
@@ -1563,7 +1471,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
   result.camera_aware_outer_rescue.requested =
       options_.enable_camera_aware_outer_rescue;
-  if (options_.enable_camera_aware_outer_rescue) {
+    if (options_.enable_camera_aware_outer_rescue) {
     const OuterBootstrapCameraIntrinsics provisional_camera =
         result.auto_camera_initialization.selected_camera;
     if (provisional_camera.NormalizedFamilyString() != "ds-none") {
@@ -1575,15 +1483,40 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       result.camera_aware_outer_rescue.skip_reason =
           "provisional_camera_is_invalid";
     } else {
+      MultiScaleOuterTagDetectorConfig rescue_cache_config =
+          config.outer_detector_config;
+      rescue_cache_config.enable_camera_aware_sphere_patch_rescue = true;
+      rescue_cache_config.camera_aware_sphere_patch_max_hamming =
+          options_.camera_aware_outer_rescue_max_hamming;
+      rescue_cache_config.camera_aware_sphere_patch_commit_mapped_corners =
+          true;
+      OuterDetectionCache rescue_cache(
+          config.outer_detector_config,
+          OuterDetectionCacheOptions{
+              options_.enable_outer_detection_cache,
+              options_.outer_detection_cache_dir,
+              Stage5CacheStage::OuterRescue,
+              MakeCameraAwareRescueSignature(
+                  provisional_camera, rescue_cache_config,
+                  options_.camera_aware_outer_rescue_max_hamming)});
       const auto rescue_start = std::chrono::steady_clock::now();
+      progress.StageStart("camera_aware_outer_rescue", frame_sources.size());
       RunCameraAwareOuterRescue(
           frame_sources, config, provisional_camera,
           options_.camera_aware_outer_rescue_max_hamming,
           options_.camera_aware_outer_rescue_worker_count,
           &bootstrap_frames, &regeneration_inputs,
-          &result.camera_aware_outer_rescue);
+          &result.camera_aware_outer_rescue,
+          &rescue_cache,
+          [&progress](std::size_t completed, std::size_t total,
+                      const std::string& detail) {
+            (void)completed;
+            progress.FrameDone("camera_aware_outer_rescue", total, detail);
+          });
       result.runtime_breakdown.camera_aware_outer_rescue_seconds =
           ElapsedSeconds(rescue_start);
+      progress.StageEnd("camera_aware_outer_rescue", frame_sources.size(),
+                        "finished");
       result.camera_aware_outer_rescue.runtime_seconds =
           result.runtime_breakdown.camera_aware_outer_rescue_seconds;
 
@@ -1637,9 +1570,12 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
   {
     const auto stage_start = std::chrono::steady_clock::now();
+    progress.StageStart("outer_bootstrap", 1);
     const MultiBoardOuterBootstrap bootstrap(config, bootstrap_options);
     result.bootstrap_result = bootstrap.Solve(bootstrap_frames);
     result.runtime_breakdown.outer_bootstrap_seconds = ElapsedSeconds(stage_start);
+    progress.StageEnd("outer_bootstrap", 1,
+                      result.bootstrap_result.success ? "finished" : "failed");
   }
   if (!result.bootstrap_result.success) {
     result.failure_reason = result.bootstrap_result.failure_reason.empty()
@@ -1842,54 +1778,40 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
     }
   } else {
     const auto stage_start = std::chrono::steady_clock::now();
+    const std::string regeneration_state_signature =
+        round1_regeneration_state != nullptr
+            ? InternalRegenerationCache::MakeSceneStateSignature(
+                  *round1_regeneration_state)
+            : InternalRegenerationCache::MakeBootstrapStateSignature(
+                  result.bootstrap_result);
+    const JointReprojectionSceneState* scene_state = round1_regeneration_state;
+    const OuterBootstrapResult* bootstrap_result = &result.bootstrap_result;
+    const ParallelRegenerationOutput parallel_output = RegenerateFramesInParallel(
+        frame_sources, regeneration_inputs, config, detection_options,
+        internal_regeneration_cache, regeneration_state_signature,
+        &progress,
+        [scene_state, bootstrap_result](
+            BoardDetectionPipeline& worker_pipeline, const cv::Mat& image,
+            const InternalRegenerationFrameInput& frame_input) {
+          InternalRegenerationFrameResult regeneration_result;
+          if (scene_state != nullptr) {
+            regeneration_result = worker_pipeline.RegenerateFrame(
+                image, frame_input, *scene_state);
+            regeneration_result.state_source_label = "outer_only_intermediate";
+          } else {
+            regeneration_result = worker_pipeline.RegenerateFrame(
+                image, frame_input, *bootstrap_result);
+          }
+          return regeneration_result;
+        });
+    if (!parallel_output.failure_reason.empty()) {
+      result.failure_reason = parallel_output.failure_reason;
+      return result;
+    }
     for (std::size_t frame_index = 0; frame_index < frame_sources.size(); ++frame_index) {
-      const cv::Mat image =
-          cv::imread(frame_sources[frame_index].image_path, cv::IMREAD_UNCHANGED);
-      if (image.empty()) {
-        result.failure_reason = "Failed to read image: " + frame_sources[frame_index].image_path;
-        return result;
-      }
-
-      InternalRegenerationFrameResult regeneration_result;
-      const std::string regeneration_state_signature =
-          round1_regeneration_state != nullptr
-              ? InternalRegenerationCache::MakeSceneStateSignature(
-                    *round1_regeneration_state)
-              : InternalRegenerationCache::MakeBootstrapStateSignature(
-                    result.bootstrap_result);
-      std::string internal_cache_warning;
-      const bool internal_cache_hit = internal_regeneration_cache.Load(
-          frame_sources[frame_index].image_path,
-          regeneration_inputs[frame_index], regeneration_state_signature,
-          &regeneration_result, &internal_cache_warning);
-      if (!internal_cache_hit) {
-        if (!internal_cache_warning.empty()) {
-          AppendUniqueWarning(
-              "Internal regeneration cache load warning: " +
-                  internal_cache_warning,
-              &result.warnings);
-        }
-        if (round1_regeneration_state != nullptr) {
-          regeneration_result = board_detection_pipeline.RegenerateFrame(
-              image, regeneration_inputs[frame_index],
-              *round1_regeneration_state);
-          regeneration_result.state_source_label = "outer_only_intermediate";
-        } else {
-          regeneration_result = board_detection_pipeline.RegenerateFrame(
-              image, regeneration_inputs[frame_index], result.bootstrap_result);
-        }
-        if (internal_regeneration_cache.enabled() &&
-            !internal_regeneration_cache.Save(
-                frame_sources[frame_index].image_path,
-                regeneration_inputs[frame_index], regeneration_state_signature,
-                regeneration_result, &internal_cache_warning) &&
-            !internal_cache_warning.empty()) {
-          AppendUniqueWarning(
-              "Internal regeneration cache store warning: " +
-                  internal_cache_warning,
-              &result.warnings);
-        }
-      }
+      AppendWarnings(parallel_output.frame_warnings[frame_index], &result.warnings);
+      InternalRegenerationFrameResult regeneration_result =
+          parallel_output.regeneration_results[frame_index];
       result.runtime_breakdown.training_internal_regeneration_cache =
           internal_regeneration_cache.stats();
       AccumulateRegenerationRuntime(
@@ -1904,17 +1826,15 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
           regeneration_result.runtime_breakdown.attempted_internal_corner_count;
       result.runtime_breakdown.round1_regeneration_valid_internal_corners +=
           regeneration_result.runtime_breakdown.valid_internal_corner_count;
-      result.round1.regeneration_results.push_back(regeneration_result);
-      for (const std::string& warning : regeneration_result.warnings) {
-        AppendUniqueWarning(warning, &result.warnings);
-      }
+      AppendWarnings(regeneration_result.warnings, &result.warnings);
+      result.round1.regeneration_results.push_back(std::move(regeneration_result));
 
       JointMeasurementFrameInput joint_input;
       joint_input.frame_index = regeneration_inputs[frame_index].frame_index;
       joint_input.frame_label = regeneration_inputs[frame_index].frame_label;
       joint_input.outer_detections = regeneration_inputs[frame_index].outer_detections;
-      joint_input.regenerated_internal = regeneration_result;
-      result.round1.joint_inputs.push_back(joint_input);
+      joint_input.regenerated_internal = result.round1.regeneration_results.back();
+      result.round1.joint_inputs.push_back(std::move(joint_input));
     }
     result.runtime_breakdown.round1_regeneration_seconds =
         ElapsedSeconds(stage_start);
@@ -1922,10 +1842,13 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
   {
     const auto stage_start = std::chrono::steady_clock::now();
+    progress.StageStart("round1_measurement_build", 1);
     result.round1.measurement_result =
         builder.Build(result.round1.joint_inputs, result.bootstrap_result);
     result.runtime_breakdown.round1_measurement_build_seconds =
         ElapsedSeconds(stage_start);
+    progress.StageEnd("round1_measurement_build", 1,
+                      result.round1.measurement_result.success ? "finished" : "failed");
   }
   result.round1.validation_summary = ValidateJointMeasurementBuilder(
       result.round1.joint_inputs, result.bootstrap_result, builder,
@@ -1948,10 +1871,13 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
   {
     const auto stage_start = std::chrono::steady_clock::now();
+    progress.StageStart("round1_residual_evaluation", 1);
     result.round1.residual_result =
         residual_evaluator.Evaluate(result.round1.measurement_result, initial_scene_state);
     result.runtime_breakdown.round1_residual_evaluation_seconds =
         ElapsedSeconds(stage_start);
+    progress.StageEnd("round1_residual_evaluation", 1,
+                      result.round1.residual_result.success ? "finished" : "failed");
   }
   if (!result.round1.residual_result.success) {
     result.failure_reason = result.round1.residual_result.failure_reason;
@@ -1961,11 +1887,14 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
   {
     const auto stage_start = std::chrono::steady_clock::now();
+    progress.StageStart("round1_selection", 1);
     result.round1.selection_result =
         selector.Select(result.round1.measurement_result, result.round1.residual_result,
                         initial_scene_state);
     result.runtime_breakdown.round1_selection_seconds =
         ElapsedSeconds(stage_start);
+    progress.StageEnd("round1_selection", 1,
+                      result.round1.selection_result.success ? "finished" : "failed");
   }
   if (!result.round1.selection_result.success) {
     result.failure_reason = result.round1.selection_result.failure_reason;
@@ -1975,6 +1904,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
   {
     const auto stage_start = std::chrono::steady_clock::now();
+    progress.StageStart("round1_optimization", 1);
     result.round1.optimization_result =
         optimizer.Optimize(result.round1.selection_result, initial_scene_state);
     result.runtime_breakdown.round1_optimization_seconds =
@@ -1993,6 +1923,8 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
         result.round1.optimization_result.runtime_breakdown.board_update_seconds;
     result.runtime_breakdown.round1_optimization_intrinsics_update_seconds =
         result.round1.optimization_result.runtime_breakdown.intrinsics_update_seconds;
+    progress.StageEnd("round1_optimization", 1,
+                      result.round1.optimization_result.success ? "finished" : "failed");
   }
   if (!result.round1.optimization_result.success) {
     result.failure_reason = result.round1.optimization_result.failure_reason;
@@ -2022,46 +1954,28 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
     result.round2.joint_inputs.reserve(frame_sources.size());
     {
       const auto stage_start = std::chrono::steady_clock::now();
-      for (std::size_t frame_index = 0; frame_index < frame_sources.size(); ++frame_index) {
-        const cv::Mat image =
-            cv::imread(frame_sources[frame_index].image_path, cv::IMREAD_UNCHANGED);
-        if (image.empty()) {
-          result.failure_reason =
-              "Failed to read image: " + frame_sources[frame_index].image_path;
-          return result;
-        }
-
-        InternalRegenerationFrameResult regeneration_result;
-        const std::string regeneration_state_signature =
-            InternalRegenerationCache::MakeSceneStateSignature(
-                result.round1.optimization_result.optimized_state);
-        std::string internal_cache_warning;
-        const bool internal_cache_hit = internal_regeneration_cache.Load(
-            frame_sources[frame_index].image_path,
-            regeneration_inputs[frame_index], regeneration_state_signature,
-            &regeneration_result, &internal_cache_warning);
-        if (!internal_cache_hit) {
-          if (!internal_cache_warning.empty()) {
-            AppendUniqueWarning(
-                "Internal regeneration cache load warning: " +
-                    internal_cache_warning,
-                &result.warnings);
-          }
-          regeneration_result = board_detection_pipeline.RegenerateFrame(
-              image, regeneration_inputs[frame_index],
+      const std::string regeneration_state_signature =
+          InternalRegenerationCache::MakeSceneStateSignature(
               result.round1.optimization_result.optimized_state);
-          if (internal_regeneration_cache.enabled() &&
-              !internal_regeneration_cache.Save(
-                  frame_sources[frame_index].image_path,
-                  regeneration_inputs[frame_index], regeneration_state_signature,
-                  regeneration_result, &internal_cache_warning) &&
-              !internal_cache_warning.empty()) {
-            AppendUniqueWarning(
-                "Internal regeneration cache store warning: " +
-                    internal_cache_warning,
-                &result.warnings);
-          }
-        }
+      const JointReprojectionSceneState* scene_state =
+          &result.round1.optimization_result.optimized_state;
+    const ParallelRegenerationOutput parallel_output = RegenerateFramesInParallel(
+        frame_sources, regeneration_inputs, config, detection_options,
+        internal_regeneration_cache, regeneration_state_signature,
+        &progress,
+        [scene_state](BoardDetectionPipeline& worker_pipeline,
+                        const cv::Mat& image,
+                        const InternalRegenerationFrameInput& frame_input) {
+            return worker_pipeline.RegenerateFrame(image, frame_input, *scene_state);
+          });
+      if (!parallel_output.failure_reason.empty()) {
+        result.failure_reason = parallel_output.failure_reason;
+        return result;
+      }
+      for (std::size_t frame_index = 0; frame_index < frame_sources.size(); ++frame_index) {
+        AppendWarnings(parallel_output.frame_warnings[frame_index], &result.warnings);
+        InternalRegenerationFrameResult regeneration_result =
+            parallel_output.regeneration_results[frame_index];
         result.runtime_breakdown.training_internal_regeneration_cache =
             internal_regeneration_cache.stats();
         AccumulateRegenerationRuntime(
@@ -2076,17 +1990,15 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
             regeneration_result.runtime_breakdown.attempted_internal_corner_count;
         result.runtime_breakdown.round2_regeneration_valid_internal_corners +=
             regeneration_result.runtime_breakdown.valid_internal_corner_count;
-        result.round2.regeneration_results.push_back(regeneration_result);
-        for (const std::string& warning : regeneration_result.warnings) {
-          AppendUniqueWarning(warning, &result.warnings);
-        }
+        AppendWarnings(regeneration_result.warnings, &result.warnings);
+        result.round2.regeneration_results.push_back(std::move(regeneration_result));
 
         JointMeasurementFrameInput joint_input;
         joint_input.frame_index = regeneration_inputs[frame_index].frame_index;
         joint_input.frame_label = regeneration_inputs[frame_index].frame_label;
         joint_input.outer_detections = regeneration_inputs[frame_index].outer_detections;
-        joint_input.regenerated_internal = regeneration_result;
-        result.round2.joint_inputs.push_back(joint_input);
+        joint_input.regenerated_internal = result.round2.regeneration_results.back();
+        result.round2.joint_inputs.push_back(std::move(joint_input));
       }
       result.runtime_breakdown.round2_regeneration_seconds =
           ElapsedSeconds(stage_start);
@@ -2094,10 +2006,13 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
     {
       const auto stage_start = std::chrono::steady_clock::now();
+      progress.StageStart("round2_measurement_build", 1);
       result.round2.measurement_result =
           builder.Build(result.round2.joint_inputs, result.bootstrap_result);
       result.runtime_breakdown.round2_measurement_build_seconds =
           ElapsedSeconds(stage_start);
+      progress.StageEnd("round2_measurement_build", 1,
+                        result.round2.measurement_result.success ? "finished" : "failed");
     }
     result.round2.validation_summary = ValidateJointMeasurementBuilder(
         result.round2.joint_inputs, result.bootstrap_result, builder,
@@ -2110,11 +2025,14 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
     {
       const auto stage_start = std::chrono::steady_clock::now();
+      progress.StageStart("round2_residual_evaluation", 1);
       result.round2.residual_result = residual_evaluator.Evaluate(
           result.round2.measurement_result,
           result.round1.optimization_result.optimized_state);
       result.runtime_breakdown.round2_residual_evaluation_seconds =
           ElapsedSeconds(stage_start);
+      progress.StageEnd("round2_residual_evaluation", 1,
+                        result.round2.residual_result.success ? "finished" : "failed");
     }
     if (!result.round2.residual_result.success) {
       result.failure_reason = result.round2.residual_result.failure_reason;
@@ -2124,11 +2042,14 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
 
     {
       const auto stage_start = std::chrono::steady_clock::now();
+      progress.StageStart("round2_selection", 1);
       result.round2.selection_result =
           selector.Select(result.round2.measurement_result, result.round2.residual_result,
                           result.round1.optimization_result.optimized_state);
       result.runtime_breakdown.round2_selection_seconds =
           ElapsedSeconds(stage_start);
+      progress.StageEnd("round2_selection", 1,
+                        result.round2.selection_result.success ? "finished" : "failed");
     }
     if (!result.round2.selection_result.success) {
       result.failure_reason = result.round2.selection_result.failure_reason;
@@ -2142,6 +2063,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
     const JointReprojectionOptimizer round2_optimizer(second_pass_options);
     {
       const auto stage_start = std::chrono::steady_clock::now();
+      progress.StageStart("round2_optimization", 1);
       result.round2.optimization_result = round2_optimizer.Optimize(
           result.round2.selection_result,
           result.round1.optimization_result.optimized_state);
@@ -2161,6 +2083,8 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
           result.round2.optimization_result.runtime_breakdown.board_update_seconds;
       result.runtime_breakdown.round2_optimization_intrinsics_update_seconds =
           result.round2.optimization_result.runtime_breakdown.intrinsics_update_seconds;
+      progress.StageEnd("round2_optimization", 1,
+                        result.round2.optimization_result.success ? "finished" : "failed");
     }
     if (!result.round2.optimization_result.success) {
       result.failure_reason = result.round2.optimization_result.failure_reason;
@@ -2237,6 +2161,7 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::RunPrecomputed(
 
   AutoCameraInitializationOptions initialization_options;
   initialization_options.mode = config.camera_initialization_mode;
+  initialization_options.reference_board_id = options_.reference_board_id;
   initialization_options.refine_mode = options_.camera_initialization_refine_mode;
   initialization_options.selection_scorer =
       options_.camera_initialization_selection_scorer;

@@ -264,8 +264,9 @@ struct AutoCameraInitializationResult {
   int stage5_init_camera_evaluation_observation_count = 0;
   int stage5_init_all_valid_outer_observations_used = 0;
   int stage5_init_rescued_outer_observation_count = 0;
+  int stage5_init_reference_board_id = 1;
   int stage5_init_rescued_outer_observation_pose_gate_rejected_count = 0;
-  double stage5_init_rescued_outer_observation_lm_weight = 0.25;
+  double stage5_init_rescued_outer_observation_lm_weight = 1.0;
   std::string stage5_init_seed_method;
   std::string stage5_init_seed_source;
   double stage5_init_omni_gamma = std::numeric_limits<double>::quiet_NaN();
@@ -501,6 +502,9 @@ struct AutoCameraInitializationResult {
 
 struct AutoCameraInitializationOptions {
   CameraInitializationMode mode = CameraInitializationMode::AutoWithManualFallback;
+  // Keep temporary shared-layout initialization in the same scene gauge as
+  // the Stage5 bootstrap instead of silently using the first YAML tag.
+  int reference_board_id = 1;
   AutoCameraInitializationRefineMode refine_mode =
       AutoCameraInitializationRefineMode::KalibrOuterLm;
   AutoCameraInitializationSelectionScorer selection_scorer =
@@ -517,12 +521,11 @@ struct AutoCameraInitializationOptions {
   // Complete-frame filtering is kept for seed diagnostics, but valid outer
   // observations from incomplete frames are included in camera evaluation.
   bool include_all_valid_outer_observations_in_evaluation = true;
-  // Camera-aware patch-rescue corners are useful evidence but are not as
-  // trustworthy as ordinary subpixel-refined corners.  Gate them by their
-  // own pose-fit threshold and downweight them in independent-pose LM.
+  // Camera-aware patch-rescue corners must pass their own image/pose gates.
+  // Once accepted they are ordinary measured corners and carry equal weight.
   bool gate_rescued_outer_observations = true;
   double rescued_outer_observation_pose_rmse_gate_pixels = 8.0;
-  double rescued_outer_observation_lm_weight = 0.25;
+  double rescued_outer_observation_lm_weight = 1.0;
   // Estimate one common board layout and one pose per frame after the
   // independent-pose seed.  This is the actual selection pass; the older
   // fixed-layout diagnostic remains separately controllable.

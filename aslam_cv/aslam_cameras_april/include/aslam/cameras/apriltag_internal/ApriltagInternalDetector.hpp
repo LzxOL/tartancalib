@@ -35,7 +35,8 @@ struct ApriltagInternalDetectionOptions {
   int refinement_window_radius = 0;
   double internal_subpix_window_scale = 0.5;
   int internal_subpix_window_min = 4;
-  int internal_subpix_window_max = 16;
+  // Zero keeps the window geometry-scaled without an absolute pixel cap.
+  int internal_subpix_window_max = 0;
   double min_quality = 0.35;
   double min_template_contrast = 24.0;
   double virtual_patch_margin = 1.15;
@@ -68,6 +69,9 @@ struct ApriltagInternalDetectionOptions {
   // fixed pixel bound, and negative disables the bound for debug ablations.
   double geometry_prior_rescue_max_corner_displacement_px = 0.0;
   double geometry_prior_rescue_min_corner_response_ratio = 0.03;
+  // The canonical spherical-refine switch also controls the DS spherical
+  // edge-support bridge used by recovered outer detections. Disabling this
+  // option is therefore a complete ablation of that recovery evidence path.
   bool geometry_prior_rescue_enable_spherical_refine = false;
   int geometry_prior_rescue_edge_sample_count = 80;
   int geometry_prior_rescue_edge_search_half_width_px = 6;
@@ -162,6 +166,9 @@ struct InternalCornerDebugInfo {
   bool original_seed_filter_would_reject = false;
   cv::Point2f original_seed_filter_image{};
   bool border_seed_fallback_to_sphere_lattice = false;
+  // True only after a current-image local refinement has actually run.  A
+  // projected pose seed alone must never be promoted to a BA observation.
+  bool image_refinement_applied = false;
   bool valid = false;
   bool image_evidence_valid = false;
 };
@@ -185,9 +192,9 @@ struct ApriltagInternalRuntimeBreakdown {
 
 struct ApriltagInternalDetectionResult {
   bool success = false;
-  // This failure also invalidates the outer observation: a border-conditioned
-  // lattice had no image-derived boundary model, so its projected-only
-  // fallback must not reach calibration.
+  // In the robust recovery mode a missing boundary model falls back to the
+  // ordinary image-refined sphere lattice.  This remains true only when the
+  // resulting points pass the current-image refinement and topology checks.
   bool reject_entire_board_observation = false;
   bool tag_detected = false;
   int board_id = -1;

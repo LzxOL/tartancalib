@@ -375,7 +375,15 @@ int main(int argc, char** argv) {
       bootstrap_options.initial_camera.fv = values[3];
       bootstrap_options.initial_camera.cu = values[4];
       bootstrap_options.initial_camera.cv = values[5];
-      bootstrap_options.initial_camera.resolution = cv::Size(4512, 4512);
+      if (config.intermediate_camera.resolution.size() != 2 ||
+          config.intermediate_camera.resolution[0] <= 0 ||
+          config.intermediate_camera.resolution[1] <= 0) {
+        throw std::runtime_error(
+            "--bootstrap-camera-intrinsics requires a valid image resolution in the config.");
+      }
+      bootstrap_options.initial_camera.resolution = cv::Size(
+          config.intermediate_camera.resolution[0],
+          config.intermediate_camera.resolution[1]);
     }
     if (args.disable_bootstrap_intrinsics_optimization) {
       bootstrap_options.max_coordinate_descent_iterations = 0;

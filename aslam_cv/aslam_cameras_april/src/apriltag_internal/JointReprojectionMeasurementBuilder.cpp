@@ -114,7 +114,41 @@ double ClampUnitLocal(double value) {
 void ApplyInternalObservationQualityWeightsToResult(
     JointMeasurementBuildResult* result,
     const JointMeasurementBuildOptions& options) {
-  if (result == nullptr || !options.enable_internal_observation_quality_weighting) {
+  if (result == nullptr) {
+    return;
+  }
+
+  if (options.robust_missing_board_recovery) {
+    // Robust recovery has already passed image refinement and topology gates.
+    // Keep its accepted internal points at unit weight; otherwise this later
+    // quality pass would silently reintroduce the low-quality down-weighting
+    // that the recovery mode is designed to remove.
+    result->solver_observations.clear();
+    result->used_internal_point_count = 0;
+    result->used_total_point_count = 0;
+    for (JointMeasurementFrameResult& frame : result->frames) {
+      for (JointBoardObservation& board : frame.board_observations) {
+        for (JointPointObservation& point : board.points) {
+          if (point.point_type == JointPointType::Internal &&
+              point.used_in_solver) {
+            point.observation_weight = 1.0;
+            point.consistency_weight = 1.0;
+            point.final_observation_weight = 1.0;
+          }
+          if (point.used_in_solver) {
+            result->solver_observations.push_back(point);
+            ++result->used_total_point_count;
+            if (point.point_type == JointPointType::Internal) {
+              ++result->used_internal_point_count;
+            }
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  if (!options.enable_internal_observation_quality_weighting) {
     return;
   }
 
@@ -700,6 +734,13 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
           if (board_level_reason != JointRejectionReasonCode::None) {
             point.rejection_reason_code = board_level_reason;
             point.rejection_detail = board_level_detail;
+          } else if (reject_entire_board_observation) {
+            point.rejection_reason_code =
+                JointRejectionReasonCode::InternalRegenerationFailed;
+            point.rejection_detail =
+                regenerated_measurement->detection.failure_reason.empty()
+                    ? "rescued board rejected by downstream image evidence"
+                    : regenerated_measurement->detection.failure_reason;
           } else if (!outer_measurement_valid) {
             point.rejection_reason_code = JointRejectionReasonCode::OuterMeasurementInvalid;
             if (!outer_measurement->failure_reason_text.empty()) {
@@ -743,9 +784,24 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
           }
         } else {
           const ApriltagInternalDetectionResult& detection = regenerated_measurement->detection;
+          std::set<int> attempted_internal_point_ids;
+          for (const InternalCornerDebugInfo& debug :
+               detection.internal_corner_debug) {
+            if (debug.corner_type != CornerType::Outer && debug.point_id >= 0) {
+              attempted_internal_point_ids.insert(debug.point_id);
+            }
+          }
           for (std::size_t point_index = 0; point_index < detection.corners.size(); ++point_index) {
             const CornerMeasurement& measurement = detection.corners[point_index];
             if (measurement.corner_type == CornerType::Outer) {
+              continue;
+            }
+            // MakeDefaultMeasurements contains the canonical union of all
+            // possible points. Only points visited by this board's active
+            // lattice are observations. Treating the untouched defaults as
+            // invalid measurements inflated diagnostics and rendered dozens
+            // of false crosses for every board, especially after pose failure.
+            if (attempted_internal_point_ids.count(measurement.point_id) == 0) {
               continue;
             }
 
@@ -767,9 +823,9 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
             if (board_level_reason != JointRejectionReasonCode::None) {
               point.rejection_reason_code = board_level_reason;
               point.rejection_detail = board_level_detail;
-            } else if ((reject_entire_board_observation ||
-                        !options_.include_outer_when_internal_failed) &&
-                       !detection.success) {
+          } else if (reject_entire_board_observation ||
+                      (!options_.include_outer_when_internal_failed &&
+                       !detection.success)) {
               point.rejection_reason_code =
                   JointRejectionReasonCode::InternalRegenerationFailed;
               point.rejection_detail =
@@ -788,8 +844,10 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
         }
       }
 
-      FilterInternalPointsByReprojectionError(
-          bootstrap_result.coarse_camera, options_, &board_observation);
+      if (!options_.robust_missing_board_recovery) {
+        FilterInternalPointsByReprojectionError(
+            bootstrap_result.coarse_camera, options_, &board_observation);
+      }
 
       board_observation.outer_point_count =
           CountUsedPoints(board_observation, JointPointType::Outer);

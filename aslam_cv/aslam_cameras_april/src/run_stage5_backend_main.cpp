@@ -44,6 +44,12 @@ std::string MatrixToCsv(const Eigen::Matrix4d& matrix);
 
 constexpr const char kFrozenBaselineLabel[] =
     "stage5_backend_frozen_v3_recovery_cache";
+// Frozen Stage5 Board Rescue Recovery Stack (FS5-BRRS): the canonical baseline
+// recovery path. Keep this keyword next to the baseline identity so future
+// changes can locate the complete board/tag rescue stack rather than enabling
+// only one recovery stage in isolation.
+constexpr const char kFrozenStage5BoardRescueRecoveryStack[] =
+    "Frozen Stage5 Board Rescue Recovery Stack (FS5-BRRS; topology identity requires DS/model-aware image evidence)";
 
 enum class IntrinsicsReleaseMode {
   Delayed,
@@ -66,6 +72,9 @@ struct CmdArgs {
   bool external_holdout_self_frontend_prepass = false;
   bool stage5_holdout_evaluate_full_training_observations = false;
   bool stage5_frontend_only = false;
+  bool stage5_enable_progress_reporting = false;
+  std::string stage5_progress_log_path;
+  int stage5_progress_interval_frames = 1;
   std::string output_path;
   std::string kalibr_camchain_yaml;
   std::vector<std::string> reference_intrinsics_specs;
@@ -85,10 +94,11 @@ struct CmdArgs {
   bool stage5_camera_aware_outer_rescue = true;
   bool stage5_camera_aware_outer_rescue_zero_detection_frames = true;
   bool stage5_camera_aware_outer_rescue_zero_detection_frames_set = true;
-  // Explicitly select the frozen recovery bundle used by the canonical
-  // baseline command. This keeps future default changes from silently
-  // disabling a recovery algorithm that has already been validated.
-  bool stage5_enable_frozen_recovery_baseline = false;
+  bool stage5_robust_missing_board_recovery = false;
+  bool stage5_robust_missing_board_recovery_explicitly_disabled = false;
+  // FS5-BRRS is part of the baseline by default. The explicit enable flag is
+  // retained as an idempotent compatibility/reproducibility switch.
+  bool stage5_enable_frozen_recovery_baseline = true;
   std::string experiment_tag;
   std::string cache_dir;
   bool all = false;
@@ -287,6 +297,7 @@ struct CmdArgs {
   double geometry_prior_rescue_accept_max_rotation_error_deg = 5.0;
   double geometry_prior_rescue_accept_max_translation_error = 0.08;
   bool geometry_guided_tag_likelihood_enabled = true;
+  bool geometry_guided_tag_likelihood_explicitly_disabled = false;
   int geometry_guided_tag_likelihood_min_visible_boards = 2;
   int geometry_guided_tag_likelihood_max_expected_hamming = 6;
   int geometry_guided_tag_likelihood_min_hamming_margin = 3;
@@ -557,7 +568,11 @@ struct RequestedExperimentConfig {
   bool camera_aware_outer_rescue = true;
   bool camera_aware_outer_rescue_zero_detection_frames = true;
   bool camera_aware_outer_rescue_zero_detection_frames_set = true;
-  bool frozen_recovery_baseline_preset = false;
+  bool robust_missing_board_recovery = false;
+  // Frozen Stage5 Board Rescue Recovery Stack (FS5-BRRS) is the default
+  // baseline preset; individual --stage5-disable-* options remain available
+  // for explicit ablation experiments.
+  bool frozen_recovery_baseline_preset = true;
   bool outer_only_ablation_mode = false;
   bool include_internal_points = true;
   bool run_second_pass = true;
@@ -1056,6 +1071,7 @@ bool HasAblationOverrides(const RequestedExperimentConfig& config) {
   return config.camera_init_mode != ati::CameraInitializationMode::Auto ||
          !config.camera_aware_outer_rescue ||
          !config.camera_aware_outer_rescue_zero_detection_frames ||
+         !config.robust_missing_board_recovery ||
          config.outer_only_ablation_mode ||
          !config.include_internal_points ||
          !config.run_second_pass ||
@@ -1185,6 +1201,9 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
   if (!config.camera_aware_outer_rescue_zero_detection_frames) {
     parts.push_back("no_zero_detection_atlas");
   }
+  if (!config.robust_missing_board_recovery) {
+    parts.push_back("no_robust_missing_board_recovery");
+  }
   if (!config.enable_geometry_prior_outer_seed) {
     parts.push_back("no_geometry_prior_outer_seed");
   }
@@ -1199,6 +1218,9 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
   }
   if (!config.geometry_prior_rescue_allow_geometry_only_pose_refit) {
     parts.push_back("no_topology_identity_rescue");
+  }
+  if (!config.geometry_guided_tag_likelihood_enabled) {
+    parts.push_back("no_model_aware_topology_tag_evidence");
   }
   if (config.geometry_prior_rescue_keep_outer_on_internal_failure) {
     parts.push_back("geometry_prior_rescue_outer_fallback");
@@ -1491,6 +1513,8 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.stage5_camera_aware_outer_rescue_zero_detection_frames;
   config.camera_aware_outer_rescue_zero_detection_frames_set =
       args.stage5_camera_aware_outer_rescue_zero_detection_frames_set;
+  config.robust_missing_board_recovery =
+      args.stage5_robust_missing_board_recovery;
   config.outer_only_ablation_mode = !args.include_internal_points;
   config.include_internal_points = args.include_internal_points;
   config.run_second_pass = !args.disable_second_pass;
@@ -1734,12 +1758,25 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
     config.camera_aware_outer_rescue = true;
     config.camera_aware_outer_rescue_zero_detection_frames = true;
     config.camera_aware_outer_rescue_zero_detection_frames_set = true;
+    if (!args.stage5_robust_missing_board_recovery_explicitly_disabled) {
+      config.robust_missing_board_recovery = true;
+    }
     config.enable_geometry_prior_outer_seed = true;
     config.geometry_prior_rescue_diagnostic_only = false;
     config.geometry_prior_rescue_use_as_observation = true;
     config.geometry_prior_rescue_keep_outer_on_internal_failure = false;
     config.geometry_prior_rescue_allow_geometry_only_pose_refit = true;
     config.geometry_prior_rescue_enable_spherical_refine = true;
+    // Topology supplies the missing board identity/pose proposal only. The
+    // canonical baseline must also require an independently image-supported
+    // DS/model-aware payload check before committing that proposal.
+    if (!args.geometry_guided_tag_likelihood_explicitly_disabled) {
+      config.geometry_guided_tag_likelihood_enabled = true;
+    }
+    // A frame with one directly decoded board still carries a usable rigid-rig
+    // pose seed. Recovery remains conservative: the missing board must pass
+    // the dedicated exact-ID/Hamming-margin, contrast, and pose-RMSE gates.
+    config.geometry_guided_tag_likelihood_allow_single_anchor = true;
   }
 
   config.enable_outer_only_intermediate_calibration =
@@ -2074,6 +2111,9 @@ void PrintUsage(const char* program) {
       << "  --stage5-frontend-only               Run detection, initialization, rescue, and\n"
       << "                                      observation regeneration on all frames; skip\n"
       << "                                      selection incremental BA and backend evaluation.\n"
+      << "  --stage5-enable-progress             Print live stage/frame progress.\n"
+      << "  --stage5-progress-log PATH           Also write live progress to PATH.\n"
+      << "  --stage5-progress-interval N         Report every N completed frames.\n"
       << "  --stage5-enable-camera-aware-sphere-patch-zero-detection\n"
       << "                                      Run the full-view sphere-patch atlas for raw\n"
       << "                                      zero-detection frames; exact-ID/Hamming-0 only.\n"
@@ -2290,6 +2330,15 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.external_holdout_self_frontend_prepass = true;
     } else if (token == "--stage5-frontend-only") {
       args.stage5_frontend_only = true;
+    } else if (token == "--stage5-enable-progress" ||
+               token == "--stage5-progress") {
+      args.stage5_enable_progress_reporting = true;
+    } else if (token == "--stage5-progress-log" && i + 1 < argc) {
+      args.stage5_enable_progress_reporting = true;
+      args.stage5_progress_log_path = argv[++i];
+    } else if (token == "--stage5-progress-interval" && i + 1 < argc) {
+      args.stage5_progress_interval_frames = std::max(1, std::stoi(argv[++i]));
+      args.stage5_enable_progress_reporting = true;
     } else if (token ==
                "--stage5-holdout-evaluate-full-training-observations") {
       args.stage5_holdout_evaluate_full_training_observations = true;
@@ -2332,6 +2381,12 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.stage5_camera_aware_outer_rescue = true;
     } else if (token == "--stage5-disable-camera-aware-outer-rescue") {
       args.stage5_camera_aware_outer_rescue = false;
+    } else if (token == "--stage5-enable-robust-missing-board-recovery") {
+      args.stage5_robust_missing_board_recovery = true;
+      args.stage5_robust_missing_board_recovery_explicitly_disabled = false;
+    } else if (token == "--stage5-disable-robust-missing-board-recovery") {
+      args.stage5_robust_missing_board_recovery = false;
+      args.stage5_robust_missing_board_recovery_explicitly_disabled = true;
     } else if (token == "--stage5-enable-frozen-recovery-baseline") {
       args.stage5_enable_frozen_recovery_baseline = true;
     } else if (token == "--kalibr-training-split-signature" && i + 1 < argc) {
@@ -3034,6 +3089,7 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.geometry_guided_tag_likelihood_enabled = true;
     } else if (token == "--stage5-disable-geometry-guided-tag-likelihood") {
       args.geometry_guided_tag_likelihood_enabled = false;
+      args.geometry_guided_tag_likelihood_explicitly_disabled = true;
     } else if (token ==
                    "--stage5-geometry-guided-tag-likelihood-min-visible-boards" &&
                i + 1 < argc) {
@@ -5407,6 +5463,10 @@ void WriteCameraAwareOuterRescueArtifacts(
            << rescue.direct_layout_geometry_gate_rejected_count << "\n";
     output << "stage5_camera_aware_outer_rescue_direct_layout_geometry_gate_not_evaluable_count: "
            << rescue.direct_layout_geometry_gate_not_evaluable_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_temporal_seed_attempted_board_observation_count: "
+           << rescue.temporal_seed_attempted_board_observation_count << "\n";
+    output << "stage5_camera_aware_outer_rescue_temporal_seed_rescued_board_observation_count: "
+           << rescue.temporal_seed_rescued_board_observation_count << "\n";
     output << "stage5_camera_aware_outer_rescue_rescued_board_observation_count: "
            << rescue.rescued_board_observation_count << "\n";
     output << "stage5_camera_aware_outer_rescue_final_success_count: "
@@ -5512,6 +5572,8 @@ void WriteExperimentConfigSummary(
     const ati::AslamBackendCalibrationResult* backend_result) {
   std::ofstream output(path.c_str());
   output << "frozen_baseline_label: " << requested.frozen_baseline_label << "\n";
+  output << "frozen_stage5_board_rescue_recovery_stack: "
+         << kFrozenStage5BoardRescueRecoveryStack << "\n";
   output << "experiment_tag: " << requested.experiment_tag << "\n";
   output << "effective_protocol_label: " << requested.effective_protocol_label << "\n";
 
@@ -5527,11 +5589,15 @@ void WriteExperimentConfigSummary(
   output << "requested_stage5_camera_aware_outer_rescue_zero_detection_frames: "
          << (requested.camera_aware_outer_rescue_zero_detection_frames ? 1 : 0)
          << "\n";
+  output << "requested_robust_missing_board_recovery: "
+         << (requested.robust_missing_board_recovery ? 1 : 0) << "\n";
   output << "requested_frozen_recovery_baseline_preset: "
          << (requested.frozen_recovery_baseline_preset ? 1 : 0) << "\n";
   output << "requested_geometry_guided_tag_likelihood_single_anchor: "
          << (requested.geometry_guided_tag_likelihood_allow_single_anchor ? 1 : 0)
          << "\n";
+  output << "requested_geometry_guided_tag_likelihood_enabled: "
+         << (requested.geometry_guided_tag_likelihood_enabled ? 1 : 0) << "\n";
   output << "requested_outer_only_ablation_mode: "
          << (requested.outer_only_ablation_mode ? 1 : 0) << "\n";
   output << "requested_strict_outer_only_ablation: "
@@ -6038,6 +6104,9 @@ void WriteExperimentConfigSummary(
   output << "requested_geometry_prior_rescue_min_corner_response_ratio: "
          << requested.geometry_prior_rescue_min_corner_response_ratio << "\n";
   output << "requested_geometry_prior_rescue_enable_spherical_refine: "
+         << (requested.geometry_prior_rescue_enable_spherical_refine ? 1 : 0)
+         << "\n";
+  output << "requested_geometry_prior_rescue_spherical_edge_support_bridge: "
          << (requested.geometry_prior_rescue_enable_spherical_refine ? 1 : 0)
          << "\n";
   output << "requested_geometry_prior_rescue_edge_sample_count: "
@@ -7065,20 +7134,18 @@ void WriteExperimentConfigSummary(
                 .geometry_prior_rescue_max_corner_displacement_px
          << "\n";
   output << "effective_geometry_prior_corner_displacement_guard_mode: "
-         << (report.baseline_result.effective_options
-                         .geometry_prior_rescue_max_corner_displacement_px < 0.0
-                 ? "disabled_debug"
-                 : (report.baseline_result.effective_options
-                                .geometry_prior_rescue_max_corner_displacement_px ==
-                            0.0
-                        ? "scale_adaptive"
-                        : "fixed_px"))
-         << "\n";
+            "diagnostic_only\n";
   output << "effective_geometry_prior_rescue_min_corner_response_ratio: "
          << report.baseline_result.effective_options
                 .geometry_prior_rescue_min_corner_response_ratio
          << "\n";
   output << "effective_geometry_prior_rescue_enable_spherical_refine: "
+         << (report.baseline_result.effective_options
+                     .geometry_prior_rescue_enable_spherical_refine
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_geometry_prior_rescue_spherical_edge_support_bridge: "
          << (report.baseline_result.effective_options
                      .geometry_prior_rescue_enable_spherical_refine
                  ? 1
@@ -7111,6 +7178,34 @@ void WriteExperimentConfigSummary(
   output << "effective_geometry_prior_rescue_accept_max_translation_error: "
          << report.baseline_result.effective_options
                 .geometry_prior_rescue_accept_max_translation_error
+         << "\n";
+  output << "effective_geometry_guided_tag_likelihood_enabled: "
+         << (report.baseline_result.effective_options
+                     .geometry_guided_tag_likelihood_enabled
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_topology_identity_requires_model_aware_tag_evidence: "
+         << (report.baseline_result.effective_options
+                     .geometry_guided_tag_likelihood_enabled
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_geometry_guided_tag_likelihood_min_visible_boards: "
+         << report.baseline_result.effective_options
+                .geometry_guided_tag_likelihood_min_visible_boards
+         << "\n";
+  output << "effective_geometry_guided_tag_likelihood_max_expected_hamming: "
+         << report.baseline_result.effective_options
+                .geometry_guided_tag_likelihood_max_expected_hamming
+         << "\n";
+  output << "effective_geometry_guided_tag_likelihood_min_hamming_margin: "
+         << report.baseline_result.effective_options
+                .geometry_guided_tag_likelihood_min_hamming_margin
+         << "\n";
+  output << "effective_geometry_guided_tag_likelihood_min_contrast: "
+         << report.baseline_result.effective_options
+                .geometry_guided_tag_likelihood_min_contrast
          << "\n";
     output << "effective_pre_backend_filter_mode: "
            << ati::ToString(report.pre_backend_filter_result.options.mode) << "\n";
@@ -8872,10 +8967,15 @@ int main(int argc, char** argv) {
     ApplyStage5ModelFamily(requested_config.models,
                            &baseline_options.config);
     if (requested_config.camera_aware_outer_rescue_zero_detection_frames_set) {
-      baseline_options.config.outer_detector_config
+    baseline_options.config.outer_detector_config
           .camera_aware_sphere_patch_rescue_zero_detection_frames =
           requested_config.camera_aware_outer_rescue_zero_detection_frames;
     }
+    baseline_options.enable_robust_missing_board_recovery =
+        requested_config.robust_missing_board_recovery;
+    baseline_options.config.outer_detector_config
+        .enable_robust_missing_board_recovery =
+        requested_config.robust_missing_board_recovery;
     if (!use_precomputed &&
         !precomputed_initialization_auxiliary_sessions.empty()) {
       const std::vector<int>& resolution =
@@ -8948,6 +9048,11 @@ int main(int argc, char** argv) {
     }
     baseline_options.reference_board_id = args.reference_board_id;
     baseline_options.frontend_only = args.stage5_frontend_only;
+    baseline_options.enable_progress_reporting =
+        args.stage5_enable_progress_reporting;
+    baseline_options.progress_log_path = args.stage5_progress_log_path;
+    baseline_options.progress_report_interval_frames =
+        std::max(1, args.stage5_progress_interval_frames);
     baseline_options.outer_only_ablation_mode =
         requested_config.outer_only_ablation_mode;
     baseline_options.include_internal_points =
@@ -9191,8 +9296,12 @@ int main(int argc, char** argv) {
                    : fs::path(args.test_image_path).stem().string());
     benchmark_input.use_external_holdout_self_frontend_prepass =
         args.external_holdout_self_frontend_prepass;
+    // With --stage5-no-holdout, evaluation uses the same full training
+    // sequence. Reuse the already-built frontend measurements instead of
+    // running a second detector/rescue pass over the identical images.
     benchmark_input.holdout_evaluate_full_training_observations =
-        args.stage5_holdout_evaluate_full_training_observations;
+        args.stage5_holdout_evaluate_full_training_observations ||
+        args.stage5_no_holdout;
     benchmark_input.baseline_options = baseline_options;
     benchmark_input.backend_options = backend_options;
     benchmark_input.committed_backend_evaluation_options =
@@ -9911,6 +10020,18 @@ int main(int argc, char** argv) {
       summary << "camera_aware_outer_rescue_count: "
               << report.baseline_result.camera_aware_outer_rescue
                      .rescued_board_observation_count
+              << "\n";
+      summary << "geometry_guided_tag_likelihood_enabled: "
+              << (report.baseline_result.effective_options
+                          .geometry_guided_tag_likelihood_enabled
+                      ? 1
+                      : 0)
+              << "\n";
+      summary << "topology_identity_requires_model_aware_tag_evidence: "
+              << (report.baseline_result.effective_options
+                          .geometry_guided_tag_likelihood_enabled
+                      ? 1
+                      : 0)
               << "\n";
       summary << "initialization_camera_family: "
               << report.baseline_result.auto_camera_initialization.selected_camera
