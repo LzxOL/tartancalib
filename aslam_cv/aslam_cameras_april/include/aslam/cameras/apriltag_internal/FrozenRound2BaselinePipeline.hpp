@@ -148,6 +148,7 @@ struct FrozenRound2BaselineOptions {
   double internal_corner_filter_quality_min = 0.35;
   double internal_corner_filter_quality_relaxation_px = 1.0;
   double internal_corner_filter_adaptive_min_threshold_px = 1.0;
+  bool enable_bidirectional_board_topology_consistency = true;
   bool use_explicit_initial_camera = false;
   OuterBootstrapCameraIntrinsics explicit_initial_camera;
   std::string explicit_initial_camera_source_label = "explicit_initial_camera";
@@ -169,6 +170,10 @@ struct FrozenRound2BaselineOptions {
   // camera initialization. The zero-detection atlas policy lives in
   // config.outer_detector_config and defaults to enabled.
   bool enable_camera_aware_outer_rescue = true;
+  // Additive exact-ID detector fallback for unresolved boards. Its OpenCV
+  // corner convention is normalized to the ETHZ/canonical board convention
+  // before any refinement or internal regeneration.
+  bool enable_opencv_apriltag_fallback = true;
   // Enables the multi-evidence missing-board path.  Direct exact-ID
   // detections remain unchanged; this flag only relaxes recovery-specific
   // visibility/refinement and boundary-model failure handling.

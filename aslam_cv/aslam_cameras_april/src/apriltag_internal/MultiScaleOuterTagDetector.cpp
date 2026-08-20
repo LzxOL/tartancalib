@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <Eigen/Eigenvalues>
+#include <opencv2/aruco.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include <aslam/cameras/apriltag_internal/DoubleSphereCameraModel.hpp>
@@ -67,6 +68,7 @@ struct ScaleCandidate {
   double max_edge = 0.0;
   double shape_quality = 0.0;
   bool from_local_patch_rescue = false;
+  bool from_opencv_apriltag_fallback = false;
   std::string local_patch_label;
   double local_patch_center_distance =
       std::numeric_limits<double>::infinity();
@@ -914,6 +916,20 @@ MultiScaleOuterTagDetectorConfig ParseConfig(const std::string& yaml_path) {
     } else if (key == "adaptiveCoarseMaxHamming" ||
                key == "adaptive_coarse_max_hamming") {
       config.adaptive_coarse_max_hamming = ParseInt(key, value);
+    } else if (key == "enableOpenCvApriltagFallback" ||
+               key == "enable_opencv_apriltag_fallback") {
+      config.enable_opencv_apriltag_fallback = ParseBool(key, value);
+    } else if (key == "opencvApriltagFallbackLongestSides" ||
+               key == "opencv_apriltag_fallback_longest_sides") {
+      config.opencv_apriltag_fallback_longest_sides = ParseIntList(key, value);
+    } else if (key == "blackBorderBits" || key == "black_border_bits" ||
+               key == "opencvApriltagMarkerBorderBits" ||
+               key == "opencv_apriltag_marker_border_bits") {
+      config.opencv_apriltag_marker_border_bits = ParseInt(key, value);
+    } else if (key == "opencvApriltagMinMarkerPerimeterRate" ||
+               key == "opencv_apriltag_min_marker_perimeter_rate") {
+      config.opencv_apriltag_min_marker_perimeter_rate =
+          ParseDouble(key, value);
     } else if (key == "outerLocalContextScale" || key == "outer_local_context_scale") {
       config.outer_local_context_scale = ParseDouble(key, value);
     } else if (key == "outerCornerMarkerRatio" || key == "outer_corner_marker_ratio" ||
@@ -942,6 +958,10 @@ MultiScaleOuterTagDetectorConfig ParseConfig(const std::string& yaml_path) {
     } else if (key == "closeEdgeOuterSubpixMaxMultiplier" ||
                key == "close_edge_outer_subpix_max_multiplier") {
       config.close_edge_outer_subpix_max_multiplier = ParseDouble(key, value);
+    } else if (key == "enableScaleAdaptiveCornerResponseRollback" ||
+               key == "enable_scale_adaptive_corner_response_rollback") {
+      config.enable_scale_adaptive_corner_response_rollback =
+          ParseBool(key, value);
     } else if (key == "outerRefineGateScale" || key == "outer_refine_gate_scale") {
       config.outer_refine_gate_scale = ParseDouble(key, value);
     } else if (key == "outerRefineGateMin" || key == "outer_refine_gate_min") {
@@ -1213,6 +1233,65 @@ bool PassesBoardQuadConsistency(
   return true;
 }
 
+bool PassesAtomicRefinementTopologyCheck(
+    const std::array<cv::Point2f, 4>& coarse,
+    const std::array<cv::Point2f, 4>& refined,
+    int* worst_corner_index,
+    std::string* diagnostic) {
+  std::array<double, 4> displacements{};
+  int worst_index = 0;
+  for (int index = 0; index < 4; ++index) {
+    displacements[static_cast<std::size_t>(index)] =
+        Norm(refined[static_cast<std::size_t>(index)] -
+             coarse[static_cast<std::size_t>(index)]);
+    if (displacements[static_cast<std::size_t>(index)] >
+        displacements[static_cast<std::size_t>(worst_index)]) {
+      worst_index = index;
+    }
+  }
+  std::array<double, 4> sorted_displacements = displacements;
+  std::sort(sorted_displacements.begin(), sorted_displacements.end());
+  const double worst_displacement = sorted_displacements[3];
+  const double second_worst_displacement = sorted_displacements[2];
+  const cv::Point2f& worst_corner = coarse[static_cast<std::size_t>(worst_index)];
+  const double local_scale = std::min(
+      Norm(coarse[static_cast<std::size_t>((worst_index + 3) % 4)] -
+           worst_corner),
+      Norm(coarse[static_cast<std::size_t>((worst_index + 1) % 4)] -
+           worst_corner));
+
+  // Recovery seeds can move coherently under extreme distortion. The failure
+  // mode addressed here is different: one occluded corner jumps to a nearby
+  // image junction while the other three corners remain stable. Express both
+  // conditions relative to this board's own scale, never as a pixel cutoff.
+  constexpr double kMaximumIsolatedDisplacementRatio = 0.05;
+  constexpr double kIsolationFactor = 4.0;
+  constexpr double kStableCornerNoiseRatio = 0.0025;
+  const double stable_corner_scale =
+      std::max(second_worst_displacement,
+               kStableCornerNoiseRatio * local_scale);
+  const bool isolated_jump =
+      local_scale > 1e-9 &&
+      worst_displacement / local_scale >
+          kMaximumIsolatedDisplacementRatio &&
+      worst_displacement > kIsolationFactor * stable_corner_scale;
+
+  if (worst_corner_index != nullptr) {
+    *worst_corner_index = worst_index;
+  }
+  if (diagnostic != nullptr) {
+    std::ostringstream stream;
+    stream << "atomic_refinement_topology:worst_corner=" << worst_index
+           << ":worst=" << worst_displacement
+           << ":second=" << second_worst_displacement
+           << ":local_scale=" << local_scale
+           << ":normalized="
+           << (local_scale > 1e-9 ? worst_displacement / local_scale : 0.0);
+    *diagnostic = stream.str();
+  }
+  return !isolated_jump;
+}
+
 bool PassesBorderCheck(const std::array<cv::Point2f, 4>& corners, const cv::Size& size,
                        double min_border_distance) {
   for (const cv::Point2f& corner : corners) {
@@ -1253,7 +1332,11 @@ bool PassesRefinedCornerResponseCheck(
     const cv::Mat& gray,
     const cv::Point2f& refined_corner,
     int subpix_radius,
-    std::string* diagnostic) {
+    std::string* diagnostic,
+    int peak_radius_override = 0,
+    int response_radius_override = 0,
+    bool require_full_neighborhood = false,
+    double* peak_ratio_output = nullptr) {
   if (gray.empty()) {
     if (diagnostic != nullptr) {
       *diagnostic = "corner_response:empty_image";
@@ -1269,9 +1352,24 @@ bool PassesRefinedCornerResponseCheck(
     return false;
   }
 
-  const int response_radius =
-      std::max(12, std::min(32, std::max(1, subpix_radius) / 3));
+  const int response_radius = response_radius_override > 0
+                                  ? response_radius_override
+                                  : std::max(12, std::min(
+                                                     32,
+                                                     std::max(1, subpix_radius) /
+                                                         3));
   const int margin = response_radius + 10;
+  if (require_full_neighborhood &&
+      (x - margin < 0 || y - margin < 0 || x + margin >= gray.cols ||
+       y + margin >= gray.rows)) {
+    if (diagnostic != nullptr) {
+      std::ostringstream stream;
+      stream << "corner_response:incomplete_scale_adaptive_neighborhood"
+             << ":search_radius=" << response_radius;
+      *diagnostic = stream.str();
+    }
+    return false;
+  }
   const int x0 = std::max(0, x - margin);
   const int y0 = std::max(0, y - margin);
   const int x1 = std::min(gray.cols, x + margin + 1);
@@ -1290,7 +1388,8 @@ bool PassesRefinedCornerResponseCheck(
 
   const int cx = x - x0;
   const int cy = y - y0;
-  const int peak_radius = 2;
+  const int peak_radius =
+      peak_radius_override > 0 ? peak_radius_override : 2;
   double refined_response = 0.0;
   for (int yy = std::max(0, cy - peak_radius);
        yy <= std::min(response.rows - 1, cy + peak_radius); ++yy) {
@@ -1314,15 +1413,17 @@ bool PassesRefinedCornerResponseCheck(
   }
 
   constexpr double kReliableCornerPeakResponse = 8.0;
-  constexpr double kMinimumRefinedCornerResponse = 5.0;
   constexpr double kMinimumPeakRatio = 0.20;
   const double peak_ratio =
       local_peak_response > 1e-9 ? refined_response / local_peak_response : 0.0;
+  if (peak_ratio_output != nullptr) {
+    *peak_ratio_output = peak_ratio;
+  }
   const bool reliable_response = local_peak_response >= kReliableCornerPeakResponse;
+  const bool has_refined_response = refined_response > 1e-9;
   const bool passes =
-      !reliable_response ||
-      (refined_response >= kMinimumRefinedCornerResponse &&
-       peak_ratio >= kMinimumPeakRatio);
+      has_refined_response &&
+      (!reliable_response || peak_ratio >= kMinimumPeakRatio);
 
   if (diagnostic != nullptr) {
     std::ostringstream stream;
@@ -1333,6 +1434,31 @@ bool PassesRefinedCornerResponseCheck(
     *diagnostic = stream.str();
   }
   return passes;
+}
+
+bool PassesScaleAdaptiveCoarseCornerResponseCheck(
+    const cv::Mat& gray,
+    const cv::Point2f& coarse_corner,
+    double local_scale,
+    int* core_radius,
+    int* search_radius,
+    double* peak_ratio,
+    std::string* diagnostic) {
+  // Express both radii as fractions of the locally projected tag edge. This
+  // preserves the same physical support region when image resolution changes.
+  const int adaptive_core_radius = std::max(
+      2, std::min(16, static_cast<int>(std::lround(0.0075 * local_scale))));
+  const int adaptive_search_radius = std::max(
+      12, std::min(64, static_cast<int>(std::lround(0.05 * local_scale))));
+  if (core_radius != nullptr) {
+    *core_radius = adaptive_core_radius;
+  }
+  if (search_radius != nullptr) {
+    *search_radius = adaptive_search_radius;
+  }
+  return PassesRefinedCornerResponseCheck(
+      gray, coarse_corner, 0, diagnostic, adaptive_core_radius,
+      adaptive_search_radius, true, peak_ratio);
 }
 
 double SampleGrayBilinear(const cv::Mat& image, const cv::Point2f& point) {
@@ -2795,6 +2921,9 @@ bool RefineCameraAwareRescuedOuterCorners(
         subpix_result.rollback_iteration;
     debug.subpix_unstable_rollback_max_displacement =
         subpix_result.max_probe_displacement;
+    const bool unstable_rollback = subpix_result.unstable_rollback_detected;
+    debug.coarse_to_subpix_displacement = Norm(refined - seed);
+    debug.coarse_to_refined_displacement = debug.coarse_to_subpix_displacement;
     const bool refined_inside =
         std::isfinite(refined.x) && std::isfinite(refined.y) &&
         (config.enable_robust_missing_board_recovery
@@ -2807,12 +2936,38 @@ bool RefineCameraAwareRescuedOuterCorners(
     debug.refined_valid = refined_inside &&
                           !subpix_result.unstable_rollback_detected;
     debug.verification_passed = debug.refined_valid;
+    if (debug.refined_valid && debug.subpix_applied) {
+      std::string response_diagnostic;
+      // This function is used only by camera-aware recovery.  Re-check the
+      // image corner after subpixel refinement, but leave the normal direct
+      // AprilTag path untouched. A nonzero response is required at the final
+      // point; when the local patch has a reliable peak, the final point must
+      // also explain a meaningful fraction of that peak.
+      if (!PassesRefinedCornerResponseCheck(
+              gray, refined, debug.subpix_window_radius,
+              &response_diagnostic)) {
+        debug.refined_valid = false;
+        debug.verification_passed = false;
+        debug.failure_reason = response_diagnostic;
+        all_valid = false;
+      }
+    }
     if (!debug.refined_valid) {
       all_valid = false;
-      debug.failure_reason = subpix_result.unstable_rollback_detected
-                                 ? "rescued_outer_subpix_unstable_rollback"
-                                 : "rescued_outer_subpix_refined_point_invalid";
+      if (unstable_rollback) {
+        debug.failure_reason =
+            "rescued_outer_subpix_unstable_rollback";
+      } else if (debug.failure_reason.empty()) {
+        debug.failure_reason =
+            "rescued_outer_subpix_refined_point_invalid";
+      }
     }
+  }
+
+  int valid_corner_count = 0;
+  for (int index = 0; index < 4; ++index) {
+    valid_corner_count +=
+        (*verification_debug)[static_cast<std::size_t>(index)].refined_valid ? 1 : 0;
   }
 
   double area_ratio = 0.0;
@@ -2824,23 +2979,124 @@ bool RefineCameraAwareRescuedOuterCorners(
   for (int index = 0; index < 4; ++index) {
     OuterCornerVerificationDebugInfo& debug =
         (*verification_debug)[static_cast<std::size_t>(index)];
+    // These values are populated before the per-corner evidence gate. Keep
+    // the final assignment for cache compatibility when a seed was rejected
+    // before cornerSubPix could run.
     debug.coarse_to_subpix_displacement =
         Norm(debug.subpix_corner - debug.coarse_corner);
     debug.coarse_to_refined_displacement =
         debug.coarse_to_subpix_displacement;
-    if (!topology_ok && debug.refined_valid) {
+    if (!topology_ok && all_valid && debug.refined_valid) {
       debug.refined_valid = false;
       debug.verification_passed = false;
       debug.failure_reason = "rescued_outer_subpix_quad_consistency:" +
                              topology_diagnostic;
     }
   }
-  if (!topology_ok) {
+  if (!topology_ok && all_valid) {
     if (failure_reason != nullptr) {
       *failure_reason = topology_diagnostic.empty()
                             ? "rescued_outer_subpix_quad_consistency_failed"
                             : "rescued_outer_subpix_quad_consistency:" +
                                   topology_diagnostic;
+    }
+    return false;
+  }
+  if (!all_valid || valid_corner_count != 4) {
+    if (failure_reason != nullptr) {
+      std::ostringstream stream;
+      stream << "rescued_outer_subpix_incomplete_refinement:valid_corners="
+             << valid_corner_count;
+      *failure_reason = stream.str();
+    }
+    return false;
+  }
+  int worst_corner_index = -1;
+  std::string atomic_topology_diagnostic;
+  if (!PassesAtomicRefinementTopologyCheck(
+          coarse_corners, *refined_corners, &worst_corner_index,
+          &atomic_topology_diagnostic)) {
+    bool spherical_support_confirms_refined_corner = false;
+    std::string spherical_support_diagnostic = "spherical_support_unavailable";
+    if (sphere_camera != nullptr && sphere_camera->IsValid() &&
+        config.enable_outer_spherical_refinement) {
+      const OuterSphericalQuadRefinementResult spherical_refinement =
+          RefineOuterCornersBySphericalPlanes(
+              gray, *sphere_camera, coarse_corners, config);
+      for (int index = 0; index < 4; ++index) {
+        const std::size_t corner_index = static_cast<std::size_t>(index);
+        const OuterSphericalCornerRefinementDebug& spherical_debug =
+            spherical_refinement.corner_debug[corner_index];
+        OuterCornerVerificationDebugInfo& debug =
+            (*verification_debug)[corner_index];
+        debug.spherical_refinement_valid = spherical_debug.success;
+        debug.spherical_failure_reason = spherical_debug.failure_reason;
+        debug.spherical_corner = spherical_debug.refined_corner;
+        debug.prev_spherical_residual = spherical_debug.prev_edge_residual;
+        debug.next_spherical_residual = spherical_debug.next_edge_residual;
+        debug.prev_spherical_support_count =
+            spherical_debug.prev_edge_support_count;
+        debug.next_spherical_support_count =
+            spherical_debug.next_edge_support_count;
+      }
+      if (spherical_refinement.joint_fit_success &&
+          spherical_refinement.successful_corner_count == 4 &&
+          worst_corner_index >= 0 && worst_corner_index < 4) {
+        const std::size_t worst_index =
+            static_cast<std::size_t>(worst_corner_index);
+        const cv::Point2f& coarse_corner = coarse_corners[worst_index];
+        const double local_scale = std::min(
+            Norm(coarse_corners[static_cast<std::size_t>(
+                     (worst_corner_index + 3) % 4)] -
+                 coarse_corner),
+            Norm(coarse_corners[static_cast<std::size_t>(
+                     (worst_corner_index + 1) % 4)] -
+                 coarse_corner));
+        const double spherical_to_subpix_displacement = Norm(
+            spherical_refinement.refined_corners[worst_index] -
+            (*refined_corners)[worst_index]);
+        constexpr double kMaximumSphericalConfirmationRatio = 0.02;
+        spherical_support_confirms_refined_corner =
+            local_scale > 1e-9 &&
+            spherical_to_subpix_displacement / local_scale <=
+                kMaximumSphericalConfirmationRatio;
+        std::ostringstream stream;
+        stream << "joint_spherical_support:corner=" << worst_corner_index
+               << ":spherical_to_subpix="
+               << spherical_to_subpix_displacement
+               << ":local_scale=" << local_scale
+               << ":normalized="
+               << (local_scale > 1e-9
+                       ? spherical_to_subpix_displacement / local_scale
+                       : 0.0);
+        spherical_support_diagnostic = stream.str();
+      } else {
+        std::ostringstream stream;
+        stream << "joint_spherical_support_failed:joint="
+               << (spherical_refinement.joint_fit_success ? 1 : 0)
+               << ":valid_corners="
+               << spherical_refinement.successful_corner_count;
+        spherical_support_diagnostic = stream.str();
+      }
+    }
+    if (spherical_support_confirms_refined_corner) {
+      return true;
+    }
+    if (worst_corner_index >= 0 && worst_corner_index < 4) {
+      OuterCornerVerificationDebugInfo& debug =
+          (*verification_debug)[static_cast<std::size_t>(worst_corner_index)];
+      debug.refined_valid = false;
+      debug.verification_passed = false;
+      debug.failure_reason =
+          "rescued_outer_isolated_refinement_jump:" +
+          atomic_topology_diagnostic + ":" +
+          spherical_support_diagnostic;
+    }
+    if (failure_reason != nullptr) {
+      *failure_reason =
+          "rescued_outer_isolated_refinement_jump:" +
+          atomic_topology_diagnostic + ":" +
+          spherical_support_diagnostic;
     }
     return false;
   }
@@ -3179,7 +3435,13 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
   const CloseEdgeOuterSubpixBoostInfo close_edge_boost_info =
       ComputeCloseEdgeOuterSubpixBoostInfo(coarse_original, gray_original.size(),
                                            config, sphere_camera);
-  const bool close_edge_subpix_boost = close_edge_boost_info.boost;
+  // OpenCV fallback corners are already decoded consistently across normalized
+  // scales. Enlarging their original-image search window near the sensor edge
+  // can include a different board/frame junction and make cornerSubPix jump.
+  // Keep the established boost unchanged for ETHZ and recovery candidates.
+  const bool close_edge_subpix_boost =
+      close_edge_boost_info.boost &&
+      !coarse_candidate.from_opencv_apriltag_fallback;
   const double close_edge_area_ratio = close_edge_boost_info.area_ratio;
   const double close_edge_max_polar_deg = close_edge_boost_info.max_polar_deg;
   const double close_edge_subpix_multiplier =
@@ -3381,6 +3643,8 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
   // The joint spherical quad is a camera-aware seed, not a replacement for
   // the final image-domain subpixel refinement.  Keep the same pixel-domain
   // refinement contract for both joint-fit and ordinary detector paths.
+  const std::array<cv::Point2f, 4> pre_subpix_seeds =
+      refined_candidate.refined_original;
   if (config.do_outer_subpix_refinement) {
     for (int index = 0; index < 4; ++index) {
       if (!method_valid[static_cast<std::size_t>(index)]) {
@@ -3476,8 +3740,41 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
       // pixel coordinates. Keep the independent corner-response check and
       // the subpixel rollback guard as the actual acceptance conditions.
       if (!response_ok) {
-        refined_valid = false;
-        debug.failure_reason = response_diagnostic;
+        bool rollback_applied = false;
+        if (config.enable_scale_adaptive_corner_response_rollback &&
+            refined_candidate.coarse.detection.good &&
+            refined_candidate.coarse.detection.hammingDistance == 0) {
+          debug.scale_adaptive_response_rollback_checked = true;
+          std::string coarse_response_diagnostic;
+          const bool coarse_response_ok =
+              PassesScaleAdaptiveCoarseCornerResponseCheck(
+                  gray_original,
+                  pre_subpix_seeds[static_cast<std::size_t>(index)],
+                  debug.local_scale,
+                  &debug.scale_adaptive_response_core_radius,
+                  &debug.scale_adaptive_response_search_radius,
+                  &debug.scale_adaptive_response_peak_ratio,
+                  &coarse_response_diagnostic);
+          if (coarse_response_ok) {
+            refined_candidate.refined_original[static_cast<std::size_t>(index)] =
+                pre_subpix_seeds[static_cast<std::size_t>(index)];
+            debug.scale_adaptive_response_rollback_applied = true;
+            debug.failure_reason =
+                "scale_adaptive_response_rollback:" + response_diagnostic +
+                ":coarse=" + coarse_response_diagnostic;
+            rollback_applied = true;
+          } else {
+            debug.failure_reason =
+                response_diagnostic + ":scale_adaptive_coarse=" +
+                coarse_response_diagnostic;
+          }
+        }
+        if (!rollback_applied) {
+          refined_valid = false;
+          if (debug.failure_reason.empty()) {
+            debug.failure_reason = response_diagnostic;
+          }
+        }
       }
     }
     debug.refined_valid = refined_valid;
@@ -3676,6 +3973,24 @@ MultiScaleOuterTagDetector::MultiScaleOuterTagDetector(MultiScaleOuterTagDetecto
   if (config_.adaptive_coarse_max_hamming < 0) {
     throw std::runtime_error("adaptive_coarse_max_hamming must be non-negative.");
   }
+  if (config_.opencv_apriltag_marker_border_bits <= 0) {
+    throw std::runtime_error(
+        "opencv_apriltag_marker_border_bits must be positive.");
+  }
+  if (!(config_.opencv_apriltag_min_marker_perimeter_rate > 0.0)) {
+    throw std::runtime_error(
+        "opencv_apriltag_min_marker_perimeter_rate must be positive.");
+  }
+  if (config_.opencv_apriltag_fallback_longest_sides.empty()) {
+    throw std::runtime_error(
+        "opencv_apriltag_fallback_longest_sides must not be empty.");
+  }
+  for (int longest_side : config_.opencv_apriltag_fallback_longest_sides) {
+    if (longest_side < 0) {
+      throw std::runtime_error(
+          "opencv_apriltag_fallback_longest_sides must be non-negative.");
+    }
+  }
   const auto validate_scale_divisors = [](const std::vector<double>& divisors,
                                           const char* field_name) {
     if (divisors.empty()) {
@@ -3774,6 +4089,7 @@ struct PerTagOuterAggregationState {
   bool saw_border_rejection = false;
   bool saw_non_border_matching_rejection = false;
   bool attempted_local_patch_rescue = false;
+  bool attempted_opencv_apriltag_fallback = false;
   std::vector<std::string> local_patch_rescue_summaries;
   std::vector<ScaleCandidate> coarse_candidates;
   std::vector<OuterWrongIdProposal> wrong_id_proposals;
@@ -3859,6 +4175,174 @@ ScaleCandidate BuildScaleCandidateFromDetection(const AprilTags::TagDetection& d
   candidate.shape_quality =
       candidate.max_edge > 1e-6 ? ClampUnit(candidate.min_edge / candidate.max_edge) : 0.0;
   return candidate;
+}
+
+void TryOpenCvAprilTagFallback(
+    const cv::Mat& gray_original,
+    const MultiScaleOuterTagDetectorConfig& config,
+    const std::map<int, std::size_t>& requested_index_by_id,
+    std::vector<PerTagOuterAggregationState>* states) {
+  if (!config.enable_opencv_apriltag_fallback || states == nullptr ||
+      states->empty()) {
+    return;
+  }
+
+  std::vector<bool> unresolved(states->size(), false);
+  bool has_unresolved = false;
+  for (std::size_t index = 0; index < states->size(); ++index) {
+    unresolved[index] = (*states)[index].coarse_candidates.empty();
+    if (unresolved[index]) {
+      (*states)[index].attempted_opencv_apriltag_fallback = true;
+      has_unresolved = true;
+    }
+  }
+  if (!has_unresolved) {
+    return;
+  }
+
+  cv::aruco::DetectorParameters parameters;
+  parameters.markerBorderBits = config.opencv_apriltag_marker_border_bits;
+  parameters.errorCorrectionRate = 0.0;
+  parameters.minMarkerPerimeterRate =
+      config.opencv_apriltag_min_marker_perimeter_rate;
+  parameters.maxMarkerPerimeterRate = 4.0;
+  parameters.cornerRefinementMethod = cv::aruco::CORNER_REFINE_NONE;
+  const cv::aruco::Dictionary dictionary = cv::aruco::getPredefinedDictionary(
+      cv::aruco::DICT_APRILTAG_36h11);
+  const cv::aruco::ArucoDetector detector(dictionary, parameters);
+
+  const int original_longest =
+      std::max(gray_original.cols, gray_original.rows);
+  std::vector<int> target_longest_sides;
+  for (int configured_side : config.opencv_apriltag_fallback_longest_sides) {
+    const int target_side =
+        configured_side == 0 ? original_longest
+                             : std::min(configured_side, original_longest);
+    if (target_side > 0 &&
+        std::find(target_longest_sides.begin(), target_longest_sides.end(),
+                  target_side) == target_longest_sides.end()) {
+      target_longest_sides.push_back(target_side);
+    }
+  }
+
+  for (int target_longest_side : target_longest_sides) {
+    const cv::Size scaled_size =
+        MakeScaledSize(gray_original.size(), target_longest_side);
+    cv::Mat scaled_gray;
+    if (scaled_size == gray_original.size()) {
+      scaled_gray = gray_original;
+    } else {
+      cv::resize(gray_original, scaled_gray, scaled_size, 0.0, 0.0,
+                 cv::INTER_AREA);
+    }
+
+    std::vector<std::vector<cv::Point2f>> corners;
+    std::vector<int> ids;
+    std::vector<std::vector<cv::Point2f>> rejected;
+    detector.detectMarkers(scaled_gray, corners, ids, rejected);
+    const double scale_factor =
+        static_cast<double>(std::max(scaled_size.width, scaled_size.height)) /
+        static_cast<double>(original_longest);
+
+    std::map<std::size_t, ScaleCandidate> best_candidate_by_index;
+    for (std::size_t detection_index = 0; detection_index < ids.size();
+         ++detection_index) {
+      const auto requested_it = requested_index_by_id.find(ids[detection_index]);
+      if (requested_it == requested_index_by_id.end() ||
+          requested_it->second >= unresolved.size() ||
+          !unresolved[requested_it->second] ||
+          detection_index >= corners.size() ||
+          corners[detection_index].size() != 4) {
+        continue;
+      }
+
+      AprilTags::TagDetection detection;
+      detection.id = ids[detection_index];
+      detection.hammingDistance = 0;
+      detection.good = true;
+      detection.observedPerimeter = 0.0f;
+      // OpenCV ArUco and ETHZ AprilTag expose the same tag-family ID, but use
+      // different canonical corner conventions.  Directly copying OpenCV's
+      // [TL, TR, BR, BL] order mirrors the canonical board coordinates and
+      // makes every regenerated internal point carry the wrong grid identity.
+      // Same-frame detections decoded by both implementations establish this
+      // OpenCV-to-ETHZ mapping for IDs 1, 5, and 6.
+      constexpr std::array<int, 4> kOpenCvToEthzCorner{{1, 0, 3, 2}};
+      for (int corner_index = 0; corner_index < 4; ++corner_index) {
+        const int opencv_index =
+            kOpenCvToEthzCorner[static_cast<std::size_t>(corner_index)];
+        const cv::Point2f& corner = corners[detection_index]
+            [static_cast<std::size_t>(opencv_index)];
+        detection.p[corner_index] = std::make_pair(corner.x, corner.y);
+        const cv::Point2f& next = corners[detection_index]
+            [static_cast<std::size_t>((opencv_index + 1) % 4)];
+        detection.observedPerimeter +=
+            static_cast<float>(cv::norm(next - corner));
+      }
+
+      OuterTagScaleDebugInfo debug;
+      debug.target_longest_side = target_longest_side;
+      debug.configured_scale_divisor = -1.0;
+      debug.scaled_size = scaled_size;
+      debug.scale_factor = scale_factor;
+      ScaleCandidate candidate = BuildScaleCandidateFromDetection(
+          detection, debug, gray_original.size());
+      candidate.from_opencv_apriltag_fallback = true;
+      if (!PassesCandidateVisibilityCheck(candidate.scaled_corners,
+                                          scaled_gray.size(), config) ||
+          candidate.scaled_area < kMinQuadAreaPixels ||
+          candidate.min_edge < kMinQuadEdgePixels ||
+          candidate.shape_quality <= 0.10) {
+        continue;
+      }
+      const auto current_it =
+          best_candidate_by_index.find(requested_it->second);
+      if (current_it == best_candidate_by_index.end() ||
+          IsCandidateBetter(candidate, current_it->second)) {
+        best_candidate_by_index[requested_it->second] = candidate;
+      }
+    }
+
+    for (std::size_t index = 0; index < states->size(); ++index) {
+      if (!unresolved[index]) {
+        continue;
+      }
+      PerTagOuterAggregationState& state = (*states)[index];
+      OuterTagScaleDebugInfo debug;
+      debug.target_longest_side = target_longest_side;
+      debug.configured_scale_divisor = -1.0;
+      debug.scaled_size = scaled_size;
+      debug.scale_factor = scale_factor;
+      debug.attempted = true;
+      debug.raw_detection_count = static_cast<int>(ids.size());
+      debug.raw_good_detection_count = static_cast<int>(ids.size());
+      std::ostringstream summary;
+      summary << "opencv_apriltag_36h11_border"
+              << config.opencv_apriltag_marker_border_bits
+              << "_hamming0 ids=";
+      for (std::size_t id_index = 0; id_index < ids.size(); ++id_index) {
+        if (id_index > 0) {
+          summary << ";";
+        }
+        summary << ids[id_index];
+      }
+      debug.raw_detection_summaries.push_back(summary.str());
+      const auto candidate_it = best_candidate_by_index.find(index);
+      if (candidate_it != best_candidate_by_index.end()) {
+        debug.matching_tag_count = 1;
+        debug.matching_good_tag_count = 1;
+        debug.accepted_candidate_count = 1;
+        state.saw_any_detection = true;
+        state.saw_matching_tag_id = true;
+        state.coarse_candidates.push_back(candidate_it->second);
+        state.result.successful_scale_longest_sides.push_back(
+            target_longest_side);
+      } else if (!ids.empty()) {
+        state.saw_any_detection = true;
+      }
+      state.result.scale_debug.push_back(std::move(debug));
+    }
+  }
 }
 
 const ScaleCandidate* BestCoarseCandidate(const PerTagOuterAggregationState& state) {
@@ -4345,6 +4829,8 @@ OuterTagDetectionResult FinalizeOuterTagDetection(
 
   OuterTagDetectionResult& result = state->result;
   result.attempted_local_patch_rescue = state->attempted_local_patch_rescue;
+  result.attempted_opencv_apriltag_fallback =
+      state->attempted_opencv_apriltag_fallback;
   result.wrong_id_proposals = state->wrong_id_proposals;
   if (state->attempted_local_patch_rescue) {
     result.local_patch_rescue_summary = state->local_patch_rescue_summaries.empty()
@@ -4466,6 +4952,8 @@ OuterTagDetectionResult FinalizeOuterTagDetection(
 
   auto fill_result_from_candidate = [&](const RefinedCandidate& chosen_candidate) {
     result.used_local_patch_rescue = chosen_candidate.coarse.from_local_patch_rescue;
+    result.used_opencv_apriltag_fallback =
+        chosen_candidate.coarse.from_opencv_apriltag_fallback;
     if (result.used_local_patch_rescue && result.local_patch_rescue_summary.empty()) {
       result.local_patch_rescue_summary = chosen_candidate.coarse.local_patch_label;
     }
@@ -4542,6 +5030,10 @@ OuterBoardMeasurement BuildOuterBoardMeasurement(const OuterTagDetectionResult& 
   measurement.attempted_local_patch_rescue = detection.attempted_local_patch_rescue;
   measurement.used_local_patch_rescue = detection.used_local_patch_rescue;
   measurement.local_patch_rescue_summary = detection.local_patch_rescue_summary;
+  measurement.attempted_opencv_apriltag_fallback =
+      detection.attempted_opencv_apriltag_fallback;
+  measurement.used_opencv_apriltag_fallback =
+      detection.used_opencv_apriltag_fallback;
   measurement.detection_quality = detection.quality;
   measurement.refined_outer_corners_original_image = detection.refined_corners_original_image;
   measurement.refined_corner_valid = detection.refined_valid;
@@ -4864,6 +5356,9 @@ std::vector<OuterTagDetectionResult> MultiScaleOuterTagDetector::DetectMultiple(
     state.result.adaptive_high_resolution_fallback_triggered =
         high_resolution_fallback_triggered;
   }
+
+  TryOpenCvAprilTagFallback(gray_original, config_, requested_index_by_id,
+                            &states);
 
   TryLocalSpherePatchRescue(gray_original, config_, sphere_camera_.get(),
                             requested_index_by_id, detector_.get(), &states);

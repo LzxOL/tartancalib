@@ -51,6 +51,27 @@ struct JointMeasurementBuildOptions {
   // deletion pass. The detector-level validity and topology checks remain
   // active; this only removes a duplicated, model-mismatch-prone hard gate.
   bool robust_missing_board_recovery = false;
+  // Keep the robust recovery path permissive for ordinary model mismatch, but
+  // reject isolated identity jumps that are far outside the residual
+  // distribution of the same board observation.
+  bool filter_gross_internal_topology_outliers = true;
+  double gross_internal_topology_min_reproj_error_px = 8.0;
+  double gross_internal_topology_sigma_threshold = 8.0;
+  double gross_internal_topology_max_outer_pose_rmse_px = 2.0;
+  // Cross-check the direct outer quad against an independently fitted,
+  // image-refined internal lattice. The check is deliberately conservative:
+  // it only acts when the internal pose is well constrained and either one
+  // isolated outer point disagrees with a 3-corner consensus, or a trusted
+  // direct exact-ID outer quad exposes an internally consistent grid-ID shift.
+  bool enable_bidirectional_board_topology_consistency = false;
+  int board_topology_min_internal_point_count = 12;
+  double board_topology_max_internal_surface_rmse_module_ratio = 0.08;
+  double board_topology_min_outer_residual_px = 3.0;
+  double board_topology_max_outer_residual_module_ratio = 0.20;
+  // Different canonical grid points must not claim the same refined image
+  // corner. At this distance the observations are indistinguishable at
+  // subpixel precision, so retain only an unambiguous higher-quality point.
+  double internal_duplicate_image_distance_px = 0.5;
   double internal_observation_low_quality_quantile = 0.2;
   double internal_observation_min_weight = 0.25;
   double internal_observation_quality_exponent = 1.0;
@@ -73,6 +94,7 @@ enum class JointRejectionReasonCode {
   MissingRegeneratedBoardResult,
   InternalRegenerationFailed,
   InternalPointInvalid,
+  DuplicateInternalImageLocation,
   InternalPointReprojectionOutlier,
 };
 

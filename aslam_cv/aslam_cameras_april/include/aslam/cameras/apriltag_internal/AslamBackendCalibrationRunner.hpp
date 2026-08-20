@@ -23,11 +23,14 @@ struct ConsistencyObservationWeightSummaryEntry {
   int num_internal_points = 0;
   double translation_error_mm = 0.0;
   double rotation_error_deg = 0.0;
+  Eigen::Vector3d translation_correction_mm = Eigen::Vector3d::Zero();
+  Eigen::Vector3d rotation_correction_deg = Eigen::Vector3d::Zero();
   double residual_rmse = 0.0;
   double polar_angle_deg = 0.0;
   double consistency_weight = 1.0;
   double final_weight = 1.0;
   bool local_pose_refit_success = false;
+  bool reference_pose_from_local_refit = false;
   bool hard_rejected = false;
   std::string failure_reason;
 };

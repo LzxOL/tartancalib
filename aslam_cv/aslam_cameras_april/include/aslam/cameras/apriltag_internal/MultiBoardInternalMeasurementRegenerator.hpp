@@ -73,6 +73,12 @@ struct GeometryPriorOuterSeedCandidate {
   double adaptive_max_corner_displacement_px =
       std::numeric_limits<double>::quiet_NaN();
   double min_corner_response_ratio = 0.0;
+  std::array<double, 4> refined_corner_local_responses{};
+  std::array<double, 4> refined_corner_local_peak_responses{};
+  std::array<double, 4> refined_corner_local_peak_ratios{};
+  int refined_corner_response_pass_count = 0;
+  double min_refined_corner_local_peak_ratio = 0.0;
+  double weakest_to_second_weakest_corner_response_ratio = 0.0;
   double edge_support_ratio = 0.0;
   double mean_edge_gradient_ratio = 0.0;
   bool rectified_patch_checked = false;

@@ -467,6 +467,23 @@ ConsistencyWeightSummary ComputeConsistencyWeightSummary(
     }
   }
 
+  std::map<std::pair<int, int>, Eigen::Isometry3d> local_pose_by_key;
+  for (const auto& entry : buffers) {
+    const OuterObservationBuffer& buffer = entry.second;
+    if (static_cast<int>(buffer.outer_targets.size()) < 4) {
+      continue;
+    }
+    Eigen::Isometry3d local_pose = Eigen::Isometry3d::Identity();
+    double local_outer_rmse = 0.0;
+    if (EstimatePoseFromObjectPoints(scene_state.camera,
+                                     buffer.outer_targets,
+                                     buffer.outer_pixels,
+                                     &local_pose,
+                                     &local_outer_rmse)) {
+      local_pose_by_key[entry.first] = local_pose;
+    }
+  }
+
   double weight_sum = 0.0;
   for (const auto& entry : buffers) {
     const int frame_index = entry.first.first;
@@ -508,13 +525,8 @@ ConsistencyWeightSummary ComputeConsistencyWeightSummary(
       continue;
     }
 
-    Eigen::Isometry3d T_camera_board_local = Eigen::Isometry3d::Identity();
-    double local_outer_rmse = 0.0;
-    if (!EstimatePoseFromObjectPoints(scene_state.camera,
-                                      buffer.outer_targets,
-                                      buffer.outer_pixels,
-                                      &T_camera_board_local,
-                                      &local_outer_rmse)) {
+    const auto local_pose_it = local_pose_by_key.find(entry.first);
+    if (local_pose_it == local_pose_by_key.end()) {
       row.failure_reason = "local_pose_refit_failed";
       summary.observations.push_back(row);
       continue;
@@ -526,7 +538,14 @@ ConsistencyWeightSummary ComputeConsistencyWeightSummary(
                                             scene_state,
                                             frame_index,
                                             board_id);
-    const Eigen::Isometry3d T_camera_reference(frame_state->T_camera_reference);
+    Eigen::Isometry3d T_camera_reference(frame_state->T_camera_reference);
+    const auto local_reference_it = local_pose_by_key.find(
+        std::make_pair(frame_index, scene_state.reference_board_id));
+    if (local_reference_it != local_pose_by_key.end()) {
+      T_camera_reference = local_reference_it->second;
+      row.reference_pose_from_local_refit = true;
+    }
+    const Eigen::Isometry3d& T_camera_board_local = local_pose_it->second;
     const Eigen::Isometry3d T_reference_board_global =
         board_id == scene_state.reference_board_id
             ? Eigen::Isometry3d::Identity()
@@ -535,8 +554,12 @@ ConsistencyWeightSummary ComputeConsistencyWeightSummary(
         T_camera_reference.inverse() * T_camera_board_local;
     const Eigen::Isometry3d delta =
         T_reference_board_global.inverse() * T_reference_board_obs;
-    row.translation_error_mm = delta.translation().norm() * 1000.0;
-    row.rotation_error_deg = ComputeRotationAngleDeg(delta.rotation());
+    row.translation_correction_mm = delta.translation() * 1000.0;
+    row.translation_error_mm = row.translation_correction_mm.norm();
+    const Eigen::AngleAxisd delta_angle_axis(delta.rotation());
+    row.rotation_correction_deg =
+        delta_angle_axis.axis() * delta_angle_axis.angle() * 180.0 / M_PI;
+    row.rotation_error_deg = row.rotation_correction_deg.norm();
 
     const double sigma_t =
         std::max(1e-6, options.consistency_translation_sigma_mm);
@@ -546,17 +569,21 @@ ConsistencyWeightSummary ComputeConsistencyWeightSummary(
     const double e_r = row.rotation_error_deg / sigma_r;
     const double e_cons = std::sqrt(e_t * e_t + e_r * e_r);
 
+    const bool is_reference_board =
+        board_id == scene_state.reference_board_id;
     double weight = 1.0;
-    switch (options.consistency_weight_mode) {
-      case AslamBackendCalibrationOptions::ConsistencyWeightMode::Cauchy:
-        weight = 1.0 / (1.0 + e_cons * e_cons);
-        break;
+    if (!is_reference_board) {
+      switch (options.consistency_weight_mode) {
+        case AslamBackendCalibrationOptions::ConsistencyWeightMode::Cauchy:
+          weight = 1.0 / (1.0 + e_cons * e_cons);
+          break;
+      }
     }
     weight = std::max(options.consistency_min_weight, std::min(1.0, weight));
     row.consistency_weight = weight;
     row.final_weight = weight;
 
-    if (options.consistency_hard_reject_enabled &&
+    if (!is_reference_board && options.consistency_hard_reject_enabled &&
         row.translation_error_mm >= options.consistency_hard_reject_translation_mm &&
         row.rotation_error_deg >= options.consistency_hard_reject_rotation_deg &&
         row.residual_rmse >= options.consistency_hard_reject_residual_px) {
@@ -749,8 +776,11 @@ void WriteTopDownweightedObservations(
     const ConsistencyWeightSummary& summary) {
   std::ofstream output(path.c_str());
   output << "frame_index,frame_label,board_id,translation_error_mm,rotation_error_deg,"
+         << "translation_x_mm,translation_y_mm,translation_z_mm,"
+         << "rotation_x_deg,rotation_y_deg,rotation_z_deg,"
          << "residual_rmse,polar_angle_deg,consistency_weight,final_weight,"
-         << "num_outer_points,num_internal_points,hard_rejected,local_pose_refit_success\n";
+         << "num_outer_points,num_internal_points,hard_rejected,local_pose_refit_success,"
+         << "reference_pose_from_local_refit\n";
   std::vector<ConsistencyObservationWeightSummaryEntry> rows = summary.observations;
   std::sort(rows.begin(), rows.end(),
             [](const ConsistencyObservationWeightSummaryEntry& lhs,
@@ -766,6 +796,12 @@ void WriteTopDownweightedObservations(
            << row.board_id << ","
            << row.translation_error_mm << ","
            << row.rotation_error_deg << ","
+           << row.translation_correction_mm.x() << ","
+           << row.translation_correction_mm.y() << ","
+           << row.translation_correction_mm.z() << ","
+           << row.rotation_correction_deg.x() << ","
+           << row.rotation_correction_deg.y() << ","
+           << row.rotation_correction_deg.z() << ","
            << row.residual_rmse << ","
            << row.polar_angle_deg << ","
            << row.consistency_weight << ","
@@ -773,7 +809,8 @@ void WriteTopDownweightedObservations(
            << row.num_outer_points << ","
            << row.num_internal_points << ","
            << (row.hard_rejected ? 1 : 0) << ","
-           << (row.local_pose_refit_success ? 1 : 0) << "\n";
+           << (row.local_pose_refit_success ? 1 : 0) << ","
+           << (row.reference_pose_from_local_refit ? 1 : 0) << "\n";
   }
 }
 
@@ -1424,6 +1461,9 @@ JointResidualEvaluationResult EvaluateIndependentFrameBoardPoseResiduals(
 double ComputeBalanceWeight(const ObservationBudget& budget,
                             JointPointType point_type,
                             const AslamBackendCalibrationOptions& options) {
+  if (options.observation_role_weight_mode == "unweighted_points") {
+    return 1.0;
+  }
   if (options.uniform_control_point_mode) {
     // Dense calibration targets contribute one independent measurement per
     // control point, matching Kalibr's per-corner unit covariance model.
@@ -3685,6 +3725,7 @@ bool ExecuteBackendOptimization(
       design_variable_labels[variable.translation_dv.get()] =
           "board_translation_board_" + std::to_string(board_state.board_id);
     }
+
   }
   const aslam::backend::TransformationExpression identity_transform(
       Eigen::Matrix4d::Identity());
@@ -3764,10 +3805,14 @@ bool ExecuteBackendOptimization(
     const double polar_angle_weight =
         ComputePolarAngleWeightScale(*camera_geometry, observation,
                                      result->options);
+    const bool use_unweighted_points =
+        result->options.observation_role_weight_mode == "unweighted_points";
     const double balance_weight =
         ComputeBalanceWeight(budget, observation.point_type, result->options) *
-        std::max(0.0, observation.final_observation_weight) *
-        polar_angle_weight;
+        (use_unweighted_points
+             ? 1.0
+             : std::max(0.0, observation.final_observation_weight) *
+                   polar_angle_weight);
     const Eigen::Matrix2d inverse_covariance = ComputeBackendInverseCovariance(
         balance_weight, observation.point_type, result->options);
     const GeometryT& observation_ray_camera =
@@ -5292,8 +5337,11 @@ void WriteTopDownweightedObservations(
     const AslamBackendCalibrationResult& result) {
   std::ofstream output(path.c_str());
   output << "frame_index,frame_label,board_id,translation_error_mm,rotation_error_deg,"
+         << "translation_x_mm,translation_y_mm,translation_z_mm,"
+         << "rotation_x_deg,rotation_y_deg,rotation_z_deg,"
          << "residual_rmse,polar_angle_deg,consistency_weight,final_weight,"
-         << "num_outer_points,num_internal_points,hard_rejected,local_pose_refit_success\n";
+         << "num_outer_points,num_internal_points,hard_rejected,local_pose_refit_success,"
+         << "reference_pose_from_local_refit\n";
   std::vector<ConsistencyObservationWeightSummaryEntry> rows =
       result.consistency_observation_summaries;
   std::sort(rows.begin(), rows.end(),
@@ -5310,6 +5358,12 @@ void WriteTopDownweightedObservations(
            << row.board_id << ","
            << row.translation_error_mm << ","
            << row.rotation_error_deg << ","
+           << row.translation_correction_mm.x() << ","
+           << row.translation_correction_mm.y() << ","
+           << row.translation_correction_mm.z() << ","
+           << row.rotation_correction_deg.x() << ","
+           << row.rotation_correction_deg.y() << ","
+           << row.rotation_correction_deg.z() << ","
            << row.residual_rmse << ","
            << row.polar_angle_deg << ","
            << row.consistency_weight << ","
@@ -5317,7 +5371,8 @@ void WriteTopDownweightedObservations(
            << row.num_outer_points << ","
            << row.num_internal_points << ","
            << (row.hard_rejected ? 1 : 0) << ","
-           << (row.local_pose_refit_success ? 1 : 0) << "\n";
+           << (row.local_pose_refit_success ? 1 : 0) << ","
+           << (row.reference_pose_from_local_refit ? 1 : 0) << "\n";
   }
 }
 

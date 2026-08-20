@@ -503,6 +503,9 @@ bool DoubleSphereCameraModel::estimateTransformation(
 
   const cv::Mat identity_camera = cv::Mat::eye(3, 3, CV_64F);
   const cv::Mat dist_coeffs = cv::Mat::zeros(4, 1, CV_64F);
+  cv::Mat best_rvec;
+  cv::Mat best_tvec;
+  double best_rmse = std::numeric_limits<double>::infinity();
 
   auto evaluate_candidate =
       [this, &object_points, &image_points](const cv::Mat& candidate_rvec,
@@ -609,6 +612,16 @@ bool DoubleSphereCameraModel::estimateTransformation(
   // reprojection objective decide whether it is usable.
   if (initial_rvec != nullptr && initial_tvec != nullptr &&
       !initial_rvec->empty() && !initial_tvec->empty()) {
+    // Keep the unrefined continuous pose as its own hypothesis. Tangent-plane
+    // refinement can switch planar branches for close-edge boards even when
+    // the previous pose remains valid under the updated camera.
+    const double initial_candidate_rmse =
+        evaluate_candidate(*initial_rvec, *initial_tvec);
+    if (initial_candidate_rmse < best_rmse) {
+      best_rmse = initial_candidate_rmse;
+      best_rvec = initial_rvec->clone();
+      best_tvec = initial_tvec->clone();
+    }
     cv::Mat initial_rotation_cv;
     cv::Rodrigues(*initial_rvec, initial_rotation_cv);
     cv::Mat initial_rotation64;
@@ -671,7 +684,13 @@ bool DoubleSphereCameraModel::estimateTransformation(
           candidate_rvec = *initial_rvec;
           candidate_tvec = *initial_tvec;
         }
-        evaluate_candidate(candidate_rvec, candidate_tvec);
+        const double candidate_rmse =
+            evaluate_candidate(candidate_rvec, candidate_tvec);
+        if (candidate_rmse < best_rmse) {
+          best_rmse = candidate_rmse;
+          best_rvec = candidate_rvec.clone();
+          best_tvec = candidate_tvec.clone();
+        }
       }
     }
   }
@@ -692,9 +711,6 @@ bool DoubleSphereCameraModel::estimateTransformation(
     candidate_tvecs.clear();
   }
 
-  cv::Mat best_rvec;
-  cv::Mat best_tvec;
-  double best_rmse = std::numeric_limits<double>::infinity();
   const std::size_t candidate_count =
       std::min(candidate_rvecs.size(), candidate_tvecs.size());
   for (std::size_t candidate_index = 0;

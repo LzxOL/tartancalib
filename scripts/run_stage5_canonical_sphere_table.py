@@ -131,6 +131,24 @@ def parse_args() -> argparse.Namespace:
         help="Include canonical Omni-radtan references in the UCM/Mei group.",
     )
     parser.add_argument(
+        "--split-mode",
+        default="random_holdout_ratio",
+        choices=("random_holdout_ratio", "random_ratio", "random_70_30", "deterministic_stride"),
+        help="Stage5 train/holdout split mode. Default uses a random holdout split.",
+    )
+    parser.add_argument(
+        "--holdout-ratio",
+        type=float,
+        default=0.30,
+        help="Fraction reserved for holdout evaluation (default: 0.30).",
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=1337,
+        help="Random split seed (default: 1337).",
+    )
+    parser.add_argument(
         "--skip-build",
         action="store_true",
         help="Skip the default run_stage5_backend build step.",
@@ -338,8 +356,8 @@ def save_current_baseline_camera(
         f"# Requested model family: {model}",
         "# Residual model: sphere_angular (tangent-plane component-wise angular residual).",
         "# This camera is the final persistent incremental-selection BA state.",
-        "# Calibration uses every input frame; no train/test split is applied.",
-        "# Metrics use a frozen frontend prepass on the same input frames and are self-evaluation only.",
+        "# Calibration uses the training partition; metrics use the frozen holdout partition.",
+        "# Train/holdout split is performed by Stage5 with the configured random seed.",
         "# Self-evaluation metrics: RMSE={} px, P95={} px.".format(
             summary["overall_rmse"], summary["p95_reprojection_error"]
         ),
@@ -434,9 +452,9 @@ def write_markdown(
     rows_by_model: dict[str, list[dict[str, object]]], path: Path, threshold: float
 ) -> None:
     lines = [
-        "# Canonical Spherical Baseline Comparison (All-Training Self-Evaluation)",
+        "# Canonical Spherical Baseline Comparison (70/30 Holdout Evaluation)",
         "",
-        f"Inl.@{threshold:g}px is computed from the same frozen self-evaluation point CSV for every method.",
+        f"Inl.@{threshold:g}px is computed from the frozen holdout point CSV for every method.",
         "",
         "| Model | Method | RMSE [px] | P95 [px] | Inl. [%] | Canonical YAML |",
         "|---|---|---:|---:|---:|---|",
@@ -473,8 +491,8 @@ def write_latex(
     lines = [
         "\\begin{table}[t]",
         "  \\centering",
-        "  \\caption{Canonical-baseline comparison with Spherical BA using all input frames for calibration. "
-        f"Inl. is the percentage of same-set self-evaluation points below {threshold:.2f} px. "
+        "  \\caption{Canonical-baseline comparison with Spherical BA using a 70/30 train/holdout split. "
+        f"Inl. is the percentage of frozen holdout points below {threshold:.2f} px. "
         "Best values within each camera model are bold.}",
         "  \\label{tab:canonical_spherical_baselines}",
         "  \\setlength{\\tabcolsep}{4.0pt}",
@@ -525,6 +543,8 @@ def run_command(command: list[str], dry_run: bool) -> None:
 def main() -> int:
     args = parse_args()
     models = normalize_models(args.models)
+    if not 0.0 < args.holdout_ratio < 1.0:
+        raise ValueError("--holdout-ratio must be in (0, 1).")
     image = resolve_repo_path(args.image)
     config = resolve_repo_path(args.config)
     canonical_root = resolve_repo_path(args.canonical_root)
@@ -576,8 +596,11 @@ def main() -> int:
         "output_base": str(output_base),
         "run_timestamp": timestamp,
         "residual_model": "sphere_angular",
-        "calibration_scope": "all_input_frames",
-        "evaluation_scope": "same_input_frozen_frontend_prepass",
+        "calibration_scope": "training_partition_only",
+        "evaluation_scope": "frozen_random_holdout_partition",
+        "split_mode": args.split_mode,
+        "holdout_ratio": args.holdout_ratio,
+        "split_seed": args.split_seed,
         "inlier_threshold_px": args.inlier_threshold_px,
         "current_baseline_root": str(current_baseline_root),
         "runs": [],
@@ -612,9 +635,12 @@ def main() -> int:
             "--stage5-enable-polar-angle-diagnostics",
             "--image",
             str(image),
-            "--test-image",
-            str(image),
-            "--stage5-external-holdout-self-frontend-prepass",
+            "--split-mode",
+            args.split_mode,
+            "--holdout-ratio",
+            str(args.holdout_ratio),
+            "--split-seed",
+            str(args.split_seed),
             "--models",
             model,
             "--kalibr-camchain",

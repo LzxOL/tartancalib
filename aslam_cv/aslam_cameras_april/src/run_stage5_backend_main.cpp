@@ -75,6 +75,8 @@ struct CmdArgs {
   bool stage5_enable_progress_reporting = false;
   std::string stage5_progress_log_path;
   int stage5_progress_interval_frames = 1;
+  bool stage5_skip_heavy_overlays = false;
+  bool stage5_enable_two_layer_ba = false;
   std::string output_path;
   std::string kalibr_camchain_yaml;
   std::vector<std::string> reference_intrinsics_specs;
@@ -92,6 +94,8 @@ struct CmdArgs {
   bool stage5_init_near_tie_prefer_lower_focal = false;
   double stage5_init_near_tie_relative_objective_tolerance = 0.0;
   bool stage5_camera_aware_outer_rescue = true;
+  bool stage5_opencv_apriltag_fallback = true;
+  bool stage5_opencv_apriltag_fallback_explicitly_disabled = false;
   bool stage5_camera_aware_outer_rescue_zero_detection_frames = true;
   bool stage5_camera_aware_outer_rescue_zero_detection_frames_set = true;
   bool stage5_robust_missing_board_recovery = false;
@@ -147,6 +151,7 @@ struct CmdArgs {
   bool stage5_trial_backend_selection_incremental = true;
   bool stage5_trial_backend_selection_carry_accepted_trial_state = true;
   bool stage5_trial_backend_selection_optimize_intrinsics = true;
+  bool stage5_independent_frame_board_camera_warmup = true;
   bool stage5_trial_backend_selection_delayed_intrinsics_release = true;
   int stage5_trial_backend_selection_intrinsics_release_iteration = 1;
   bool stage5_trial_backend_selection_persistent_intrinsics_anchor_prior = false;
@@ -197,6 +202,7 @@ struct CmdArgs {
   double internal_corner_filter_quality_min = 0.35;
   double internal_corner_filter_quality_relaxation_px = 1.0;
   double internal_corner_filter_adaptive_min_threshold_px = 1.0;
+  bool stage5_bidirectional_board_topology_consistency = true;
   std::string backend_polar_angle_weight_mode = "none";
   std::string backend_polar_angle_weight_bin_edges = "0,30,50,70,85,100";
   std::string backend_polar_angle_weight_fixed_bin_scales = "1.0,1.0,0.75,0.5,0.25";
@@ -566,6 +572,7 @@ struct RequestedExperimentConfig {
   ati::CameraInitializationMode camera_init_mode =
       ati::CameraInitializationMode::Auto;
   bool camera_aware_outer_rescue = true;
+  bool opencv_apriltag_fallback = true;
   bool camera_aware_outer_rescue_zero_detection_frames = true;
   bool camera_aware_outer_rescue_zero_detection_frames_set = true;
   bool robust_missing_board_recovery = false;
@@ -628,6 +635,7 @@ struct RequestedExperimentConfig {
   bool trial_backend_selection_incremental = true;
   bool trial_backend_selection_carry_accepted_trial_state = true;
   bool trial_backend_selection_optimize_intrinsics = true;
+  bool independent_frame_board_camera_warmup = true;
   bool trial_backend_selection_delayed_intrinsics_release = true;
   int trial_backend_selection_intrinsics_release_iteration = 1;
   bool trial_backend_selection_persistent_intrinsics_anchor_prior = false;
@@ -678,6 +686,7 @@ struct RequestedExperimentConfig {
   double internal_corner_filter_quality_min = 0.35;
   double internal_corner_filter_quality_relaxation_px = 1.0;
   double internal_corner_filter_adaptive_min_threshold_px = 1.0;
+  bool bidirectional_board_topology_consistency = true;
   std::string backend_polar_angle_weight_mode = "none";
   std::vector<double> backend_polar_angle_weight_bin_edges_deg = {0.0, 30.0, 50.0, 70.0, 85.0, 100.0};
   std::vector<double> backend_polar_angle_weight_fixed_bin_scales = {1.0, 1.0, 0.75, 0.5, 0.25};
@@ -1088,6 +1097,7 @@ bool HasAblationOverrides(const RequestedExperimentConfig& config) {
          std::fabs(config.internal_corner_filter_quality_min - 0.35) > 1e-12 ||
          std::fabs(config.internal_corner_filter_quality_relaxation_px - 1.0) > 1e-12 ||
          std::fabs(config.internal_corner_filter_adaptive_min_threshold_px - 1.0) > 1e-12 ||
+         !config.bidirectional_board_topology_consistency ||
 	         config.backend_residual_model != "image_plane" ||
 	         config.enable_hybrid_pixel_ray_final_refinement ||
 	         config.backend_angular_observed_ray_mode != "dynamic_current_camera" ||
@@ -1169,6 +1179,9 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
          << static_cast<int>(std::round(
                 config.internal_corner_filter_max_reproj_error * 10.0));
     parts.push_back(part.str());
+  }
+  if (!config.bidirectional_board_topology_consistency) {
+    parts.push_back("no_bidirectional_board_topology_consistency");
   }
   if (std::fabs(config.internal_corner_filter_quality_min - 0.35) > 1e-12) {
     std::ostringstream part;
@@ -1579,6 +1592,8 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.stage5_trial_backend_selection_carry_accepted_trial_state;
   config.trial_backend_selection_optimize_intrinsics =
       args.stage5_trial_backend_selection_optimize_intrinsics;
+  config.independent_frame_board_camera_warmup =
+      args.stage5_independent_frame_board_camera_warmup;
   config.trial_backend_selection_delayed_intrinsics_release =
       args.stage5_trial_backend_selection_delayed_intrinsics_release;
   config.trial_backend_selection_intrinsics_release_iteration =
@@ -1680,6 +1695,10 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.internal_corner_filter_quality_relaxation_px;
   config.internal_corner_filter_adaptive_min_threshold_px =
       args.internal_corner_filter_adaptive_min_threshold_px;
+  config.bidirectional_board_topology_consistency =
+      args.stage5_bidirectional_board_topology_consistency;
+  config.opencv_apriltag_fallback =
+      args.stage5_opencv_apriltag_fallback;
   config.internal_regeneration_diagnostics =
       args.internal_regeneration_diagnostics;
   config.export_internal_seed_step_overlays =
@@ -1756,6 +1775,9 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
     // preset only prevents one of its prerequisite stages from being omitted.
     config.frozen_recovery_baseline_preset = true;
     config.camera_aware_outer_rescue = true;
+    if (!args.stage5_opencv_apriltag_fallback_explicitly_disabled) {
+      config.opencv_apriltag_fallback = true;
+    }
     config.camera_aware_outer_rescue_zero_detection_frames = true;
     config.camera_aware_outer_rescue_zero_detection_frames_set = true;
     if (!args.stage5_robust_missing_board_recovery_explicitly_disabled) {
@@ -2114,6 +2136,9 @@ void PrintUsage(const char* program) {
       << "  --stage5-enable-progress             Print live stage/frame progress.\n"
       << "  --stage5-progress-log PATH           Also write live progress to PATH.\n"
       << "  --stage5-progress-interval N         Report every N completed frames.\n"
+      << "  --stage5-enable-two-layer-ba        Refine intrinsics with independent\n"
+      << "                                      frame-board poses, then refine the\n"
+      << "                                      shared board layout with fixed intrinsics.\n"
       << "  --stage5-enable-camera-aware-sphere-patch-zero-detection\n"
       << "                                      Run the full-view sphere-patch atlas for raw\n"
       << "                                      zero-detection frames; exact-ID/Hamming-0 only.\n"
@@ -2160,11 +2185,26 @@ void PrintUsage(const char* program) {
       << "                                      outer-tag rescue; enabled by default.\n"
       << "  --stage5-disable-camera-aware-outer-rescue\n"
       << "                                      Disable it for detector ablation.\n"
+      << "  --stage5-enable-opencv-apriltag-fallback\n"
+      << "                                      Enable exact-ID OpenCV AprilTag fallback\n"
+      << "                                      for unresolved boards; baseline default.\n"
+      << "  --stage5-disable-opencv-apriltag-fallback\n"
+      << "                                      Disable it for detector ablation.\n"
+      << "  --stage5-enable-bidirectional-board-topology-consistency\n"
+      << "                                      Cross-check direct outer corners against\n"
+      << "                                      a reliable image-refined internal grid.\n"
+      << "  --stage5-disable-bidirectional-board-topology-consistency\n"
+      << "                                      Disable this post-regeneration check.\n"
       << "  --stage5-enable-frozen-recovery-baseline\n"
       << "                                      Force the canonical recovery bundle:\n"
       << "                                      camera-aware rescue, zero-detection atlas,\n"
       << "                                      geometry-prior observation, spherical\n"
       << "                                      refinement, and topology identity rescue.\n"
+      << "  --stage5-enable-independent-frame-board-camera-warmup\n"
+      << "                                      Jointly refine camera intrinsics with one\n"
+      << "                                      temporary pose per internally supported board.\n"
+      << "  --stage5-disable-independent-frame-board-camera-warmup\n"
+      << "                                      Disable the Kalibr-style camera warmup ablation.\n"
       << "  --output PATH                        Output directory.\n"
       << "  --runtime-mode research|fast         Runtime preset.\n"
       << "  --cache-dir PATH                     Optional frontend cache directory.\n"
@@ -2339,6 +2379,10 @@ CmdArgs ParseArgs(int argc, char** argv) {
     } else if (token == "--stage5-progress-interval" && i + 1 < argc) {
       args.stage5_progress_interval_frames = std::max(1, std::stoi(argv[++i]));
       args.stage5_enable_progress_reporting = true;
+    } else if (token == "--stage5-skip-heavy-overlays") {
+      args.stage5_skip_heavy_overlays = true;
+    } else if (token == "--stage5-enable-two-layer-ba") {
+      args.stage5_enable_two_layer_ba = true;
     } else if (token ==
                "--stage5-holdout-evaluate-full-training-observations") {
       args.stage5_holdout_evaluate_full_training_observations = true;
@@ -2381,6 +2425,18 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.stage5_camera_aware_outer_rescue = true;
     } else if (token == "--stage5-disable-camera-aware-outer-rescue") {
       args.stage5_camera_aware_outer_rescue = false;
+    } else if (token == "--stage5-enable-opencv-apriltag-fallback") {
+      args.stage5_opencv_apriltag_fallback = true;
+      args.stage5_opencv_apriltag_fallback_explicitly_disabled = false;
+    } else if (token == "--stage5-disable-opencv-apriltag-fallback") {
+      args.stage5_opencv_apriltag_fallback = false;
+      args.stage5_opencv_apriltag_fallback_explicitly_disabled = true;
+    } else if (token ==
+               "--stage5-enable-bidirectional-board-topology-consistency") {
+      args.stage5_bidirectional_board_topology_consistency = true;
+    } else if (token ==
+               "--stage5-disable-bidirectional-board-topology-consistency") {
+      args.stage5_bidirectional_board_topology_consistency = false;
     } else if (token == "--stage5-enable-robust-missing-board-recovery") {
       args.stage5_robust_missing_board_recovery = true;
       args.stage5_robust_missing_board_recovery_explicitly_disabled = false;
@@ -2389,6 +2445,13 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.stage5_robust_missing_board_recovery_explicitly_disabled = true;
     } else if (token == "--stage5-enable-frozen-recovery-baseline") {
       args.stage5_enable_frozen_recovery_baseline = true;
+      args.stage5_independent_frame_board_camera_warmup = true;
+    } else if (token ==
+               "--stage5-enable-independent-frame-board-camera-warmup") {
+      args.stage5_independent_frame_board_camera_warmup = true;
+    } else if (token ==
+               "--stage5-disable-independent-frame-board-camera-warmup") {
+      args.stage5_independent_frame_board_camera_warmup = false;
     } else if (token == "--kalibr-training-split-signature" && i + 1 < argc) {
       args.kalibr_training_split_signature = argv[++i];
     } else if (token == "--camera-init-mode" && i + 1 < argc) {
@@ -4376,11 +4439,38 @@ void WriteEvaluationSummary(const std::string& path,
   output << "angular_point_count: " << evaluation.angular_point_count << "\n";
   output << "p95_reprojection_error: "
          << evaluation.p95_reprojection_error << "\n";
+  output << "primary_metric_scope: valid_board_observations_only\n";
+  output << "raw_observation_stress_metric_scope: all_pose_refit_observations\n";
+  output << "residual_sanity_threshold_px: "
+         << evaluation.residual_sanity_threshold_px << "\n";
+  output << "valid_board_observation_count: "
+         << evaluation.valid_board_observation_count << "\n";
+  output << "raw_board_observation_count: "
+         << evaluation.raw_board_observation_count << "\n";
+  output << "invalid_board_observation_count: "
+         << evaluation.invalid_board_observation_count << "\n";
+  output << "pose_init_failed_board_observation_count: "
+         << evaluation.pose_init_failed_board_observation_count << "\n";
+  output << "residual_sanity_failed_board_observation_count: "
+         << evaluation.residual_sanity_failed_board_observation_count << "\n";
+  output << "projection_invalid_board_observation_count: "
+         << evaluation.projection_invalid_board_observation_count << "\n";
+  output << "projection_failure_point_count: "
+         << evaluation.projection_failure_point_count << "\n";
+  output << "nonfinite_residual_point_count: "
+         << evaluation.nonfinite_residual_point_count << "\n";
+  output << "raw_overall_rmse: " << evaluation.raw_overall_rmse << "\n";
+  output << "raw_p95_reprojection_error: "
+         << evaluation.raw_p95_reprojection_error << "\n";
+  output << "raw_point_count: " << evaluation.raw_point_count << "\n";
   if (evaluation.uniform_control_point_mode) {
     output << "test_rmse_all_control_points: " << evaluation.overall_rmse << "\n";
   } else {
     output << "outer_only_rmse: " << evaluation.outer_only_rmse << "\n";
     output << "internal_only_rmse: " << evaluation.internal_only_rmse << "\n";
+    output << "raw_outer_only_rmse: " << evaluation.raw_outer_only_rmse << "\n";
+    output << "raw_internal_only_rmse: "
+           << evaluation.raw_internal_only_rmse << "\n";
     output << "excluded_board_id_for_rmse: "
            << evaluation.excluded_board_id_for_rmse << "\n";
     output << "overall_rmse_excluding_board: "
@@ -5398,7 +5488,8 @@ void WriteOuterOnlyIntermediateArtifacts(
 
 void WriteCameraAwareOuterRescueArtifacts(
     const fs::path& output_dir,
-    const ati::FrozenRound2BaselineResult& baseline_result) {
+    const ati::FrozenRound2BaselineResult& baseline_result,
+    bool write_visualizations = true) {
   const ati::CameraAwareOuterRescueSummary& rescue =
       baseline_result.camera_aware_outer_rescue;
   if (!rescue.requested) {
@@ -5518,7 +5609,7 @@ void WriteCameraAwareOuterRescueArtifacts(
     }
   }
 
-  if (rescue.records.empty()) {
+  if (rescue.records.empty() || !write_visualizations) {
     return;
   }
   const fs::path visualization_dir =
@@ -5585,6 +5676,8 @@ void WriteExperimentConfigSummary(
          << ati::ToString(requested.camera_init_mode) << "\n";
   output << "requested_stage5_camera_aware_outer_rescue: "
          << (requested.camera_aware_outer_rescue ? 1 : 0) << "\n";
+  output << "requested_stage5_opencv_apriltag_fallback: "
+         << (requested.opencv_apriltag_fallback ? 1 : 0) << "\n";
   output << "requested_stage5_camera_aware_outer_rescue_zero_detection_frames: "
          << (requested.camera_aware_outer_rescue_zero_detection_frames ? 1 : 0)
          << "\n";
@@ -5662,6 +5755,35 @@ void WriteExperimentConfigSummary(
   output << "requested_outer_subpix_window_max: "
          << report.baseline_result.effective_options
                 .config.outer_detector_config.outer_subpix_window_max
+         << "\n";
+  output << "requested_enable_scale_adaptive_corner_response_rollback: "
+         << (report.baseline_result.effective_options.config.outer_detector_config
+                     .enable_scale_adaptive_corner_response_rollback
+                 ? 1
+                 : 0)
+         << "\n";
+  const ati::MultiScaleOuterTagDetectorConfig& effective_outer_detector =
+      report.baseline_result.effective_options.config.outer_detector_config;
+  output << "requested_enable_opencv_apriltag_fallback: "
+         << (requested.opencv_apriltag_fallback ? 1 : 0)
+         << "\n";
+  output << "requested_opencv_apriltag_fallback_longest_sides: ";
+  for (std::size_t index = 0;
+       index < effective_outer_detector
+                   .opencv_apriltag_fallback_longest_sides.size();
+       ++index) {
+    if (index > 0) {
+      output << ",";
+    }
+    output << effective_outer_detector
+                  .opencv_apriltag_fallback_longest_sides[index];
+  }
+  output << "\n";
+  output << "requested_opencv_apriltag_marker_border_bits: "
+         << effective_outer_detector.opencv_apriltag_marker_border_bits
+         << "\n";
+  output << "requested_opencv_apriltag_min_marker_perimeter_rate: "
+         << effective_outer_detector.opencv_apriltag_min_marker_perimeter_rate
          << "\n";
   output << "requested_enable_close_edge_outer_subpix_boost: "
          << (report.baseline_result.effective_options.config
@@ -5749,6 +5871,9 @@ void WriteExperimentConfigSummary(
          << "\n";
   output << "requested_stage5_trial_backend_selection_optimize_intrinsics: "
          << (requested.trial_backend_selection_optimize_intrinsics ? 1 : 0)
+         << "\n";
+  output << "requested_stage5_independent_frame_board_camera_warmup: "
+         << (requested.independent_frame_board_camera_warmup ? 1 : 0)
          << "\n";
   output << "requested_stage5_trial_backend_selection_delayed_intrinsics_release: "
          << (requested.trial_backend_selection_delayed_intrinsics_release ? 1 : 0)
@@ -6082,6 +6207,9 @@ void WriteExperimentConfigSummary(
          << requested.internal_corner_filter_quality_relaxation_px << "\n";
   output << "requested_internal_corner_filter_adaptive_min_threshold_px: "
          << requested.internal_corner_filter_adaptive_min_threshold_px << "\n";
+  output << "requested_bidirectional_board_topology_consistency: "
+         << (requested.bidirectional_board_topology_consistency ? 1 : 0)
+         << "\n";
   output << "requested_enable_geometry_prior_outer_seed: "
          << (requested.enable_geometry_prior_outer_seed ? 1 : 0) << "\n";
   output << "requested_geometry_prior_rescue_diagnostic_only: "
@@ -6227,6 +6355,15 @@ void WriteExperimentConfigSummary(
   output << "stage5_failure_reason: " << report.failure_reason << "\n";
   output << "effective_stage5_camera_aware_outer_rescue: "
          << (report.baseline_result.camera_aware_outer_rescue.enabled ? 1 : 0)
+         << "\n";
+  output << "effective_stage5_opencv_apriltag_fallback: "
+         << (effective_outer_detector.enable_opencv_apriltag_fallback ? 1 : 0)
+         << "\n";
+  output << "effective_stage5_scale_adaptive_corner_response_rollback: "
+         << (effective_outer_detector
+                     .enable_scale_adaptive_corner_response_rollback
+                 ? 1
+                 : 0)
          << "\n";
   output << "stage5_camera_aware_outer_rescue_camera_source: "
          << report.baseline_result.camera_aware_outer_rescue.camera_source
@@ -6615,6 +6752,12 @@ void WriteExperimentConfigSummary(
          << "\n";
   output << "effective_stage5_trial_backend_selection_optimize_intrinsics: "
          << (report.trial_backend_selection_result.optimize_intrinsics_in_trial
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_stage5_independent_frame_board_camera_warmup: "
+         << (report.trial_backend_selection_result
+                     .persistent_independent_camera_warmup_requested
                  ? 1
                  : 0)
          << "\n";
@@ -7080,6 +7223,12 @@ void WriteExperimentConfigSummary(
   output << "effective_internal_corner_filter_adaptive_min_threshold_px: "
          << report.baseline_result.effective_options
                 .internal_corner_filter_adaptive_min_threshold_px
+         << "\n";
+  output << "effective_bidirectional_board_topology_consistency: "
+         << (report.baseline_result.effective_options
+                     .enable_bidirectional_board_topology_consistency
+                 ? 1
+                 : 0)
          << "\n";
   output << "effective_enable_geometry_prior_outer_seed: "
          << (report.baseline_result.effective_options
@@ -8383,6 +8532,317 @@ void WriteBackendDiagnosticArtifacts(const fs::path& output_dir,
   }
 }
 
+struct TwoLayerBaMetrics {
+  bool success = false;
+  double overall_rmse = std::numeric_limits<double>::infinity();
+  double p95_residual = std::numeric_limits<double>::infinity();
+  double reference_board_rmse = std::numeric_limits<double>::infinity();
+  int point_count = 0;
+  int board_observation_count = 0;
+  int reference_board_observation_count = 0;
+  int reference_board_point_count = 0;
+};
+
+void WriteTwoLayerBacktrackingRow(
+    std::ofstream* output,
+    double scale,
+    const TwoLayerBaMetrics& independent,
+    const TwoLayerBaMetrics& shared,
+    bool observation_set_preserved,
+    bool numerical_health_pass,
+    bool shared_health_pass,
+    bool independent_health_pass,
+    bool reference_board_health_pass,
+    bool accepted) {
+  if (output == nullptr || !output->good()) {
+    return;
+  }
+  *output << scale << "," << independent.overall_rmse << ","
+          << independent.p95_residual << ","
+          << independent.reference_board_rmse << ","
+          << shared.overall_rmse << "," << shared.p95_residual << ","
+          << shared.reference_board_rmse << "," << shared.point_count << ","
+          << shared.reference_board_observation_count << ","
+          << (observation_set_preserved ? 1 : 0) << ","
+          << (numerical_health_pass ? 1 : 0) << ","
+          << (shared_health_pass ? 1 : 0) << ","
+          << (independent_health_pass ? 1 : 0) << ","
+          << (reference_board_health_pass ? 1 : 0) << ","
+          << (accepted ? 1 : 0) << "\n";
+}
+
+ati::OuterBootstrapCameraIntrinsics InterpolateCameraIntrinsics(
+    const ati::OuterBootstrapCameraIntrinsics& baseline,
+    const ati::OuterBootstrapCameraIntrinsics& candidate,
+    double scale) {
+  const double clamped = std::max(0.0, std::min(1.0, scale));
+  ati::OuterBootstrapCameraIntrinsics result = baseline;
+  const auto interpolate = [clamped](double from, double to) {
+    return from + clamped * (to - from);
+  };
+  result.xi = interpolate(baseline.xi, candidate.xi);
+  result.alpha = interpolate(baseline.alpha, candidate.alpha);
+  result.beta = interpolate(baseline.beta, candidate.beta);
+  result.fu = interpolate(baseline.fu, candidate.fu);
+  result.fv = interpolate(baseline.fv, candidate.fv);
+  result.cu = interpolate(baseline.cu, candidate.cu);
+  result.cv = interpolate(baseline.cv, candidate.cv);
+  if (baseline.distortion_coeffs.size() == candidate.distortion_coeffs.size()) {
+    result.distortion_coeffs.resize(baseline.distortion_coeffs.size(), 0.0);
+    for (std::size_t index = 0; index < result.distortion_coeffs.size(); ++index) {
+      result.distortion_coeffs[index] =
+          interpolate(baseline.distortion_coeffs[index],
+                      candidate.distortion_coeffs[index]);
+    }
+  }
+  return result;
+}
+
+double PercentileFromResiduals(std::vector<double> values, double percentile) {
+  if (values.empty()) {
+    return std::numeric_limits<double>::infinity();
+  }
+  std::sort(values.begin(), values.end());
+  const double clamped = std::max(0.0, std::min(100.0, percentile));
+  const double position =
+      clamped * 0.01 * static_cast<double>(values.size() - 1);
+  const std::size_t lower = static_cast<std::size_t>(std::floor(position));
+  const std::size_t upper = static_cast<std::size_t>(std::ceil(position));
+  const double fraction = position - static_cast<double>(lower);
+  return values[lower] * (1.0 - fraction) + values[upper] * fraction;
+}
+
+TwoLayerBaMetrics ComputeTwoLayerBaMetrics(
+    const ati::AslamBackendCalibrationResult& result) {
+  TwoLayerBaMetrics metrics;
+  const ati::JointResidualEvaluationResult& residual = result.optimized_residual;
+  metrics.success = result.success && residual.success;
+  metrics.overall_rmse = residual.overall_rmse;
+  metrics.point_count = static_cast<int>(residual.point_diagnostics.size());
+  metrics.board_observation_count =
+      static_cast<int>(residual.board_observation_diagnostics.size());
+  std::vector<double> norms;
+  norms.reserve(residual.point_diagnostics.size());
+  for (const ati::JointResidualPointDiagnostics& point :
+       residual.point_diagnostics) {
+    if (std::isfinite(point.residual_norm)) {
+      norms.push_back(point.residual_norm);
+    }
+  }
+  metrics.p95_residual = PercentileFromResiduals(norms, 95.0);
+  for (const ati::JointResidualBoardDiagnostics& board :
+       residual.board_diagnostics) {
+    if (board.board_id == result.effective_problem_input.reference_board_id) {
+      metrics.reference_board_rmse = board.rmse;
+      metrics.reference_board_observation_count = board.observation_count;
+      metrics.reference_board_point_count = board.point_count;
+      break;
+    }
+  }
+  metrics.success =
+      metrics.success && std::isfinite(metrics.overall_rmse) &&
+      std::isfinite(metrics.p95_residual) &&
+      std::isfinite(metrics.reference_board_rmse);
+  return metrics;
+}
+
+bool OptimizationStagesAreHealthy(
+    const ati::AslamBackendCalibrationResult& result) {
+  if (!result.success || result.stages.empty()) {
+    return false;
+  }
+  for (const ati::AslamBackendOptimizationStageSummary& stage : result.stages) {
+    if (!std::isfinite(stage.objective_start) ||
+        !std::isfinite(stage.objective_final) ||
+        stage.linear_solver_failure ||
+        stage.objective_final >
+            stage.objective_start +
+                1e-10 * std::max(1.0, std::abs(stage.objective_start))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+double RobustUpperThreshold(const std::vector<double>& finite_values,
+                            double absolute_floor) {
+  std::vector<double> values;
+  values.reserve(finite_values.size());
+  for (double value : finite_values) {
+    if (std::isfinite(value)) {
+      values.push_back(value);
+    }
+  }
+  if (values.empty()) {
+    return absolute_floor;
+  }
+  const double median = PercentileFromResiduals(values, 50.0);
+  std::vector<double> deviations;
+  deviations.reserve(values.size());
+  for (double value : values) {
+    deviations.push_back(std::abs(value - median));
+  }
+  const double robust_sigma =
+      1.4826 * PercentileFromResiduals(deviations, 50.0);
+  return std::max(absolute_floor, median + 4.0 * robust_sigma);
+}
+
+void WriteTwoLayerConsistencyCsv(
+    const std::string& path,
+    const ati::AslamBackendCalibrationResult& independent_result,
+    const ati::AslamBackendCalibrationResult& shared_diagnostic_result) {
+  std::map<std::pair<int, int>, double> independent_rmse;
+  for (const ati::JointResidualBoardObservationDiagnostics& row :
+       independent_result.optimized_residual.board_observation_diagnostics) {
+    independent_rmse[std::make_pair(row.frame_index, row.board_id)] = row.rmse;
+  }
+
+  std::vector<double> independent_values;
+  std::vector<double> positive_gaps;
+  std::vector<double> translation_corrections;
+  std::vector<double> rotation_corrections;
+  for (const ati::ConsistencyObservationWeightSummaryEntry& row :
+       shared_diagnostic_result.consistency_observation_summaries) {
+    const auto it = independent_rmse.find(
+        std::make_pair(row.frame_index, row.board_id));
+    if (it == independent_rmse.end() || !row.local_pose_refit_success) {
+      continue;
+    }
+    independent_values.push_back(it->second);
+    positive_gaps.push_back(std::max(0.0, row.residual_rmse - it->second));
+    if (row.board_id !=
+        shared_diagnostic_result.effective_problem_input.reference_board_id) {
+      translation_corrections.push_back(row.translation_error_mm);
+      rotation_corrections.push_back(row.rotation_error_deg);
+    }
+  }
+  const double independent_bad_threshold =
+      RobustUpperThreshold(independent_values, 1.0);
+  const double gap_bad_threshold = RobustUpperThreshold(positive_gaps, 0.5);
+  const double translation_bad_threshold =
+      RobustUpperThreshold(translation_corrections, 1.0);
+  const double rotation_bad_threshold =
+      RobustUpperThreshold(rotation_corrections, 0.5);
+
+  std::ofstream output(path.c_str());
+  output << "frame_index,frame_label,board_id,independent_rmse,shared_rmse,"
+            "consistency_gap,translation_correction_mm,rotation_correction_deg,"
+            "translation_x_mm,translation_y_mm,translation_z_mm,"
+            "rotation_x_deg,rotation_y_deg,rotation_z_deg,"
+            "independent_bad_threshold,gap_bad_threshold,"
+            "translation_bad_threshold,rotation_bad_threshold,classification,"
+            "num_outer_points,num_internal_points,local_pose_refit_success,"
+            "reference_pose_from_local_refit,failure_reason\n";
+  for (const ati::ConsistencyObservationWeightSummaryEntry& row :
+       shared_diagnostic_result.consistency_observation_summaries) {
+    const auto it = independent_rmse.find(
+        std::make_pair(row.frame_index, row.board_id));
+    const double local_rmse =
+        it == independent_rmse.end()
+            ? std::numeric_limits<double>::quiet_NaN()
+            : it->second;
+    const double gap =
+        std::isfinite(local_rmse) ? row.residual_rmse - local_rmse
+                                  : std::numeric_limits<double>::quiet_NaN();
+    std::string classification = "unclassified";
+    if (!row.local_pose_refit_success || !std::isfinite(local_rmse)) {
+      classification = "pose_refit_failed";
+    } else if (local_rmse > independent_bad_threshold) {
+      classification = "observation_or_imaging_issue";
+    } else if (gap > gap_bad_threshold &&
+               (row.translation_error_mm > translation_bad_threshold ||
+                row.rotation_error_deg > rotation_bad_threshold)) {
+      classification = "shared_layout_inconsistent";
+    } else {
+      classification = "consistent";
+    }
+    output << row.frame_index << "," << row.frame_label << ","
+           << row.board_id << "," << local_rmse << ","
+           << row.residual_rmse << "," << gap << ","
+           << row.translation_error_mm << "," << row.rotation_error_deg << ","
+           << row.translation_correction_mm.x() << ","
+           << row.translation_correction_mm.y() << ","
+           << row.translation_correction_mm.z() << ","
+           << row.rotation_correction_deg.x() << ","
+           << row.rotation_correction_deg.y() << ","
+           << row.rotation_correction_deg.z() << ","
+           << independent_bad_threshold << "," << gap_bad_threshold << ","
+           << translation_bad_threshold << "," << rotation_bad_threshold
+           << "," << classification << "," << row.num_outer_points << ","
+           << row.num_internal_points << ","
+           << (row.local_pose_refit_success ? 1 : 0) << ","
+           << (row.reference_pose_from_local_refit ? 1 : 0) << ","
+           << row.failure_reason << "\n";
+  }
+}
+
+void WriteTwoLayerBaSummary(
+    const std::string& path,
+    bool attempted,
+    bool committed,
+    const std::string& rollback_reason,
+    const TwoLayerBaMetrics& baseline_shared,
+    const TwoLayerBaMetrics& baseline_independent,
+    const TwoLayerBaMetrics& candidate_independent,
+    const TwoLayerBaMetrics& candidate_shared,
+    bool observation_set_preserved,
+    bool numerical_health_pass,
+    bool shared_health_pass,
+    bool independent_health_pass,
+    bool reference_board_health_pass,
+    double selected_camera_step_scale) {
+  std::ofstream output(path.c_str());
+  output << "enabled: 1\n";
+  output << "attempted: " << (attempted ? 1 : 0) << "\n";
+  output << "committed: " << (committed ? 1 : 0) << "\n";
+  output << "rollback_reason: " << rollback_reason << "\n";
+  output << "intrinsics_layer_pose_mode: independent_frame_board_pose\n";
+  output << "layout_layer_pose_mode: reference_chain\n";
+  output << "layout_layer_intrinsics_fixed: 1\n";
+  output << "camera_step_policy: training_pareto_min_shared_rmse_with_layout_only_fallback\n";
+  output << "shared_objective: unweighted_image_plane_l2\n";
+  output << "independent_rmse_policy: non_degrading_with_improvement_preferred\n";
+  output << "independent_p95_tolerance_policy: max_0.01_px_or_1_percent\n";
+  output << "reference_board_policy: preserve_observations_and_no_worse_than_reference_board_baseline\n";
+  output << "selected_camera_step_scale: " << selected_camera_step_scale
+         << "\n";
+  output << "observation_set_preserved: "
+         << (observation_set_preserved ? 1 : 0) << "\n";
+  output << "numerical_health_pass: " << (numerical_health_pass ? 1 : 0)
+         << "\n";
+  output << "shared_health_pass: " << (shared_health_pass ? 1 : 0) << "\n";
+  output << "independent_health_pass: "
+         << (independent_health_pass ? 1 : 0) << "\n";
+  output << "reference_board_health_pass: "
+         << (reference_board_health_pass ? 1 : 0) << "\n";
+  output << "baseline_shared_rmse: " << baseline_shared.overall_rmse << "\n";
+  output << "candidate_shared_rmse: " << candidate_shared.overall_rmse << "\n";
+  output << "baseline_shared_p95: " << baseline_shared.p95_residual << "\n";
+  output << "candidate_shared_p95: " << candidate_shared.p95_residual << "\n";
+  output << "baseline_independent_rmse: "
+         << baseline_independent.overall_rmse << "\n";
+  output << "candidate_independent_rmse: "
+         << candidate_independent.overall_rmse << "\n";
+  output << "baseline_independent_p95: "
+         << baseline_independent.p95_residual << "\n";
+  output << "candidate_independent_p95: "
+         << candidate_independent.p95_residual << "\n";
+  output << "baseline_shared_reference_board_rmse: "
+         << baseline_shared.reference_board_rmse << "\n";
+  output << "candidate_shared_reference_board_rmse: "
+         << candidate_shared.reference_board_rmse << "\n";
+  output << "baseline_independent_reference_board_rmse: "
+         << baseline_independent.reference_board_rmse << "\n";
+  output << "candidate_independent_reference_board_rmse: "
+         << candidate_independent.reference_board_rmse << "\n";
+  output << "baseline_reference_board_observation_count: "
+         << baseline_shared.reference_board_observation_count << "\n";
+  output << "candidate_reference_board_observation_count: "
+         << candidate_shared.reference_board_observation_count << "\n";
+  output << "baseline_point_count: " << baseline_shared.point_count << "\n";
+  output << "candidate_point_count: " << candidate_shared.point_count << "\n";
+}
+
 struct PixelRayHybridLambdaBinAccumulator {
   int count = 0;
   double sum = 0.0;
@@ -9034,6 +9494,8 @@ int main(int argc, char** argv) {
         args.precomputed_initialization_point_scope;
     baseline_options.enable_camera_aware_outer_rescue =
         requested_config.camera_aware_outer_rescue && !use_precomputed;
+    baseline_options.enable_opencv_apriltag_fallback =
+        requested_config.opencv_apriltag_fallback && !use_precomputed;
     baseline_options.rerun_camera_initialization_after_outer_rescue = true;
     baseline_options.camera_aware_outer_rescue_max_hamming = 0;
     baseline_options.camera_initialization_auxiliary_session_count =
@@ -9103,6 +9565,8 @@ int main(int argc, char** argv) {
         requested_config.internal_corner_filter_quality_relaxation_px;
     baseline_options.internal_corner_filter_adaptive_min_threshold_px =
         requested_config.internal_corner_filter_adaptive_min_threshold_px;
+    baseline_options.enable_bidirectional_board_topology_consistency =
+        requested_config.bidirectional_board_topology_consistency;
     baseline_options.enable_internal_observation_quality_weighting =
         requested_config.internal_observation_weight_mode ==
             ati::InternalObservationWeightMode::Enabled &&
@@ -9559,6 +10023,9 @@ int main(int argc, char** argv) {
     benchmark_input.trial_backend_selection_options.optimize_intrinsics_in_trial =
         requested_config.trial_backend_selection_optimize_intrinsics;
     benchmark_input.trial_backend_selection_options
+        .independent_frame_board_camera_warmup =
+        requested_config.independent_frame_board_camera_warmup;
+    benchmark_input.trial_backend_selection_options
         .delayed_intrinsics_release_in_trial =
         requested_config.trial_backend_selection_delayed_intrinsics_release;
     benchmark_input.trial_backend_selection_options.intrinsics_release_iteration =
@@ -9972,10 +10439,14 @@ int main(int argc, char** argv) {
       ati::WriteAutoCameraInitializationBootstrapViewsCsv(
           (output_dir / "auto_camera_initialization_bootstrap_views.csv").string(),
           report.baseline_result.auto_camera_initialization);
-      WriteCameraAwareOuterRescueArtifacts(output_dir, report.baseline_result);
+      WriteCameraAwareOuterRescueArtifacts(
+          output_dir, report.baseline_result,
+          !args.stage5_skip_heavy_overlays);
       ati::WriteInternalRegenerationDiagnostics(output_dir, report);
-      ati::WriteFrameBoardObservationFlowDiagnostics(
-          output_dir, report, all_frames_for_lookup, nullptr, nullptr);
+      if (!args.stage5_skip_heavy_overlays) {
+        ati::WriteFrameBoardObservationFlowDiagnostics(
+            output_dir, report, all_frames_for_lookup, nullptr, nullptr);
+      }
       if (requested_config.enable_geometry_prior_outer_seed) {
         ati::WriteGeometryPriorOuterSeedDiagnostics(output_dir, report);
       }
@@ -10019,6 +10490,24 @@ int main(int argc, char** argv) {
       summary << "camera_aware_outer_rescue_count: "
               << report.baseline_result.camera_aware_outer_rescue
                      .rescued_board_observation_count
+              << "\n";
+      summary << "frozen_recovery_baseline_preset_requested: "
+              << (requested_config.frozen_recovery_baseline_preset ? 1 : 0)
+              << "\n";
+      summary << "opencv_apriltag_fallback_requested: "
+              << (requested_config.opencv_apriltag_fallback ? 1 : 0)
+              << "\n";
+      summary << "opencv_apriltag_fallback_effective: "
+              << (report.baseline_result.effective_options.config
+                          .outer_detector_config.enable_opencv_apriltag_fallback
+                      ? 1
+                      : 0)
+              << "\n";
+      summary << "bidirectional_board_topology_consistency_effective: "
+              << (report.baseline_result.effective_options
+                          .enable_bidirectional_board_topology_consistency
+                      ? 1
+                      : 0)
               << "\n";
       summary << "geometry_guided_tag_likelihood_enabled: "
               << (report.baseline_result.effective_options
@@ -10228,12 +10717,16 @@ int main(int argc, char** argv) {
               .string(),
           report.baseline_result.auto_camera_initialization);
     }
-    WriteAutoCameraInitializationBootstrapCornerOverlays(
-        output_dir / "auto_camera_initialization_bootstrap_corner_overlays",
-        report.baseline_result.auto_camera_initialization,
-        report.baseline_result.frame_sources);
+    if (!args.stage5_skip_heavy_overlays) {
+      WriteAutoCameraInitializationBootstrapCornerOverlays(
+          output_dir / "auto_camera_initialization_bootstrap_corner_overlays",
+          report.baseline_result.auto_camera_initialization,
+          report.baseline_result.frame_sources);
+    }
     WriteOuterOnlyIntermediateArtifacts(output_dir, report.baseline_result);
-    WriteCameraAwareOuterRescueArtifacts(output_dir, report.baseline_result);
+    WriteCameraAwareOuterRescueArtifacts(
+        output_dir, report.baseline_result,
+        !args.stage5_skip_heavy_overlays);
     WriteExperimentConfigSummary(
         (output_dir / "experiment_config_summary.txt").string(),
         requested_config,
@@ -10400,7 +10893,7 @@ int main(int argc, char** argv) {
         ati::WriteGeometryPriorOuterSeedDiagnostics(output_dir, report);
       }
     }
-    if (!use_precomputed &&
+    if (!args.stage5_skip_heavy_overlays && !use_precomputed &&
         (requested_config.internal_regeneration_diagnostics ||
          write_selection_diagnostics)) {
       ati::WriteFrameBoardObservationFlowDiagnostics(
@@ -10576,16 +11069,493 @@ int main(int argc, char** argv) {
         args.runtime_mode == ati::Stage5RuntimeMode::Research;
     runner_options.export_variable_block_influence_diagnostics =
         runner_options.export_cost_parity_diagnostics;
-    const ati::AslamBackendCalibrationRunner backend_runner(runner_options);
     PrintProgress(
         "final backend BA removed; evaluating incremental-selection committed state...");
     const auto backend_stage_start = std::chrono::steady_clock::now();
+    const ati::AslamBackendCalibrationRunner backend_runner(runner_options);
     ati::AslamBackendCalibrationResult backend_result =
         backend_runner.Run(report.backend_problem_input);
     AddRuntimeStage(&runtime_summary,
                     "backend_committed_state_evaluation",
                     ElapsedSeconds(backend_stage_start), false);
     PrintBackendResultProgress(backend_result);
+
+    if (backend_result.success && args.stage5_enable_two_layer_ba) {
+      PrintProgress(
+          "running protected two-layer BA: independent intrinsics then fixed-camera shared layout...");
+      const TwoLayerBaMetrics baseline_shared_metrics =
+          ComputeTwoLayerBaMetrics(backend_result);
+
+      ati::AslamBackendCalibrationOptions independent_baseline_options =
+          runner_options;
+      independent_baseline_options.skip_optimization = false;
+      independent_baseline_options.force_pose_only = true;
+      independent_baseline_options.board_pose_parameterization =
+          ati::AslamBackendCalibrationOptions::BoardPoseParameterization::
+              IndependentFrameBoardPose;
+      independent_baseline_options.multi_board_consistency_weighting = false;
+      independent_baseline_options.export_cost_parity_diagnostics = false;
+      independent_baseline_options.export_variable_block_influence_diagnostics =
+          false;
+      independent_baseline_options.run_jacobian_consistency_check = false;
+      const auto independent_baseline_start =
+          std::chrono::steady_clock::now();
+      const ati::AslamBackendCalibrationRunner independent_baseline_runner(
+          independent_baseline_options);
+      const ati::AslamBackendCalibrationResult independent_baseline_result =
+          independent_baseline_runner.Run(report.backend_problem_input);
+      const TwoLayerBaMetrics baseline_independent_metrics =
+          ComputeTwoLayerBaMetrics(independent_baseline_result);
+      AddRuntimeStage(&runtime_summary,
+                      "two_layer_independent_fixed_camera_baseline",
+                      ElapsedSeconds(independent_baseline_start), false);
+      WriteBackendDiagnosticArtifacts(
+          output_dir, "two_layer_independent_baseline",
+          independent_baseline_result);
+
+      ati::CalibrationBackendProblemInput independent_candidate_input =
+          report.backend_problem_input;
+      independent_candidate_input.optimization_masks.optimize_intrinsics = true;
+      independent_candidate_input.optimization_masks.delayed_intrinsics_release =
+          true;
+      independent_candidate_input.optimization_masks.intrinsics_release_iteration =
+          std::max(1, independent_candidate_input.optimization_masks
+                          .intrinsics_release_iteration);
+      ati::AslamBackendCalibrationOptions independent_candidate_options =
+          independent_baseline_options;
+      independent_candidate_options.force_pose_only = false;
+      const auto independent_candidate_start =
+          std::chrono::steady_clock::now();
+      const ati::AslamBackendCalibrationRunner independent_candidate_runner(
+          independent_candidate_options);
+      ati::AslamBackendCalibrationResult independent_candidate_result =
+          independent_candidate_runner.Run(independent_candidate_input);
+      AddRuntimeStage(&runtime_summary, "two_layer_independent_intrinsics",
+                      ElapsedSeconds(independent_candidate_start), false);
+      WriteBackendDiagnosticArtifacts(
+          output_dir, "two_layer_independent_intrinsics",
+          independent_candidate_result);
+
+      ati::AslamBackendCalibrationResult shared_candidate_result;
+      ati::AslamBackendCalibrationResult shared_diagnostic_result;
+      double selected_camera_step_scale = 1.0;
+      if (independent_candidate_result.success) {
+        ati::CalibrationBackendProblemInput shared_candidate_input =
+            report.backend_problem_input;
+        shared_candidate_input.scene_state.camera =
+            independent_candidate_result.optimized_scene_state.camera;
+        shared_candidate_input.optimization_masks.optimize_intrinsics = false;
+        shared_candidate_input.optimization_masks.delayed_intrinsics_release =
+            false;
+        shared_candidate_input.optimization_masks.optimize_frame_poses = true;
+        shared_candidate_input.optimization_masks.optimize_board_poses = true;
+
+        ati::AslamBackendCalibrationOptions shared_candidate_options =
+            runner_options;
+        shared_candidate_options.skip_optimization = false;
+        shared_candidate_options.force_pose_only = true;
+        shared_candidate_options.board_pose_parameterization =
+            ati::AslamBackendCalibrationOptions::BoardPoseParameterization::
+                ReferenceChain;
+        // The protected shared layer is accepted with an unweighted
+        // image-plane RMSE gate, so solve exactly that objective. This mode is
+        // intentionally local to two-layer BA and does not alter selection or
+        // the frozen frontend observation set.
+        shared_candidate_options.observation_role_weight_mode =
+            "unweighted_points";
+        shared_candidate_options.use_huber_loss = false;
+        shared_candidate_options.residual_model = ati::ResidualModel::ImagePlane;
+        shared_candidate_options.use_point_type_residual_split = false;
+        shared_candidate_options.angular_auxiliary_enabled = false;
+        shared_candidate_options.pixel_ray_hybrid_refinement_mode = false;
+        shared_candidate_options.pixel_ray_hybrid_polar_adaptive_enabled = false;
+        shared_candidate_options.polar_angle_weight_mode =
+            ati::AslamBackendCalibrationOptions::PolarAngleWeightMode::None;
+        shared_candidate_options.internal_anisotropic_weight_mode = "off";
+        shared_candidate_options.multi_board_consistency_weighting = false;
+        shared_candidate_options.export_cost_parity_diagnostics = false;
+        shared_candidate_options.export_variable_block_influence_diagnostics =
+            false;
+        shared_candidate_options.run_jacobian_consistency_check = false;
+        const auto shared_candidate_start =
+            std::chrono::steady_clock::now();
+        const ati::AslamBackendCalibrationRunner shared_candidate_runner(
+            shared_candidate_options);
+        shared_candidate_result =
+            shared_candidate_runner.Run(shared_candidate_input);
+        AddRuntimeStage(&runtime_summary,
+                        "two_layer_fixed_camera_shared_layout",
+                        ElapsedSeconds(shared_candidate_start), false);
+        WriteBackendDiagnosticArtifacts(
+            output_dir, "two_layer_shared_layout", shared_candidate_result);
+
+        const double health_tolerance_px = 1e-4;
+        const double independent_tail_tolerance_px =
+            std::max(0.01,
+                     0.01 * baseline_independent_metrics.p95_residual);
+        const TwoLayerBaMetrics full_shared_metrics =
+            ComputeTwoLayerBaMetrics(shared_candidate_result);
+        const TwoLayerBaMetrics full_independent_metrics =
+            ComputeTwoLayerBaMetrics(independent_candidate_result);
+        std::ofstream backtracking_summary(
+            (output_dir / "two_layer_backtracking_summary.csv").string().c_str());
+        backtracking_summary
+            << "scale,independent_rmse,independent_p95,"
+               "independent_reference_board_rmse,shared_rmse,shared_p95,"
+               "shared_reference_board_rmse,point_count,"
+               "reference_board_observation_count,observation_set_preserved,"
+               "numerical_health_pass,shared_health_pass,"
+               "independent_health_pass,reference_board_health_pass,accepted\n";
+        const bool full_step_shared_pass =
+            full_shared_metrics.success &&
+            full_shared_metrics.overall_rmse <=
+                baseline_shared_metrics.overall_rmse + health_tolerance_px &&
+            full_shared_metrics.p95_residual <=
+                baseline_shared_metrics.p95_residual + health_tolerance_px;
+        const bool full_observation_set_preserved =
+            baseline_shared_metrics.point_count == full_shared_metrics.point_count &&
+            baseline_shared_metrics.board_observation_count ==
+                full_shared_metrics.board_observation_count &&
+            backend_result.effective_problem_input.measurement_dataset
+                    .accepted_board_observation_keys ==
+                shared_candidate_result.effective_problem_input
+                    .measurement_dataset.accepted_board_observation_keys;
+        const bool full_numerical_pass =
+            OptimizationStagesAreHealthy(independent_candidate_result) &&
+            OptimizationStagesAreHealthy(shared_candidate_result);
+        const bool full_independent_pass =
+            full_independent_metrics.success &&
+            full_independent_metrics.overall_rmse <
+                baseline_independent_metrics.overall_rmse - health_tolerance_px &&
+            full_independent_metrics.p95_residual <=
+                baseline_independent_metrics.p95_residual +
+                    independent_tail_tolerance_px;
+        const bool full_reference_pass =
+            full_shared_metrics.reference_board_rmse <=
+                baseline_shared_metrics.reference_board_rmse +
+                    health_tolerance_px &&
+            full_independent_metrics.reference_board_rmse <=
+                baseline_independent_metrics.reference_board_rmse +
+                    health_tolerance_px &&
+            full_shared_metrics.reference_board_observation_count >=
+                baseline_shared_metrics.reference_board_observation_count &&
+            full_shared_metrics.reference_board_point_count >=
+                baseline_shared_metrics.reference_board_point_count;
+        const bool full_step_pass =
+            full_observation_set_preserved && full_numerical_pass &&
+            full_step_shared_pass && full_independent_pass &&
+            full_reference_pass;
+        WriteTwoLayerBacktrackingRow(
+            &backtracking_summary, 1.0, full_independent_metrics,
+            full_shared_metrics, full_observation_set_preserved,
+            full_numerical_pass, full_step_shared_pass, full_independent_pass,
+            full_reference_pass, full_step_pass);
+        if (!full_step_pass && baseline_independent_metrics.success) {
+          const ati::OuterBootstrapCameraIntrinsics full_candidate_camera =
+              independent_candidate_result.optimized_scene_state.camera;
+          const std::vector<double> backtracking_scales = {
+              0.5, 0.25, 0.125, 0.0625, 0.0};
+          bool found_safe_probe = false;
+          double best_safe_probe_shared_rmse =
+              std::numeric_limits<double>::infinity();
+          for (double scale : backtracking_scales) {
+            const ati::OuterBootstrapCameraIntrinsics probe_camera =
+                InterpolateCameraIntrinsics(
+                    backend_result.optimized_scene_state.camera,
+                    full_candidate_camera, scale);
+            ati::CalibrationBackendProblemInput independent_probe_input =
+                report.backend_problem_input;
+            independent_probe_input.scene_state.camera = probe_camera;
+            independent_probe_input.optimization_masks.optimize_intrinsics = false;
+            independent_probe_input.optimization_masks
+                .delayed_intrinsics_release = false;
+            const ati::AslamBackendCalibrationRunner independent_probe_runner(
+                independent_baseline_options);
+            ati::AslamBackendCalibrationResult independent_probe_result =
+                independent_probe_runner.Run(independent_probe_input);
+
+            ati::CalibrationBackendProblemInput shared_probe_input =
+                report.backend_problem_input;
+            shared_probe_input.scene_state.camera = probe_camera;
+            shared_probe_input.optimization_masks.optimize_intrinsics = false;
+            shared_probe_input.optimization_masks.delayed_intrinsics_release =
+                false;
+            shared_probe_input.optimization_masks.optimize_frame_poses = true;
+            shared_probe_input.optimization_masks.optimize_board_poses = true;
+            const ati::AslamBackendCalibrationRunner shared_probe_runner(
+                shared_candidate_options);
+            ati::AslamBackendCalibrationResult shared_probe_result =
+                shared_probe_runner.Run(shared_probe_input);
+
+            const std::string scale_label =
+                std::to_string(static_cast<int>(std::round(scale * 10000.0)));
+            WriteBackendDiagnosticArtifacts(
+                output_dir,
+                "two_layer_backtrack_" + scale_label + "_independent",
+                independent_probe_result);
+            WriteBackendDiagnosticArtifacts(
+                output_dir,
+                "two_layer_backtrack_" + scale_label + "_shared",
+                shared_probe_result);
+
+            const TwoLayerBaMetrics probe_independent_metrics =
+                ComputeTwoLayerBaMetrics(independent_probe_result);
+            const TwoLayerBaMetrics probe_shared_metrics =
+                ComputeTwoLayerBaMetrics(shared_probe_result);
+            const bool probe_observation_set_preserved =
+                baseline_shared_metrics.point_count ==
+                    probe_shared_metrics.point_count &&
+                baseline_shared_metrics.board_observation_count ==
+                    probe_shared_metrics.board_observation_count &&
+                backend_result.effective_problem_input.measurement_dataset
+                        .accepted_board_observation_keys ==
+                    shared_probe_result.effective_problem_input
+                        .measurement_dataset.accepted_board_observation_keys;
+            const bool probe_numerical_pass =
+                OptimizationStagesAreHealthy(independent_probe_result) &&
+                OptimizationStagesAreHealthy(shared_probe_result);
+            const bool probe_shared_pass =
+                probe_shared_metrics.success &&
+                probe_shared_metrics.overall_rmse <=
+                    baseline_shared_metrics.overall_rmse + health_tolerance_px &&
+                probe_shared_metrics.p95_residual <=
+                    baseline_shared_metrics.p95_residual + health_tolerance_px;
+            const bool probe_independent_pass =
+                probe_independent_metrics.success &&
+                probe_independent_metrics.overall_rmse <=
+                    baseline_independent_metrics.overall_rmse +
+                        health_tolerance_px &&
+                probe_independent_metrics.p95_residual <=
+                    baseline_independent_metrics.p95_residual +
+                        independent_tail_tolerance_px;
+            const bool probe_reference_pass =
+                probe_shared_metrics.reference_board_rmse <=
+                    baseline_shared_metrics.reference_board_rmse +
+                        health_tolerance_px &&
+                probe_independent_metrics.reference_board_rmse <=
+                    baseline_independent_metrics.reference_board_rmse +
+                        health_tolerance_px &&
+                probe_shared_metrics.reference_board_observation_count >=
+                    baseline_shared_metrics.reference_board_observation_count &&
+                probe_shared_metrics.reference_board_point_count >=
+                    baseline_shared_metrics.reference_board_point_count;
+            const bool probe_pass =
+                probe_numerical_pass && probe_observation_set_preserved &&
+                probe_shared_pass && probe_independent_pass &&
+                probe_reference_pass;
+            WriteTwoLayerBacktrackingRow(
+                &backtracking_summary, scale, probe_independent_metrics,
+                probe_shared_metrics, probe_observation_set_preserved,
+                probe_numerical_pass, probe_shared_pass,
+                probe_independent_pass, probe_reference_pass,
+                probe_pass);
+            if (probe_pass &&
+                probe_shared_metrics.overall_rmse <
+                    best_safe_probe_shared_rmse - health_tolerance_px) {
+              found_safe_probe = true;
+              best_safe_probe_shared_rmse =
+                  probe_shared_metrics.overall_rmse;
+              independent_candidate_result = independent_probe_result;
+              shared_candidate_result = shared_probe_result;
+              selected_camera_step_scale = scale;
+            }
+          }
+          if (found_safe_probe) {
+            PrintProgress(
+                "two-layer training Pareto backtracking selected scale=" +
+                std::to_string(selected_camera_step_scale));
+          }
+        }
+
+        if (shared_candidate_result.success) {
+          ati::CalibrationBackendProblemInput diagnostic_input =
+              report.backend_problem_input;
+          diagnostic_input.scene_state.camera =
+              shared_candidate_result.optimized_scene_state.camera;
+          diagnostic_input.scene_state.frames =
+              shared_candidate_result.optimized_scene_state.frames;
+          diagnostic_input.scene_state.boards =
+              shared_candidate_result.optimized_scene_state.boards;
+          diagnostic_input.optimization_masks.optimize_intrinsics = false;
+          diagnostic_input.optimization_masks.optimize_frame_poses = false;
+          diagnostic_input.optimization_masks.optimize_board_poses = false;
+          diagnostic_input.optimization_masks.delayed_intrinsics_release = false;
+          ati::AslamBackendCalibrationOptions diagnostic_options =
+              shared_candidate_options;
+          diagnostic_options.skip_optimization = true;
+          diagnostic_options.force_pose_only = true;
+          diagnostic_options.multi_board_consistency_weighting = true;
+          diagnostic_options.consistency_min_weight = 1.0;
+          diagnostic_options.consistency_apply_to_outer = false;
+          diagnostic_options.consistency_apply_to_internal = false;
+          diagnostic_options.consistency_hard_reject_enabled = false;
+          const ati::AslamBackendCalibrationRunner diagnostic_runner(
+              diagnostic_options);
+          shared_diagnostic_result = diagnostic_runner.Run(diagnostic_input);
+          WriteBackendDiagnosticArtifacts(
+              output_dir, "two_layer_shared_consistency_diagnostic",
+              shared_diagnostic_result);
+          if (shared_diagnostic_result.success) {
+            WriteTwoLayerConsistencyCsv(
+                (output_dir / "two_layer_frame_board_consistency.csv").string(),
+                independent_candidate_result, shared_diagnostic_result);
+          }
+          WriteCommittedBackendTrainingPointsCsv(
+              (output_dir / "two_layer_independent_points.csv").string(),
+              independent_candidate_result.optimized_residual);
+          WriteCommittedBackendTrainingPointsCsv(
+              (output_dir / "two_layer_shared_points.csv").string(),
+              shared_candidate_result.optimized_residual);
+        }
+      }
+
+      const TwoLayerBaMetrics candidate_independent_metrics =
+          ComputeTwoLayerBaMetrics(independent_candidate_result);
+      const TwoLayerBaMetrics candidate_shared_metrics =
+          ComputeTwoLayerBaMetrics(shared_candidate_result);
+      const double health_tolerance_px = 1e-4;
+      const double independent_tail_tolerance_px =
+          std::max(0.01,
+                   0.01 * baseline_independent_metrics.p95_residual);
+      const bool observation_set_preserved =
+          baseline_shared_metrics.point_count ==
+              candidate_shared_metrics.point_count &&
+          baseline_shared_metrics.board_observation_count ==
+              candidate_shared_metrics.board_observation_count &&
+          baseline_shared_metrics.reference_board_observation_count ==
+              candidate_shared_metrics.reference_board_observation_count &&
+          backend_result.effective_problem_input.measurement_dataset
+                  .accepted_board_observation_keys ==
+              shared_candidate_result.effective_problem_input
+                  .measurement_dataset.accepted_board_observation_keys;
+      const bool numerical_health_pass =
+          OptimizationStagesAreHealthy(independent_baseline_result) &&
+          OptimizationStagesAreHealthy(independent_candidate_result) &&
+          OptimizationStagesAreHealthy(shared_candidate_result);
+      const bool shared_health_pass =
+          candidate_shared_metrics.success &&
+          candidate_shared_metrics.overall_rmse <=
+              baseline_shared_metrics.overall_rmse + health_tolerance_px &&
+          candidate_shared_metrics.p95_residual <=
+              baseline_shared_metrics.p95_residual + health_tolerance_px;
+      const bool independent_health_pass =
+          baseline_independent_metrics.success &&
+          candidate_independent_metrics.success &&
+          candidate_independent_metrics.overall_rmse <=
+              baseline_independent_metrics.overall_rmse + health_tolerance_px &&
+          candidate_independent_metrics.p95_residual <=
+              baseline_independent_metrics.p95_residual +
+                  independent_tail_tolerance_px;
+      const bool reference_board_health_pass =
+          candidate_shared_metrics.reference_board_rmse <=
+              baseline_shared_metrics.reference_board_rmse +
+                  health_tolerance_px &&
+          candidate_independent_metrics.reference_board_rmse <=
+              baseline_independent_metrics.reference_board_rmse +
+                  health_tolerance_px &&
+          candidate_shared_metrics.reference_board_observation_count >=
+              baseline_shared_metrics.reference_board_observation_count &&
+          candidate_shared_metrics.reference_board_point_count >=
+              baseline_shared_metrics.reference_board_point_count;
+      const bool commit_two_layer =
+          numerical_health_pass && observation_set_preserved &&
+          shared_health_pass && independent_health_pass &&
+          reference_board_health_pass;
+      std::string rollback_reason;
+      if (!commit_two_layer) {
+        std::vector<std::string> failed_gates;
+        if (!numerical_health_pass) {
+          failed_gates.push_back("numerical_health");
+        }
+        if (!observation_set_preserved) {
+          failed_gates.push_back("observation_set_preservation");
+        }
+        if (!shared_health_pass) {
+          failed_gates.push_back("shared_rmse");
+        }
+        if (!independent_health_pass) {
+          failed_gates.push_back("independent_rmse_or_p95");
+        }
+        if (!reference_board_health_pass) {
+          failed_gates.push_back("reference_board");
+        }
+        rollback_reason = JoinStringVector(failed_gates, ",");
+      }
+      WriteTwoLayerBaSummary(
+          (output_dir / "two_layer_ba_summary.txt").string(), true,
+          commit_two_layer, rollback_reason, baseline_shared_metrics,
+          baseline_independent_metrics, candidate_independent_metrics,
+          candidate_shared_metrics, observation_set_preserved,
+          numerical_health_pass, shared_health_pass, independent_health_pass,
+          reference_board_health_pass, selected_camera_step_scale);
+      if (commit_two_layer) {
+        backend_result = shared_candidate_result;
+        PrintProgress("two-layer BA committed after all health gates passed.");
+        PrintBackendResultProgress(backend_result);
+      } else {
+        PrintProgress("two-layer BA rolled back to committed baseline: " +
+                      rollback_reason);
+      }
+    }
+
+    if (backend_result.success &&
+        requested_config.backend_multi_board_consistency_weighting &&
+        !args.stage5_enable_two_layer_ba) {
+      ati::AslamBackendCalibrationOptions weighted_options = runner_options;
+      weighted_options.skip_optimization = false;
+      weighted_options.export_cost_parity_diagnostics = false;
+      weighted_options.export_variable_block_influence_diagnostics = false;
+      weighted_options.run_jacobian_consistency_check = false;
+      PrintProgress(
+          "running protected consistency-weighted post-selection refinement...");
+      const auto weighted_start = std::chrono::steady_clock::now();
+      const ati::AslamBackendCalibrationRunner weighted_runner(weighted_options);
+      ati::AslamBackendCalibrationResult weighted_result =
+          weighted_runner.Run(report.backend_problem_input);
+      AddRuntimeStage(&runtime_summary,
+                      "consistency_weighted_post_selection_refinement",
+                      ElapsedSeconds(weighted_start), false);
+      WriteBackendDiagnosticArtifacts(
+          output_dir, "consistency_weighted_refinement_probe", weighted_result);
+
+      bool objective_nonincreasing = !weighted_result.stages.empty();
+      for (const auto& stage : weighted_result.stages) {
+        objective_nonincreasing =
+            objective_nonincreasing && std::isfinite(stage.objective_start) &&
+            std::isfinite(stage.objective_final) &&
+            stage.objective_final <=
+                stage.objective_start +
+                    1e-10 * std::max(1.0, std::abs(stage.objective_start));
+      }
+      const double committed_shared_rmse =
+          backend_result.optimized_residual.overall_rmse;
+      const double shared_health_limit = std::max(
+          2.0 * committed_shared_rmse, committed_shared_rmse + 2.0);
+      const bool weighted_health_pass =
+          weighted_result.success && objective_nonincreasing &&
+          weighted_result.optimized_residual.success &&
+          weighted_result.optimized_scene_state.camera.IsValid() &&
+          std::isfinite(weighted_result.optimized_residual.overall_rmse) &&
+          weighted_result.optimized_residual.overall_rmse <= shared_health_limit;
+      if (weighted_health_pass) {
+        backend_result = weighted_result;
+        PrintProgress(
+            "consistency-weighted refinement committed from numerical and "
+            "shared-scene health checks.");
+        PrintBackendResultProgress(backend_result);
+      } else {
+        std::ostringstream warning;
+        warning << "consistency-weighted refinement rolled back"
+                << " success=" << (weighted_result.success ? 1 : 0)
+                << " objective_nonincreasing="
+                << (objective_nonincreasing ? 1 : 0)
+                << " committed_shared_rmse=" << committed_shared_rmse
+                << " candidate_shared_rmse="
+                << weighted_result.optimized_residual.overall_rmse
+                << " shared_health_limit=" << shared_health_limit;
+        PrintProgress(warning.str());
+      }
+    }
     WriteBackendDiagnosticArtifacts(output_dir, "backend_optimization", backend_result);
     if (backend_result.success) {
       ati::WriteBoardLayoutPoseDeltaCsv(
@@ -10901,8 +11871,9 @@ int main(int argc, char** argv) {
         requested_config.enable_trial_backend_frame_board_selection ||
         requested_config.selection_mode == "kalibr_style_frame_board" ||
         requested_config.selection_mode == "kalibr_style_batch";
-    if (requested_config.internal_regeneration_diagnostics ||
-        write_backend_selection_diagnostics) {
+    if (!args.stage5_skip_heavy_overlays &&
+        (requested_config.internal_regeneration_diagnostics ||
+         write_backend_selection_diagnostics)) {
       ati::WriteFrameBoardObservationFlowDiagnostics(
           output_dir, report, all_frames_for_lookup,
           &backend_training_evaluation,

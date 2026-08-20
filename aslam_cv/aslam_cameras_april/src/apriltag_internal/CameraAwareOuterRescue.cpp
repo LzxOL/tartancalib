@@ -39,7 +39,7 @@ std::string MakeCameraAwareRescueSignatureImpl(
     int reference_board_id) {
   std::ostringstream stream;
   stream << std::setprecision(17)
-         << "camera_aware_outer_rescue_v6_robust_missing_board_recovery|family="
+         << "camera_aware_outer_rescue_v10_spherical_support_confirmation|family="
          << camera.NormalizedFamilyString()
          << "|distortion=" << camera.NormalizedDistortionModel()
          << "|camera=";

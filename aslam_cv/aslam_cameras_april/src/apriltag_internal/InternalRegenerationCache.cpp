@@ -20,11 +20,11 @@ namespace {
 namespace fs = boost::filesystem;
 
 constexpr const char kCacheFormatVersion[] =
-      "internal_regeneration_cache_v27_multi_missing_topology_assignment";
+      "internal_regeneration_cache_v36_outer_corner_debug";
 constexpr const char kStageImplementationVersion[] =
-      "internal_refinement_v27_multi_missing_topology_assignment";
+      "internal_refinement_v36_outer_corner_debug";
 constexpr const char kArtifactSchemaVersion[] =
-    "internal_regeneration_frame_v1";
+    "internal_regeneration_frame_v2_outer_corner_debug";
 
 std::uint64_t HashBytes(const std::string& text) {
   std::uint64_t hash = 1469598103934665603ull;
@@ -250,6 +250,80 @@ void ReadBoolArray(const cv::FileNode& node, std::array<bool, 4>* values) {
   }
 }
 
+// The final regeneration cache owns the observations consumed by all Stage5
+// diagnostics. Preserve the refinement trace here as well as in the outer
+// cache, otherwise a cache hit silently turns every corner_index back to -1.
+void WriteOuterCornerVerificationDebug(
+    cv::FileStorage* storage,
+    const OuterCornerVerificationDebugInfo& debug) {
+  *storage << "{";
+  *storage << "corner_index" << debug.corner_index;
+  WritePoint2f(storage, "coarse_corner", debug.coarse_corner);
+  WritePoint2f(storage, "verified_corner", debug.verified_corner);
+  WritePoint2f(storage, "subpix_corner", debug.subpix_corner);
+  *storage << "local_scale" << debug.local_scale;
+  *storage << "verification_roi_radius" << debug.verification_roi_radius;
+  *storage << "candidate_radius" << debug.candidate_radius;
+  *storage << "branch_search_radius" << debug.branch_search_radius;
+  *storage << "verification_quality" << debug.verification_quality;
+  *storage << "coarse_to_verified_displacement"
+           << debug.coarse_to_verified_displacement;
+  *storage << "coarse_to_subpix_displacement"
+           << debug.coarse_to_subpix_displacement;
+  *storage << "coarse_to_refined_displacement"
+           << debug.coarse_to_refined_displacement;
+  *storage << "corner_marker_width" << debug.corner_marker_width;
+  *storage << "configured_outer_subpix_scale"
+           << debug.configured_outer_subpix_scale;
+  *storage << "configured_outer_subpix_window_scale"
+           << debug.configured_outer_subpix_window_scale;
+  *storage << "configured_outer_subpix_window_radius"
+           << debug.configured_outer_subpix_window_radius;
+  *storage << "configured_outer_subpix_window_min"
+           << debug.configured_outer_subpix_window_min;
+  *storage << "configured_outer_subpix_window_max"
+           << debug.configured_outer_subpix_window_max;
+  *storage << "raw_subpix_window_radius" << debug.raw_subpix_window_radius;
+  *storage << "pre_boost_subpix_window_radius"
+           << debug.pre_boost_subpix_window_radius;
+  *storage << "boosted_raw_subpix_window_radius"
+           << debug.boosted_raw_subpix_window_radius;
+  *storage << "subpix_window_clamp_limit" << debug.subpix_window_clamp_limit;
+  *storage << "subpix_window_clamped" << (debug.subpix_window_clamped ? 1 : 0);
+  *storage << "subpix_window_radius" << debug.subpix_window_radius;
+  *storage << "subpix_unstable_rollback_detected"
+           << (debug.subpix_unstable_rollback_detected ? 1 : 0);
+  *storage << "subpix_unstable_rollback_iteration"
+           << debug.subpix_unstable_rollback_iteration;
+  *storage << "subpix_unstable_rollback_max_displacement"
+           << debug.subpix_unstable_rollback_max_displacement;
+  *storage << "close_edge_subpix_boost_applied"
+           << (debug.close_edge_subpix_boost_applied ? 1 : 0);
+  *storage << "close_edge_subpix_area_ratio"
+           << debug.close_edge_subpix_area_ratio;
+  *storage << "close_edge_subpix_max_polar_deg"
+           << debug.close_edge_subpix_max_polar_deg;
+  *storage << "close_edge_subpix_multiplier"
+           << debug.close_edge_subpix_multiplier;
+  *storage << "refine_displacement_limit" << debug.refine_displacement_limit;
+  *storage << "refined_valid" << (debug.refined_valid ? 1 : 0);
+  *storage << "verification_passed" << (debug.verification_passed ? 1 : 0);
+  *storage << "subpix_applied" << (debug.subpix_applied ? 1 : 0);
+  *storage << "failure_reason" << debug.failure_reason;
+  *storage << "}";
+}
+
+void WriteOuterCornerVerificationDebugArray(
+    cv::FileStorage* storage,
+    const char* key,
+    const std::array<OuterCornerVerificationDebugInfo, 4>& values) {
+  *storage << key << "[";
+  for (const OuterCornerVerificationDebugInfo& value : values) {
+    WriteOuterCornerVerificationDebug(storage, value);
+  }
+  *storage << "]";
+}
+
 void WritePointVector(cv::FileStorage* storage,
                       const std::string& name,
                       const std::vector<cv::Point2f>& points) {
@@ -349,6 +423,8 @@ void WriteInternalCornerDebug(cv::FileStorage* storage,
                               const InternalCornerDebugInfo& debug) {
   *storage << "{";
   *storage << "point_id" << debug.point_id;
+  *storage << "lattice_u" << debug.lattice_u;
+  *storage << "lattice_v" << debug.lattice_v;
   *storage << "corner_type" << static_cast<int>(debug.corner_type);
   WritePoint2f(storage, "predicted_image", debug.predicted_image);
   WritePoint2f(storage, "border_seed_image", debug.border_seed_image);
@@ -376,6 +452,10 @@ void WriteInternalCornerDebug(cv::FileStorage* storage,
   *storage << "template_quality" << debug.template_quality;
   *storage << "gradient_quality" << debug.gradient_quality;
   *storage << "final_quality" << debug.final_quality;
+  *storage << "image_template_quality" << debug.image_template_quality;
+  *storage << "image_gradient_quality" << debug.image_gradient_quality;
+  *storage << "image_centering_quality" << debug.image_centering_quality;
+  *storage << "image_final_quality" << debug.image_final_quality;
   *storage << "predicted_to_seed_displacement" << debug.predicted_to_seed_displacement;
   *storage << "seed_to_refined_displacement" << debug.seed_to_refined_displacement;
   *storage << "predicted_to_refined_displacement" << debug.predicted_to_refined_displacement;
@@ -394,6 +474,8 @@ void WriteInternalCornerDebug(cv::FileStorage* storage,
 InternalCornerDebugInfo ReadInternalCornerDebug(const cv::FileNode& node) {
   InternalCornerDebugInfo debug;
   debug.point_id = static_cast<int>(node["point_id"]);
+  debug.lattice_u = static_cast<int>(node["lattice_u"]);
+  debug.lattice_v = static_cast<int>(node["lattice_v"]);
   debug.corner_type =
       static_cast<CornerType>(static_cast<int>(node["corner_type"]));
   debug.predicted_image = ReadPoint2f(node["predicted_image"]);
@@ -422,6 +504,14 @@ InternalCornerDebugInfo ReadInternalCornerDebug(const cv::FileNode& node) {
   debug.template_quality = static_cast<double>(node["template_quality"]);
   debug.gradient_quality = static_cast<double>(node["gradient_quality"]);
   debug.final_quality = static_cast<double>(node["final_quality"]);
+  debug.image_template_quality =
+      static_cast<double>(node["image_template_quality"]);
+  debug.image_gradient_quality =
+      static_cast<double>(node["image_gradient_quality"]);
+  debug.image_centering_quality =
+      static_cast<double>(node["image_centering_quality"]);
+  debug.image_final_quality =
+      static_cast<double>(node["image_final_quality"]);
   debug.predicted_to_seed_displacement = static_cast<double>(node["predicted_to_seed_displacement"]);
   debug.seed_to_refined_displacement = static_cast<double>(node["seed_to_refined_displacement"]);
   debug.predicted_to_refined_displacement = static_cast<double>(node["predicted_to_refined_displacement"]);
@@ -523,6 +613,54 @@ void WriteDetection(cv::FileStorage* storage,
   *storage << "runtime_subpix_seconds" << runtime.subpix_seconds;
   *storage << "runtime_attempted_internal_corner_count" << runtime.attempted_internal_corner_count;
   *storage << "runtime_valid_internal_corner_count" << runtime.valid_internal_corner_count;
+  // The detector may replace a missing outer observation with a geometry-
+  // validated rescue. Preserve that effective outer result in the internal
+  // cache; reattaching only the raw frame input loses the rescue on cache hits.
+  *storage << "outer_detection" << "{";
+  const OuterTagDetectionResult& outer = detection.outer_detection;
+  *storage << "success" << (outer.success ? 1 : 0);
+  *storage << "board_id" << outer.board_id;
+  *storage << "detected_tag_id" << outer.detected_tag_id;
+  *storage << "original_longest_side" << outer.original_longest_side;
+  *storage << "chosen_scale_longest_side" << outer.chosen_scale_longest_side;
+  *storage << "chosen_scale_factor" << outer.chosen_scale_factor;
+  *storage << "scale_configuration_mode" << outer.scale_configuration_mode;
+  *storage << "hamming" << outer.hamming;
+  *storage << "good" << (outer.good ? 1 : 0);
+  *storage << "attempted_local_patch_rescue"
+           << (outer.attempted_local_patch_rescue ? 1 : 0);
+  *storage << "used_local_patch_rescue"
+           << (outer.used_local_patch_rescue ? 1 : 0);
+  *storage << "local_patch_rescue_summary" << outer.local_patch_rescue_summary;
+  *storage << "quality" << outer.quality;
+  *storage << "failure_reason" << static_cast<int>(outer.failure_reason);
+  *storage << "failure_reason_text" << outer.failure_reason_text;
+  WriteArray(storage, "coarse_corners_scaled_image", outer.coarse_corners_scaled_image,
+             [](cv::FileStorage* s, const Eigen::Vector2d& point) {
+               *s << "[" << point.x() << point.y() << "]";
+             });
+  WriteArray(storage, "coarse_corners_original_image", outer.coarse_corners_original_image,
+             [](cv::FileStorage* s, const Eigen::Vector2d& point) {
+               *s << "[" << point.x() << point.y() << "]";
+             });
+  WriteArray(storage, "refined_corners_original_image", outer.refined_corners_original_image,
+             [](cv::FileStorage* s, const Eigen::Vector2d& point) {
+               *s << "[" << point.x() << point.y() << "]";
+             });
+  WriteBoolArray(storage, "refined_valid", outer.refined_valid);
+  *storage << "board_quad_consistency_checked"
+           << (outer.board_quad_consistency_checked ? 1 : 0);
+  *storage << "board_quad_consistency_passed"
+           << (outer.board_quad_consistency_passed ? 1 : 0);
+  *storage << "board_quad_worst_corner_index" << outer.board_quad_worst_corner_index;
+  *storage << "board_quad_worst_corner_displacement_px"
+           << outer.board_quad_worst_corner_displacement_px;
+  *storage << "board_quad_area_ratio" << outer.board_quad_area_ratio;
+  *storage << "board_quad_consistency_diagnostic"
+           << outer.board_quad_consistency_diagnostic;
+  WriteOuterCornerVerificationDebugArray(
+      storage, "corner_verification_debug", outer.corner_verification_debug);
+  *storage << "}";
   *storage << "}";
 }
 
@@ -530,6 +668,102 @@ template <typename T>
 T ReadScalar(const cv::FileNode& node, const char* key, const T& fallback) {
   const cv::FileNode value = node[key];
   return value.empty() ? fallback : static_cast<T>(value);
+}
+
+void ReadOuterCornerVerificationDebug(
+    const cv::FileNode& node,
+    OuterCornerVerificationDebugInfo* debug) {
+  if (debug == nullptr) {
+    return;
+  }
+  *debug = OuterCornerVerificationDebugInfo{};
+  if (node.empty() || !node.isMap()) {
+    return;
+  }
+  debug->corner_index = ReadScalar<int>(node, "corner_index", -1);
+  debug->coarse_corner = ReadPoint2f(node["coarse_corner"]);
+  debug->verified_corner = ReadPoint2f(node["verified_corner"]);
+  debug->subpix_corner = ReadPoint2f(node["subpix_corner"]);
+  debug->local_scale = ReadScalar<double>(node, "local_scale", 0.0);
+  debug->verification_roi_radius =
+      ReadScalar<int>(node, "verification_roi_radius", 0);
+  debug->candidate_radius = ReadScalar<int>(node, "candidate_radius", 0);
+  debug->branch_search_radius =
+      ReadScalar<int>(node, "branch_search_radius", 0);
+  debug->verification_quality =
+      ReadScalar<double>(node, "verification_quality", 0.0);
+  debug->coarse_to_verified_displacement =
+      ReadScalar<double>(node, "coarse_to_verified_displacement", 0.0);
+  debug->coarse_to_subpix_displacement =
+      ReadScalar<double>(node, "coarse_to_subpix_displacement", 0.0);
+  debug->coarse_to_refined_displacement =
+      ReadScalar<double>(node, "coarse_to_refined_displacement", 0.0);
+  debug->corner_marker_width =
+      ReadScalar<double>(node, "corner_marker_width", 0.0);
+  debug->configured_outer_subpix_scale =
+      ReadScalar<double>(node, "configured_outer_subpix_scale", 0.0);
+  debug->configured_outer_subpix_window_scale =
+      ReadScalar<double>(node, "configured_outer_subpix_window_scale", 0.0);
+  debug->configured_outer_subpix_window_radius =
+      ReadScalar<int>(node, "configured_outer_subpix_window_radius", 0);
+  debug->configured_outer_subpix_window_min =
+      ReadScalar<int>(node, "configured_outer_subpix_window_min", 0);
+  debug->configured_outer_subpix_window_max =
+      ReadScalar<int>(node, "configured_outer_subpix_window_max", 0);
+  debug->raw_subpix_window_radius =
+      ReadScalar<int>(node, "raw_subpix_window_radius", 0);
+  debug->pre_boost_subpix_window_radius =
+      ReadScalar<int>(node, "pre_boost_subpix_window_radius", 0);
+  debug->boosted_raw_subpix_window_radius =
+      ReadScalar<int>(node, "boosted_raw_subpix_window_radius", 0);
+  debug->subpix_window_clamp_limit =
+      ReadScalar<int>(node, "subpix_window_clamp_limit", 0);
+  debug->subpix_window_clamped =
+      ReadScalar<int>(node, "subpix_window_clamped", 0) != 0;
+  debug->subpix_window_radius =
+      ReadScalar<int>(node, "subpix_window_radius", 0);
+  debug->subpix_unstable_rollback_detected =
+      ReadScalar<int>(node, "subpix_unstable_rollback_detected", 0) != 0;
+  debug->subpix_unstable_rollback_iteration =
+      ReadScalar<int>(node, "subpix_unstable_rollback_iteration", 0);
+  debug->subpix_unstable_rollback_max_displacement = ReadScalar<double>(
+      node, "subpix_unstable_rollback_max_displacement", 0.0);
+  debug->close_edge_subpix_boost_applied =
+      ReadScalar<int>(node, "close_edge_subpix_boost_applied", 0) != 0;
+  debug->close_edge_subpix_area_ratio =
+      ReadScalar<double>(node, "close_edge_subpix_area_ratio", 0.0);
+  debug->close_edge_subpix_max_polar_deg =
+      ReadScalar<double>(node, "close_edge_subpix_max_polar_deg", 0.0);
+  debug->close_edge_subpix_multiplier =
+      ReadScalar<double>(node, "close_edge_subpix_multiplier", 1.0);
+  debug->refine_displacement_limit =
+      ReadScalar<double>(node, "refine_displacement_limit", 0.0);
+  debug->refined_valid =
+      ReadScalar<int>(node, "refined_valid", 0) != 0;
+  debug->verification_passed =
+      ReadScalar<int>(node, "verification_passed", 0) != 0;
+  debug->subpix_applied =
+      ReadScalar<int>(node, "subpix_applied", 0) != 0;
+  debug->failure_reason =
+      ReadScalar<std::string>(node, "failure_reason", "");
+}
+
+void ReadOuterCornerVerificationDebugArray(
+    const cv::FileNode& node,
+    std::array<OuterCornerVerificationDebugInfo, 4>* values) {
+  if (values == nullptr) {
+    return;
+  }
+  values->fill(OuterCornerVerificationDebugInfo{});
+  if (node.empty() || !node.isSeq()) {
+    return;
+  }
+  int index = 0;
+  for (cv::FileNodeIterator it = node.begin();
+       it != node.end() && index < 4; ++it, ++index) {
+    ReadOuterCornerVerificationDebug(*it,
+                                     &(*values)[static_cast<std::size_t>(index)]);
+  }
 }
 
 void ReadDetection(const cv::FileNode& node,
@@ -643,6 +877,59 @@ void ReadDetection(const cv::FileNode& node,
   runtime.subpix_seconds = ReadScalar<double>(node, "runtime_subpix_seconds", 0.0);
   runtime.attempted_internal_corner_count = ReadScalar<int>(node, "runtime_attempted_internal_corner_count", 0);
   runtime.valid_internal_corner_count = ReadScalar<int>(node, "runtime_valid_internal_corner_count", 0);
+  const cv::FileNode outer_node = node["outer_detection"];
+  if (!outer_node.empty() && outer_node.isMap()) {
+    OuterTagDetectionResult& outer = detection->outer_detection;
+    outer.success = ReadScalar<int>(outer_node, "success", 0) != 0;
+    outer.board_id = ReadScalar<int>(outer_node, "board_id", -1);
+    outer.detected_tag_id = ReadScalar<int>(outer_node, "detected_tag_id", -1);
+    outer.original_longest_side = ReadScalar<int>(outer_node, "original_longest_side", 0);
+    outer.chosen_scale_longest_side =
+        ReadScalar<int>(outer_node, "chosen_scale_longest_side", 0);
+    outer.chosen_scale_factor =
+        ReadScalar<double>(outer_node, "chosen_scale_factor", 1.0);
+    outer.scale_configuration_mode =
+        ReadScalar<std::string>(outer_node, "scale_configuration_mode", "");
+    outer.hamming = ReadScalar<int>(outer_node, "hamming", -1);
+    outer.good = ReadScalar<int>(outer_node, "good", 0) != 0;
+    outer.attempted_local_patch_rescue =
+        ReadScalar<int>(outer_node, "attempted_local_patch_rescue", 0) != 0;
+    outer.used_local_patch_rescue =
+        ReadScalar<int>(outer_node, "used_local_patch_rescue", 0) != 0;
+    outer.local_patch_rescue_summary =
+        ReadScalar<std::string>(outer_node, "local_patch_rescue_summary", "");
+    outer.quality = ReadScalar<double>(outer_node, "quality", 0.0);
+    outer.failure_reason = static_cast<OuterTagFailureReason>(
+        ReadScalar<int>(outer_node, "failure_reason",
+                        static_cast<int>(OuterTagFailureReason::NoDetectionsAtAll)));
+    outer.failure_reason_text =
+        ReadScalar<std::string>(outer_node, "failure_reason_text", "");
+    ReadArray(outer_node["coarse_corners_scaled_image"],
+              &outer.coarse_corners_scaled_image,
+              [](const cv::FileNode& value) { return ReadVec2d(value); });
+    ReadArray(outer_node["coarse_corners_original_image"],
+              &outer.coarse_corners_original_image,
+              [](const cv::FileNode& value) { return ReadVec2d(value); });
+    ReadArray(outer_node["refined_corners_original_image"],
+              &outer.refined_corners_original_image,
+              [](const cv::FileNode& value) { return ReadVec2d(value); });
+    ReadBoolArray(outer_node["refined_valid"], &outer.refined_valid);
+    outer.board_quad_consistency_checked =
+        ReadScalar<int>(outer_node, "board_quad_consistency_checked", 0) != 0;
+    outer.board_quad_consistency_passed =
+        ReadScalar<int>(outer_node, "board_quad_consistency_passed", 0) != 0;
+    outer.board_quad_worst_corner_index =
+        ReadScalar<int>(outer_node, "board_quad_worst_corner_index", -1);
+    outer.board_quad_worst_corner_displacement_px =
+        ReadScalar<double>(outer_node, "board_quad_worst_corner_displacement_px", 0.0);
+    outer.board_quad_area_ratio =
+        ReadScalar<double>(outer_node, "board_quad_area_ratio", 0.0);
+    outer.board_quad_consistency_diagnostic =
+        ReadScalar<std::string>(outer_node, "board_quad_consistency_diagnostic", "");
+    ReadOuterCornerVerificationDebugArray(
+        outer_node["corner_verification_debug"],
+        &outer.corner_verification_debug);
+  }
 }
 
 void WriteFrameResult(cv::FileStorage* storage,
@@ -1054,11 +1341,17 @@ bool InternalRegenerationCache::Load(
       ++stats_.load_failures;
       return false;
     }
+    // New cache artifacts carry the effective outer detection selected during
+    // regeneration (which may be a geometry-prior rescue). Only fall back to
+    // the frame input for legacy artifacts that predate this field.
     for (RegeneratedBoardMeasurement& measurement : frame_result->board_measurements) {
-      for (const OuterTagDetectionResult& outer : frame_input.outer_detections.detections) {
-        if (outer.board_id == measurement.board_id) {
-          measurement.detection.outer_detection = outer;
-          break;
+      if (!measurement.detection.outer_detection.success &&
+          measurement.detection.outer_detection.failure_reason_text.empty()) {
+        for (const OuterTagDetectionResult& outer : frame_input.outer_detections.detections) {
+          if (outer.board_id == measurement.board_id) {
+            measurement.detection.outer_detection = outer;
+            break;
+          }
         }
       }
     }

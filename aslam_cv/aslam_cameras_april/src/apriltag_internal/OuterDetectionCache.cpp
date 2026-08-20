@@ -18,11 +18,11 @@ namespace {
 namespace fs = boost::filesystem;
 
 constexpr const char kCacheFormatVersion[] =
-    "outer_detection_cache_v9_stage_separated";
+    "outer_detection_cache_v10_scale_adaptive_response_rollback";
 constexpr const char kOuterDetectionStageImplementationVersion[] =
-    "outer_detection_final_v6_stage_separated";
+    "outer_detection_final_v7_scale_adaptive_response_rollback";
 constexpr const char kOuterRescueStageImplementationVersion[] =
-    "outer_rescue_v1_signature_keyed";
+    "outer_rescue_v5_spherical_support_confirmation";
 
 std::uint64_t HashBytes(const std::string& text) {
   std::uint64_t hash = 1469598103934665603ull;
@@ -101,6 +101,8 @@ std::string MakeConfigSignature(const MultiScaleOuterTagDetectorConfig& config) 
          << config.close_edge_outer_subpix_multiplier
          << "|close_edge_outer_subpix_max_multiplier="
          << config.close_edge_outer_subpix_max_multiplier
+         << "|enable_scale_adaptive_corner_response_rollback="
+         << (config.enable_scale_adaptive_corner_response_rollback ? 1 : 0)
          << "|max_outer_refine_displacement=" << config.max_outer_refine_displacement
          << "|outer_refine_displacement_scale="
          << config.outer_refine_displacement_scale
@@ -140,6 +142,23 @@ std::string MakeConfigSignature(const MultiScaleOuterTagDetectorConfig& config) 
       stream << ",";
     }
     stream << config.refine_camera.resolution[index];
+  }
+  if (config.enable_opencv_apriltag_fallback) {
+    stream << "|enable_opencv_apriltag_fallback=1"
+           << "|opencv_apriltag_corner_order=ethz_1_0_3_2_v1"
+           << "|opencv_apriltag_marker_border_bits="
+           << config.opencv_apriltag_marker_border_bits
+           << "|opencv_apriltag_min_marker_perimeter_rate="
+           << config.opencv_apriltag_min_marker_perimeter_rate
+           << "|opencv_apriltag_fallback_longest_sides=";
+    for (std::size_t index = 0;
+         index < config.opencv_apriltag_fallback_longest_sides.size();
+         ++index) {
+      if (index > 0) {
+        stream << ",";
+      }
+      stream << config.opencv_apriltag_fallback_longest_sides[index];
+    }
   }
   return stream.str();
 }
@@ -417,6 +436,16 @@ void WriteOuterCornerVerificationDebug(
            << debug.subpix_unstable_rollback_iteration;
   *storage << "subpix_unstable_rollback_max_displacement"
            << debug.subpix_unstable_rollback_max_displacement;
+  *storage << "scale_adaptive_response_rollback_checked"
+           << (debug.scale_adaptive_response_rollback_checked ? 1 : 0);
+  *storage << "scale_adaptive_response_rollback_applied"
+           << (debug.scale_adaptive_response_rollback_applied ? 1 : 0);
+  *storage << "scale_adaptive_response_core_radius"
+           << debug.scale_adaptive_response_core_radius;
+  *storage << "scale_adaptive_response_search_radius"
+           << debug.scale_adaptive_response_search_radius;
+  *storage << "scale_adaptive_response_peak_ratio"
+           << debug.scale_adaptive_response_peak_ratio;
   *storage << "refine_displacement_limit" << debug.refine_displacement_limit;
   *storage << "refined_valid" << (debug.refined_valid ? 1 : 0);
   *storage << "verification_passed" << (debug.verification_passed ? 1 : 0);
@@ -535,6 +564,18 @@ void ReadOuterCornerVerificationDebug(
     debug->subpix_unstable_rollback_max_displacement =
         static_cast<double>(node["subpix_unstable_rollback_max_displacement"]);
   }
+  if (!node["scale_adaptive_response_rollback_checked"].empty()) {
+    debug->scale_adaptive_response_rollback_checked =
+        static_cast<int>(node["scale_adaptive_response_rollback_checked"]) != 0;
+    debug->scale_adaptive_response_rollback_applied =
+        static_cast<int>(node["scale_adaptive_response_rollback_applied"]) != 0;
+    debug->scale_adaptive_response_core_radius =
+        static_cast<int>(node["scale_adaptive_response_core_radius"]);
+    debug->scale_adaptive_response_search_radius =
+        static_cast<int>(node["scale_adaptive_response_search_radius"]);
+    debug->scale_adaptive_response_peak_ratio =
+        static_cast<double>(node["scale_adaptive_response_peak_ratio"]);
+  }
   debug->refine_displacement_limit =
       static_cast<double>(node["refine_displacement_limit"]);
   debug->refined_valid = static_cast<int>(node["refined_valid"]) != 0;
@@ -578,6 +619,10 @@ OuterBoardMeasurement BuildBoardMeasurement(const OuterTagDetectionResult& detec
   measurement.attempted_local_patch_rescue = detection.attempted_local_patch_rescue;
   measurement.used_local_patch_rescue = detection.used_local_patch_rescue;
   measurement.local_patch_rescue_summary = detection.local_patch_rescue_summary;
+  measurement.attempted_opencv_apriltag_fallback =
+      detection.attempted_opencv_apriltag_fallback;
+  measurement.used_opencv_apriltag_fallback =
+      detection.used_opencv_apriltag_fallback;
   measurement.detection_quality = detection.quality;
   measurement.refined_outer_corners_original_image =
       detection.refined_corners_original_image;
@@ -607,6 +652,10 @@ void WriteDetection(cv::FileStorage* storage,
   *storage << "used_local_patch_rescue"
            << (detection.used_local_patch_rescue ? 1 : 0);
   *storage << "local_patch_rescue_summary" << detection.local_patch_rescue_summary;
+  *storage << "attempted_opencv_apriltag_fallback"
+           << (detection.attempted_opencv_apriltag_fallback ? 1 : 0);
+  *storage << "used_opencv_apriltag_fallback"
+           << (detection.used_opencv_apriltag_fallback ? 1 : 0);
   *storage << "quality" << detection.quality;
   *storage << "board_quad_consistency_checked"
            << (detection.board_quad_consistency_checked ? 1 : 0);
@@ -656,6 +705,12 @@ OuterTagDetectionResult ReadDetection(const cv::FileNode& node) {
       static_cast<int>(node["used_local_patch_rescue"]) != 0;
   detection.local_patch_rescue_summary =
       static_cast<std::string>(node["local_patch_rescue_summary"]);
+  detection.attempted_opencv_apriltag_fallback =
+      !node["attempted_opencv_apriltag_fallback"].empty() &&
+      static_cast<int>(node["attempted_opencv_apriltag_fallback"]) != 0;
+  detection.used_opencv_apriltag_fallback =
+      !node["used_opencv_apriltag_fallback"].empty() &&
+      static_cast<int>(node["used_opencv_apriltag_fallback"]) != 0;
   detection.quality = static_cast<double>(node["quality"]);
   detection.board_quad_consistency_checked =
       !node["board_quad_consistency_checked"].empty() &&

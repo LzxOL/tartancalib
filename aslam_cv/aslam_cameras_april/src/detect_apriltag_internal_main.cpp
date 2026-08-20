@@ -582,7 +582,10 @@ int RunOuterCornersOnly(const CmdArgs& args,
                 "adaptive_coarse_scale_attempt_count,"
                 "adaptive_fallback_scale_attempt_count,"
                 "adaptive_high_resolution_fallback_triggered,"
-                "failure_reason,x0,y0,x1,y1,x2,y2,x3,y3\n";
+                "attempted_opencv_apriltag_fallback,"
+                "used_opencv_apriltag_fallback,"
+                "failure_reason,corner_refinement_failures,"
+                "x0,y0,x1,y1,x2,y2,x3,y3\n";
 
   std::set<int> dataset_discovered_ids;
   std::map<int, int> successful_frame_count_by_id;
@@ -621,7 +624,26 @@ int RunOuterCornersOnly(const CmdArgs& args,
                  << detection.adaptive_fallback_scale_attempt_count << ","
                  << (detection.adaptive_high_resolution_fallback_triggered ? 1 : 0)
                  << ","
-                 << CsvField(detection.failure_reason_text);
+                 << (detection.attempted_opencv_apriltag_fallback ? 1 : 0)
+                 << ","
+                 << (detection.used_opencv_apriltag_fallback ? 1 : 0) << ","
+                 << CsvField(detection.failure_reason_text) << ",";
+      std::ostringstream corner_failures;
+      for (std::size_t corner_index = 0;
+           corner_index < detection.corner_verification_debug.size();
+           ++corner_index) {
+        const ati::OuterCornerVerificationDebugInfo& debug =
+            detection.corner_verification_debug[corner_index];
+        if (corner_index > 0) {
+          corner_failures << ";";
+        }
+        corner_failures << corner_index << ":"
+                        << (detection.refined_valid[corner_index] ? "valid" : "invalid");
+        if (!debug.failure_reason.empty()) {
+          corner_failures << ":" << debug.failure_reason;
+        }
+      }
+      corner_csv << CsvField(corner_failures.str());
       for (const Eigen::Vector2d& corner : detection.refined_corners_original_image) {
         corner_csv << "," << corner.x() << "," << corner.y();
       }

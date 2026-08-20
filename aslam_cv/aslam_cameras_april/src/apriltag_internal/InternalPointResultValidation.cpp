@@ -79,11 +79,11 @@ void EnforceInternalTopologyAssignment(ApriltagInternalDetectionResult* result) 
 
     CornerMeasurement& measurement =
         result->corners[static_cast<std::size_t>(debug.point_id)];
-    const bool refinement_required = result->outer_detection.used_local_patch_rescue;
+    const bool recovery_board = result->outer_detection.used_local_patch_rescue;
     const bool refined_ok =
         IsFinitePoint(debug.refined_image) &&
         IsInsideImageWithBorder(debug.refined_image, result->image_size, 0.0) &&
-        (!refinement_required || debug.image_refinement_applied);
+        (!recovery_board || debug.image_refinement_applied);
     if (refined_ok) {
       measurement.image_xy =
           Eigen::Vector2d(debug.refined_image.x, debug.refined_image.y);
@@ -158,6 +158,115 @@ void SuppressDuplicateRefinedInternalCorners(ApriltagInternalDetectionResult* re
     if (!measurement.valid) {
       continue;
     }
+    measurement.valid = false;
+    measurement.quality = 0.0;
+    debug.valid = false;
+    debug.image_evidence_valid = false;
+    debug.final_quality = 0.0;
+  }
+  RecomputeCornerCounts(result);
+}
+
+void SuppressLocallyInconsistentRecoveredCorners(
+    ApriltagInternalDetectionResult* result) {
+  if (result == nullptr || !result->outer_detection.used_local_patch_rescue) {
+    return;
+  }
+  std::vector<bool> suppress(result->internal_corner_debug.size(), false);
+  constexpr double kMaxNormalizedGridResidual = 0.45;
+  constexpr double kEvidenceWeakThreshold = 0.20;
+  for (std::size_t i = 0; i < result->internal_corner_debug.size(); ++i) {
+    const InternalCornerDebugInfo& candidate = result->internal_corner_debug[i];
+    if (!candidate.valid || candidate.corner_type == CornerType::Outer ||
+        candidate.lattice_u < 0 || candidate.lattice_v < 0 ||
+        candidate.local_module_scale <= 1.0 || candidate.image_evidence_valid) {
+      continue;
+    }
+    const InternalCornerDebugInfo* left = nullptr;
+    const InternalCornerDebugInfo* right = nullptr;
+    const InternalCornerDebugInfo* up = nullptr;
+    const InternalCornerDebugInfo* down = nullptr;
+    for (const InternalCornerDebugInfo& other : result->internal_corner_debug) {
+      if (!other.valid || other.corner_type == CornerType::Outer) continue;
+      if (other.lattice_v == candidate.lattice_v) {
+        if (other.lattice_u < candidate.lattice_u &&
+            (left == nullptr || other.lattice_u > left->lattice_u)) {
+          left = &other;
+        }
+        if (other.lattice_u > candidate.lattice_u &&
+            (right == nullptr || other.lattice_u < right->lattice_u)) {
+          right = &other;
+        }
+      }
+      if (other.lattice_u == candidate.lattice_u) {
+        if (other.lattice_v < candidate.lattice_v &&
+            (up == nullptr || other.lattice_v > up->lattice_v)) {
+          up = &other;
+        }
+        if (other.lattice_v > candidate.lattice_v &&
+            (down == nullptr || other.lattice_v < down->lattice_v)) {
+          down = &other;
+        }
+      }
+    }
+    if (left == nullptr || right == nullptr || up == nullptr || down == nullptr) {
+      continue;
+    }
+    const double row_alpha =
+        static_cast<double>(candidate.lattice_u - left->lattice_u) /
+        static_cast<double>(right->lattice_u - left->lattice_u);
+    const double col_alpha =
+        static_cast<double>(candidate.lattice_v - up->lattice_v) /
+        static_cast<double>(down->lattice_v - up->lattice_v);
+    const cv::Point2f row_mid =
+        left->refined_image + static_cast<float>(row_alpha) *
+                                  (right->refined_image - left->refined_image);
+    const cv::Point2f col_mid =
+        up->refined_image + static_cast<float>(col_alpha) *
+                                (down->refined_image - up->refined_image);
+    const double row_residual = PointDistancePx(candidate.refined_image, row_mid) /
+                                candidate.local_module_scale;
+    const double col_residual = PointDistancePx(candidate.refined_image, col_mid) /
+                                candidate.local_module_scale;
+    if (row_residual > kMaxNormalizedGridResidual &&
+        col_residual > kMaxNormalizedGridResidual &&
+        candidate.image_final_quality < kEvidenceWeakThreshold) {
+      suppress[i] = true;
+    }
+  }
+  for (std::size_t i = 0; i < suppress.size(); ++i) {
+    if (!suppress[i]) continue;
+    InternalCornerDebugInfo& debug = result->internal_corner_debug[i];
+    if (debug.point_id < 0 ||
+        static_cast<std::size_t>(debug.point_id) >= result->corners.size()) continue;
+    CornerMeasurement& measurement =
+        result->corners[static_cast<std::size_t>(debug.point_id)];
+    measurement.valid = false;
+    measurement.quality = 0.0;
+    debug.valid = false;
+    debug.image_evidence_valid = false;
+    debug.final_quality = 0.0;
+  }
+  RecomputeCornerCounts(result);
+}
+
+void SuppressZeroImageEvidenceRecoveredCorners(
+    ApriltagInternalDetectionResult* result) {
+  if (result == nullptr || !result->outer_detection.used_local_patch_rescue) {
+    return;
+  }
+  for (InternalCornerDebugInfo& debug : result->internal_corner_debug) {
+    if (!debug.valid || debug.corner_type == CornerType::Outer ||
+        (std::isfinite(debug.image_final_quality) &&
+         debug.image_final_quality > 0.0)) {
+      continue;
+    }
+    if (debug.point_id < 0 ||
+        static_cast<std::size_t>(debug.point_id) >= result->corners.size()) {
+      continue;
+    }
+    CornerMeasurement& measurement =
+        result->corners[static_cast<std::size_t>(debug.point_id)];
     measurement.valid = false;
     measurement.quality = 0.0;
     debug.valid = false;

@@ -1207,7 +1207,19 @@ void WriteGeometryPriorOuterSeedDiagnostics(
       << "spherical_refine_failure_summary,"
       << "max_corner_displacement_px,max_refinement_displacement_px,"
       << "adaptive_max_corner_displacement_px,"
-      << "min_corner_response_ratio,edge_support_ratio,"
+      << "min_corner_response_ratio,"
+      << "refined_corner_local_response0,refined_corner_local_peak0,"
+      << "refined_corner_local_peak_ratio0,"
+      << "refined_corner_local_response1,refined_corner_local_peak1,"
+      << "refined_corner_local_peak_ratio1,"
+      << "refined_corner_local_response2,refined_corner_local_peak2,"
+      << "refined_corner_local_peak_ratio2,"
+      << "refined_corner_local_response3,refined_corner_local_peak3,"
+      << "refined_corner_local_peak_ratio3,"
+      << "refined_corner_response_pass_count,"
+      << "min_refined_corner_local_peak_ratio,"
+      << "weakest_to_second_weakest_corner_response_ratio,"
+      << "edge_support_ratio,"
       << "mean_edge_gradient_ratio,rectified_patch_checked,"
       << "rectified_patch_decode_success,rectified_patch_detected_tag_id,"
       << "rectified_patch_hamming,rectified_patch_summary,"
@@ -1235,6 +1247,7 @@ void WriteGeometryPriorOuterSeedDiagnostics(
       << "accepted_as_rescued_observation,reject_reason\n";
 
   int normal_detected_outer_count = 0;
+  int opencv_fallback_outer_count = 0;
   int geometry_prior_seed_count = 0;
   int image_validated_rescued_count = 0;
   int backend_used_rescued_count = 0;
@@ -1249,7 +1262,12 @@ void WriteGeometryPriorOuterSeedDiagnostics(
           for (const ati::RegeneratedBoardMeasurement& measurement :
                frame.board_measurements) {
             if (measurement.detection.outer_detection.success &&
-                !measurement.detection.outer_detection.used_local_patch_rescue) {
+                measurement.detection.outer_detection
+                    .used_opencv_apriltag_fallback) {
+              ++opencv_fallback_outer_count;
+            } else if (measurement.detection.outer_detection.success &&
+                       !measurement.detection.outer_detection
+                            .used_local_patch_rescue) {
               ++normal_detected_outer_count;
             }
             if (measurement.detection.outer_detection.success &&
@@ -1330,6 +1348,22 @@ void WriteGeometryPriorOuterSeedDiagnostics(
                 << candidate.max_refinement_displacement_px << ","
                 << candidate.adaptive_max_corner_displacement_px << ","
                 << candidate.min_corner_response_ratio << ","
+                << candidate.refined_corner_local_responses[0] << ","
+                << candidate.refined_corner_local_peak_responses[0] << ","
+                << candidate.refined_corner_local_peak_ratios[0] << ","
+                << candidate.refined_corner_local_responses[1] << ","
+                << candidate.refined_corner_local_peak_responses[1] << ","
+                << candidate.refined_corner_local_peak_ratios[1] << ","
+                << candidate.refined_corner_local_responses[2] << ","
+                << candidate.refined_corner_local_peak_responses[2] << ","
+                << candidate.refined_corner_local_peak_ratios[2] << ","
+                << candidate.refined_corner_local_responses[3] << ","
+                << candidate.refined_corner_local_peak_responses[3] << ","
+                << candidate.refined_corner_local_peak_ratios[3] << ","
+                << candidate.refined_corner_response_pass_count << ","
+                << candidate.min_refined_corner_local_peak_ratio << ","
+                << candidate.weakest_to_second_weakest_corner_response_ratio
+                << ","
                 << candidate.edge_support_ratio << ","
                 << candidate.mean_edge_gradient_ratio << ","
                 << (candidate.rectified_patch_checked ? 1 : 0) << ","
@@ -1436,6 +1470,8 @@ void WriteGeometryPriorOuterSeedDiagnostics(
   summary << "corner_displacement_guard_mode: diagnostic_only\n";
   summary << "normal_detected_outer_observation_count: "
           << normal_detected_outer_count << "\n";
+  summary << "opencv_fallback_outer_observation_count: "
+          << opencv_fallback_outer_count << "\n";
   summary << "geometry_prior_seed_count: " << geometry_prior_seed_count
           << "\n";
   summary << "image_validated_rescued_outer_observation_count: "
@@ -1532,6 +1568,7 @@ void WriteIntermediateFrontendRegenerationSummary(
   int round1_image_validated_rescue_count = 0;
   int round1_backend_used_rescue_count = 0;
   int round1_normal_outer_count = 0;
+  int round1_opencv_fallback_outer_count = 0;
   int round1_attempted_internal_count = 0;
   int round1_valid_internal_count = 0;
   std::map<std::string, int> state_source_counts;
@@ -1558,7 +1595,10 @@ void WriteIntermediateFrontendRegenerationSummary(
       if (!measurement.detection.outer_detection.success) {
         continue;
       }
-      if (measurement.detection.outer_detection.used_local_patch_rescue) {
+      if (measurement.detection.outer_detection
+              .used_opencv_apriltag_fallback) {
+        ++round1_opencv_fallback_outer_count;
+      } else if (measurement.detection.outer_detection.used_local_patch_rescue) {
         ++round1_backend_used_rescue_count;
       } else {
         ++round1_normal_outer_count;
@@ -1623,6 +1663,8 @@ void WriteIntermediateFrontendRegenerationSummary(
           << "\n";
   summary << "round1_normal_detected_outer_observation_count: "
           << round1_normal_outer_count << "\n";
+  summary << "round1_opencv_fallback_outer_observation_count: "
+          << round1_opencv_fallback_outer_count << "\n";
   summary << "round1_geometry_prior_seed_count: " << round1_seed_count << "\n";
   summary << "round1_image_validated_rescued_outer_observation_count: "
           << round1_image_validated_rescue_count << "\n";
@@ -2645,7 +2687,7 @@ void DrawInternalPointFilterOverlay(
   cv::putText(*output, "blue=frontend-valid, frame pose unavailable  magenta=regen failed  gray=other rejected",
               cv::Point(16, 76), cv::FONT_HERSHEY_SIMPLEX, 0.42,
               cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-  cv::putText(*output, "cyan cross=outer corners; cyan boxes=outer subpix window; boost=1 means enlarged window.",
+  cv::putText(*output, "cyan cross=used outer; red X=topology-rejected outer; cyan boxes=outer subpix window.",
               cv::Point(16, 98), cv::FONT_HERSHEY_SIMPLEX, 0.42,
               cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
 
@@ -2676,8 +2718,19 @@ void DrawInternalPointFilterOverlay(
         board_center += xy;
         outer_polygon.emplace_back(static_cast<int>(std::round(xy.x)),
                                    static_cast<int>(std::round(xy.y)));
-        cv::drawMarker(*output, xy, cv::Scalar(255, 220, 0),
-                       cv::MARKER_CROSS, 13, 1, cv::LINE_AA);
+        const bool topology_rejected =
+            !point.used_in_solver &&
+            point.rejection_reason_code ==
+                ati::JointRejectionReasonCode::OuterMeasurementInvalid &&
+            point.rejection_detail.find("bidirectional_board_topology") !=
+                std::string::npos;
+        cv::drawMarker(*output, xy,
+                       topology_rejected ? cv::Scalar(0, 0, 255)
+                                         : cv::Scalar(255, 220, 0),
+                       topology_rejected ? cv::MARKER_TILTED_CROSS
+                                         : cv::MARKER_CROSS,
+                       topology_rejected ? 17 : 13,
+                       topology_rejected ? 2 : 1, cv::LINE_AA);
         continue;
       }
 
@@ -2735,8 +2788,10 @@ void DrawInternalPointFilterOverlay(
     }
 
     if (outer_polygon.size() >= 4) {
-      cv::polylines(*output, outer_polygon, true, cv::Scalar(255, 220, 0), 2,
-                    cv::LINE_AA);
+      // Do not join image-plane outer points with straight segments. Under a
+      // wide-angle projection those chords are not board edges and make a
+      // correct corner set look visibly displaced. The individual outer
+      // markers above remain the authoritative visualization.
       board_center *= 1.0f / static_cast<float>(outer_count);
       const ati::RegeneratedBoardMeasurement* regenerated = nullptr;
       if (!board->points.empty()) {
@@ -3791,10 +3846,15 @@ void WriteGlobalSceneStateConsistencyAudit(
       row.frame_label = frame.frame_label;
       row.board_id = measurement.board_id;
       row.observation_source =
-          outer.used_local_patch_rescue ? "rescued" : "normal_detected";
+          outer.used_opencv_apriltag_fallback
+              ? "opencv_fallback"
+              : (outer.used_local_patch_rescue ? "rescued"
+                                               : "normal_detected");
       row.state_stage = "backend_optimized";
       row.generation_state_source =
-          outer.used_local_patch_rescue
+          outer.used_opencv_apriltag_fallback
+              ? round_label + "_opencv_apriltag_fallback"
+              : outer.used_local_patch_rescue
               ? (outer.local_patch_rescue_summary.empty()
                      ? "geometry_prior_rescue_unknown"
                      : outer.local_patch_rescue_summary)
@@ -5085,18 +5145,27 @@ void WriteFrameBoardObservationFlowDiagnostics(
       << "close_edge_subpix_area_ratio,"
       << "close_edge_subpix_max_polar_deg,"
       << "close_edge_subpix_multiplier,coarse_u,coarse_v,"
-      << "subpix_u,subpix_v,failure_reason\n";
+      << "verified_u,verified_v,subpix_u,subpix_v,final_u,final_v,"
+      << "refined_valid,verification_passed,coarse_to_verified_displacement,"
+      << "coarse_to_subpix_displacement,coarse_to_refined_displacement,"
+      << "failure_reason\n";
   for (const ati::InternalRegenerationFrameResult& frame :
        artifacts.regeneration_results) {
     for (const ati::RegeneratedBoardMeasurement& measurement :
          frame.board_measurements) {
       const bool outer_detected = measurement.detection.outer_detection.success;
+      const ati::OuterTagDetectionResult& outer_detection =
+          measurement.detection.outer_detection;
       const std::array<ati::OuterCornerVerificationDebugInfo, 4>& debug_values =
-          measurement.detection.outer_detection.corner_verification_debug;
+          outer_detection.corner_verification_debug;
       for (const ati::OuterCornerVerificationDebugInfo& debug : debug_values) {
-        if (debug.corner_index < 0) {
+        if (debug.corner_index < 0 || debug.corner_index >= 4) {
           continue;
         }
+        const std::size_t corner_index =
+            static_cast<std::size_t>(debug.corner_index);
+        const Eigen::Vector2d& final_corner =
+            outer_detection.refined_corners_original_image[corner_index];
         outer_subpix_debug_csv
             << round_label << ","
             << frame.frame_index << ","
@@ -5128,8 +5197,17 @@ void WriteFrameBoardObservationFlowDiagnostics(
             << debug.close_edge_subpix_multiplier << ","
             << debug.coarse_corner.x << ","
             << debug.coarse_corner.y << ","
+            << debug.verified_corner.x << ","
+            << debug.verified_corner.y << ","
             << debug.subpix_corner.x << ","
             << debug.subpix_corner.y << ","
+            << final_corner.x() << ","
+            << final_corner.y() << ","
+            << (debug.refined_valid ? 1 : 0) << ","
+            << (debug.verification_passed ? 1 : 0) << ","
+            << debug.coarse_to_verified_displacement << ","
+            << debug.coarse_to_subpix_displacement << ","
+            << debug.coarse_to_refined_displacement << ","
             << CsvEscape(debug.failure_reason) << "\n";
       }
     }
@@ -6469,6 +6547,67 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.persistent_incremental_seed_board_observation_count << "\n";
   summary << "persistent_incremental_seed_point_count: "
           << result.persistent_incremental_seed_point_count << "\n";
+  summary << "persistent_independent_camera_warmup_requested: "
+          << (result.persistent_independent_camera_warmup_requested ? 1 : 0)
+          << "\n";
+  summary << "persistent_independent_camera_warmup_attempted: "
+          << (result.persistent_independent_camera_warmup_attempted ? 1 : 0)
+          << "\n";
+  summary << "persistent_independent_camera_warmup_success: "
+          << (result.persistent_independent_camera_warmup_success ? 1 : 0)
+          << "\n";
+  summary << "persistent_independent_camera_warmup_committed: "
+          << (result.persistent_independent_camera_warmup_committed ? 1 : 0)
+          << "\n";
+  summary << "persistent_independent_camera_warmup_health_pass: "
+          << (result.persistent_independent_camera_warmup_health_pass ? 1 : 0)
+          << "\n";
+  summary << "persistent_independent_camera_warmup_pose_count: "
+          << result.persistent_independent_camera_warmup_pose_count << "\n";
+  summary << "persistent_independent_camera_warmup_point_count: "
+          << result.persistent_independent_camera_warmup_point_count << "\n";
+  summary << "persistent_independent_camera_warmup_iterations: "
+          << result.persistent_independent_camera_warmup_iterations << "\n";
+  summary << "persistent_independent_camera_warmup_objective_start: "
+          << result.persistent_independent_camera_warmup_objective_start
+          << "\n";
+  summary << "persistent_independent_camera_warmup_objective_final: "
+          << result.persistent_independent_camera_warmup_objective_final
+          << "\n";
+  summary << "persistent_independent_camera_warmup_rmse_before: "
+          << result.persistent_independent_camera_warmup_rmse_before << "\n";
+  summary << "persistent_independent_camera_warmup_rmse_after: "
+          << result.persistent_independent_camera_warmup_rmse_after << "\n";
+  summary << "persistent_independent_camera_warmup_p95_before: "
+          << result.persistent_independent_camera_warmup_p95_before << "\n";
+  summary << "persistent_independent_camera_warmup_p95_after: "
+          << result.persistent_independent_camera_warmup_p95_after << "\n";
+  summary << "persistent_independent_camera_warmup_seed_quarantined_count: "
+          << result
+                 .persistent_independent_camera_warmup_seed_quarantined_count
+          << "\n";
+  summary << "persistent_independent_camera_warmup_instability_quarantined_count: "
+          << result
+                 .persistent_independent_camera_warmup_instability_quarantined_count
+          << "\n";
+  summary << "persistent_independent_camera_warmup_quarantine_retry_attempted: "
+          << (result
+                      .persistent_independent_camera_warmup_quarantine_retry_attempted
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_independent_camera_warmup_quarantine_retry_success: "
+          << (result
+                      .persistent_independent_camera_warmup_quarantine_retry_success
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_independent_camera_warmup_quarantine_reason: "
+          << result.persistent_independent_camera_warmup_quarantine_reason
+          << "\n";
+  summary << "persistent_independent_camera_warmup_rollback_reason: "
+          << result.persistent_independent_camera_warmup_rollback_reason
+          << "\n";
   summary << "persistent_incremental_seed_intrinsics_warmup_attempted: "
           << (result.persistent_incremental_seed_intrinsics_warmup_attempted
                   ? 1
@@ -6654,6 +6793,42 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
       << "persistent_incremental_final_full_training_invalid_projection_count: "
       << result
              .persistent_incremental_final_full_training_invalid_projection_count
+      << "\n";
+  summary << "persistent_incremental_curated_bundle_state_consistency_pass: "
+          << (result
+                      .persistent_incremental_curated_bundle_state_consistency_pass
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_incremental_curated_bundle_shared_scene_health_pass: "
+          << (result
+                      .persistent_incremental_curated_bundle_shared_scene_health_pass
+                  ? 1
+                  : 0)
+          << "\n";
+  summary
+      << "persistent_incremental_curated_bundle_used_validated_baseline_fallback: "
+      << (result
+                  .persistent_incremental_curated_bundle_used_validated_baseline_fallback
+              ? 1
+              : 0)
+      << "\n";
+  summary << "persistent_incremental_committed_state_pixel_rmse: "
+          << result.persistent_incremental_committed_state_pixel_rmse << "\n";
+  summary << "persistent_incremental_curated_bundle_pixel_rmse: "
+          << result.persistent_incremental_curated_bundle_pixel_rmse << "\n";
+  summary
+      << "persistent_incremental_curated_bundle_state_consistency_tolerance_px: "
+      << result
+             .persistent_incremental_curated_bundle_state_consistency_tolerance_px
+      << "\n";
+  summary << "persistent_incremental_validated_baseline_pixel_rmse: "
+          << result.persistent_incremental_validated_baseline_pixel_rmse
+          << "\n";
+  summary
+      << "persistent_incremental_curated_bundle_shared_scene_rmse_limit_px: "
+      << result
+             .persistent_incremental_curated_bundle_shared_scene_rmse_limit_px
       << "\n";
   summary << "persistent_incremental_kb_distortion_guard_enabled: "
           << (result.persistent_incremental_kb_distortion_guard_enabled ? 1

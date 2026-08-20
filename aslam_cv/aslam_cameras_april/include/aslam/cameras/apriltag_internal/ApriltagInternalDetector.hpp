@@ -102,6 +102,8 @@ struct ApriltagInternalDetectionOptions {
 
 struct InternalCornerDebugInfo {
   int point_id = -1;
+  int lattice_u = -1;
+  int lattice_v = -1;
   CornerType corner_type = CornerType::LCorner;
   cv::Point2f predicted_image{};
   cv::Point2f border_seed_image{};

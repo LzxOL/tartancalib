@@ -23,6 +23,70 @@
 namespace aslam {
 namespace cameras {
 namespace apriltag_internal {
+namespace {
+
+struct LocalCornerResponseEvidence {
+  double refined_response = 0.0;
+  double local_peak_response = 0.0;
+  double peak_ratio = 0.0;
+  bool passes = false;
+};
+
+LocalCornerResponseEvidence EvaluateLocalCornerResponseEvidence(
+    const cv::Mat& gray, const cv::Point2f& corner, int subpix_radius) {
+  LocalCornerResponseEvidence evidence;
+  if (gray.empty()) return evidence;
+  const int x = static_cast<int>(std::lround(corner.x));
+  const int y = static_cast<int>(std::lround(corner.y));
+  if (x < 0 || x >= gray.cols || y < 0 || y >= gray.rows) return evidence;
+
+  const int response_radius =
+      std::max(12, std::min(32, std::max(1, subpix_radius) / 3));
+  const int margin = response_radius + 10;
+  const int x0 = std::max(0, x - margin);
+  const int y0 = std::max(0, y - margin);
+  const int x1 = std::min(gray.cols, x + margin + 1);
+  const int y1 = std::min(gray.rows, y + margin + 1);
+  if (x1 - x0 < 20 || y1 - y0 < 20) return evidence;
+
+  cv::Mat roi;
+  gray(cv::Rect(x0, y0, x1 - x0, y1 - y0)).convertTo(roi, CV_32F);
+  cv::Mat response;
+  cv::cornerMinEigenVal(roi, response, 15, 3);
+  const int cx = x - x0;
+  const int cy = y - y0;
+  for (int yy = std::max(0, cy - 2);
+       yy <= std::min(response.rows - 1, cy + 2); ++yy) {
+    for (int xx = std::max(0, cx - 2);
+         xx <= std::min(response.cols - 1, cx + 2); ++xx) {
+      evidence.refined_response = std::max(
+          evidence.refined_response,
+          static_cast<double>(response.at<float>(yy, xx)));
+    }
+  }
+  for (int yy = std::max(0, cy - response_radius);
+       yy <= std::min(response.rows - 1, cy + response_radius); ++yy) {
+    for (int xx = std::max(0, cx - response_radius);
+         xx <= std::min(response.cols - 1, cx + response_radius); ++xx) {
+      evidence.local_peak_response = std::max(
+          evidence.local_peak_response,
+          static_cast<double>(response.at<float>(yy, xx)));
+    }
+  }
+  evidence.peak_ratio = evidence.local_peak_response > 1e-9
+                            ? evidence.refined_response /
+                                  evidence.local_peak_response
+                            : 0.0;
+  constexpr double kReliableCornerPeakResponse = 8.0;
+  constexpr double kMinimumPeakRatio = 0.20;
+  evidence.passes = evidence.refined_response > 1e-9 &&
+                    (evidence.local_peak_response <
+                         kReliableCornerPeakResponse ||
+                     evidence.peak_ratio >= kMinimumPeakRatio);
+  return evidence;
+}
+
+}  // namespace
 
 bool HasDirectExactOuterAnchor(
     const InternalRegenerationFrameInput& frame_input,
@@ -1688,7 +1752,9 @@ OuterTagDetectionResult BuildRescuedOuterDetection(
     const IntermediateCameraConfig& camera_config,
     const ApriltagInternalDetectionOptions& options,
     const cv::Size& image_size,
+    const std::array<cv::Point2f, 4>& coarse_corners,
     const std::array<cv::Point2f, 4>& refined_corners,
+    int subpix_window_radius,
     bool tag_id_validated,
     bool topology_identity_assigned,
     double quality,
@@ -1720,10 +1786,12 @@ OuterTagDetectionResult BuildRescuedOuterDetection(
   for (int index = 0; index < 4; ++index) {
     const cv::Point2f& corner = refined_corners[static_cast<std::size_t>(index)];
     const Eigen::Vector2d eigen_corner(corner.x, corner.y);
+    const cv::Point2f& coarse_corner =
+        coarse_corners[static_cast<std::size_t>(index)];
     detection.coarse_corners_scaled_image[static_cast<std::size_t>(index)] =
-        eigen_corner;
+        Eigen::Vector2d(coarse_corner.x, coarse_corner.y);
     detection.coarse_corners_original_image[static_cast<std::size_t>(index)] =
-        eigen_corner;
+        Eigen::Vector2d(coarse_corner.x, coarse_corner.y);
     detection.refined_corners_original_image[static_cast<std::size_t>(index)] =
         eigen_corner;
     detection.refined_valid[static_cast<std::size_t>(index)] = true;
@@ -1735,7 +1803,7 @@ OuterTagDetectionResult BuildRescuedOuterDetection(
     const cv::Point2f& next_corner =
         refined_corners[static_cast<std::size_t>((index + 1) % 4)];
     debug.corner_index = index;
-    debug.coarse_corner = corner;
+    debug.coarse_corner = coarse_corner;
     debug.verified_corner = corner;
     debug.subpix_corner = corner;
     debug.prev_edge_direction = previous_corner - corner;
@@ -1745,6 +1813,17 @@ OuterTagDetectionResult BuildRescuedOuterDetection(
     debug.next_marker_support_points =
         edge_supports[static_cast<std::size_t>(index)];
     debug.local_scale = CornerLocalScale(refined_corners, index);
+    debug.corner_marker_width =
+        options.outer_detector_config.outer_corner_marker_ratio > 0.0
+            ? options.outer_detector_config.outer_corner_marker_ratio *
+                  debug.local_scale
+            : debug.local_scale;
+    debug.subpix_window_radius = std::max(2, subpix_window_radius);
+    debug.subpix_applied = true;
+    debug.coarse_to_subpix_displacement =
+        PointDistance(coarse_corner, corner);
+    debug.coarse_to_refined_displacement =
+        debug.coarse_to_subpix_displacement;
     debug.verification_quality = quality;
     debug.refined_valid = true;
     debug.verification_passed = true;
@@ -2050,11 +2129,19 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
             : "disabled";
   }
 
+  if (options.geometry_prior_rescue_enable_spherical_refine &&
+      (!candidate.spherical_refine_attempted ||
+       !candidate.spherical_refine_success ||
+       candidate.spherical_refine_successful_corner_count != 4)) {
+    candidate.reject_reason =
+        validation_source + "_image_evidence_failed_incomplete_spherical_refinement";
+    return candidate;
+  }
+
   // A successful joint fit supplies a camera-aware quad seed, but it is not a
   // substitute for the final image-domain subpixel measurement.  Refine that
   // complete quad with the same cornerSubPix stage used by ordinary image
-  // observations.  When the joint fit fails, the atomic fallback above keeps
-  // the original seed; partial spherical corners are never mixed in.
+  // observations. Partial spherical corners are never mixed in or committed.
   std::vector<cv::Point2f> refined_points;
   refined_points.reserve(initial_corners.size());
   for (const cv::Point2f& point : initial_corners) {
@@ -2142,6 +2229,44 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
         min_response_ratio, SampleFloatAt(corner_response, point) / response_norm);
   }
   candidate.min_corner_response_ratio = min_response_ratio;
+  candidate.refined_corner_response_pass_count = 0;
+  candidate.min_refined_corner_local_peak_ratio = 1.0;
+  for (int index = 0; index < 4; ++index) {
+    const LocalCornerResponseEvidence evidence =
+        EvaluateLocalCornerResponseEvidence(
+            gray, refined_corners[static_cast<std::size_t>(index)],
+            candidate.subpix_window_radius);
+    candidate.refined_corner_local_responses[static_cast<std::size_t>(index)] =
+        evidence.refined_response;
+    candidate.refined_corner_local_peak_responses[
+        static_cast<std::size_t>(index)] = evidence.local_peak_response;
+    candidate.refined_corner_local_peak_ratios[static_cast<std::size_t>(index)] =
+        evidence.peak_ratio;
+    candidate.min_refined_corner_local_peak_ratio = std::min(
+        candidate.min_refined_corner_local_peak_ratio, evidence.peak_ratio);
+    if (evidence.passes) ++candidate.refined_corner_response_pass_count;
+  }
+  std::array<double, 4> ordered_local_responses =
+      candidate.refined_corner_local_responses;
+  std::sort(ordered_local_responses.begin(), ordered_local_responses.end());
+  candidate.weakest_to_second_weakest_corner_response_ratio =
+      ordered_local_responses[1] > 1e-9
+          ? ordered_local_responses[0] / ordered_local_responses[1]
+          : 0.0;
+  // Geometry recovery must provide four independently supported physical
+  // corners. An occluder can replace one board edge and still produce a
+  // successful 4/4 spherical line fit; in that case one final intersection
+  // is an isolated response outlier. Compare within the quad so uniformly
+  // weak, highly distorted but visible boards are retained.
+  constexpr double kMinimumAtomicCornerResponseBalance = 0.25;
+  if (candidate.weakest_to_second_weakest_corner_response_ratio <
+      kMinimumAtomicCornerResponseBalance) {
+    candidate.local_corner_refine_success = false;
+    candidate.reject_reason =
+        validation_source +
+        "_image_evidence_failed_atomic_corner_response_balance";
+    return candidate;
+  }
   const bool corner_response_ok =
       min_response_ratio >=
       options.geometry_prior_rescue_min_corner_response_ratio;
@@ -2233,7 +2358,20 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
   const bool topology_identity_context =
       geometry_only_pose_refit_candidate && unique_topology_context &&
       topology_visible_refit && topology_pose_ok && topology_image_ok &&
-      locally_observed_quad;
+      locally_observed_quad &&
+      // A visible-refit pose only supplies the geometric slot prediction.  It
+      // does not establish the missing board's identity.  That identity is
+      // established only after an observed wrong-ID quad has passed the
+      // explicit topology association step (which appends _topology_assoc to
+      // the prediction source label).
+      candidate.prediction_source_label.find("_topology_assoc") !=
+          std::string::npos &&
+      // An edge/weak quad is only a geometric image candidate.  It has not
+      // established the payload identity, so it must still pass the
+      // model-aware tag-likelihood check below.  Otherwise a failed exact-ID
+      // fallback could be promoted solely by projected topology, which is
+      // precisely the failure mode seen for recovered B5 in frame 31.
+      !geometry_guided_edge_quad && !weak_quad_alternative;
   const bool single_anchor_context =
       options.geometry_guided_tag_likelihood_allow_single_anchor &&
       candidate.visible_boards_used.size() == 1u &&
@@ -2453,7 +2591,8 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
             << " trans_err="
             << candidate.local_vs_global_translation_error;
     *rescued_detection = BuildRescuedOuterDetection(
-        board_id, gray, camera_config, options, gray.size(), refined_corners,
+        board_id, gray, camera_config, options, gray.size(), initial_corners,
+        refined_corners, candidate.subpix_window_radius,
         tag_id_validated, topology_identity_context,
         std::max(min_response_ratio, edge_metrics.mean_gradient_ratio),
         summary.str());

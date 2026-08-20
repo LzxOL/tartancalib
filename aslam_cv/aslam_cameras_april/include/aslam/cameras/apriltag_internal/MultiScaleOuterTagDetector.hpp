@@ -89,6 +89,13 @@ struct MultiScaleOuterTagDetectorConfig {
   std::vector<double> adaptive_coarse_scale_divisors{4.5, 3.5, 2.5};
   std::vector<double> adaptive_fallback_scale_divisors{2.0, 1.5, 1.0};
   int adaptive_coarse_max_hamming = 0;
+  // Additive exact-ID fallback for tags unresolved by the ETHZ detector.
+  // Fixed target longest sides make the search independent of input image
+  // resolution; 0 requests one final pass at native resolution.
+  bool enable_opencv_apriltag_fallback = false;
+  std::vector<int> opencv_apriltag_fallback_longest_sides{1600, 2400, 3600, 0};
+  int opencv_apriltag_marker_border_bits = 2;
+  double opencv_apriltag_min_marker_perimeter_rate = 0.005;
   bool enable_outer_spherical_refinement = true;
   bool do_outer_subpix_refinement = true;
   double outer_local_context_scale = 0.05;
@@ -101,6 +108,11 @@ struct MultiScaleOuterTagDetectorConfig {
   double close_edge_outer_subpix_border_ratio = 0.15;
   double close_edge_outer_subpix_multiplier = 1.4;
   double close_edge_outer_subpix_max_multiplier = 2.4;
+  // If a large close-edge subpixel window lands away from the locally
+  // supported corner, retry the exact-ID detector seed with neighborhoods
+  // expressed relative to the projected tag size. The retry requires a full
+  // in-image neighborhood and therefore does not recover cropped corners.
+  bool enable_scale_adaptive_corner_response_rollback = true;
   double outer_refine_gate_scale = 0.025;
   double outer_refine_gate_min = 6.0;
   double min_detection_quality = 0.0;
@@ -262,6 +274,11 @@ struct OuterCornerVerificationDebugInfo {
   bool subpix_unstable_rollback_detected = false;
   int subpix_unstable_rollback_iteration = 0;
   double subpix_unstable_rollback_max_displacement = 0.0;
+  bool scale_adaptive_response_rollback_checked = false;
+  bool scale_adaptive_response_rollback_applied = false;
+  int scale_adaptive_response_core_radius = 0;
+  int scale_adaptive_response_search_radius = 0;
+  double scale_adaptive_response_peak_ratio = 0.0;
   double refine_displacement_limit = 0.0;
   bool refined_valid = false;
   bool verification_passed = false;
@@ -343,6 +360,8 @@ struct OuterTagDetectionResult {
   bool attempted_local_patch_rescue = false;
   bool used_local_patch_rescue = false;
   std::string local_patch_rescue_summary;
+  bool attempted_opencv_apriltag_fallback = false;
+  bool used_opencv_apriltag_fallback = false;
   std::vector<OuterWrongIdProposal> wrong_id_proposals;
   std::array<Eigen::Vector2d, 4> coarse_corners_scaled_image{};
   std::array<Eigen::Vector2d, 4> coarse_corners_original_image{};
@@ -370,6 +389,8 @@ struct OuterBoardMeasurement {
   bool attempted_local_patch_rescue = false;
   bool used_local_patch_rescue = false;
   std::string local_patch_rescue_summary;
+  bool attempted_opencv_apriltag_fallback = false;
+  bool used_opencv_apriltag_fallback = false;
   double detection_quality = 0.0;
   int valid_refined_corner_count = 0;
   std::array<Eigen::Vector2d, 4> refined_outer_corners_original_image{};

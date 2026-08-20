@@ -116,6 +116,10 @@ struct CameraModelRefitPointDiagnostics {
   int source_board_observation_index = -1;
   int source_point_index = -1;
   JointObservationSourceKind source_kind = JointObservationSourceKind::OuterMeasurement;
+  // A point can remain in the diagnostic CSV while being excluded from the
+  // primary valid-observation metric (for example, its board pose failed).
+  bool evaluation_included = true;
+  std::string exclusion_reason;
 };
 
 struct CameraModelRefitBoardObservationDiagnostics {
@@ -137,6 +141,9 @@ struct CameraModelRefitBoardObservationDiagnostics {
   double evaluation_rmse = 0.0;
   double outer_evaluation_rmse = 0.0;
   double internal_evaluation_rmse = 0.0;
+  bool evaluation_included = false;
+  int invalid_projection_point_count = 0;
+  int nonfinite_point_count = 0;
   std::string failure_reason;
 };
 
@@ -182,6 +189,24 @@ struct CameraModelRefitEvaluationResult {
   double p95_reprojection_error = 0.0;
   double outer_only_rmse = 0.0;
   double internal_only_rmse = 0.0;
+  // Primary metrics above use only valid board observations. These raw metrics
+  // retain every observation for transparent stress testing and auditing.
+  int valid_board_observation_count = 0;
+  int raw_board_observation_count = 0;
+  int raw_point_count = 0;
+  int raw_outer_point_count = 0;
+  int raw_internal_point_count = 0;
+  double raw_overall_rmse = 0.0;
+  double raw_outer_only_rmse = 0.0;
+  double raw_internal_only_rmse = 0.0;
+  double raw_p95_reprojection_error = 0.0;
+  int invalid_board_observation_count = 0;
+  int pose_init_failed_board_observation_count = 0;
+  int residual_sanity_failed_board_observation_count = 0;
+  int projection_invalid_board_observation_count = 0;
+  int projection_failure_point_count = 0;
+  int nonfinite_residual_point_count = 0;
+  double residual_sanity_threshold_px = 25.0;
   int excluded_board_id_for_rmse = 1;
   int point_count_excluding_board = 0;
   int outer_point_count_excluding_board = 0;
@@ -368,6 +393,9 @@ struct TrialBackendFrameBoardSelectionOptions {
   bool incremental_acceptance = true;
   bool carry_accepted_trial_state = true;
   bool optimize_intrinsics_in_trial = true;
+  // Kalibr-style camera initialization: one temporary pose per frame-board,
+  // fixed board-local geometry, and camera-only state commit.
+  bool independent_frame_board_camera_warmup = false;
   bool delayed_intrinsics_release_in_trial = true;
   int intrinsics_release_iteration = 1;
   bool persistent_intrinsics_anchor_prior_enabled = false;
@@ -773,6 +801,26 @@ struct TrialBackendFrameBoardSelectionResult {
   int persistent_incremental_seed_frame_count = 0;
   int persistent_incremental_seed_board_observation_count = 0;
   int persistent_incremental_seed_point_count = 0;
+  bool persistent_independent_camera_warmup_requested = false;
+  bool persistent_independent_camera_warmup_attempted = false;
+  bool persistent_independent_camera_warmup_success = false;
+  bool persistent_independent_camera_warmup_committed = false;
+  bool persistent_independent_camera_warmup_health_pass = false;
+  int persistent_independent_camera_warmup_pose_count = 0;
+  int persistent_independent_camera_warmup_point_count = 0;
+  int persistent_independent_camera_warmup_iterations = 0;
+  double persistent_independent_camera_warmup_objective_start = 0.0;
+  double persistent_independent_camera_warmup_objective_final = 0.0;
+  double persistent_independent_camera_warmup_rmse_before = 0.0;
+  double persistent_independent_camera_warmup_rmse_after = 0.0;
+  double persistent_independent_camera_warmup_p95_before = 0.0;
+  double persistent_independent_camera_warmup_p95_after = 0.0;
+  int persistent_independent_camera_warmup_seed_quarantined_count = 0;
+  int persistent_independent_camera_warmup_instability_quarantined_count = 0;
+  bool persistent_independent_camera_warmup_quarantine_retry_attempted = false;
+  bool persistent_independent_camera_warmup_quarantine_retry_success = false;
+  std::string persistent_independent_camera_warmup_quarantine_reason;
+  std::string persistent_independent_camera_warmup_rollback_reason;
   bool persistent_incremental_seed_intrinsics_warmup_attempted = false;
   bool persistent_incremental_seed_intrinsics_warmup_success = false;
   bool persistent_incremental_seed_intrinsics_warmup_converged_by_relative_objective = false;
@@ -848,6 +896,17 @@ struct TrialBackendFrameBoardSelectionResult {
   int persistent_incremental_final_full_training_pose_success_count = 0;
   int persistent_incremental_final_full_training_pose_total_count = 0;
   int persistent_incremental_final_full_training_invalid_projection_count = 0;
+  bool persistent_incremental_curated_bundle_state_consistency_pass = true;
+  bool persistent_incremental_curated_bundle_shared_scene_health_pass = true;
+  bool persistent_incremental_curated_bundle_used_validated_baseline_fallback =
+      false;
+  double persistent_incremental_committed_state_pixel_rmse = 0.0;
+  double persistent_incremental_curated_bundle_pixel_rmse = 0.0;
+  double persistent_incremental_curated_bundle_state_consistency_tolerance_px =
+      0.0;
+  double persistent_incremental_validated_baseline_pixel_rmse = 0.0;
+  double persistent_incremental_curated_bundle_shared_scene_rmse_limit_px =
+      0.0;
   bool persistent_incremental_kb_distortion_guard_enabled = false;
   int persistent_incremental_kb_ray_curve_validity_rejected_count = 0;
   bool persistent_incremental_adaptive_saturation_stop_enabled = false;
@@ -1224,7 +1283,8 @@ class Stage5Benchmark {
       const std::string& dataset_label,
       const std::string& split_label,
       const std::string& split_signature,
-      bool include_points_not_used_in_solver = false) const;
+      bool include_points_not_used_in_solver = false,
+      bool require_internal_solver_support = false) const;
   std::string FindFrameImagePath(const Stage5BenchmarkReport& report,
                                  int frame_index) const;
 

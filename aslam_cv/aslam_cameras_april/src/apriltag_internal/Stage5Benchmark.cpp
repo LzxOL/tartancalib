@@ -40,6 +40,9 @@ namespace apriltag_internal {
 namespace {
 
 constexpr double kInvalidProjectionPenaltyPixels = 100.0;
+// Keep this aligned with JointMeasurementSelectionOptions::max_board_observation_rmse.
+// It is an evaluation validity gate only; it never changes backend selection.
+constexpr double kHoldoutResidualSanityThresholdPx = 25.0;
 constexpr double kWideFovPoseRescueTriggerRmse = 50.0;
 constexpr double kWideFovPoseRescueMaxRayAngleRadians =
     85.0 * 3.14159265358979323846 / 180.0;
@@ -2108,6 +2111,63 @@ CalibrationStateBundle BuildBundleForAcceptedFrameBoardKeys(
   return bundle;
 }
 
+std::set<FrameBoardKey> CollectInternallySupportedFrameBoardKeys(
+    const CalibrationMeasurementDataset& dataset) {
+  std::set<FrameBoardKey> keys;
+  for (const JointMeasurementFrameResult& frame : dataset.frames) {
+    for (const JointBoardObservation& board : frame.board_observations) {
+      int internal_solver_point_count = 0;
+      for (const JointPointObservation& point : board.points) {
+        if (point.used_in_solver &&
+            point.point_type == JointPointType::Internal) {
+          ++internal_solver_point_count;
+        }
+      }
+      if (board.used_in_solver && internal_solver_point_count > 0) {
+        keys.insert(FrameBoardKey(frame.frame_index, board.board_id));
+      }
+    }
+  }
+  return keys;
+}
+
+std::set<FrameBoardKey> CollectIndependentPoseSupportedFrameBoardKeys(
+    const CalibrationMeasurementDataset& dataset,
+    const OuterBootstrapCameraIntrinsics& camera,
+    double max_independent_pose_refit_rmse_px) {
+  std::set<FrameBoardKey> keys;
+  for (const JointMeasurementFrameResult& frame : dataset.frames) {
+    for (const JointBoardObservation& board : frame.board_observations) {
+      if (!board.used_in_solver) {
+        continue;
+      }
+      std::vector<Eigen::Vector3d> targets;
+      std::vector<cv::Point2f> pixels;
+      for (const JointPointObservation& point : board.points) {
+        if (point.used_in_solver) {
+          targets.push_back(point.target_xyz_board);
+          pixels.emplace_back(static_cast<float>(point.image_xy.x()),
+                              static_cast<float>(point.image_xy.y()));
+        }
+      }
+      if (targets.size() < 4) {
+        continue;
+      }
+      Eigen::Isometry3d T_camera_board = Eigen::Isometry3d::Identity();
+      double pose_refit_rmse = 0.0;
+      if (!EstimatePoseForBenchmarkRefit(
+              camera, targets, pixels, &T_camera_board, &pose_refit_rmse) ||
+          !std::isfinite(pose_refit_rmse) ||
+          (max_independent_pose_refit_rmse_px > 0.0 &&
+           pose_refit_rmse > max_independent_pose_refit_rmse_px)) {
+        continue;
+      }
+      keys.insert(FrameBoardKey(frame.frame_index, board.board_id));
+    }
+  }
+  return keys;
+}
+
 CalibrationBundleMetadata BuildMetadataFromBundle(
     const CalibrationStateBundle& bundle,
     const std::string& source_pipeline_label) {
@@ -2708,6 +2768,52 @@ void CopyPersistentIncrementalSummary(
       incremental_result.seed_board_observation_count;
   result->persistent_incremental_seed_point_count =
       incremental_result.seed_point_count;
+  result->persistent_independent_camera_warmup_requested =
+      incremental_result.independent_frame_board_camera_warmup_requested;
+  result->persistent_independent_camera_warmup_attempted =
+      incremental_result.independent_frame_board_camera_warmup_attempted;
+  result->persistent_independent_camera_warmup_success =
+      incremental_result.independent_frame_board_camera_warmup_success;
+  result->persistent_independent_camera_warmup_committed =
+      incremental_result.independent_frame_board_camera_warmup_committed;
+  result->persistent_independent_camera_warmup_health_pass =
+      incremental_result.independent_frame_board_camera_warmup_health_pass;
+  result->persistent_independent_camera_warmup_pose_count =
+      incremental_result.independent_frame_board_camera_warmup_pose_count;
+  result->persistent_independent_camera_warmup_point_count =
+      incremental_result.independent_frame_board_camera_warmup_point_count;
+  result->persistent_independent_camera_warmup_iterations =
+      incremental_result.independent_frame_board_camera_warmup_iterations;
+  result->persistent_independent_camera_warmup_objective_start =
+      incremental_result.independent_frame_board_camera_warmup_objective_start;
+  result->persistent_independent_camera_warmup_objective_final =
+      incremental_result.independent_frame_board_camera_warmup_objective_final;
+  result->persistent_independent_camera_warmup_rmse_before =
+      incremental_result.independent_frame_board_camera_warmup_rmse_before;
+  result->persistent_independent_camera_warmup_rmse_after =
+      incremental_result.independent_frame_board_camera_warmup_rmse_after;
+  result->persistent_independent_camera_warmup_p95_before =
+      incremental_result.independent_frame_board_camera_warmup_p95_before;
+  result->persistent_independent_camera_warmup_p95_after =
+      incremental_result.independent_frame_board_camera_warmup_p95_after;
+  result->persistent_independent_camera_warmup_seed_quarantined_count =
+      incremental_result
+          .independent_frame_board_camera_warmup_seed_quarantined_count;
+  result->persistent_independent_camera_warmup_instability_quarantined_count =
+      incremental_result
+          .independent_frame_board_camera_warmup_instability_quarantined_count;
+  result->persistent_independent_camera_warmup_quarantine_retry_attempted =
+      incremental_result
+          .independent_frame_board_camera_warmup_quarantine_retry_attempted;
+  result->persistent_independent_camera_warmup_quarantine_retry_success =
+      incremental_result
+          .independent_frame_board_camera_warmup_quarantine_retry_success;
+  result->persistent_independent_camera_warmup_quarantine_reason =
+      incremental_result
+          .independent_frame_board_camera_warmup_quarantine_reason;
+  result->persistent_independent_camera_warmup_rollback_reason =
+      incremental_result
+          .independent_frame_board_camera_warmup_rollback_reason;
   result->persistent_incremental_seed_intrinsics_warmup_attempted =
       incremental_result.seed_intrinsics_warmup_attempted;
   result->persistent_incremental_seed_intrinsics_warmup_success =
@@ -2861,6 +2967,25 @@ void CopyPersistentIncrementalSummary(
       incremental_result.final_full_training_pose_total_count;
   result->persistent_incremental_final_full_training_invalid_projection_count =
       incremental_result.final_full_training_invalid_projection_count;
+  result->persistent_incremental_curated_bundle_state_consistency_pass =
+      incremental_result.curated_bundle_state_consistency_pass;
+  result->persistent_incremental_curated_bundle_shared_scene_health_pass =
+      incremental_result.curated_bundle_shared_scene_health_pass;
+  result
+      ->persistent_incremental_curated_bundle_used_validated_baseline_fallback =
+      incremental_result.curated_bundle_used_validated_baseline_fallback;
+  result->persistent_incremental_committed_state_pixel_rmse =
+      incremental_result.committed_state_pixel_rmse;
+  result->persistent_incremental_curated_bundle_pixel_rmse =
+      incremental_result.curated_bundle_pixel_rmse;
+  result
+      ->persistent_incremental_curated_bundle_state_consistency_tolerance_px =
+      incremental_result.curated_bundle_state_consistency_tolerance_px;
+  result->persistent_incremental_validated_baseline_pixel_rmse =
+      incremental_result.validated_baseline_pixel_rmse;
+  result
+      ->persistent_incremental_curated_bundle_shared_scene_rmse_limit_px =
+      incremental_result.curated_bundle_shared_scene_rmse_limit_px;
   result->persistent_incremental_kb_distortion_guard_enabled =
       incremental_result.kb_distortion_guard_enabled;
   result->persistent_incremental_kb_ray_curve_validity_rejected_count =
@@ -3627,10 +3752,80 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
                                       result.robust_sigma_board_rmse))
           : result.threshold_px;
 
-  const std::set<FrameBoardKey> baseline_keys =
+  std::set<FrameBoardKey> baseline_keys =
       CollectAcceptedFrameBoardKeys(baseline_bundle.measurement_dataset);
   const std::set<FrameBoardKey> candidate_pool_keys =
       CollectAcceptedFrameBoardKeys(candidate_pool_bundle.measurement_dataset);
+  const std::set<FrameBoardKey> independent_pose_supported_keys =
+      CollectIndependentPoseSupportedFrameBoardKeys(
+          candidate_pool_bundle.measurement_dataset,
+          candidate_pool_bundle.scene_state.camera,
+          options.max_threshold_px);
+  std::set<FrameBoardKey> frame_cohesion_seed_keys;
+  CalibrationStateBundle frame_cohesive_baseline_bundle = baseline_bundle;
+  if (!options.single_board_dense_grid_profile &&
+      options.selection_mode ==
+          TrialBackendFrameBoardSelectionOptions::SelectionMode::KalibrStyleBatch &&
+      options.candidate_batch_granularity ==
+          TrialBackendFrameBoardSelectionOptions::CandidateBatchGranularity::Frame) {
+    std::set<int> baseline_frame_indices;
+    for (const FrameBoardKey& key : baseline_keys) {
+      baseline_frame_indices.insert(key.first);
+    }
+    for (const auto& entry : accumulators) {
+      const FrameBoardKey& key = entry.first;
+      const TrialBoardRmseAccumulator& accumulator = entry.second;
+      if (baseline_frame_indices.count(key.first) == 0 ||
+          baseline_keys.count(key) > 0 ||
+          candidate_pool_keys.count(key) == 0 ||
+          independent_pose_supported_keys.count(key) == 0 ||
+          accumulator.internal_point_count <= 0 ||
+          accumulator.point_count <= 0) {
+        continue;
+      }
+      const double rmse = std::sqrt(
+          accumulator.squared_error_sum /
+          static_cast<double>(accumulator.point_count));
+      if (!std::isfinite(rmse) || rmse > result.threshold_px) {
+        continue;
+      }
+      baseline_keys.insert(key);
+      frame_cohesion_seed_keys.insert(key);
+    }
+    if (!frame_cohesion_seed_keys.empty()) {
+      frame_cohesive_baseline_bundle = BuildBundleForAcceptedFrameBoardKeys(
+          candidate_pool_bundle,
+          candidate_pool_bundle,
+          baseline_keys,
+          baseline_bundle.measurement_dataset.source_stage_label +
+              "_frame_cohesive_seed");
+      if (!frame_cohesive_baseline_bundle.IsReadyForBackend()) {
+        result.failure_reason =
+            "frame-cohesive seed expansion produced an invalid backend bundle";
+        return result;
+      }
+      std::ostringstream warning;
+      warning << "Frame-granularity seed cohesion added "
+              << frame_cohesion_seed_keys.size()
+              << " healthy board observations from already selected frames; "
+                 "the reference board is retained whenever healthy.";
+      result.warnings.push_back(warning.str());
+      result.baseline_seed_frame_count =
+          frame_cohesive_baseline_bundle.measurement_dataset.accepted_frame_count;
+      result.baseline_seed_board_observation_count =
+          frame_cohesive_baseline_bundle.measurement_dataset
+              .accepted_board_observation_count;
+      result.baseline_seed_outer_point_count =
+          frame_cohesive_baseline_bundle.measurement_dataset
+              .accepted_outer_point_count;
+      result.baseline_seed_internal_point_count =
+          frame_cohesive_baseline_bundle.measurement_dataset
+              .accepted_internal_point_count;
+      result.baseline_seed_total_point_count =
+          frame_cohesive_baseline_bundle.measurement_dataset
+              .accepted_total_point_count;
+    }
+  }
   const DenseGridOutlierFilterResult dense_grid_filter =
       FilterDenseGridOutliers(candidate_pool_bundle,
                               result.trial_backend_result,
@@ -3657,7 +3852,8 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
   const std::set<FrameBoardKey> persistent_candidate_pool_keys =
       CollectAcceptedFrameBoardKeys(
           persistent_candidate_pool_bundle.measurement_dataset);
-  CalibrationStateBundle persistent_baseline_bundle = baseline_bundle;
+  CalibrationStateBundle persistent_baseline_bundle =
+      frame_cohesive_baseline_bundle;
   if (dense_grid_filter.enabled) {
     std::set<FrameBoardKey> filtered_seed_keys;
     std::set_intersection(
@@ -3669,7 +3865,7 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
         persistent_candidate_pool_bundle,
         persistent_candidate_pool_bundle,
         filtered_seed_keys,
-        baseline_bundle.measurement_dataset.source_stage_label +
+        frame_cohesive_baseline_bundle.measurement_dataset.source_stage_label +
             "_dense_grid_filtered_seed");
     if (!persistent_baseline_bundle.IsReadyForBackend()) {
       result.failure_reason =
@@ -3720,7 +3916,14 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
     decision.board_id = key.second;
     decision.baseline_seed = true;
     decision.kept = true;
-    decision.reason = "baseline_seed";
+    const bool added_by_frame_cohesion =
+        frame_cohesion_seed_keys.count(key) > 0;
+    decision.reason =
+        added_by_frame_cohesion
+            ? (key.second == baseline_bundle.scene_state.reference_board_id
+                   ? "reference_board_seed_frame_cohesion"
+                   : "baseline_seed_frame_cohesion")
+            : "baseline_seed";
     const auto accum_it = accumulators.find(key);
     if (accum_it != accumulators.end()) {
       decision.frame_label = accum_it->second.frame_label;
@@ -3897,7 +4100,7 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
   const std::map<int, int> candidate_pool_board_capacity_by_frame =
       CountFrameBoardObservationCapacity(candidate_pool_keys);
   AslamBackendCalibrationResult current_backend = RunShortTrialBackend(
-      baseline_bundle,
+      frame_cohesive_baseline_bundle,
       backend_options,
       options,
       "_trial_backend_incremental_seed");
@@ -4075,6 +4278,25 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
             : deterministic_seed;
     std::mt19937 rng(result.candidate_shuffle_seed);
     std::shuffle(candidate_decisions.begin(), candidate_decisions.end(), rng);
+  }
+  if (!options.single_board_dense_grid_profile) {
+    const auto first_quarantined = std::stable_partition(
+        candidate_decisions.begin(), candidate_decisions.end(),
+        [&independent_pose_supported_keys](
+            const TrialBackendFrameBoardObservationDecision& decision) {
+          return independent_pose_supported_keys.count(
+                     FrameBoardKey(decision.frame_index, decision.board_id)) > 0;
+        });
+    const std::size_t quarantine_count = static_cast<std::size_t>(
+        std::distance(first_quarantined, candidate_decisions.end()));
+    if (quarantine_count > 0) {
+      std::ostringstream warning;
+      warning << "Deferred " << quarantine_count
+              << " high-independent-pose-residual observations until after "
+                 "the normal candidate schedule; they remain eligible under "
+                 "the updated camera and full-training health gates.";
+      result.warnings.push_back(warning.str());
+    }
   }
   if (!options.force_include_frame_board_keys.empty() ||
       !options.force_include_frame_label_board_keys.empty()) {
@@ -4545,6 +4767,42 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
           persistent_candidate_observation_attempt_count;
       accepted_keys = persistent_result.accepted_keys;
       result.curated_bundle = persistent_result.curated_bundle;
+      // A successful independent-pose warmup can discover an unstable
+      // frame-board observation that was part of the initial seed.  The
+      // estimator uses the quarantine while retrying warmup, but candidate
+      // traversal may otherwise re-admit that key later.  Make the final
+      // backend contract explicit: quarantined observations are excluded
+      // from the committed bundle as well as from subsequent diagnostics.
+      if (!persistent_result.quarantined_keys.empty()) {
+        std::size_t removed_quarantined_keys = 0;
+        for (const FrameBoardKey& key : persistent_result.quarantined_keys) {
+          removed_quarantined_keys += accepted_keys.erase(key);
+        }
+        // Rebuild even when the estimator's accepted-key set already omitted
+        // the quarantined key: its carried curated bundle may still contain
+        // the pre-warmup seed observations.
+        if (removed_quarantined_keys > 0 ||
+            !persistent_result.quarantined_keys.empty()) {
+          result.curated_bundle = BuildBundleForAcceptedFrameBoardKeys(
+              result.curated_bundle, candidate_pool_bundle, accepted_keys,
+              result.curated_bundle.measurement_dataset.source_stage_label +
+                  "_warmup_quarantine_excluded");
+          if (!result.curated_bundle.IsReadyForBackend()) {
+            result.failure_reason =
+                "Warmup quarantine removed every usable backend observation.";
+            result.warnings.insert(result.warnings.end(),
+                                   persistent_result.warnings.begin(),
+                                   persistent_result.warnings.end());
+            return result;
+          }
+          std::ostringstream quarantine_warning;
+          quarantine_warning
+              << "Removed " << removed_quarantined_keys
+              << " independent-warmup-quarantined frame-board observation(s) "
+                 "from the committed backend bundle.";
+          result.warnings.push_back(quarantine_warning.str());
+        }
+      }
       result.success = true;
       result.rejected_board_observation_count =
           static_cast<int>(candidate_pool_keys.size() > accepted_keys.size()
@@ -4889,7 +5147,14 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
         decision_by_key[key] = candidate;
       }
       result.decisions.reserve(decision_by_key.size());
-      for (const auto& entry : decision_by_key) {
+      for (auto& entry : decision_by_key) {
+        entry.second.kept = accepted_keys.find(entry.first) !=
+                            accepted_keys.end();
+        if (!entry.second.kept &&
+            persistent_result.quarantined_keys.count(entry.first) > 0) {
+          entry.second.reason =
+              "adaptive_frame_board_instability_quarantine";
+        }
         result.decisions.push_back(entry.second);
       }
       return result;
@@ -6558,7 +6823,13 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildTrainingEvaluationDataset(
       }
 
       eval_board.has_pose_fit_outer_points = (eval_board.outer_point_count >= 4);
-      if (!eval_board.points.empty()) {
+      // Keep outer-only observations in frontend diagnostics, but do not use
+      // them for the camera-model evaluation.  Without an internal lattice
+      // point there is no solver-ready board support and a four-corner-only
+      // pose can create an artificial, very large residual.  Boards with any
+      // internal point, including ordinary partial-board observations, are
+      // unchanged.
+      if (!eval_board.points.empty() && eval_board.internal_point_count > 0) {
         frame_input.board_observations.push_back(eval_board);
         ++dataset.board_observation_count;
         dataset.outer_point_count += eval_board.outer_point_count;
@@ -6588,13 +6859,15 @@ Stage5Benchmark::BuildEvaluationDatasetFromMeasurementResult(
     const std::string& dataset_label,
     const std::string& split_label,
     const std::string& split_signature,
-    bool include_points_not_used_in_solver) const {
+    bool include_points_not_used_in_solver,
+    bool require_internal_solver_support) const {
   CalibrationEvaluationDataset dataset;
   dataset.dataset_label = dataset_label;
   dataset.split_label = split_label;
   dataset.split_signature = split_signature;
   dataset.internal_regeneration_results = regeneration_results;
 
+  int excluded_without_internal_support_count = 0;
   for (const JointMeasurementFrameResult& frame_result :
        measurement_result.frames) {
     CalibrationEvaluationFrameInput frame_input;
@@ -6637,11 +6910,17 @@ Stage5Benchmark::BuildEvaluationDatasetFromMeasurementResult(
 
       eval_board.has_pose_fit_outer_points =
           (eval_board.outer_point_count >= 4);
-      if (!eval_board.points.empty() && eval_board.has_pose_fit_outer_points) {
+      const bool has_required_internal_support =
+          !require_internal_solver_support || eval_board.internal_point_count > 0;
+      if (!eval_board.points.empty() && eval_board.has_pose_fit_outer_points &&
+          has_required_internal_support) {
         frame_input.board_observations.push_back(eval_board);
         ++dataset.board_observation_count;
         dataset.outer_point_count += eval_board.outer_point_count;
         dataset.internal_point_count += eval_board.internal_point_count;
+      } else if (!has_required_internal_support &&
+                 eval_board.has_pose_fit_outer_points) {
+        ++excluded_without_internal_support_count;
       }
     }
 
@@ -6663,6 +6942,13 @@ Stage5Benchmark::BuildEvaluationDatasetFromMeasurementResult(
   }
   for (const std::string& warning : measurement_result.warnings) {
     dataset.warnings.push_back(warning);
+  }
+  if (excluded_without_internal_support_count > 0) {
+    std::ostringstream warning;
+    warning << "Excluded " << excluded_without_internal_support_count
+            << " board observation(s) from " << split_label
+            << " evaluation because no solver-ready internal point was present.";
+    dataset.warnings.push_back(warning.str());
   }
   if (!dataset.success) {
     dataset.failure_reason = split_label + " evaluation dataset is empty.";
@@ -7083,6 +7369,7 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
   result.split_signature = dataset.split_signature;
   result.camera = camera;
   result.uniform_control_point_mode = dataset.uniform_control_point_mode;
+  result.residual_sanity_threshold_px = kHoldoutResidualSanityThresholdPx;
 
   if (!dataset.success) {
     result.failure_reason =
@@ -7100,6 +7387,9 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
   double total_angular_squared_error = 0.0;
   double outer_squared_error = 0.0;
   double internal_squared_error = 0.0;
+  double raw_total_squared_error = 0.0;
+  double raw_outer_squared_error = 0.0;
+  double raw_internal_squared_error = 0.0;
   double total_squared_error_excluding_board = 0.0;
   double outer_squared_error_excluding_board = 0.0;
   double internal_squared_error_excluding_board = 0.0;
@@ -7107,9 +7397,17 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
   int total_angular_point_count = 0;
   int outer_point_count = 0;
   int internal_point_count = 0;
+  int raw_total_point_count = 0;
+  int raw_outer_point_count = 0;
+  int raw_internal_point_count = 0;
+  int valid_board_observation_count = 0;
+  int raw_board_observation_count = 0;
+  std::vector<CameraModelRefitPointDiagnostics> valid_point_diagnostics;
   int total_point_count_excluding_board = 0;
   int outer_point_count_excluding_board = 0;
   int internal_point_count_excluding_board = 0;
+  int raw_projection_failure_point_count = 0;
+  int raw_nonfinite_residual_point_count = 0;
   double pose_fit_outer_squared_rmse = 0.0;
 
   for (const CalibrationEvaluationFrameInput& frame : dataset.frames) {
@@ -7130,6 +7428,7 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
       board_diag.frame_index = frame.frame_index;
       board_diag.frame_label = frame.frame_label;
       board_diag.board_id = board.board_id;
+      ++raw_board_observation_count;
 
       std::vector<Eigen::Vector3d> outer_targets;
       std::vector<cv::Point2f> outer_pixels;
@@ -7158,6 +7457,9 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
         board_diag.failure_reason = dataset.uniform_control_point_mode
                                         ? "insufficient_control_points"
                                         : "insufficient_outer_pose_fit_points";
+        board_diag.evaluation_included = false;
+        ++result.invalid_board_observation_count;
+        ++result.pose_init_failed_board_observation_count;
         result.board_observation_diagnostics.push_back(board_diag);
         result.warnings.push_back(
             "Skipped board observation without enough pose-fit points: frame=" +
@@ -7172,6 +7474,9 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
       if (!EstimatePoseForBenchmarkRefit(camera, pose_targets, pose_pixels,
                                          &T_camera_board, &pose_fit_outer_rmse)) {
         board_diag.failure_reason = "pose_only_refit_failed";
+        board_diag.evaluation_included = false;
+        ++result.invalid_board_observation_count;
+        ++result.pose_init_failed_board_observation_count;
         result.board_observation_diagnostics.push_back(board_diag);
         result.warnings.push_back(
             "Pose refit failed: frame=" + frame.frame_label + " board=" +
@@ -7232,7 +7537,10 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
       double board_squared_error = 0.0;
       double board_outer_squared_error = 0.0;
       double board_internal_squared_error = 0.0;
+      double board_angular_squared_error = 0.0;
       int board_point_count = 0;
+      int board_angular_point_count = 0;
+      bool board_projection_invalid = false;
       for (const CalibrationEvaluationPointObservation& point : board.points) {
         CameraModelRefitPointDiagnostics point_diag;
         point_diag.method_label = method_label;
@@ -7254,6 +7562,9 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
         double squared_error = 0.0;
         if (!camera_model.vsEuclideanToKeypoint(T_camera_board * point.target_xyz_board,
                                                 &predicted)) {
+          board_projection_invalid = true;
+          ++board_diag.invalid_projection_point_count;
+          ++raw_projection_failure_point_count;
           point_diag.predicted_image_xy = Eigen::Vector2d::Constant(
               std::numeric_limits<double>::quiet_NaN());
           point_diag.residual_xy = Eigen::Vector2d::Constant(kInvalidProjectionPenaltyPixels);
@@ -7265,6 +7576,13 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
           point_diag.residual_xy = predicted - point.image_xy;
           point_diag.residual_norm = point_diag.residual_xy.norm();
           squared_error = point_diag.residual_xy.squaredNorm();
+          if (!point_diag.predicted_image_xy.allFinite() ||
+              !point_diag.residual_xy.allFinite() ||
+              !std::isfinite(point_diag.residual_norm)) {
+            board_projection_invalid = true;
+            ++board_diag.nonfinite_point_count;
+            ++raw_nonfinite_residual_point_count;
+          }
 
           AngularObservationGeometry observation_geometry;
           AngularPredictionGeometry prediction_geometry;
@@ -7277,8 +7595,8 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
                 ComputeAngularResidualTangent(observation_geometry,
                                               prediction_geometry);
             if (angular_residual.allFinite()) {
-              total_angular_squared_error += angular_residual.squaredNorm();
-              ++total_angular_point_count;
+              board_angular_squared_error += angular_residual.squaredNorm();
+              ++board_angular_point_count;
             }
           }
         }
@@ -7286,34 +7604,14 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
         result.point_diagnostics.push_back(point_diag);
         board_squared_error += squared_error;
         ++board_point_count;
-        if (point.board_id != result.excluded_board_id_for_rmse) {
-          total_squared_error_excluding_board += squared_error;
-          ++total_point_count_excluding_board;
-        }
         if (dataset.uniform_control_point_mode) {
           // Checkerboard control points are one homogeneous measurement set.
         } else if (point.point_type == JointPointType::Outer) {
-          outer_squared_error += squared_error;
           board_outer_squared_error += squared_error;
-          frame_outer_squared_error += squared_error;
-          ++outer_point_count;
           ++board_diag.outer_point_count;
-          ++frame_outer_count;
-          if (point.board_id != result.excluded_board_id_for_rmse) {
-            outer_squared_error_excluding_board += squared_error;
-            ++outer_point_count_excluding_board;
-          }
         } else {
-          internal_squared_error += squared_error;
           board_internal_squared_error += squared_error;
-          frame_internal_squared_error += squared_error;
-          ++internal_point_count;
           ++board_diag.internal_point_count;
-          ++frame_internal_count;
-          if (point.board_id != result.excluded_board_id_for_rmse) {
-            internal_squared_error_excluding_board += squared_error;
-            ++internal_point_count_excluding_board;
-          }
         }
       }
 
@@ -7333,11 +7631,77 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
               ? std::sqrt(board_internal_squared_error /
                           static_cast<double>(board_diag.internal_point_count))
               : 0.0;
+      const bool residual_sanity_failed =
+          !std::isfinite(pose_fit_outer_rmse) ||
+          pose_fit_outer_rmse > kHoldoutResidualSanityThresholdPx;
+      board_diag.evaluation_included =
+          !residual_sanity_failed && !board_projection_invalid &&
+          board_diag.nonfinite_point_count == 0;
+      if (residual_sanity_failed) {
+        board_diag.failure_reason = "outer_residual_sanity_failed";
+        ++result.residual_sanity_failed_board_observation_count;
+      } else if (board_projection_invalid) {
+        board_diag.failure_reason = "projection_invalid";
+        ++result.projection_invalid_board_observation_count;
+      }
+      if (!board_diag.evaluation_included) {
+        ++result.invalid_board_observation_count;
+      }
+
+      // Raw stress metrics deliberately retain the rejected observation.
+      raw_total_squared_error += board_squared_error;
+      raw_total_point_count += board_point_count;
+      raw_outer_squared_error += board_outer_squared_error;
+      raw_internal_squared_error += board_internal_squared_error;
+      raw_outer_point_count += board_diag.outer_point_count;
+      raw_internal_point_count += board_diag.internal_point_count;
+
+      if (board_diag.evaluation_included) {
+        ++valid_board_observation_count;
+        total_squared_error += board_squared_error;
+        total_point_count += board_point_count;
+        outer_squared_error += board_outer_squared_error;
+        internal_squared_error += board_internal_squared_error;
+        outer_point_count += board_diag.outer_point_count;
+        internal_point_count += board_diag.internal_point_count;
+        total_angular_squared_error += board_angular_squared_error;
+        total_angular_point_count += board_angular_point_count;
+        frame_squared_error += board_squared_error;
+        frame_point_count += board_point_count;
+        frame_outer_squared_error += board_outer_squared_error;
+        frame_internal_squared_error += board_internal_squared_error;
+        frame_outer_count += board_diag.outer_point_count;
+        frame_internal_count += board_diag.internal_point_count;
+        for (CameraModelRefitPointDiagnostics& point_diag :
+             result.point_diagnostics) {
+          if (point_diag.frame_index == board_diag.frame_index &&
+              point_diag.board_id == board_diag.board_id &&
+              point_diag.method_label == method_label) {
+            point_diag.evaluation_included = true;
+            valid_point_diagnostics.push_back(point_diag);
+          }
+        }
+        if (board.board_id != result.excluded_board_id_for_rmse) {
+          total_squared_error_excluding_board += board_squared_error;
+          total_point_count_excluding_board += board_point_count;
+          outer_squared_error_excluding_board += board_outer_squared_error;
+          outer_point_count_excluding_board += board_diag.outer_point_count;
+          internal_squared_error_excluding_board += board_internal_squared_error;
+          internal_point_count_excluding_board += board_diag.internal_point_count;
+        }
+      } else {
+        const std::string reason = board_diag.failure_reason;
+        for (CameraModelRefitPointDiagnostics& point_diag :
+             result.point_diagnostics) {
+          if (point_diag.frame_index == board_diag.frame_index &&
+              point_diag.board_id == board_diag.board_id &&
+              point_diag.method_label == method_label) {
+            point_diag.evaluation_included = false;
+            point_diag.exclusion_reason = reason;
+          }
+        }
+      }
       result.board_observation_diagnostics.push_back(board_diag);
-      total_squared_error += board_squared_error;
-      total_point_count += board_point_count;
-      frame_squared_error += board_squared_error;
-      frame_point_count += board_point_count;
     }
 
     if (frame_point_count > 0) {
@@ -7380,6 +7744,8 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
   result.evaluated_frame_count = static_cast<int>(result.frame_diagnostics.size());
   result.evaluated_board_observation_count =
       static_cast<int>(result.board_observation_diagnostics.size());
+  result.valid_board_observation_count = valid_board_observation_count;
+  result.raw_board_observation_count = raw_board_observation_count;
   result.pose_only_refit_success_rate =
       result.pose_only_refit_attempt_count > 0
           ? static_cast<double>(result.pose_only_refit_success_count) /
@@ -7394,16 +7760,28 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
   result.angular_point_count = total_angular_point_count;
   result.outer_point_count = outer_point_count;
   result.internal_point_count = internal_point_count;
+  result.raw_point_count = raw_total_point_count;
+  result.raw_outer_point_count = raw_outer_point_count;
+  result.raw_internal_point_count = raw_internal_point_count;
+  result.projection_failure_point_count = raw_projection_failure_point_count;
+  result.nonfinite_residual_point_count = raw_nonfinite_residual_point_count;
   result.point_count_excluding_board = total_point_count_excluding_board;
   result.outer_point_count_excluding_board = outer_point_count_excluding_board;
   result.internal_point_count_excluding_board = internal_point_count_excluding_board;
-  if (total_point_count <= 0) {
-    result.failure_reason = "Camera-only refit evaluation produced zero valid points.";
+  if (raw_total_point_count <= 0) {
+    result.failure_reason = "Camera-only refit evaluation produced zero points.";
     return result;
+  }
+  if (total_point_count <= 0) {
+    result.warnings.push_back(
+        "No valid board observations remained after pose/residual/projection gating; "
+        "primary RMSE is unavailable while raw stress metrics remain available.");
   }
 
   result.overall_rmse =
-      std::sqrt(total_squared_error / static_cast<double>(total_point_count));
+      total_point_count > 0
+          ? std::sqrt(total_squared_error / static_cast<double>(total_point_count))
+          : std::numeric_limits<double>::quiet_NaN();
   result.overall_angular_rmse_rad =
       total_angular_point_count > 0
           ? std::sqrt(total_angular_squared_error /
@@ -7412,14 +7790,35 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
   result.overall_angular_rmse_deg =
       result.overall_angular_rmse_rad * kRadiansToDegrees;
   std::vector<double> residual_norms;
-  residual_norms.reserve(result.point_diagnostics.size());
-  for (const CameraModelRefitPointDiagnostics& point :
-       result.point_diagnostics) {
-    if (std::isfinite(point.residual_norm)) {
+  residual_norms.reserve(valid_point_diagnostics.size());
+  std::vector<double> raw_residual_norms;
+  raw_residual_norms.reserve(result.point_diagnostics.size());
+  for (const CameraModelRefitPointDiagnostics& point : result.point_diagnostics) {
+    if (point.evaluation_included && std::isfinite(point.residual_norm)) {
       residual_norms.push_back(point.residual_norm);
+    }
+    if (std::isfinite(point.residual_norm)) {
+      raw_residual_norms.push_back(point.residual_norm);
     }
   }
   result.p95_reprojection_error = ComputePercentile(residual_norms, 0.95);
+  result.raw_overall_rmse =
+      raw_total_point_count > 0
+          ? std::sqrt(raw_total_squared_error /
+                      static_cast<double>(raw_total_point_count))
+          : std::numeric_limits<double>::quiet_NaN();
+  result.raw_outer_only_rmse =
+      raw_outer_point_count > 0
+          ? std::sqrt(raw_outer_squared_error /
+                      static_cast<double>(raw_outer_point_count))
+          : std::numeric_limits<double>::quiet_NaN();
+  result.raw_internal_only_rmse =
+      raw_internal_point_count > 0
+          ? std::sqrt(raw_internal_squared_error /
+                      static_cast<double>(raw_internal_point_count))
+          : std::numeric_limits<double>::quiet_NaN();
+  result.raw_p95_reprojection_error =
+      ComputePercentile(raw_residual_norms, 0.95);
   result.outer_only_rmse =
       outer_point_count > 0
           ? std::sqrt(outer_squared_error / static_cast<double>(outer_point_count))
@@ -7444,7 +7843,7 @@ CameraModelRefitEvaluationResult Stage5Benchmark::EvaluateCameraModel(
                       static_cast<double>(internal_point_count_excluding_board))
           : 0.0;
   ComputeKalibrStyleResidualStatistics(
-      result.point_diagnostics,
+      valid_point_diagnostics,
       &result.mean_residual_x,
       &result.mean_residual_y,
       &result.std_residual_x,
@@ -8090,6 +8489,45 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
         trial_candidate_bundle.measurement_dataset
             .accepted_internal_point_count;
   }
+
+  // An outer-only board is useful as a frontend diagnostic, but it has no
+  // independent lattice support for validating the shared camera/frame
+  // geometry.  In the ordinary backend path it can therefore inject a large
+  // pose residual (for example when internal regeneration produced zero
+  // usable points).  Remove only these observations from the backend seed;
+  // boards with any solver-ready internal point, including normal partial
+  // boards, are left unchanged.
+  if (!single_board_dense_grid_profile &&
+      !(input.enable_large_intrinsic_perturbation &&
+        input.large_intrinsic_perturbation_outer_only_after_application)) {
+    const std::set<FrameBoardKey> seed_keys =
+        CollectAcceptedFrameBoardKeys(
+            curated_backend_seed_bundle.measurement_dataset);
+    const std::set<FrameBoardKey> internal_seed_keys =
+        CollectInternallySupportedFrameBoardKeys(
+            curated_backend_seed_bundle.measurement_dataset);
+    if (!internal_seed_keys.empty() &&
+        internal_seed_keys.size() < seed_keys.size()) {
+      const std::size_t removed_count =
+          seed_keys.size() - internal_seed_keys.size();
+      curated_backend_seed_bundle = BuildBundleForAcceptedFrameBoardKeys(
+          curated_backend_seed_bundle, curated_backend_seed_bundle,
+          internal_seed_keys,
+          curated_backend_seed_bundle.measurement_dataset.source_stage_label +
+              "_outer_only_diagnostic_excluded_from_backend");
+      if (!curated_backend_seed_bundle.IsReadyForBackend()) {
+        report.failure_reason =
+            "Outer-only backend gate removed every usable seed observation.";
+        return report;
+      }
+      std::ostringstream warning;
+      warning << "Backend outer-only gate excluded " << removed_count
+              << " frame-board observation(s) without solver-ready internal "
+                 "support; observations remain available in frontend diagnostics.";
+      curated_backend_seed_bundle.warnings.push_back(warning.str());
+      report.warnings.push_back(warning.str());
+    }
+  }
   if (input.enable_large_intrinsic_perturbation) {
     report.large_intrinsic_perturbation.selection_seed_camera =
         curated_backend_seed_bundle.scene_state.camera;
@@ -8127,6 +8565,85 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
             : trial_candidate_bundle.measurement_dataset.source_stage_label +
                   "_single_board_dense_grid_atomic_views";
     ReevaluateCalibrationStateBundle(&trial_candidate_bundle);
+  }
+
+  if (input.trial_backend_selection_options.enabled &&
+      !single_board_dense_grid_profile &&
+      !(input.enable_large_intrinsic_perturbation &&
+        input.large_intrinsic_perturbation_outer_only_after_application)) {
+    const std::set<FrameBoardKey> internally_supported_keys =
+        CollectInternallySupportedFrameBoardKeys(
+            trial_candidate_bundle.measurement_dataset);
+    constexpr double kMaxIndependentBoardPoseRefitRmsePx = 25.0;
+    const std::set<FrameBoardKey> seed_pose_supported_keys =
+        CollectIndependentPoseSupportedFrameBoardKeys(
+            trial_candidate_bundle.measurement_dataset,
+            trial_candidate_bundle.scene_state.camera,
+            kMaxIndependentBoardPoseRefitRmsePx);
+    const std::set<FrameBoardKey> candidate_keys =
+        CollectAcceptedFrameBoardKeys(
+            trial_candidate_bundle.measurement_dataset);
+    if (!internally_supported_keys.empty()) {
+      const std::size_t removed_count =
+          candidate_keys.size() - internally_supported_keys.size();
+      trial_candidate_bundle = BuildBundleForAcceptedFrameBoardKeys(
+          trial_candidate_bundle,
+          trial_candidate_bundle,
+          internally_supported_keys,
+          trial_candidate_bundle.measurement_dataset.source_stage_label +
+              "_internal_support_required_for_backend");
+
+      const std::set<FrameBoardKey> original_seed_keys =
+          CollectAcceptedFrameBoardKeys(
+              curated_backend_seed_bundle.measurement_dataset);
+      std::set<FrameBoardKey> internally_supported_seed_keys;
+      std::set_intersection(
+          original_seed_keys.begin(), original_seed_keys.end(),
+          internally_supported_keys.begin(), internally_supported_keys.end(),
+          std::inserter(internally_supported_seed_keys,
+                        internally_supported_seed_keys.end()));
+      std::set<FrameBoardKey> filtered_seed_keys;
+      if (input.trial_backend_selection_options
+              .independent_frame_board_camera_warmup) {
+        // The camera-only warmup consumes every internally supported
+        // observation, then applies this same pose-RMSE quarantine using the
+        // warmed (or exactly restored) camera inside the persistent estimator.
+        filtered_seed_keys = internally_supported_seed_keys;
+      } else {
+        std::set_intersection(
+            internally_supported_seed_keys.begin(),
+            internally_supported_seed_keys.end(),
+            seed_pose_supported_keys.begin(), seed_pose_supported_keys.end(),
+            std::inserter(filtered_seed_keys, filtered_seed_keys.end()));
+      }
+      curated_backend_seed_bundle = BuildBundleForAcceptedFrameBoardKeys(
+          trial_candidate_bundle,
+          trial_candidate_bundle,
+          filtered_seed_keys,
+          curated_backend_seed_bundle.measurement_dataset.source_stage_label +
+              "_internal_support_required_for_backend_seed");
+      if (!trial_candidate_bundle.IsReadyForBackend() ||
+          !curated_backend_seed_bundle.IsReadyForBackend()) {
+        report.failure_reason =
+            "Backend internal-support gate removed every usable candidate or seed observation.";
+        return report;
+      }
+      std::ostringstream warning;
+      warning << "Backend internal-support gate removed " << removed_count
+              << " observations without internal solver support from the "
+                 "candidate pool. The seed additionally quarantined "
+              << (internally_supported_seed_keys.size() -
+                  filtered_seed_keys.size())
+              << " observations with independent board-pose refit RMSE above "
+              << kMaxIndependentBoardPoseRefitRmsePx
+              << " px"
+              << (input.trial_backend_selection_options
+                          .independent_frame_board_camera_warmup
+                      ? " (quarantine deferred until after camera warmup)"
+                      : "; quarantined observations remain eligible after the camera improves.");
+      trial_candidate_bundle.warnings.push_back(warning.str());
+      curated_backend_seed_bundle.warnings.push_back(warning.str());
+    }
   }
 
   TrialBackendFrameBoardSelectionOptions effective_selection_options =
@@ -8442,23 +8959,32 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
         input.external_holdout_label.empty()
             ? report.dataset_label + "_precomputed_holdout"
             : input.external_holdout_label,
-        "holdout", report.split.split_signature + "_frozen_precomputed");
+        "holdout", report.split.split_signature + "_frozen_precomputed",
+        false, true);
     report.runtime_breakdown.holdout_dataset_build_seconds =
         ElapsedSeconds(stage_start);
   } else if (input.holdout_evaluate_full_training_observations) {
     const auto stage_start = std::chrono::steady_clock::now();
-    const FrozenRoundArtifacts& training_frontend_artifacts =
-        report.baseline_result.round2_available
-            ? report.baseline_result.round2
-            : report.baseline_result.round1;
+    // The full-sequence diagnostic used to evaluate every frontend
+    // observation, including boards already rejected by residual sanity.
+    // For the formal backend holdout, use the curated solver-ready dataset
+    // instead.  The raw frontend path remains available through the frontend
+    // diagnostics and overlays, but must not contaminate the backend metric.
+    const JointMeasurementBuildResult accepted_backend_measurements =
+        BuildTrialMeasurementResultFromDataset(
+            report.backend_problem_input.measurement_dataset,
+            report.backend_problem_input.measurement_dataset.reference_board_id);
     report.holdout_dataset = BuildEvaluationDatasetFromMeasurementResult(
-        training_frontend_artifacts.measurement_result,
-        training_frontend_artifacts.regeneration_results,
-        report.dataset_label + "_same_sequence_full_frontend",
+        accepted_backend_measurements,
+        std::vector<InternalRegenerationFrameResult>{},
+        report.dataset_label + "_same_sequence_backend_accepted",
         "holdout",
         report.split.split_signature +
-            "_same_sequence_full_frontend_observations",
-        true);
+            "_same_sequence_backend_accepted_observations",
+        false, true);
+    report.holdout_dataset.warnings.push_back(
+        "Formal same-sequence holdout uses the curated backend solver-ready "
+        "board observations; rejected frontend observations remain diagnostic-only.");
     report.runtime_breakdown.holdout_dataset_build_seconds =
         ElapsedSeconds(stage_start);
   } else if (report.external_holdout_self_frontend_prepass_used) {
@@ -8503,7 +9029,8 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
           holdout_prepass_options.dataset_label,
           "holdout",
           report.split.split_signature +
-              "_external_holdout_self_frontend_prepass_full_measurements");
+              "_external_holdout_self_frontend_prepass_full_measurements",
+          false, true);
       report.holdout_dataset.split_label = "holdout";
       report.runtime_breakdown.holdout_dataset_build_seconds =
           ElapsedSeconds(dataset_start);
@@ -9608,6 +10135,37 @@ void WriteStage5BenchmarkTrainingSummary(const std::string& path,
 void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
                                         const Stage5BenchmarkReport& report) {
   std::ofstream output(path.c_str());
+  const auto write_metric_scope = [&output](const std::string& prefix,
+                                             const CameraModelRefitEvaluationResult& evaluation) {
+    output << prefix << "primary_metric_scope: valid_board_observations_only\n";
+    output << prefix << "raw_observation_stress_metric_scope: all_pose_refit_observations\n";
+    output << prefix << "residual_sanity_threshold_px: "
+           << evaluation.residual_sanity_threshold_px << "\n";
+    output << prefix << "valid_board_observation_count: "
+           << evaluation.valid_board_observation_count << "\n";
+    output << prefix << "raw_board_observation_count: "
+           << evaluation.raw_board_observation_count << "\n";
+    output << prefix << "invalid_board_observation_count: "
+           << evaluation.invalid_board_observation_count << "\n";
+    output << prefix << "pose_init_failed_board_observation_count: "
+           << evaluation.pose_init_failed_board_observation_count << "\n";
+    output << prefix << "residual_sanity_failed_board_observation_count: "
+           << evaluation.residual_sanity_failed_board_observation_count << "\n";
+    output << prefix << "projection_invalid_board_observation_count: "
+           << evaluation.projection_invalid_board_observation_count << "\n";
+    output << prefix << "projection_failure_point_count: "
+           << evaluation.projection_failure_point_count << "\n";
+    output << prefix << "nonfinite_residual_point_count: "
+           << evaluation.nonfinite_residual_point_count << "\n";
+    output << prefix << "raw_overall_rmse: " << evaluation.raw_overall_rmse << "\n";
+    output << prefix << "raw_outer_only_rmse: "
+           << evaluation.raw_outer_only_rmse << "\n";
+    output << prefix << "raw_internal_only_rmse: "
+           << evaluation.raw_internal_only_rmse << "\n";
+    output << prefix << "raw_p95_reprojection_error: "
+           << evaluation.raw_p95_reprojection_error << "\n";
+    output << prefix << "raw_point_count: " << evaluation.raw_point_count << "\n";
+  };
   output << "split_label: holdout\n";
   output << "split_signature: " << report.split_signature << "\n";
   output << "evaluation_protocol: "
@@ -9624,6 +10182,8 @@ void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
          << "\n";
   WriteEvaluationCameraSummary(output, "our_", report.our_holdout_evaluation);
   WriteEvaluationCameraSummary(output, "kalibr_", report.kalibr_holdout_evaluation);
+  write_metric_scope("our_", report.our_holdout_evaluation);
+  write_metric_scope("kalibr_", report.kalibr_holdout_evaluation);
   output << "our_overall_rmse: " << report.our_holdout_evaluation.overall_rmse << "\n";
   output << "our_p95_reprojection_error: "
          << report.our_holdout_evaluation.p95_reprojection_error << "\n";
@@ -9742,6 +10302,7 @@ void WriteStage5BenchmarkHoldoutSummary(const std::string& path,
     const std::string prefix =
         "reference_" + SanitizeMetricKey(evaluation.method_label) + "_";
     WriteEvaluationCameraSummary(output, prefix, evaluation);
+    write_metric_scope(prefix, evaluation);
     output << prefix << "overall_rmse: " << evaluation.overall_rmse << "\n";
     output << prefix << "p95_reprojection_error: "
            << evaluation.p95_reprojection_error << "\n";
@@ -9927,7 +10488,8 @@ void WriteCameraModelRefitPointsCsv(
   std::ofstream output(path.c_str());
   output << "method,split,frame_index,frame_label,board_id,point_id,point_type,"
          << "observed_x,observed_y,predicted_x,predicted_y,target_x,target_y,target_z,"
-         << "residual_x,residual_y,residual_norm,debug_quality,source_kind,source_point_index\n";
+         << "residual_x,residual_y,residual_norm,debug_quality,source_kind,source_point_index,"
+         << "evaluation_included,exclusion_reason\n";
   const auto write_points = [&output](const CameraModelRefitEvaluationResult& evaluation) {
     for (const CameraModelRefitPointDiagnostics& point : evaluation.point_diagnostics) {
       output << point.method_label << ","
@@ -9949,7 +10511,9 @@ void WriteCameraModelRefitPointsCsv(
              << point.residual_norm << ","
              << point.quality << ","
              << ToString(point.source_kind) << ","
-             << point.source_point_index << "\n";
+             << point.source_point_index << ","
+             << (point.evaluation_included ? 1 : 0) << ","
+             << point.exclusion_reason << "\n";
     }
   };
   for (const CameraModelRefitEvaluationResult& evaluation : evaluations) {
@@ -9966,7 +10530,8 @@ void WriteCameraModelRefitBoardObservationsCsv(
          << "outer_evaluation_rmse,internal_evaluation_rmse,"
          << "all_point_pose_refit_success,all_point_pose_refit_point_count,"
          << "all_point_pose_refit_rmse,all_point_pose_refit_internal_rmse,"
-         << "point_count,outer_point_count,internal_point_count,failure_reason\n";
+         << "point_count,outer_point_count,internal_point_count,evaluation_included,"
+         << "invalid_projection_point_count,nonfinite_point_count,failure_reason\n";
   for (const CameraModelRefitEvaluationResult& evaluation : evaluations) {
     for (const CameraModelRefitBoardObservationDiagnostics& board :
          evaluation.board_observation_diagnostics) {
@@ -9987,6 +10552,9 @@ void WriteCameraModelRefitBoardObservationsCsv(
              << board.point_count << ","
              << board.outer_point_count << ","
              << board.internal_point_count << ","
+             << (board.evaluation_included ? 1 : 0) << ","
+             << board.invalid_projection_point_count << ","
+             << board.nonfinite_point_count << ","
              << board.failure_reason << "\n";
     }
   }

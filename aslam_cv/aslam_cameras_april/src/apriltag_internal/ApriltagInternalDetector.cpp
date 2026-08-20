@@ -583,7 +583,10 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
     } else if (key == "tagSize" || key == "tag_size") {
       config.tag_size = ParseDouble(key, value);
     } else if (key == "blackBorderBits" || key == "black_border_bits") {
-      config.black_border_bits = ParseInt(key, value);
+      const int black_border_bits = ParseInt(key, value);
+      config.black_border_bits = black_border_bits;
+      config.outer_detector_config.opencv_apriltag_marker_border_bits =
+          black_border_bits;
     } else if (key == "minVisiblePoints" || key == "min_visible_points") {
       config.min_visible_points = ParseInt(key, value);
     } else if (key == "canonicalPixelsPerModule" || key == "canonical_pixels_per_module") {
@@ -716,6 +719,23 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
                key == "adaptive_coarse_max_hamming") {
       config.outer_detector_config.adaptive_coarse_max_hamming =
           ParseInt(key, value);
+    } else if (key == "enableOpenCvApriltagFallback" ||
+               key == "enable_opencv_apriltag_fallback") {
+      config.outer_detector_config.enable_opencv_apriltag_fallback =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "opencvApriltagFallbackLongestSides" ||
+               key == "opencv_apriltag_fallback_longest_sides") {
+      config.outer_detector_config.opencv_apriltag_fallback_longest_sides =
+          ParseIntList(key, value);
+    } else if (key == "opencvApriltagMarkerBorderBits" ||
+               key == "opencv_apriltag_marker_border_bits") {
+      config.outer_detector_config.opencv_apriltag_marker_border_bits =
+          ParseInt(key, value);
+    } else if (key == "opencvApriltagMinMarkerPerimeterRate" ||
+               key == "opencv_apriltag_min_marker_perimeter_rate") {
+      config.outer_detector_config.opencv_apriltag_min_marker_perimeter_rate =
+          ParseDouble(key, value);
     } else if (key == "outerLocalContextScale" || key == "outer_local_context_scale") {
       config.outer_detector_config.outer_local_context_scale = ParseDouble(key, value);
     } else if (key == "outerCornerMarkerRatio" || key == "outer_corner_marker_ratio" ||
@@ -3980,6 +4000,8 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
 
     InternalCornerDebugInfo debug;
     debug.point_id = point_id;
+    debug.lattice_u = corner_info.lattice_u;
+    debug.lattice_v = corner_info.lattice_v;
     debug.corner_type = corner_info.corner_type;
     debug.predicted_image = predicted_image;
     debug.refined_image = refined_image;
@@ -4290,6 +4312,8 @@ void PopulateInternalCornersFromPinholeBootstrapPatch(
 
     InternalCornerDebugInfo debug;
     debug.point_id = point_id;
+    debug.lattice_u = corner_info.lattice_u;
+    debug.lattice_v = corner_info.lattice_v;
     debug.corner_type = corner_info.corner_type;
     debug.predicted_image = patch_frame.predicted_image;
     debug.sphere_seed_image = seed_image;
@@ -4482,6 +4506,8 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     const CanonicalCorner& corner_info = model.corner(point_id);
     InternalCornerDebugInfo debug;
     debug.point_id = point_id;
+    debug.lattice_u = corner_info.lattice_u;
+    debug.lattice_v = corner_info.lattice_v;
     debug.corner_type = corner_info.corner_type;
 
     SphereLatticeFrame frame;
@@ -4744,13 +4770,11 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
             gray, gray_integral, evidence_sample, structure_refined_image,
             options.min_template_contrast);
         constexpr double kStructurePathSelectionMargin = 0.005;
-        const double seed_path_score = seed_path_evidence;
-        const double structure_path_score = structure_path_evidence;
         const bool structure_seed_promising =
             structure_candidate_evidence + 0.12 >= seed_candidate_evidence;
         if (structure_seed_promising ||
-            structure_path_score >
-                seed_path_score + kStructurePathSelectionMargin) {
+            structure_path_evidence > seed_path_evidence +
+                                      kStructurePathSelectionMargin) {
           subpix_seed_image = structure_candidate_image;
           subpix_seed_ray = structure_candidate_ray;
           refined_image = structure_refined_image;
@@ -4846,10 +4870,8 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
         has_frame && has_seed &&
         IsInsideImageWithBorder(refined_image, gray.size(), options.min_border_distance) &&
         ImageEvidencePassesQualityGate(options, image_score.final_quality);
-    // Image evidence remains diagnostic for the sphere-border lattice. The
-    // projected/refined point is the observation validity gate here, matching
-    // the pre-recovery baseline. Recovery candidates are still protected by
-    // their separate board-level image/pose validation before entering BA.
+    // The final image-evidence gate is applied centrally below so every
+    // generation path checks the evidence at its actual refined position.
     const bool valid = has_frame && has_seed &&
                        IsInsideImageForRecovery(refined_image, gray.size(), options);
     debug.image_refinement_applied = image_refinement_applied;
@@ -5788,6 +5810,8 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
   // Keep the finite/image-domain and duplicate checks below; the recovery
   // path has already performed its board-level identity and pose validation.
   SuppressDuplicateRefinedInternalCorners(&result);
+  SuppressLocallyInconsistentRecoveredCorners(&result);
+  SuppressZeroImageEvidenceRecoveredCorners(&result);
   RecomputeCornerCounts(&result);
 
   // A geometry/topology recovery has no decoded payload. Do not let it enter

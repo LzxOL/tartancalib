@@ -14,6 +14,10 @@ void EnforceInternalTopologyAssignment(
     ApriltagInternalDetectionResult* result);
 void SuppressDuplicateRefinedInternalCorners(
     ApriltagInternalDetectionResult* result);
+void SuppressLocallyInconsistentRecoveredCorners(
+    ApriltagInternalDetectionResult* result);
+void SuppressZeroImageEvidenceRecoveredCorners(
+    ApriltagInternalDetectionResult* result);
 void RecomputeCornerCounts(ApriltagInternalDetectionResult* result);
 
 }  // namespace apriltag_internal

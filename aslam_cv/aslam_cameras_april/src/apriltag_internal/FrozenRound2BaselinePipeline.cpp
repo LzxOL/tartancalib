@@ -594,8 +594,6 @@ JointMeasurementBuildValidationSummary ValidateJointMeasurementBuilder(
   summary.flat_hierarchical_consistent =
       hierarchical_used_points == static_cast<int>(primary_result.solver_observations.size());
   summary.counting_consistent =
-      primary_result.used_outer_point_count ==
-          4 * primary_result.accepted_outer_board_observation_count &&
       primary_result.used_total_point_count ==
           static_cast<int>(primary_result.solver_observations.size()) &&
       primary_result.used_board_observation_count ==
@@ -660,6 +658,28 @@ JointMeasurementBuildValidationSummary ValidateJointMeasurementBuilder(
                     summary.label_mismatch_warning_observed;
   if (!summary.success && summary.failure_reason.empty()) {
     summary.failure_reason = "Joint measurement builder validation failed.";
+    std::ostringstream diagnostics;
+    diagnostics << "Joint measurement validation flags: counting_consistent="
+                << (summary.counting_consistent ? 1 : 0)
+                << " flat_hierarchical_consistent="
+                << (summary.flat_hierarchical_consistent ? 1 : 0)
+                << " frame_order_invariant="
+                << (summary.frame_order_invariant ? 1 : 0)
+                << " label_mismatch_warning_observed="
+                << (summary.label_mismatch_warning_observed ? 1 : 0)
+                << " primary_used_frames=" << primary_result.used_frame_count
+                << " primary_used_boards="
+                << primary_result.used_board_observation_count
+                << " primary_used_outer=" << primary_result.used_outer_point_count
+                << " primary_accepted_outer_boards="
+                << primary_result.accepted_outer_board_observation_count
+                << " primary_used_internal="
+                << primary_result.used_internal_point_count
+                << " primary_solver_points="
+                << primary_result.solver_observations.size();
+    const std::string diagnostic_text = diagnostics.str();
+    summary.warnings.push_back(diagnostic_text);
+    summary.failure_reason += " " + diagnostic_text;
   }
   return summary;
 }
@@ -1219,6 +1239,11 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   }
   config.outer_detector_config.enable_robust_missing_board_recovery =
       options_.enable_robust_missing_board_recovery;
+  config.outer_detector_config.enable_opencv_apriltag_fallback =
+      options_.enable_opencv_apriltag_fallback;
+  result.effective_options.config.outer_detector_config
+      .enable_opencv_apriltag_fallback =
+      options_.enable_opencv_apriltag_fallback;
   if (options_.enable_camera_aware_outer_rescue) {
     // The first detection pass must remain independent of YAML/camchain
     // intrinsics. A camera is injected only after outer-only initialization.
@@ -1316,6 +1341,8 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       options_.internal_corner_filter_quality_relaxation_px;
   build_options.filter_internal_corner_adaptive_min_threshold_px =
       options_.internal_corner_filter_adaptive_min_threshold_px;
+  build_options.enable_bidirectional_board_topology_consistency =
+      options_.enable_bidirectional_board_topology_consistency;
   const JointReprojectionMeasurementBuilder builder(config, build_options);
   JointResidualEvaluationOptions residual_options;
   const JointReprojectionResidualEvaluator residual_evaluator(residual_options);
