@@ -100,14 +100,82 @@ void EnforceInternalTopologyAssignment(ApriltagInternalDetectionResult* result) 
   RecomputeCornerCounts(result);
 }
 
+void SuppressWrongLatticeSlotAssignments(
+    ApriltagInternalDetectionResult* result) {
+  if (result == nullptr || result->internal_corner_debug.size() < 2) {
+    return;
+  }
+
+  constexpr double kMinOwnSlotDistanceModules = 0.75;
+  constexpr double kMaxOtherSlotDistanceModules = 0.25;
+  constexpr double kMinOwnershipMarginModules = 0.50;
+  std::vector<bool> suppress(result->internal_corner_debug.size(), false);
+  for (std::size_t i = 0; i < result->internal_corner_debug.size(); ++i) {
+    const InternalCornerDebugInfo& candidate = result->internal_corner_debug[i];
+    if (!candidate.valid || candidate.point_id < 0 ||
+        candidate.corner_type == CornerType::Outer ||
+        candidate.local_module_scale <= 1.0 ||
+        !IsFinitePoint(candidate.predicted_image) ||
+        !IsFinitePoint(candidate.refined_image)) {
+      continue;
+    }
+
+    const double own_distance =
+        PointDistancePx(candidate.refined_image, candidate.predicted_image);
+    const double scale = candidate.local_module_scale;
+    if (own_distance < kMinOwnSlotDistanceModules * scale) {
+      continue;
+    }
+
+    double nearest_other_distance = std::numeric_limits<double>::infinity();
+    for (std::size_t j = 0; j < result->internal_corner_debug.size(); ++j) {
+      if (i == j) {
+        continue;
+      }
+      const InternalCornerDebugInfo& other = result->internal_corner_debug[j];
+      if (other.point_id < 0 || other.point_id == candidate.point_id ||
+          other.corner_type == CornerType::Outer ||
+          !IsFinitePoint(other.predicted_image) ||
+          !IsInsideImageWithBorder(other.predicted_image, result->image_size,
+                                   1.0)) {
+        continue;
+      }
+      nearest_other_distance = std::min(
+          nearest_other_distance,
+          PointDistancePx(candidate.refined_image, other.predicted_image));
+    }
+
+    if (nearest_other_distance <= kMaxOtherSlotDistanceModules * scale &&
+        own_distance - nearest_other_distance >=
+            kMinOwnershipMarginModules * scale) {
+      suppress[i] = true;
+    }
+  }
+
+  for (std::size_t i = 0; i < suppress.size(); ++i) {
+    if (!suppress[i]) {
+      continue;
+    }
+    InternalCornerDebugInfo& debug = result->internal_corner_debug[i];
+    if (debug.point_id < 0 ||
+        static_cast<std::size_t>(debug.point_id) >= result->corners.size()) {
+      continue;
+    }
+    CornerMeasurement& measurement =
+        result->corners[static_cast<std::size_t>(debug.point_id)];
+    measurement.valid = false;
+    measurement.quality = 0.0;
+    debug.valid = false;
+    debug.image_evidence_valid = false;
+    debug.final_quality = 0.0;
+  }
+  RecomputeCornerCounts(result);
+}
+
 void SuppressDuplicateRefinedInternalCorners(ApriltagInternalDetectionResult* result) {
   if (result == nullptr || result->internal_corner_debug.size() < 2) {
     return;
   }
-  constexpr double kDuplicateRefinedCornerDistancePx = 2.0;
-  constexpr double kDuplicateRefinedCornerDistance2 =
-      kDuplicateRefinedCornerDistancePx * kDuplicateRefinedCornerDistancePx;
-
   std::vector<bool> suppress(result->internal_corner_debug.size(), false);
   constexpr double kDuplicateWinnerMargin = 0.05;
   for (std::size_t i = 0; i < result->internal_corner_debug.size(); ++i) {
@@ -122,7 +190,16 @@ void SuppressDuplicateRefinedInternalCorners(ApriltagInternalDetectionResult* re
       }
       const double dx = static_cast<double>(a.refined_image.x - b.refined_image.x);
       const double dy = static_cast<double>(a.refined_image.y - b.refined_image.y);
-      if (dx * dx + dy * dy <= kDuplicateRefinedCornerDistance2) {
+      const double pair_module_scale =
+          a.local_module_scale > 1.0 && b.local_module_scale > 1.0
+              ? std::min(a.local_module_scale, b.local_module_scale)
+              : std::max(a.local_module_scale, b.local_module_scale);
+      // Duplicate identity is a lattice-space property, not a native-pixel
+      // property.  Use a small fraction of the locally projected module so
+      // the same physical coincidence is detected at every image resolution.
+      const double duplicate_distance =
+          pair_module_scale > 1.0 ? 0.08 * pair_module_scale : 2.0;
+      if (dx * dx + dy * dy <= duplicate_distance * duplicate_distance) {
         const double score_a = DuplicateCandidateScore(a);
         const double score_b = DuplicateCandidateScore(b);
         if (score_a > score_b + kDuplicateWinnerMargin) {

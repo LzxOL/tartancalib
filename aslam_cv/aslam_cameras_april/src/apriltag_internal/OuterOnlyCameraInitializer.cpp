@@ -99,6 +99,8 @@ ParseAutoCameraInitializationSelectionScorer(const std::string& value) {
 
 namespace {
 
+constexpr double kInitializationPoseMaxRmsePx = 25.0;
+
 struct OuterObservationRecord {
   int frame_index = -1;
   std::string frame_label;
@@ -1298,6 +1300,20 @@ AutoCameraInitializationCandidate EvaluateCandidateOnObservations(
 
   double total_weighted_squared_rmse = 0.0;
   double successful_observation_weight = 0.0;
+  std::vector<double> successful_observation_rmses;
+  successful_observation_rmses.reserve(observations.size());
+  double max_observation_rmse = -std::numeric_limits<double>::infinity();
+  int worst_observation_frame_index = -1;
+  int worst_observation_board_id = -1;
+  double robust_loss_sum = 0.0;
+  constexpr double kOuterHealthHuberDeltaPx = 3.0;
+  const auto huber_loss = [](double residual, double delta) {
+    const double absolute_residual = std::abs(residual);
+    if (absolute_residual <= delta) {
+      return 0.5 * residual * residual;
+    }
+    return delta * (absolute_residual - 0.5 * delta);
+  };
   std::set<int> successful_frames;
   std::set<int> successful_boards;
   std::map<int, std::vector<std::pair<int, Eigen::Isometry3d>>>
@@ -1305,11 +1321,10 @@ AutoCameraInitializationCandidate EvaluateCandidateOnObservations(
   for (const OuterObservationRecord& observation : observations) {
     Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
     double observation_rmse = 0.0;
-    if (!EstimatePoseFromObjectPoints(candidate.camera,
-                                      observation.object_points,
-                                      observation.image_points,
-                                      &pose,
-                                      &observation_rmse)) {
+    if (!EstimatePoseFromObjectPointsStrict(
+            candidate.camera, observation.object_points,
+            observation.image_points, kInitializationPoseMaxRmsePx, &pose,
+            &observation_rmse)) {
       ++candidate.pose_failure_count;
       continue;
     }
@@ -1320,7 +1335,16 @@ AutoCameraInitializationCandidate EvaluateCandidateOnObservations(
             : 1.0;
     total_weighted_squared_rmse +=
         observation_weight * observation_rmse * observation_rmse;
+    robust_loss_sum += observation_weight *
+                       huber_loss(observation_rmse,
+                                  kOuterHealthHuberDeltaPx);
     successful_observation_weight += observation_weight;
+    successful_observation_rmses.push_back(observation_rmse);
+    if (observation_rmse > max_observation_rmse) {
+      max_observation_rmse = observation_rmse;
+      worst_observation_frame_index = observation.frame_index;
+      worst_observation_board_id = observation.board_id;
+    }
     successful_frames.insert(observation.frame_index);
     successful_boards.insert(observation.board_id);
     successful_poses_by_frame[observation.frame_index].push_back(
@@ -1338,6 +1362,23 @@ AutoCameraInitializationCandidate EvaluateCandidateOnObservations(
     candidate.mean_observation_rmse =
         std::sqrt(total_weighted_squared_rmse /
                   successful_observation_weight);
+    candidate.robust_observation_rmse = std::sqrt(
+        2.0 * robust_loss_sum / successful_observation_weight);
+    std::sort(successful_observation_rmses.begin(),
+              successful_observation_rmses.end());
+    const std::size_t median_index =
+        successful_observation_rmses.size() / 2u;
+    candidate.median_observation_rmse =
+        successful_observation_rmses[median_index];
+    const std::size_t p95_index = std::min(
+        successful_observation_rmses.size() - 1u,
+        static_cast<std::size_t>(std::ceil(
+            0.95 * static_cast<double>(successful_observation_rmses.size()))) -
+            1u);
+    candidate.p95_observation_rmse = successful_observation_rmses[p95_index];
+    candidate.max_observation_rmse = max_observation_rmse;
+    candidate.worst_observation_frame_index = worst_observation_frame_index;
+    candidate.worst_observation_board_id = worst_observation_board_id;
     candidate.valid = true;
   } else {
     candidate.failure_reason = "no outer pose fits succeeded";
@@ -1356,27 +1397,28 @@ bool CandidateIsBetter(const AutoCameraInitializationCandidate& lhs,
   if (lhs.pose_success_count != rhs.pose_success_count) {
     return lhs.pose_success_count > rhs.pose_success_count;
   }
+  if (lhs.projection_failure_count != rhs.projection_failure_count) {
+    return lhs.projection_failure_count < rhs.projection_failure_count;
+  }
   if (std::abs(lhs.success_rate - rhs.success_rate) > 1e-12) {
     return lhs.success_rate > rhs.success_rate;
   }
-  const bool lhs_basic_reprojection_health =
-      std::isfinite(lhs.mean_observation_rmse) &&
-      lhs.mean_observation_rmse < 80.0;
-  const bool rhs_basic_reprojection_health =
-      std::isfinite(rhs.mean_observation_rmse) &&
-      rhs.mean_observation_rmse < 80.0;
-  if (lhs_basic_reprojection_health != rhs_basic_reprojection_health) {
-    return lhs_basic_reprojection_health;
+  const bool lhs_p95_finite = std::isfinite(lhs.p95_observation_rmse);
+  const bool rhs_p95_finite = std::isfinite(rhs.p95_observation_rmse);
+  if (lhs_p95_finite != rhs_p95_finite) {
+    return lhs_p95_finite;
   }
-  if (!lhs_basic_reprojection_health &&
-      std::abs(lhs.mean_observation_rmse - rhs.mean_observation_rmse) > 1e-12) {
-    return lhs.mean_observation_rmse < rhs.mean_observation_rmse;
+  if (lhs_p95_finite &&
+      std::abs(lhs.p95_observation_rmse - rhs.p95_observation_rmse) > 1e-12) {
+    return lhs.p95_observation_rmse < rhs.p95_observation_rmse;
   }
-  // Layout and leave-one-board-out metrics are diagnostics only here. They can
-  // be explained by pose/layout compensation, so do not let them rank the
-  // camera seed that enters the independent outer-corner LM.
-  if (std::abs(lhs.mean_observation_rmse - rhs.mean_observation_rmse) > 1e-12) {
-    return lhs.mean_observation_rmse < rhs.mean_observation_rmse;
+  if (std::abs(lhs.robust_observation_rmse - rhs.robust_observation_rmse) >
+      1e-12) {
+    return lhs.robust_observation_rmse < rhs.robust_observation_rmse;
+  }
+  if (std::abs(lhs.median_observation_rmse - rhs.median_observation_rmse) >
+      1e-12) {
+    return lhs.median_observation_rmse < rhs.median_observation_rmse;
   }
   if (lhs.successful_frame_count != rhs.successful_frame_count) {
     return lhs.successful_frame_count > rhs.successful_frame_count;
@@ -1384,16 +1426,61 @@ bool CandidateIsBetter(const AutoCameraInitializationCandidate& lhs,
   return lhs.successful_board_count > rhs.successful_board_count;
 }
 
+// Use the same independent Outer4 observation set to compare every refined
+// basin.  Projection validity is a hard feasibility condition.  Among
+// feasible basins, residual quality comes first: a handful of difficult
+// frame-board poses must not select a globally worse camera basin merely
+// because that basin reports more local pose initializations.
+bool RefinedOuterEvaluationIsBetter(
+    const AutoCameraInitializationCandidate& candidate,
+    double candidate_lm_objective,
+    const AutoCameraInitializationCandidate& incumbent,
+    double incumbent_lm_objective) {
+  if (candidate.projection_failure_count !=
+      incumbent.projection_failure_count) {
+    return candidate.projection_failure_count <
+           incumbent.projection_failure_count;
+  }
+  const bool candidate_p95_finite =
+      std::isfinite(candidate.p95_observation_rmse);
+  const bool incumbent_p95_finite =
+      std::isfinite(incumbent.p95_observation_rmse);
+  if (candidate_p95_finite != incumbent_p95_finite) {
+    return candidate_p95_finite;
+  }
+  if (candidate_p95_finite &&
+      std::abs(candidate.p95_observation_rmse -
+               incumbent.p95_observation_rmse) > 1e-12) {
+    return candidate.p95_observation_rmse < incumbent.p95_observation_rmse;
+  }
+  if (std::abs(candidate.robust_observation_rmse -
+               incumbent.robust_observation_rmse) > 1e-12) {
+    return candidate.robust_observation_rmse <
+           incumbent.robust_observation_rmse;
+  }
+  if (std::abs(candidate.median_observation_rmse -
+               incumbent.median_observation_rmse) > 1e-12) {
+    return candidate.median_observation_rmse <
+           incumbent.median_observation_rmse;
+  }
+  if (candidate.pose_success_count != incumbent.pose_success_count) {
+    return candidate.pose_success_count > incumbent.pose_success_count;
+  }
+  if (std::abs(candidate_lm_objective - incumbent_lm_objective) > 1e-12) {
+    return candidate_lm_objective < incumbent_lm_objective;
+  }
+  return candidate.source_label < incumbent.source_label;
+}
+
 double CandidateObjective(const AutoCameraInitializationCandidate& candidate) {
   if (!candidate.valid || candidate.observation_count <= 0) {
     return std::numeric_limits<double>::infinity();
   }
-  const double fail_fraction =
-      static_cast<double>(candidate.pose_failure_count) /
-      static_cast<double>(candidate.observation_count);
+  const double robust_rmse = candidate.robust_observation_rmse;
   const double rmse = candidate.mean_observation_rmse;
-  return rmse * rmse +
-         2500.0 * fail_fraction;
+  const double effective_rmse =
+      std::isfinite(robust_rmse) ? robust_rmse : rmse;
+  return effective_rmse * effective_rmse;
 }
 
 bool IsAcceptableAutoCandidate(const AutoCameraInitializationCandidate& candidate,
@@ -1403,7 +1490,8 @@ bool IsAcceptableAutoCandidate(const AutoCameraInitializationCandidate& candidat
   return candidate.valid &&
          candidate.pose_success_count >= min_success &&
          candidate.success_rate >= min_success_rate &&
-         candidate.mean_observation_rmse < 20.0;
+         std::isfinite(candidate.robust_observation_rmse) &&
+         candidate.robust_observation_rmse < 20.0;
 }
 
 bool IsRefinableKalibrLikeSeed(const AutoCameraInitializationCandidate& candidate,
@@ -1417,8 +1505,8 @@ bool IsRefinableKalibrLikeSeed(const AutoCameraInitializationCandidate& candidat
          candidate.valid &&
          candidate.pose_success_count >= min_success &&
          candidate.success_rate >= min_success_rate &&
-         std::isfinite(candidate.mean_observation_rmse) &&
-         candidate.mean_observation_rmse < 150.0;
+         std::isfinite(candidate.robust_observation_rmse) &&
+         candidate.robust_observation_rmse < 150.0;
 }
 
 bool IsPhysicallyPlausibleOmniNoneSeed(
@@ -1603,11 +1691,9 @@ PoseFitOutlierGateResult FilterPoseFitOutliersForInitialization(
   for (const OuterObservationRecord& observation : observations) {
     Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
     double rmse = std::numeric_limits<double>::infinity();
-    if (!EstimatePoseFromObjectPoints(camera,
-                                      observation.object_points,
-                                      observation.image_points,
-                                      &pose,
-                                      &rmse) ||
+    if (!EstimatePoseFromObjectPointsStrict(
+            camera, observation.object_points, observation.image_points,
+            kInitializationPoseMaxRmsePx, &pose, &rmse) ||
         !std::isfinite(rmse)) {
       ++result.pose_failure_count;
       continue;
@@ -2359,12 +2445,10 @@ std::vector<OuterObservationRecord> SelectKalibrOuterLmObservations(
 
 	    candidate.quality_score =
 	        std::log1p(std::max(0.0, area)) + 0.1 * observation.quality;
-    candidate.pose_success =
-        EstimatePoseFromObjectPoints(camera,
-                                     observation.object_points,
-                                     observation.image_points,
-                                     &candidate.T_camera_board,
-                                     &candidate.pose_fit_outer_rmse);
+    candidate.pose_success = EstimatePoseFromObjectPointsStrict(
+        camera, observation.object_points, observation.image_points,
+        kInitializationPoseMaxRmsePx, &candidate.T_camera_board,
+        &candidate.pose_fit_outer_rmse);
     if (candidate.pose_success) {
       const CameraInformationResult information =
           ComputeCameraInformationForObservation(
@@ -2596,9 +2680,9 @@ SelectionInformationDiagnostics EvaluateSelectionInformationAtCamera(
   for (const OuterObservationRecord& observation : observations) {
     Eigen::Isometry3d T_camera_board = Eigen::Isometry3d::Identity();
     double pose_rmse = std::numeric_limits<double>::infinity();
-    if (!EstimatePoseFromObjectPoints(camera, observation.object_points,
-                                      observation.image_points,
-                                      &T_camera_board, &pose_rmse)) {
+    if (!EstimatePoseFromObjectPointsStrict(
+            camera, observation.object_points, observation.image_points,
+            kInitializationPoseMaxRmsePx, &T_camera_board, &pose_rmse)) {
       continue;
     }
     const CameraInformationResult information =
@@ -2752,7 +2836,9 @@ bool EstimateFramePoseFromLayout(
   if (object_points.size() < 4) {
     return false;
   }
-  return EstimatePoseFromObjectPoints(camera, object_points, image_points, pose, rmse);
+  return EstimatePoseFromObjectPointsStrict(
+      camera, object_points, image_points, kInitializationPoseMaxRmsePx, pose,
+      rmse);
 }
 
 void EvaluateLeaveOneBoardOutPrediction(
@@ -2892,16 +2978,13 @@ double LayoutSeedObjective(const AutoCameraInitializationCandidate& candidate) {
   if (!candidate.valid || candidate.observation_count <= 0) {
     return std::numeric_limits<double>::infinity();
   }
-  const double fail_fraction =
-      static_cast<double>(candidate.pose_failure_count) /
-      static_cast<double>(std::max(1, candidate.observation_count));
   const bool has_loo =
       candidate.leave_one_board_out_success_count > 0 &&
       std::isfinite(candidate.leave_one_board_out_rmse);
   const double rmse =
       has_loo ? candidate.leave_one_board_out_rmse
               : candidate.mean_observation_rmse;
-  return rmse * rmse + 2500.0 * fail_fraction;
+  return rmse * rmse;
 }
 
 double LayoutSeedStepForLabel(const std::string& label,
@@ -4109,11 +4192,10 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrOuterLm(
   for (const OuterObservationRecord& observation : observations) {
     Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
     double rmse = 0.0;
-    if (!EstimatePoseFromObjectPoints(initial_camera,
-                                      observation.object_points,
-                                      observation.image_points,
-                                      &pose,
-                                      &rmse)) {
+    if (!EstimatePoseFromObjectPointsStrict(
+            initial_camera, observation.object_points,
+            observation.image_points, kInitializationPoseMaxRmsePx, &pose,
+            &rmse)) {
       continue;
     }
     KalibrOuterLmView view;
@@ -4257,11 +4339,10 @@ void PopulatePrincipalProfile(
   for (const OuterObservationRecord& observation : observations) {
     Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
     double pose_rmse = std::numeric_limits<double>::infinity();
-    if (EstimatePoseFromObjectPoints(selected_camera,
-                                     observation.object_points,
-                                     observation.image_points,
-                                     &pose,
-                                     &pose_rmse)) {
+    if (EstimatePoseFromObjectPointsStrict(
+            selected_camera, observation.object_points,
+            observation.image_points, kInitializationPoseMaxRmsePx, &pose,
+            &pose_rmse)) {
       profile_observations.push_back(observation);
     }
   }
@@ -4579,11 +4660,10 @@ void PopulatePoseExcitationDiagnostic(
     }
     Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
     double pose_rmse = std::numeric_limits<double>::infinity();
-    if (!EstimatePoseFromObjectPoints(selected_camera,
-                                      observation.object_points,
-                                      observation.image_points,
-                                      &pose,
-                                      &pose_rmse)) {
+    if (!EstimatePoseFromObjectPointsStrict(
+            selected_camera, observation.object_points,
+            observation.image_points, kInitializationPoseMaxRmsePx, &pose,
+            &pose_rmse)) {
       continue;
     }
     const Eigen::Vector3d normal = pose.linear().col(2).normalized();
@@ -5212,12 +5292,9 @@ std::vector<AutoCameraInitializationResidual> EvaluateSelectedResiduals(
 
     Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
     double pose_fit_outer_rmse = 0.0;
-    residual.pose_success =
-        EstimatePoseFromObjectPoints(camera,
-                                     observation.object_points,
-                                     observation.image_points,
-                                     &pose,
-                                     &pose_fit_outer_rmse);
+    residual.pose_success = EstimatePoseFromObjectPointsStrict(
+        camera, observation.object_points, observation.image_points,
+        kInitializationPoseMaxRmsePx, &pose, &pose_fit_outer_rmse);
     if (residual.pose_success) {
       residual.pose_fit_outer_rmse = pose_fit_outer_rmse;
     } else {
@@ -6236,6 +6313,8 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
 	        double best_objective = CandidateObjective(best_candidate);
 	        double best_lm_selection_objective =
 	            std::numeric_limits<double>::infinity();
+	        double best_lm_objective =
+	            std::numeric_limits<double>::infinity();
 	        KalibrOuterLmRefinementResult best_lm_refined;
 	        AutoCameraInitializationCandidate best_lm_seed = best_candidate;
 	        std::string best_lm_source_label;
@@ -6293,9 +6372,10 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
             for (const OuterObservationRecord& observation : all_observations) {
               Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
               double pose_rmse = std::numeric_limits<double>::infinity();
-              if (EstimatePoseFromObjectPoints(
+              if (EstimatePoseFromObjectPointsStrict(
                       seed_candidate.camera, observation.object_points,
-                      observation.image_points, &pose, &pose_rmse)) {
+                      observation.image_points, kInitializationPoseMaxRmsePx,
+                      &pose, &pose_rmse)) {
                 ++selected_pose_success_count;
               } else {
                 ++selected_pose_failure_count;
@@ -6577,22 +6657,24 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
 	          const bool omni_none_seed =
 	              selection_refined.camera.NormalizedFamilyString() ==
 	              "omni-none";
-	          const double full_outer_health_selection_weight =
-	              (omni_none_seed ||
-	               options_.use_direct_dense_control_points)
-	                  ? 0.0
-	                  : 1e-3;
-	          const double full_outer_health_objective =
-	              std::isfinite(refined_objective)
-	                  ? refined_objective
-	                  : std::numeric_limits<double>::infinity();
-	          const double combined_lm_selection_objective =
-	              std::isfinite(lm_selection_objective) &&
-	                      std::isfinite(full_outer_health_objective)
-	                  ? lm_selection_objective +
-	                        full_outer_health_selection_weight *
-	                            full_outer_health_objective
-	                  : std::numeric_limits<double>::infinity();
+	          // The independent LM is a basin refiner, not the final camera
+	          // ranking objective.  Rank every basin on the same full Outer4
+	          // observation set, using Huber loss so a small number of bad
+	          // pose hypotheses cannot make a physically good basin lose to a
+	          // worse one.  Keep the LM term only as a deterministic tie-break.
+	          const double full_outer_health_selection_weight = 1.0;
+          const double full_outer_health_objective =
+              std::isfinite(refined_eval.robust_observation_rmse)
+                  ? refined_eval.robust_observation_rmse *
+                        refined_eval.robust_observation_rmse
+                  : std::numeric_limits<double>::infinity();
+          const double combined_lm_selection_objective =
+              std::isfinite(lm_selection_objective) &&
+                      std::isfinite(full_outer_health_objective)
+                  ? full_outer_health_selection_weight *
+                        full_outer_health_objective +
+                        1e-3 * lm_selection_objective
+                  : std::numeric_limits<double>::infinity();
 	          std::ostringstream trial_warning;
 	          trial_warning
 	              << "Kalibr-style multi-start LM trial rank="
@@ -6665,6 +6747,9 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
 	              refinement_health_acceptable &&
 	              std::isfinite(selection_refined.final_robust_rmse) &&
 	              selection_refined.residual_count > 0 &&
+	              refined_eval.projection_failure_count == 0 &&
+	              std::isfinite(refined_eval.p95_observation_rmse) &&
+	              refined_eval.p95_observation_rmse < 50.0 &&
 	              (options_.use_direct_dense_control_points
 	                   ? selection_refined.camera.IsValid()
 	                   : refined_eval.valid &&
@@ -6681,12 +6766,13 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
               std::isfinite(seed_candidate.camera.fv) &&
               std::isfinite(selection_refined.camera.fu) &&
               std::isfinite(selection_refined.camera.fv);
-		          const bool objective_improved_before_near_tie_policy =
-		              std::isfinite(combined_lm_selection_objective) &&
-		              combined_lm_selection_objective + 1e-9 <
-		                  best_lm_selection_objective;
-		          bool frame_objective_improved =
-		              objective_improved_before_near_tie_policy;
+	          const bool objective_improved_before_near_tie_policy =
+	              selected_refined_basin_index < 0 ||
+	              RefinedOuterEvaluationIsBetter(
+	                  refined_eval, lm_selection_objective, best_candidate,
+	                  best_lm_objective);
+          bool frame_objective_improved =
+              objective_improved_before_near_tie_policy;
 		          bool compared_as_near_tie = false;
 		          bool preferred_by_lower_focal_near_tie_policy = false;
 		          if (options_.prefer_lower_focal_in_near_tie &&
@@ -6751,6 +6837,22 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
           basin_record.iteration_count = selection_refined.iteration_count;
           basin_record.seed_objective = seed_objective;
           basin_record.full_outer_objective = refined_objective;
+          basin_record.full_outer_robust_rmse =
+              refined_eval.robust_observation_rmse;
+          basin_record.full_outer_median_rmse =
+              refined_eval.median_observation_rmse;
+          basin_record.full_outer_p95_rmse = refined_eval.p95_observation_rmse;
+          basin_record.full_outer_pose_success_count =
+              refined_eval.pose_success_count;
+          basin_record.full_outer_pose_failure_count =
+              refined_eval.pose_failure_count;
+          basin_record.full_outer_max_rmse = refined_eval.max_observation_rmse;
+          basin_record.full_outer_worst_frame_index =
+              refined_eval.worst_observation_frame_index;
+          basin_record.full_outer_worst_board_id =
+              refined_eval.worst_observation_board_id;
+          basin_record.full_outer_projection_failure_count =
+              refined_eval.projection_failure_count;
           basin_record.lm_initial_rmse = selection_refined.initial_rmse;
           basin_record.lm_final_rmse = selection_refined.final_rmse;
           basin_record.lm_final_robust_rmse =
@@ -6804,8 +6906,9 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
 		          }
 		          selected_refined_basin_index = basin_record.trial_index;
 		          result.refined_basin_candidates.back().selected = true;
-		          best_objective = refined_objective;
+	          best_objective = refined_objective;
 	          best_lm_selection_objective = combined_lm_selection_objective;
+	          best_lm_objective = lm_selection_objective;
 	          best_lm_refined = selection_refined;
           best_lm_seed = seed_candidate;
           best_lm_source_label = lm_source_label;
@@ -7054,12 +7157,10 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
                full_health_observations) {
             Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
             double pose_rmse = std::numeric_limits<double>::quiet_NaN();
-            const bool pose_success =
-                EstimatePoseFromObjectPoints(best_lm_seed.camera,
-                                             observation.object_points,
-                                             observation.image_points,
-                                             &pose,
-                                             &pose_rmse);
+            const bool pose_success = EstimatePoseFromObjectPointsStrict(
+                best_lm_seed.camera, observation.object_points,
+                observation.image_points, kInitializationPoseMaxRmsePx, &pose,
+                &pose_rmse);
             AppendBootstrapObservationRecord(
                 observation,
                 used_observation_keys.count(
@@ -7814,7 +7915,10 @@ void WriteAutoCameraInitializationCandidatesCsv(
          << "xi,alpha,beta,fu,fv,cu,cv,"
          << "observation_count,pose_success_count,pose_failure_count,"
          << "successful_frame_count,successful_board_count,success_rate,"
-         << "mean_observation_rmse,leave_one_board_out_attempt_count,"
+         << "mean_observation_rmse,robust_observation_rmse,"
+         << "median_observation_rmse,p95_observation_rmse,max_observation_rmse,"
+         << "worst_observation_frame_index,worst_observation_board_id,"
+         << "projection_failure_count,leave_one_board_out_attempt_count,"
          << "leave_one_board_out_success_count,leave_one_board_out_rmse,"
          << "relative_layout_pair_family_count,relative_layout_pair_sample_count,"
          << "relative_layout_translation_rmse,relative_layout_rotation_rmse_deg,"
@@ -7877,6 +7981,13 @@ void WriteAutoCameraInitializationCandidatesCsv(
            << candidate.successful_board_count << ","
            << candidate.success_rate << ","
            << candidate.mean_observation_rmse << ","
+           << candidate.robust_observation_rmse << ","
+           << candidate.median_observation_rmse << ","
+           << candidate.p95_observation_rmse << ","
+           << candidate.max_observation_rmse << ","
+           << candidate.worst_observation_frame_index << ","
+           << candidate.worst_observation_board_id << ","
+           << candidate.projection_failure_count << ","
            << candidate.leave_one_board_out_attempt_count << ","
            << candidate.leave_one_board_out_success_count << ","
            << candidate.leave_one_board_out_rmse << ","
@@ -7905,6 +8016,10 @@ void WriteAutoCameraInitializationRefinedBasinsCsv(
       << "shared_layout_frame_count,shared_layout_board_count,"
       << "shared_layout_observation_count,shared_layout_initial_rmse,"
       << "shared_layout_final_rmse,shared_layout_final_robust_rmse,"
+      << "full_outer_robust_rmse,full_outer_median_rmse,full_outer_p95_rmse,"
+      << "full_outer_pose_success_count,full_outer_pose_failure_count,"
+      << "full_outer_max_rmse,full_outer_worst_frame_index,"
+      << "full_outer_worst_board_id,full_outer_projection_failure_count,"
       << "combined_selection_objective,"
       << "full_outer_health_acceptable,camera_step_finite,"
       << "objective_improved_before_near_tie_policy,compared_as_near_tie,"
@@ -7938,6 +8053,15 @@ void WriteAutoCameraInitializationRefinedBasinsCsv(
            << basin.shared_layout_initial_rmse << ","
            << basin.shared_layout_final_rmse << ","
            << basin.shared_layout_final_robust_rmse << ","
+           << basin.full_outer_robust_rmse << ","
+           << basin.full_outer_median_rmse << ","
+           << basin.full_outer_p95_rmse << ","
+           << basin.full_outer_pose_success_count << ","
+           << basin.full_outer_pose_failure_count << ","
+           << basin.full_outer_max_rmse << ","
+           << basin.full_outer_worst_frame_index << ","
+           << basin.full_outer_worst_board_id << ","
+           << basin.full_outer_projection_failure_count << ","
            << basin.combined_selection_objective << ","
            << (basin.full_outer_health_acceptable ? 1 : 0) << ","
            << (basin.camera_step_finite ? 1 : 0) << ","

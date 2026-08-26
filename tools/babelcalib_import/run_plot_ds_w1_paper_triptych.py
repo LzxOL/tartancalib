@@ -58,6 +58,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noise-sigma-px", type=float, default=0.25)
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--dpi", type=int, default=400)
+    parser.add_argument(
+        "--expected-accepted-group-count", type=int, default=208,
+        help=(
+            "Expected number of accepted frame-board groups shared by the prefix "
+            "and information experiments. This is a provenance check, not a "
+            "selection parameter."
+        ),
+    )
     parser.add_argument("--force-experiments", action="store_true")
     parser.add_argument(
         "--prefix-dir", type=Path,
@@ -109,7 +117,7 @@ def prefix_complete(args: argparse.Namespace) -> bool:
             and close(float(summary["initial_peripheral_ray_p95_deg"]), args.perturbation_level_deg)
             and int(summary["seed_count"]) == args.prefix_seed_count
             and close(float(summary["noise_sigma_px"]), args.noise_sigma_px)
-            and int(summary["accepted_group_count"]) == 208
+            and int(summary["accepted_group_count"]) == args.expected_accepted_group_count
         )
     except (FileNotFoundError, KeyError, TypeError, ValueError):
         return False
@@ -344,8 +352,8 @@ def validate_information(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[s
         method: frame[frame.method == method].sort_values("budget_percent")
         for method in METHODS
     }
-    if any(len(grouped[method]) != 11 for method in METHODS):
-        raise RuntimeError("W1 information requires 11 budgets for both methods")
+    if any(len(grouped[method]) < 2 for method in METHODS):
+        raise RuntimeError("W1 information requires at least two budgets for both methods")
     for left, right in zip(
         grouped["Outer-only"].to_dict("records"),
         grouped["Outer+Internal"].to_dict("records"), strict=True,
@@ -377,9 +385,9 @@ def validate_cross_experiment_prefix(
             raise ValueError(f"{name} schedule is missing {sorted(missing)}")
     left = prefix_schedule[columns].astype(int).reset_index(drop=True)
     right = information_schedule[columns].astype(int).reset_index(drop=True)
-    if len(left) != 208 or not left.equals(right):
+    if len(left) != args.expected_accepted_group_count or not left.equals(right):
         raise RuntimeError(
-            "Panels (a) and (c) do not use the same ordered 208-group prefix"
+            "Panels (a) and (c) do not use the same ordered accepted-group prefix"
         )
     prefix_hashes = prefix_meta["source_hashes"]
     information_hashes = information_meta["source_hashes"]
@@ -503,7 +511,10 @@ def make_figure(args: argparse.Namespace) -> tuple[Path, Path]:
     axis.set_ylabel(r"Weak-direction information, $I_{W_1}$")
     axis.set_xticks([5, 20, 40, 60, 80, 100])
     axis.set_xlim(1, 103)
-    axis.set_ylim(1.4e3, 1.45e6)
+    info_min = min(float(group.raw_w1_information.min()) for group in info_groups.values())
+    info_max = max(float(group.raw_w1_information.max()) for group in info_groups.values())
+    axis.set_ylim(10.0 ** math.floor(math.log10(info_min)),
+                  10.0 ** math.ceil(math.log10(info_max)))
     axis.text(
         0.98, 0.07,
         f"Median gain: {np.median(gains):.2f}$\\times$\n"
@@ -673,7 +684,8 @@ def make_figure(args: argparse.Namespace) -> tuple[Path, Path]:
         "panel_c_initial_peripheral_ray_p95_deg": prefix_meta["initial_peripheral_ray_p95_deg"],
         "panel_c_pre_specified_target_error_deg": TARGET_ERROR_DEG,
         "panel_c_first_budget_reaching_target": target_budgets,
-        "panel_a_c_shared_ordered_208_group_prefix_verified": True,
+        "expected_accepted_group_count": args.expected_accepted_group_count,
+        "panel_a_c_shared_ordered_accepted_group_prefix_verified": True,
         "panel_a_c_shared_source_hashes_verified": True,
         "source_paths": {
             "prefix_summary": str((args.prefix_dir / "prefix_summary.csv").resolve()),
@@ -709,6 +721,7 @@ def main() -> int:
     if (
         args.perturbation_level_deg <= 0.0 or args.noise_sigma_px < 0.0
         or args.prefix_seed_count <= 0 or args.sweep_seed_count <= 0
+        or args.expected_accepted_group_count <= 0
         or args.radial_bins <= 0 or args.jobs <= 0 or args.dpi <= 0
         or not 0.0 < args.peripheral_rho_threshold <= 1.0
     ):

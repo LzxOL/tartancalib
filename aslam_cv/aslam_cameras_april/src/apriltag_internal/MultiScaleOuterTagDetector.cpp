@@ -1354,10 +1354,7 @@ bool PassesRefinedCornerResponseCheck(
 
   const int response_radius = response_radius_override > 0
                                   ? response_radius_override
-                                  : std::max(12, std::min(
-                                                     32,
-                                                     std::max(1, subpix_radius) /
-                                                         3));
+                                  : std::max(8, std::max(1, subpix_radius) / 3);
   const int margin = response_radius + 10;
   if (require_full_neighborhood &&
       (x - margin < 0 || y - margin < 0 || x + margin >= gray.cols ||
@@ -1447,9 +1444,9 @@ bool PassesScaleAdaptiveCoarseCornerResponseCheck(
   // Express both radii as fractions of the locally projected tag edge. This
   // preserves the same physical support region when image resolution changes.
   const int adaptive_core_radius = std::max(
-      2, std::min(16, static_cast<int>(std::lround(0.0075 * local_scale))));
+      2, static_cast<int>(std::lround(0.0075 * local_scale)));
   const int adaptive_search_radius = std::max(
-      12, std::min(64, static_cast<int>(std::lround(0.05 * local_scale))));
+      8, static_cast<int>(std::lround(0.05 * local_scale)));
   if (core_radius != nullptr) {
     *core_radius = adaptive_core_radius;
   }
@@ -2177,6 +2174,16 @@ SphericalCornerRefinement RefineCornerBySphericalPlanes(
       ClampUnit(static_cast<double>(std::min(refinement.prev_edge_fit.support_count,
                                              refinement.next_edge_fit.support_count)) /
                 8.0);
+  const double normalized_displacement =
+      local_scale > 1e-9 ? Norm(projected_corner - corner) / local_scale
+                         : std::numeric_limits<double>::infinity();
+  const double maximum_normalized_displacement =
+      std::max(0.12, 4.0 * config.outer_refine_gate_scale);
+  if (!std::isfinite(normalized_displacement) ||
+      normalized_displacement > maximum_normalized_displacement) {
+    refinement.failure_reason = "spherical_refinement_trust_region";
+    return refinement;
+  }
   refinement.quality = std::min(residual_quality, support_quality);
   refinement.success = true;
   refinement.failure_reason = "pass";
@@ -2296,6 +2303,44 @@ bool RefineOuterQuadByJointSphericalPlanes(
         std::max(joint_result.max_displacement_px, debug.displacement_px);
     joint_result.min_quality = std::min(joint_result.min_quality, debug.quality);
     ++joint_result.successful_corner_count;
+  }
+
+  // A valid wide-angle refinement can move all four corners coherently.  The
+  // failure mode that must be rejected is an isolated corner being pulled to
+  // another strong junction.  Keep this guard entirely board-scale normalized
+  // so changing image resolution cannot change the decision.
+  std::array<double, 4> displacements{};
+  int worst_corner_index = 0;
+  for (int index = 0; index < 4; ++index) {
+    displacements[static_cast<std::size_t>(index)] = Norm(
+        joint_result.refined_corners[static_cast<std::size_t>(index)] -
+        corner_seeds[static_cast<std::size_t>(index)]);
+    if (displacements[static_cast<std::size_t>(index)] >
+        displacements[static_cast<std::size_t>(worst_corner_index)]) {
+      worst_corner_index = index;
+    }
+  }
+  std::array<double, 4> ordered_displacements = displacements;
+  std::sort(ordered_displacements.begin(), ordered_displacements.end());
+  const cv::Point2f& worst_seed =
+      corner_seeds[static_cast<std::size_t>(worst_corner_index)];
+  const double worst_local_scale = std::min(
+      Norm(corner_seeds[static_cast<std::size_t>((worst_corner_index + 3) % 4)] -
+           worst_seed),
+      Norm(corner_seeds[static_cast<std::size_t>((worst_corner_index + 1) % 4)] -
+           worst_seed));
+  const double worst_displacement = ordered_displacements[3];
+  const double second_worst_displacement = ordered_displacements[2];
+  const double minimum_isolated_ratio =
+      std::max(0.05, 2.0 * config.outer_refine_gate_scale);
+  const double stable_corner_scale = std::max(
+      second_worst_displacement, 0.0025 * worst_local_scale);
+  if (worst_local_scale <= 1e-9 ||
+      (worst_displacement / worst_local_scale > minimum_isolated_ratio &&
+       worst_displacement > 2.0 * stable_corner_scale)) {
+    joint_result.corner_debug[static_cast<std::size_t>(worst_corner_index)]
+        .failure_reason = "joint_spherical_refinement_isolated_jump";
+    return false;
   }
   joint_result.success = true;
   joint_result.joint_fit_success = true;

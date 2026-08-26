@@ -1,6 +1,7 @@
 #ifndef ASLAM_CAMERAS_APRILTAG_INTERNAL_STAGE5_INCREMENTAL_BACKEND_ESTIMATOR_HPP
 #define ASLAM_CAMERAS_APRILTAG_INTERNAL_STAGE5_INCREMENTAL_BACKEND_ESTIMATOR_HPP
 
+#include <map>
 #include <set>
 #include <string>
 #include <utility>
@@ -53,6 +54,12 @@ struct Stage5IncrementalBackendEstimatorOptions {
   bool use_candidate_intrinsics_anchor_prior = false;
   bool normalize_information_gain_by_board_observation = false;
   bool use_split_residual_health_gate = true;
+  // A newly admitted frame has a different observation distribution from the
+  // committed seed.  Comparing its standalone RMSE to the seed RMSE rejects
+  // valid hard views solely because they are harder.  Model-aware selection
+  // therefore uses the absolute candidate health checks plus committed-scene
+  // regression checks instead.
+  bool use_candidate_relative_residual_gate = true;
   bool use_bearing_pixel_safety_gate = true;
   bool use_full_training_pose_refit_health_gate = true;
   bool use_kb_distortion_guard = true;
@@ -270,6 +277,7 @@ struct Stage5IncrementalBackendEstimatorResult {
   int seed_frame_count = 0;
   int seed_board_observation_count = 0;
   int seed_point_count = 0;
+  bool seed_outer_only_residuals = false;
   bool independent_frame_board_camera_warmup_requested = false;
   bool independent_frame_board_camera_warmup_attempted = false;
   bool independent_frame_board_camera_warmup_success = false;
@@ -302,6 +310,11 @@ struct Stage5IncrementalBackendEstimatorResult {
   int attempted_batch_count = 0;
   int accepted_batch_count = 0;
   int rejected_batch_count = 0;
+  std::map<std::string, int> rejection_reason_counts;
+  // Stable categories for aggregate reports.  rejection_reason_counts keeps
+  // the detailed text for per-batch debugging; this map is intentionally not
+  // keyed by dynamic numeric diagnostics.
+  std::map<std::string, int> rejection_reason_code_counts;
   std::string solver_profile_name;
   std::string solver_objective_unit;
   int solver_max_iterations = 0;
@@ -350,12 +363,16 @@ struct Stage5IncrementalBackendEstimatorResult {
   int initial_full_training_pose_success_count = 0;
   int initial_full_training_pose_total_count = 0;
   int initial_full_training_invalid_projection_count = 0;
+  int initial_full_training_invalid_outer_projection_count = 0;
+  int initial_full_training_invalid_internal_projection_count = 0;
   double final_full_training_pixel_rmse = 0.0;
   double final_full_training_pixel_p95 = 0.0;
   double final_full_training_pose_success_rate = 0.0;
   int final_full_training_pose_success_count = 0;
   int final_full_training_pose_total_count = 0;
   int final_full_training_invalid_projection_count = 0;
+  int final_full_training_invalid_outer_projection_count = 0;
+  int final_full_training_invalid_internal_projection_count = 0;
   bool curated_bundle_state_consistency_pass = true;
   bool curated_bundle_shared_scene_health_pass = true;
   bool curated_bundle_used_validated_baseline_fallback = false;

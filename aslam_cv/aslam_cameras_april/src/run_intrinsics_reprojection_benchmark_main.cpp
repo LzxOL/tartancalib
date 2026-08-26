@@ -967,6 +967,36 @@ void WritePointsCsv(const std::string& path,
   }
 }
 
+void WriteFrozenObservationsCsv(
+    const std::string& path,
+    const std::vector<std::string>& image_paths,
+    const ati::CalibrationEvaluationDataset& dataset) {
+  std::ofstream out(path.c_str());
+  out << "frame_index,frame_label,image_path,board_id,point_id,point_type,"
+      << "observed_x,observed_y,target_x,target_y,target_z,quality\n";
+  out << std::setprecision(12);
+  for (const ati::CalibrationEvaluationFrameInput& frame : dataset.frames) {
+    std::string image_path;
+    if (frame.frame_index >= 0 &&
+        frame.frame_index < static_cast<int>(image_paths.size())) {
+      image_path = image_paths[static_cast<std::size_t>(frame.frame_index)];
+    }
+    for (const ati::CalibrationEvaluationBoardObservation& board :
+         frame.board_observations) {
+      for (const ati::CalibrationEvaluationPointObservation& point :
+           board.points) {
+        out << point.frame_index << "," << point.frame_label << ","
+            << image_path << "," << point.board_id << "," << point.point_id
+            << "," << PointTypeString(point.point_type) << ","
+            << point.image_xy.x() << "," << point.image_xy.y() << ","
+            << point.target_xyz_board.x() << ","
+            << point.target_xyz_board.y() << ","
+            << point.target_xyz_board.z() << "," << point.quality << "\n";
+      }
+    }
+  }
+}
+
 void WriteBoardCsv(const std::string& path,
                    const ati::CameraModelRefitEvaluationResult& evaluation) {
   std::ofstream out(path.c_str());
@@ -1503,6 +1533,9 @@ int main(int argc, char** argv) {
 
     const ati::Stage5Benchmark benchmark;
     const fs::path output_dir(args.output_path);
+    WriteFrozenObservationsCsv(
+        (output_dir / "frozen_observations.csv").string(), image_paths,
+        dataset);
     std::vector<ModelEvaluationRecord> model_records;
     for (std::size_t model_index = 0;
          model_index < evaluation_intrinsics_specs.size(); ++model_index) {

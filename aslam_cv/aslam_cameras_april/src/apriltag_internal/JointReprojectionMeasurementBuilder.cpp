@@ -483,7 +483,6 @@ std::array<CanonicalCorner, 4> OuterCanonicalCorners(const ApriltagCanonicalMode
 
 struct BoardTopologyConsistencyOutcome {
   bool evaluated = false;
-  int rejected_outer_point_count = 0;
   int rejected_internal_point_count = 0;
   std::string diagnostic;
 };
@@ -666,10 +665,9 @@ bool FitReliableInternalTopologySurface(
   return true;
 }
 
-BoardTopologyConsistencyOutcome EnforceBidirectionalBoardTopologyConsistency(
+BoardTopologyConsistencyOutcome EnforceInternalBoardTopologyConsistency(
     const ApriltagCanonicalModel& model,
     const JointMeasurementBuildOptions& options,
-    bool direct_exact_id_outer,
     JointBoardObservation* board_observation) {
   BoardTopologyConsistencyOutcome outcome;
   if (board_observation == nullptr ||
@@ -740,139 +738,6 @@ BoardTopologyConsistencyOutcome EnforceBidirectionalBoardTopologyConsistency(
     }
   }
 
-  // Use the original outer set for the outer check.  An internal outlier is
-  // evidence against one lattice point, not a reason to discard the board's
-  // independently observed outer quad.
-
-  std::array<Eigen::Vector2d, 4> predicted_outer{};
-  std::array<double, 4> outer_residuals{};
-  std::array<double, 4> outer_thresholds{};
-  for (std::size_t index = 0; index < outer_points.size(); ++index) {
-    predicted_outer[index] =
-        internal_surface.Evaluate(outer_points[index]->target_xyz_board);
-    if (!predicted_outer[index].allFinite()) {
-      outcome.evaluated = false;
-      return outcome;
-    }
-  }
-
-  int consistent_outer_count = 0;
-  int inconsistent_outer_count = 0;
-  int isolated_inconsistent_index = -1;
-  for (std::size_t index = 0; index < outer_points.size(); ++index) {
-    outer_thresholds[index] = std::max(
-        {options.board_topology_min_outer_residual_px,
-         options.board_topology_max_outer_residual_module_ratio *
-             module_scale_px,
-         internal_surface.residual_median +
-             6.0 * std::max(0.25, internal_surface.residual_sigma)});
-    outer_residuals[index] =
-        (predicted_outer[index] - outer_points[index]->image_xy).norm();
-    if (outer_residuals[index] <= outer_thresholds[index]) {
-      ++consistent_outer_count;
-    } else {
-      ++inconsistent_outer_count;
-      isolated_inconsistent_index = static_cast<int>(index);
-    }
-  }
-
-  std::ostringstream diagnostic;
-  diagnostic << "bidirectional_board_topology surface_rmse="
-             << internal_surface.rmse << " module_scale_px="
-             << module_scale_px << " surface_rmse_module_ratio="
-             << internal_surface.rmse / module_scale_px
-             << " internal_median=" << internal_surface.residual_median
-             << " internal_sigma=" << internal_surface.residual_sigma
-             << " outer_residuals=";
-  for (std::size_t index = 0; index < outer_residuals.size(); ++index) {
-    if (index > 0) {
-      diagnostic << ";";
-    }
-    diagnostic << outer_residuals[index] << "/" << outer_thresholds[index];
-  }
-
-  if (consistent_outer_count == 3 && inconsistent_outer_count == 1 &&
-      isolated_inconsistent_index >= 0) {
-    JointPointObservation& rejected =
-        *outer_points[static_cast<std::size_t>(isolated_inconsistent_index)];
-    rejected.used_in_solver = false;
-    rejected.rejection_reason_code =
-        JointRejectionReasonCode::OuterMeasurementInvalid;
-    rejected.rejection_detail =
-        diagnostic.str() + " action=reject_isolated_outer_topology_mismatch";
-    outcome.rejected_outer_point_count = 1;
-    outcome.diagnostic = rejected.rejection_detail;
-    return outcome;
-  }
-
-  if (direct_exact_id_outer && consistent_outer_count <= 1 &&
-      inconsistent_outer_count >= 3) {
-    std::array<Eigen::Vector2d, 4> module_offsets{};
-    bool offsets_valid = model.Pitch() > 1e-12;
-    for (std::size_t index = 0; index < outer_points.size() && offsets_valid;
-         ++index) {
-      const Eigen::Matrix2d jacobian =
-          internal_surface.Jacobian(outer_points[index]->target_xyz_board);
-      const Eigen::FullPivLU<Eigen::Matrix2d> decomposition(jacobian);
-      if (!jacobian.allFinite() || !decomposition.isInvertible()) {
-        offsets_valid = false;
-        break;
-      }
-      const Eigen::Vector2d pixel_residual =
-          outer_points[index]->image_xy - predicted_outer[index];
-      module_offsets[index] =
-          decomposition.solve(pixel_residual) / model.Pitch();
-      offsets_valid = module_offsets[index].allFinite();
-    }
-
-    std::vector<double> offset_x;
-    std::vector<double> offset_y;
-    for (const Eigen::Vector2d& offset : module_offsets) {
-      offset_x.push_back(offset.x());
-      offset_y.push_back(offset.y());
-    }
-    const Eigen::Vector2d common_offset(
-        Quantile(offset_x, 0.5), Quantile(offset_y, 0.5));
-    const Eigen::Vector2d integer_offset(
-        std::round(common_offset.x()), std::round(common_offset.y()));
-    double max_corner_offset_deviation = 0.0;
-    for (const Eigen::Vector2d& offset : module_offsets) {
-      max_corner_offset_deviation =
-          std::max(max_corner_offset_deviation,
-                   (offset - common_offset).norm());
-    }
-    const bool coherent_nonzero_integer_offset =
-        offsets_valid && integer_offset.squaredNorm() >= 1.0 &&
-        (common_offset - integer_offset).cwiseAbs().maxCoeff() <= 0.25 &&
-        max_corner_offset_deviation <= 0.35;
-
-    diagnostic << " module_offsets=";
-    for (std::size_t index = 0; index < module_offsets.size(); ++index) {
-      if (index > 0) {
-        diagnostic << ";";
-      }
-      diagnostic << module_offsets[index].x() << ":"
-                 << module_offsets[index].y();
-    }
-    diagnostic << " common_offset=" << common_offset.x() << ":"
-               << common_offset.y() << " integer_offset="
-               << integer_offset.x() << ":" << integer_offset.y()
-               << " max_offset_deviation="
-               << max_corner_offset_deviation;
-
-    if (coherent_nonzero_integer_offset) {
-      for (JointPointObservation* point : internal_points) {
-        point->used_in_solver = false;
-        point->rejection_reason_code =
-            JointRejectionReasonCode::InternalPointReprojectionOutlier;
-        point->rejection_detail =
-            diagnostic.str() +
-            " action=reject_coherent_internal_grid_identity_shift";
-        ++outcome.rejected_internal_point_count;
-      }
-      outcome.diagnostic = internal_points.front()->rejection_detail;
-    }
-  }
   return outcome;
 }
 
@@ -1261,22 +1126,11 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
           outer_refinement_invalid = outer_refinement_invalid || !valid;
         }
       }
-      // A partially regenerated lattice with an invalid supporting-line
-      // model is not a valid board pose, even when the four direct tag
-      // corners happen to pass their local sub-pixel checks.  Limit this
-      // additional gate to boards for which regeneration actually produced
-      // internal support; boards with no usable internal lattice remain
-      // governed by the ordinary outer-detection checks above.
-      bool supporting_line_invalid = false;
-      if (regenerated_measurement != nullptr) {
-        const ApriltagInternalDetectionResult& regenerated_detection =
-            regenerated_measurement->detection;
-        supporting_line_invalid =
-            regenerated_detection.valid_internal_corner_count > 0 &&
-            !regenerated_detection.border_boundary_model_valid;
-      }
-      const bool board_geometry_invalid =
-          outer_refinement_invalid || supporting_line_invalid;
+      // Supporting-line coverage is diagnostic-only. Under a wide-angle
+      // projection a visually valid curved border can have weak straight-line
+      // support. The independently refined outer corners and regenerated
+      // internal lattice remain the authoritative image measurements.
+      const bool board_geometry_invalid = outer_refinement_invalid;
       bool internal_regeneration_failed_for_board = false;
       std::string internal_regeneration_failure_detail;
       const bool reject_entire_board_observation =
@@ -1346,9 +1200,7 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
             point.rejection_reason_code =
                 JointRejectionReasonCode::OuterMeasurementInvalid;
             point.rejection_detail =
-                supporting_line_invalid
-                    ? "board rejected because supporting-line boundary model is invalid"
-                    : "board rejected because all four outer corners were not refined";
+                "board rejected because all four outer corners were not refined";
           } else if (!outer_measurement->success ||
                      !outer_measurement->refined_corner_valid[
                          static_cast<std::size_t>(corner_index)]) {
@@ -1441,9 +1293,7 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
               point.rejection_reason_code =
                   JointRejectionReasonCode::OuterMeasurementInvalid;
               point.rejection_detail =
-                  supporting_line_invalid
-                      ? "board rejected because supporting-line boundary model is invalid"
-                      : "board rejected because all four outer corners were not refined";
+                  "board rejected because all four outer corners were not refined";
             } else if (reject_entire_board_observation ||
                       (!options_.include_outer_when_internal_failed &&
                        !detection.success)) {
@@ -1465,26 +1315,13 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
         }
       }
 
-      const OuterTagDetectionResult* topology_outer_detection =
-          regenerated_measurement != nullptr
-              ? &regenerated_measurement->detection.outer_detection
-              : nullptr;
-      const bool direct_exact_id_outer =
-          topology_outer_detection != nullptr &&
-          topology_outer_detection->success &&
-          topology_outer_detection->detected_tag_id == board_id &&
-          topology_outer_detection->hamming == 0 &&
-          !topology_outer_detection->used_local_patch_rescue;
       const BoardTopologyConsistencyOutcome topology_outcome =
-          EnforceBidirectionalBoardTopologyConsistency(
-              model, options_, direct_exact_id_outer, &board_observation);
-      if (topology_outcome.rejected_outer_point_count > 0 ||
-          topology_outcome.rejected_internal_point_count > 0) {
+          EnforceInternalBoardTopologyConsistency(
+              model, options_, &board_observation);
+      if (topology_outcome.rejected_internal_point_count > 0) {
         std::ostringstream warning;
         warning << "frame " << frame_input.frame_index << " board "
-                << board_id << " topology consistency rejected outer="
-                << topology_outcome.rejected_outer_point_count
-                << " internal="
+                << board_id << " topology consistency rejected internal="
                 << topology_outcome.rejected_internal_point_count << " "
                 << topology_outcome.diagnostic;
         AppendUniqueWarning(warning.str(), &result.warnings);

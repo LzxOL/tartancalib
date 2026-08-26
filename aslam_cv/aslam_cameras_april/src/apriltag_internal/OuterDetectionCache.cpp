@@ -18,11 +18,11 @@ namespace {
 namespace fs = boost::filesystem;
 
 constexpr const char kCacheFormatVersion[] =
-    "outer_detection_cache_v10_scale_adaptive_response_rollback";
+    "outer_detection_cache_v11_resolution_invariant_refinement_guard";
 constexpr const char kOuterDetectionStageImplementationVersion[] =
-    "outer_detection_final_v7_scale_adaptive_response_rollback";
+    "outer_detection_final_v8_resolution_invariant_refinement_guard";
 constexpr const char kOuterRescueStageImplementationVersion[] =
-    "outer_rescue_v5_spherical_support_confirmation";
+    "outer_rescue_v6_spherical_trust_region";
 
 std::uint64_t HashBytes(const std::string& text) {
   std::uint64_t hash = 1469598103934665603ull;

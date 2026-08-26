@@ -1238,6 +1238,15 @@ void WriteGeometryPriorOuterSeedDiagnostics(
       << "roi_redetect_bbox_width,roi_redetect_bbox_height,"
       << "roi_redetect_summary,"
       << "roi_valid,image_evidence_checked,tag_id_validated,"
+      << "topology_association_checked,topology_association_passed,"
+      << "topology_assigned_board_id,topology_best_normalized_cost,"
+      << "topology_second_best_normalized_cost,"
+      << "topology_normalized_cost_margin,"
+      << "topology_internal_verification_checked,"
+      << "topology_internal_verification_passed,"
+      << "topology_internal_verification_point_count,"
+      << "topology_internal_pose_rmse,topology_internal_outer_rmse,"
+      << "topology_internal_verification_summary,"
       << "image_evidence_success,local_redetect_success,"
       << "local_corner_refine_success,pose_refit_success,"
       << "local_vs_global_rotation_error_deg,"
@@ -1398,6 +1407,21 @@ void WriteGeometryPriorOuterSeedDiagnostics(
                 << (candidate.roi_valid ? 1 : 0) << ","
                 << (candidate.image_evidence_checked ? 1 : 0) << ","
                 << (candidate.tag_id_validated ? 1 : 0) << ","
+                << (candidate.topology_association_checked ? 1 : 0) << ","
+                << (candidate.topology_association_passed ? 1 : 0) << ","
+                << candidate.topology_assigned_board_id << ","
+                << candidate.topology_best_normalized_cost << ","
+                << candidate.topology_second_best_normalized_cost << ","
+                << candidate.topology_normalized_cost_margin << ","
+                << (candidate.topology_internal_verification_checked ? 1 : 0)
+                << ","
+                << (candidate.topology_internal_verification_passed ? 1 : 0)
+                << ","
+                << candidate.topology_internal_verification_point_count << ","
+                << candidate.topology_internal_pose_rmse << ","
+                << candidate.topology_internal_outer_rmse << ","
+                << CsvEscape(candidate.topology_internal_verification_summary)
+                << ","
                 << (candidate.image_evidence_success ? 1 : 0) << ","
                 << (candidate.local_redetect_success ? 1 : 0) << ","
                 << (candidate.local_corner_refine_success ? 1 : 0) << ","
@@ -1744,9 +1768,19 @@ struct FrameBoardObservationFlowRow {
   std::string selection_reason_code;
   std::string selection_reason_detail;
   double selection_rmse = 0.0;
+  bool trial_decision_available = false;
+  bool trial_kept = false;
+  bool trial_hard_validity_pass = false;
+  bool trial_catastrophic_residual = false;
+  std::string trial_reason;
+  double trial_rmse = std::numeric_limits<double>::quiet_NaN();
+  double trial_threshold_px = std::numeric_limits<double>::quiet_NaN();
+  double trial_global_rmse_delta = std::numeric_limits<double>::quiet_NaN();
   bool final_used_in_backend = false;
   int final_outer_point_count = 0;
   int final_internal_point_count = 0;
+  std::string final_decision_class;
+  std::string final_decision_detail;
   std::string final_status;
 };
 
@@ -1830,6 +1864,19 @@ const ati::JointBoardObservationSelectionDecision* FindSelectionDecision(
     int board_id) {
   for (const ati::JointBoardObservationSelectionDecision& decision :
        selection_result.board_observation_decisions) {
+    if (decision.frame_index == frame_index && decision.board_id == board_id) {
+      return &decision;
+    }
+  }
+  return nullptr;
+}
+
+const ati::TrialBackendFrameBoardObservationDecision* FindTrialSelectionDecision(
+    const ati::TrialBackendFrameBoardSelectionResult& selection_result,
+    int frame_index,
+    int board_id) {
+  for (const ati::TrialBackendFrameBoardObservationDecision& decision :
+       selection_result.decisions) {
     if (decision.frame_index == frame_index && decision.board_id == board_id) {
       return &decision;
     }
@@ -1966,6 +2013,28 @@ std::string DeriveFrameBoardFlowStatus(
   if (row.measurement_built && !row.pre_selection_solver_ready) {
     return "measurement_not_solver_ready";
   }
+  // The trial backend is the authoritative final selection stage.  The
+  // earlier selection RMSE is evaluated against an intermediate shared scene
+  // and may change substantially after the trial refits poses and intrinsics.
+  // Keep these failure modes distinct so a valid local detection is never
+  // reported as an image/refinement failure merely because it conflicts with
+  // the current shared board layout.
+  if (row.trial_decision_available && !row.trial_kept) {
+    if (row.trial_reason == "batch_catastrophic_residual_gate") {
+      if (std::isfinite(row.trial_rmse) &&
+          std::isfinite(row.trial_threshold_px) &&
+          row.trial_rmse > row.trial_threshold_px) {
+        return "rejected_trial_local_residual";
+      }
+      return "rejected_shared_layout_conflict";
+    }
+    if (row.trial_reason == "marginal_information_gain_gate") {
+      return "not_selected_redundant_information";
+    }
+    if (!row.trial_reason.empty()) {
+      return "not_selected_trial_backend";
+    }
+  }
   if (row.selection_decision_available && !row.selection_accepted) {
     return std::string("rejected_by_selection_") + row.selection_reason_code;
   }
@@ -1978,6 +2047,18 @@ std::string StatusShortLabel(const std::string& status) {
   }
   if (status == "used_partial_internal_points") {
     return "PARTIAL";
+  }
+  if (status == "rejected_trial_local_residual") {
+    return "LOCAL_RMSE";
+  }
+  if (status == "rejected_shared_layout_conflict") {
+    return "LAYOUT";
+  }
+  if (status == "not_selected_redundant_information") {
+    return "REDUNDANT";
+  }
+  if (status == "not_selected_trial_backend") {
+    return "TRIAL_SKIP";
   }
   if (status == "dropped_by_strict_internal_failure") {
     return "STRICT";
@@ -2003,6 +2084,18 @@ cv::Scalar StatusColor(const std::string& status) {
   }
   if (status == "used_partial_internal_points") {
     return cv::Scalar(0, 210, 210);
+  }
+  if (status == "rejected_trial_local_residual") {
+    return cv::Scalar(40, 40, 230);
+  }
+  if (status == "rejected_shared_layout_conflict") {
+    return cv::Scalar(220, 60, 220);
+  }
+  if (status == "not_selected_redundant_information") {
+    return cv::Scalar(0, 190, 255);
+  }
+  if (status == "not_selected_trial_backend") {
+    return cv::Scalar(180, 180, 180);
   }
   if (status == "dropped_by_strict_internal_failure") {
     return cv::Scalar(40, 40, 230);
@@ -2662,6 +2755,7 @@ void DrawInternalPointFilterOverlay(
     const std::vector<const ati::JointBoardObservation*>& board_observations,
     const std::map<std::pair<int, int>, const ati::RegeneratedBoardMeasurement*>&
         regenerated_by_frame_board,
+    const std::map<std::pair<int, int>, std::string>& final_status_by_frame_board,
     cv::Mat* output) {
   if (output == nullptr) {
     return;
@@ -2676,18 +2770,18 @@ void DrawInternalPointFilterOverlay(
     *output = image.clone();
   }
 
-  cv::rectangle(*output, cv::Point(8, 8), cv::Point(940, 118),
+  cv::rectangle(*output, cv::Point(8, 8), cv::Point(1180, 118),
                 cv::Scalar(0, 0, 0), cv::FILLED);
   cv::putText(*output, "Internal point filter overlay",
               cv::Point(16, 30), cv::FONT_HERSHEY_SIMPLEX, 0.58,
               cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-  cv::putText(*output, "green=solver-ready  red=frontend-invalid  orange=local geometry outlier",
+  cv::putText(*output, "point colors: green=frontend-valid  red=frontend-invalid  orange=local geometry outlier",
               cv::Point(16, 54), cv::FONT_HERSHEY_SIMPLEX, 0.42,
               cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-  cv::putText(*output, "blue=frontend-valid, frame pose unavailable  magenta=regen failed  gray=other rejected",
+  cv::putText(*output, "board final state: green=backend-used  purple=shared-layout conflict  red=local residual  yellow=redundant",
               cv::Point(16, 76), cv::FONT_HERSHEY_SIMPLEX, 0.42,
               cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-  cv::putText(*output, "cyan cross=used outer; red X=topology-rejected outer; cyan boxes=outer subpix window.",
+  cv::putText(*output, "cyan cross=observed outer; cyan boxes=outer subpix window. Point color alone does not mean final BA use.",
               cv::Point(16, 98), cv::FONT_HERSHEY_SIMPLEX, 0.42,
               cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
 
@@ -2718,19 +2812,8 @@ void DrawInternalPointFilterOverlay(
         board_center += xy;
         outer_polygon.emplace_back(static_cast<int>(std::round(xy.x)),
                                    static_cast<int>(std::round(xy.y)));
-        const bool topology_rejected =
-            !point.used_in_solver &&
-            point.rejection_reason_code ==
-                ati::JointRejectionReasonCode::OuterMeasurementInvalid &&
-            point.rejection_detail.find("bidirectional_board_topology") !=
-                std::string::npos;
-        cv::drawMarker(*output, xy,
-                       topology_rejected ? cv::Scalar(0, 0, 255)
-                                         : cv::Scalar(255, 220, 0),
-                       topology_rejected ? cv::MARKER_TILTED_CROSS
-                                         : cv::MARKER_CROSS,
-                       topology_rejected ? 17 : 13,
-                       topology_rejected ? 2 : 1, cv::LINE_AA);
+        cv::drawMarker(*output, xy, cv::Scalar(255, 220, 0),
+                       cv::MARKER_CROSS, 13, 1, cv::LINE_AA);
         continue;
       }
 
@@ -2869,6 +2952,15 @@ void DrawInternalPointFilterOverlay(
         }
       }
       std::ostringstream label;
+      const std::pair<int, int> board_key(
+          board->points.empty() ? -1 : board->points.front().frame_index,
+          board->board_id);
+      const auto final_status_it =
+          final_status_by_frame_board.find(board_key);
+      const std::string final_status =
+          final_status_it == final_status_by_frame_board.end()
+              ? "not_used_unknown"
+              : final_status_it->second;
       label << "B" << board->board_id << " used=" << used_internal
             << " invalid=" << invalid_internal
             << " outlier=" << outlier_internal
@@ -2884,11 +2976,12 @@ void DrawInternalPointFilterOverlay(
             << " raw=" << max_raw_outer_subpix_radius
             << " clamp=" << min_outer_subpix_clamp_limit
             << " scale=" << std::setprecision(2) << outer_subpix_config_scale
-            << " clipped=" << (outer_subpix_clamped ? 1 : 0);
+            << " clipped=" << (outer_subpix_clamped ? 1 : 0)
+            << " BA=" << StatusShortLabel(final_status);
       cv::putText(*output, label.str(),
                   cv::Point(static_cast<int>(std::round(board_center.x)),
                             static_cast<int>(std::round(board_center.y))),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255, 255, 255),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.45, StatusColor(final_status),
                   1, cv::LINE_AA);
     }
 
@@ -4658,6 +4751,22 @@ void WriteFrameBoardObservationFlowDiagnostics(
       }
     }
 
+    const ati::TrialBackendFrameBoardObservationDecision* trial_decision =
+        FindTrialSelectionDecision(report.trial_backend_selection_result,
+                                   frame_index, board_id);
+    if (trial_decision != nullptr) {
+      row.trial_decision_available = true;
+      row.trial_kept = trial_decision->kept;
+      row.trial_hard_validity_pass = trial_decision->hard_validity_pass;
+      row.trial_catastrophic_residual =
+          trial_decision->catastrophic_residual;
+      row.trial_reason = trial_decision->reason;
+      row.trial_rmse = trial_decision->trial_rmse;
+      row.trial_threshold_px =
+          report.trial_backend_selection_result.threshold_px;
+      row.trial_global_rmse_delta = trial_decision->global_rmse_delta;
+    }
+
     const auto final_count_it = final_counts.find(key);
     if (final_count_it != final_counts.end()) {
       row.final_outer_point_count = final_count_it->second.first;
@@ -4666,9 +4775,31 @@ void WriteFrameBoardObservationFlowDiagnostics(
           row.final_outer_point_count + row.final_internal_point_count > 0;
     }
     row.final_status = DeriveFrameBoardFlowStatus(row);
+    row.final_decision_class = StatusShortLabel(row.final_status);
+    if (row.final_used_in_backend) {
+      row.final_decision_detail = "used_by_final_backend";
+    } else if (row.trial_decision_available) {
+      std::ostringstream detail;
+      detail << row.trial_reason;
+      if (std::isfinite(row.trial_rmse)) {
+        detail << " trial_rmse=" << row.trial_rmse;
+      }
+      if (std::isfinite(row.trial_global_rmse_delta)) {
+        detail << " global_rmse_delta=" << row.trial_global_rmse_delta;
+      }
+      row.final_decision_detail = detail.str();
+    } else if (row.selection_decision_available) {
+      row.final_decision_detail = row.selection_reason_detail;
+    }
 
     geometries[key] = BuildVisualGeometry(regenerated, board_observation);
     rows.push_back(row);
+  }
+
+  std::map<std::pair<int, int>, std::string> final_status_by_frame_board;
+  for (const FrameBoardObservationFlowRow& row : rows) {
+    final_status_by_frame_board[std::make_pair(row.frame_index, row.board_id)] =
+        row.final_status;
   }
 
   std::map<int, std::vector<FrameBoardObservationFlowRow> > strict_rows_by_frame;
@@ -4814,8 +4945,12 @@ void WriteFrameBoardObservationFlowDiagnostics(
       << "point_rejection_reasons,strict_drop_candidate,"
       << "selection_decision_available,selection_accepted,"
       << "selection_reason_code,selection_reason_detail,selection_rmse,"
+      << "trial_decision_available,trial_kept,trial_reason,trial_rmse,"
+      << "trial_threshold_px,trial_hard_validity_pass,"
+      << "trial_catastrophic_residual,trial_global_rmse_delta,"
       << "final_used_in_backend,final_outer_point_count,"
-      << "final_internal_point_count,final_status\n";
+      << "final_internal_point_count,final_decision_class,"
+      << "final_decision_detail,final_status\n";
   for (const FrameBoardObservationFlowRow& row : rows) {
     csv << row.round_label << ","
         << row.frame_index << ","
@@ -4848,9 +4983,19 @@ void WriteFrameBoardObservationFlowDiagnostics(
         << CsvEscape(row.selection_reason_code) << ","
         << CsvEscape(row.selection_reason_detail) << ","
         << row.selection_rmse << ","
+        << (row.trial_decision_available ? 1 : 0) << ","
+        << (row.trial_kept ? 1 : 0) << ","
+        << CsvEscape(row.trial_reason) << ","
+        << row.trial_rmse << ","
+        << row.trial_threshold_px << ","
+        << (row.trial_hard_validity_pass ? 1 : 0) << ","
+        << (row.trial_catastrophic_residual ? 1 : 0) << ","
+        << row.trial_global_rmse_delta << ","
         << (row.final_used_in_backend ? 1 : 0) << ","
         << row.final_outer_point_count << ","
         << row.final_internal_point_count << ","
+        << CsvEscape(row.final_decision_class) << ","
+        << CsvEscape(row.final_decision_detail) << ","
         << CsvEscape(row.final_status) << "\n";
   }
 
@@ -4984,6 +5129,7 @@ void WriteFrameBoardObservationFlowDiagnostics(
   }
 
   std::map<std::string, int> status_counts;
+  std::map<std::string, int> final_decision_class_counts;
   std::map<std::string, int> non_strict_not_used_counts;
   std::map<std::string, int> internal_failure_reason_counts;
   std::map<std::string, int> internal_camera_source_counts;
@@ -4994,6 +5140,7 @@ void WriteFrameBoardObservationFlowDiagnostics(
   int partial_internal_used_count = 0;
   for (const FrameBoardObservationFlowRow& row : rows) {
     ++status_counts[row.final_status];
+    ++final_decision_class_counts[row.final_decision_class];
     if (row.final_used_in_backend) {
       ++final_used_count;
     } else {
@@ -5051,6 +5198,10 @@ void WriteFrameBoardObservationFlowDiagnostics(
   summary << "partial_internal_used_count: " << partial_internal_used_count << "\n";
   summary << "\nstatus_counts:\n";
   for (const auto& entry : status_counts) {
+    summary << "  " << entry.first << ": " << entry.second << "\n";
+  }
+  summary << "\nfinal_decision_class_counts:\n";
+  for (const auto& entry : final_decision_class_counts) {
     summary << "  " << entry.first << ": " << entry.second << "\n";
   }
   summary << "\nnon_strict_not_used_counts:\n";
@@ -5668,7 +5819,7 @@ void WriteFrameBoardObservationFlowDiagnostics(
       << "internal_total_count,internal_used_count,"
       << "internal_invalid_count,internal_reprojection_outlier_count,"
       << "internal_regeneration_failed_count,internal_other_rejected_count,"
-      << "used_ratio,point_rejection_reasons\n";
+      << "used_ratio,point_rejection_reasons,final_status\n";
   std::map<int, std::vector<const ati::JointBoardObservation*> >
       internal_filter_boards_by_frame;
   int internal_filter_board_count = 0;
@@ -5743,7 +5894,10 @@ void WriteFrameBoardObservationFlowDiagnostics(
           << internal_regen_failed << ","
           << internal_other << ","
           << SafeRatio(internal_used, internal_total) << ","
-          << CsvEscape(JoinReasonCounts(reason_counts)) << "\n";
+          << CsvEscape(JoinReasonCounts(reason_counts)) << ","
+          << CsvEscape(final_status_by_frame_board[
+                 std::make_pair(frame.frame_index, board.board_id)])
+          << "\n";
     }
   }
   int internal_filter_overlay_count = 0;
@@ -5758,7 +5912,8 @@ void WriteFrameBoardObservationFlowDiagnostics(
     const cv::Mat image = cv::imread(path_it->second, cv::IMREAD_UNCHANGED);
     cv::Mat overlay;
     DrawInternalPointFilterOverlay(image, entry.second,
-                                   regenerated_by_frame_board, &overlay);
+                                   regenerated_by_frame_board,
+                                   final_status_by_frame_board, &overlay);
     if (overlay.empty()) {
       continue;
     }
@@ -6446,6 +6601,28 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << ati::ToString(result.selection_mode) << "\n";
   summary << "candidate_order_mode: "
           << ati::ToString(result.candidate_order_mode) << "\n";
+  summary << "model_aware_information_coreset_enabled: "
+          << (result.model_aware_information_coreset_enabled ? 1 : 0)
+          << "\n";
+  summary << "model_aware_parameter_dimension: "
+          << result.model_aware_parameter_dimension << "\n";
+  summary << "model_aware_parameter_labels: ";
+  for (std::size_t index = 0; index < result.model_aware_parameter_labels.size();
+       ++index) {
+    if (index > 0) {
+      summary << ";";
+    }
+    summary << result.model_aware_parameter_labels[index];
+  }
+  summary << "\n";
+  summary << "model_aware_frame_count_scanned: "
+          << result.model_aware_frame_count_scanned << "\n";
+  summary << "model_aware_frame_count_accepted: "
+          << result.model_aware_frame_count_accepted << "\n";
+  summary << "model_aware_max_remaining_information_gain: "
+          << result.model_aware_max_remaining_information_gain << "\n";
+  summary << "model_aware_seed_fisher_rank: "
+          << result.model_aware_seed_fisher_rank << "\n";
   summary << "info_gain_proxy_mode: "
           << ati::ToString(result.info_gain_proxy_mode) << "\n";
   summary << "candidate_batch_granularity: "
@@ -6547,6 +6724,9 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.persistent_incremental_seed_board_observation_count << "\n";
   summary << "persistent_incremental_seed_point_count: "
           << result.persistent_incremental_seed_point_count << "\n";
+  summary << "persistent_incremental_seed_outer_only_residuals: "
+          << (result.persistent_incremental_seed_outer_only_residuals ? 1 : 0)
+          << "\n";
   summary << "persistent_independent_camera_warmup_requested: "
           << (result.persistent_independent_camera_warmup_requested ? 1 : 0)
           << "\n";
@@ -6648,6 +6828,28 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.persistent_incremental_accepted_batch_count << "\n";
   summary << "persistent_incremental_rejected_batch_count: "
           << result.persistent_incremental_rejected_batch_count << "\n";
+  summary << "persistent_incremental_rejection_reason_counts: ";
+  bool first_rejection_reason = true;
+  for (const auto& entry :
+       result.persistent_incremental_rejection_reason_counts) {
+    if (!first_rejection_reason) {
+      summary << ";";
+    }
+    summary << entry.first << "=" << entry.second;
+    first_rejection_reason = false;
+  }
+  summary << "\n";
+  summary << "persistent_incremental_rejection_reason_code_counts: ";
+  bool first_rejection_reason_code = true;
+  for (const auto& entry :
+       result.persistent_incremental_rejection_reason_code_counts) {
+    if (!first_rejection_reason_code) {
+      summary << ";";
+    }
+    summary << entry.first << "=" << entry.second;
+    first_rejection_reason_code = false;
+  }
+  summary << "\n";
   summary << "persistent_incremental_solver_profile_name: "
           << result.persistent_incremental_solver_profile_name << "\n";
   summary << "persistent_incremental_solver_objective_unit: "
@@ -6773,6 +6975,16 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
       << result
              .persistent_incremental_initial_full_training_invalid_projection_count
       << "\n";
+  summary
+      << "persistent_incremental_initial_full_training_invalid_outer_projection_count: "
+      << result
+             .persistent_incremental_initial_full_training_invalid_outer_projection_count
+      << "\n";
+  summary
+      << "persistent_incremental_initial_full_training_invalid_internal_projection_count: "
+      << result
+             .persistent_incremental_initial_full_training_invalid_internal_projection_count
+      << "\n";
   summary << "persistent_incremental_final_full_training_pixel_rmse: "
           << result.persistent_incremental_final_full_training_pixel_rmse
           << "\n";
@@ -6793,6 +7005,16 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
       << "persistent_incremental_final_full_training_invalid_projection_count: "
       << result
              .persistent_incremental_final_full_training_invalid_projection_count
+      << "\n";
+  summary
+      << "persistent_incremental_final_full_training_invalid_outer_projection_count: "
+      << result
+             .persistent_incremental_final_full_training_invalid_outer_projection_count
+      << "\n";
+  summary
+      << "persistent_incremental_final_full_training_invalid_internal_projection_count: "
+      << result
+             .persistent_incremental_final_full_training_invalid_internal_projection_count
       << "\n";
   summary << "persistent_incremental_curated_bundle_state_consistency_pass: "
           << (result
@@ -7103,6 +7325,8 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
       << "intrinsics_jacobian_trace_gain,"
       << "intrinsics_jacobian_rank_gain,"
       << "intrinsics_jacobian_info_term,"
+      << "model_aware_information_gain,model_aware_rank_gain,"
+      << "model_aware_weak_direction_gain,"
       << "frame_completion_bonus,new_board_bonus,cap_penalty,"
       << "information_gain_proxy,residual_overage_penalty,"
       << "batch_acceptance_score,accepted_by_batch_acceptance,"
@@ -7297,6 +7521,9 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
         << decision.intrinsics_jacobian_trace_gain << ","
         << decision.intrinsics_jacobian_rank_gain << ","
         << decision.intrinsics_jacobian_info_term << ","
+        << decision.model_aware_information_gain << ","
+        << decision.model_aware_rank_gain << ","
+        << decision.model_aware_weak_direction_gain << ","
         << decision.frame_completion_bonus << ","
         << decision.new_board_bonus << ","
         << decision.cap_penalty << ","

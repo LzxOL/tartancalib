@@ -530,6 +530,7 @@ OuterBootstrapOptions MakeBootstrapOptions(const ApriltagInternalConfig& config,
   bootstrap_options.init_cu_offset = config.sphere_lattice_init_cu_offset;
   bootstrap_options.init_cv_offset = config.sphere_lattice_init_cv_offset;
   bootstrap_options.min_detection_quality = config.outer_detector_config.min_detection_quality;
+  bootstrap_options.optimize_intrinsics = options.optimize_bootstrap_intrinsics;
   return bootstrap_options;
 }
 
@@ -1262,6 +1263,8 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       options_.force_internal_seed_from_prediction;
   detection_options.bypass_internal_seed_filters =
       options_.bypass_internal_seed_filters;
+  detection_options.enable_internal_lattice_slot_ownership_check =
+      options_.enable_internal_lattice_slot_ownership_check;
   detection_options.enable_geometry_prior_outer_seed =
       options_.enable_geometry_prior_outer_seed;
   detection_options.geometry_prior_rescue_diagnostic_only =
@@ -1288,6 +1291,8 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
       options_.geometry_prior_rescue_min_edge_gradient_ratio;
   detection_options.geometry_prior_rescue_accept_max_outer_rmse =
       options_.geometry_prior_rescue_accept_max_outer_rmse;
+  detection_options.geometry_prior_rescue_scale_aware_outer_rmse_gate =
+      options_.geometry_prior_rescue_scale_aware_outer_rmse_gate;
   detection_options.geometry_prior_rescue_accept_max_rotation_error_deg =
       options_.geometry_prior_rescue_accept_max_rotation_error_deg;
   detection_options.geometry_prior_rescue_accept_max_translation_error =
@@ -1449,6 +1454,8 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   initialization_options.refine_mode = options_.camera_initialization_refine_mode;
   initialization_options.selection_scorer =
       options_.camera_initialization_selection_scorer;
+  initialization_options.enable_shared_frame_board_constraint =
+      !options_.camera_initialization_use_independent_frame_board_poses;
   initialization_options.enable_principal_profile =
       options_.enable_camera_initialization_principal_profile;
   initialization_options.principal_profile_radius_px =
@@ -2205,6 +2212,8 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::RunPrecomputed(
   initialization_options.refine_mode = options_.camera_initialization_refine_mode;
   initialization_options.selection_scorer =
       options_.camera_initialization_selection_scorer;
+  initialization_options.enable_shared_frame_board_constraint =
+      !options_.camera_initialization_use_independent_frame_board_poses;
   initialization_options.enable_principal_profile =
       options_.enable_camera_initialization_principal_profile;
   initialization_options.principal_profile_radius_px =

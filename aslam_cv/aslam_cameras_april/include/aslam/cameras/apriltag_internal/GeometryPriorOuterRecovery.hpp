@@ -68,6 +68,7 @@ GeometryPriorOuterSeedCandidate EvaluateGeometryPriorOuterSeedCandidate(
     double frame_pose_refit_outer_rmse,
     double frame_normal_outer_refit_rmse_median,
     const std::string& original_failure_reason,
+    const std::vector<std::array<Eigen::Vector2d, 4>>& competing_topology_slots,
     const OuterWrongIdProposal* wrong_id_proposal,
     OuterTagDetectionResult* rescued_detection);
 

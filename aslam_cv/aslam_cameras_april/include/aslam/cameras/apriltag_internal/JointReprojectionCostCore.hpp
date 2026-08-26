@@ -175,6 +175,18 @@ bool EstimatePoseFromObjectPoints(const OuterBootstrapCameraIntrinsics& intrinsi
                                   Eigen::Isometry3d* pose,
                                   double* rmse);
 
+// Initialization-only pose validation. Unlike the legacy helper above this
+// never falls back to a pinhole solve or assigns a penalty to invalid
+// projections. All supplied observations must be valid in the active camera
+// model and the resulting pose must satisfy the supplied RMSE bound.
+bool EstimatePoseFromObjectPointsStrict(
+    const OuterBootstrapCameraIntrinsics& intrinsics,
+    const std::vector<Eigen::Vector3d>& object_points,
+    const std::vector<cv::Point2f>& image_points,
+    double max_rmse,
+    Eigen::Isometry3d* pose,
+    double* rmse);
+
 struct TransformCandidate {
   Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
   double weight = 1.0;

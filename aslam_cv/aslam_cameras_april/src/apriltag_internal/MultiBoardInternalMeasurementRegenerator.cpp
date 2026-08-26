@@ -9,6 +9,7 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -427,6 +428,268 @@ ApriltagInternalDetectionResult BuildFailedDetectionResult(
   return detection;
 }
 
+bool VerifyRecoveredInternalMeasurement(
+    const ApriltagInternalConfig& config,
+    const ApriltagInternalDetectionOptions& options,
+    const IntermediateCameraConfig& camera_config,
+    GeometryPriorOuterSeedCandidate* candidate,
+    ApriltagInternalDetectionResult* detection) {
+  if (candidate == nullptr || detection == nullptr) {
+    return true;
+  }
+
+  candidate->topology_internal_verification_checked = true;
+  std::vector<Eigen::Vector3d> internal_object_points;
+  std::vector<cv::Point2f> internal_image_points;
+  std::vector<CornerMeasurement*> internal_measurements;
+  for (CornerMeasurement& corner : detection->corners) {
+    if (!corner.valid || corner.corner_type == CornerType::Outer ||
+        !corner.image_xy.allFinite() || !corner.target_xyz.allFinite()) {
+      continue;
+    }
+    internal_object_points.push_back(corner.target_xyz);
+    internal_image_points.emplace_back(static_cast<float>(corner.image_xy.x()),
+                                       static_cast<float>(corner.image_xy.y()));
+    internal_measurements.push_back(&corner);
+  }
+  candidate->topology_internal_verification_point_count =
+      static_cast<int>(internal_object_points.size());
+
+  const int minimum_internal_count =
+      std::max(4, std::min(8, config.min_visible_points));
+  if (static_cast<int>(internal_object_points.size()) < minimum_internal_count) {
+    std::ostringstream stream;
+    stream << "topology_internal_verify insufficient_points="
+           << internal_object_points.size()
+           << " required=" << minimum_internal_count;
+    candidate->topology_internal_verification_summary = stream.str();
+    candidate->accepted_as_rescued_observation = false;
+    candidate->reject_reason =
+        "topology_internal_verification_rejected_insufficient_points";
+    detection->success = false;
+    detection->reject_entire_board_observation = true;
+    detection->failure_reason = candidate->reject_reason;
+    return false;
+  }
+
+  OuterBootstrapCameraIntrinsics intrinsics;
+  intrinsics.camera_model = camera_config.camera_model;
+  intrinsics.distortion_model = camera_config.distortion_model;
+  intrinsics.resolution = detection->image_size;
+  if (!intrinsics.SetIntrinsicsVector(camera_config.intrinsics) ||
+      !intrinsics.SetDistortionVector(camera_config.distortion_coeffs)) {
+    candidate->topology_internal_verification_summary =
+        "topology_internal_verify invalid_camera";
+    candidate->accepted_as_rescued_observation = false;
+    candidate->reject_reason =
+        "topology_internal_verification_rejected_invalid_camera";
+    detection->success = false;
+    detection->reject_entire_board_observation = true;
+    detection->failure_reason = candidate->reject_reason;
+    return false;
+  }
+
+  Eigen::Isometry3d internal_pose = Eigen::Isometry3d::Identity();
+  double internal_rmse = std::numeric_limits<double>::infinity();
+  if (!EstimatePoseFromObjectPoints(intrinsics, internal_object_points,
+                                    internal_image_points, &internal_pose,
+                                    &internal_rmse)) {
+    candidate->topology_internal_verification_summary =
+        "topology_internal_verify pose_fit_failed";
+    candidate->accepted_as_rescued_observation = false;
+    candidate->reject_reason =
+        "topology_internal_verification_rejected_pose_fit";
+    detection->success = false;
+    detection->reject_entire_board_observation = true;
+    detection->failure_reason = candidate->reject_reason;
+    return false;
+  }
+  const DoubleSphereCameraModel camera =
+      DoubleSphereCameraModel::FromConfig(camera_config);
+  const double max_internal_rmse =
+      std::max(3.0, options.geometry_prior_rescue_accept_max_outer_rmse);
+
+  // A few locally bad refinements must not invalidate an otherwise coherent
+  // recovered lattice. Greedily remove at most 20% of the valid internal
+  // points, always refitting the pose, and accept the trimmed result only when
+  // it becomes genuinely low-residual. Coherently shifted grids therefore
+  // remain rejected instead of being rescued by a permissive threshold.
+  std::vector<int> active_indices(internal_object_points.size());
+  std::iota(active_indices.begin(), active_indices.end(), 0);
+  const int maximum_trim_count = static_cast<int>(
+      std::floor(0.2 * static_cast<double>(active_indices.size())));
+  int trimmed_count = 0;
+  while (internal_rmse > max_internal_rmse &&
+         trimmed_count < maximum_trim_count &&
+         static_cast<int>(active_indices.size()) > minimum_internal_count) {
+    int worst_active_position = -1;
+    double worst_residual = -1.0;
+    for (std::size_t active_position = 0;
+         active_position < active_indices.size(); ++active_position) {
+      const int point_index = active_indices[active_position];
+      Eigen::Vector2d projected;
+      if (!camera.IsValid() ||
+          !camera.vsEuclideanToKeypoint(
+              internal_pose * internal_object_points[point_index], &projected)) {
+        worst_active_position = static_cast<int>(active_position);
+        break;
+      }
+      const cv::Point2f& observed = internal_image_points[point_index];
+      const double residual =
+          (projected - Eigen::Vector2d(observed.x, observed.y)).norm();
+      if (residual > worst_residual) {
+        worst_residual = residual;
+        worst_active_position = static_cast<int>(active_position);
+      }
+    }
+    if (worst_active_position < 0) {
+      break;
+    }
+    active_indices.erase(active_indices.begin() + worst_active_position);
+    std::vector<Eigen::Vector3d> trimmed_object_points;
+    std::vector<cv::Point2f> trimmed_image_points;
+    trimmed_object_points.reserve(active_indices.size());
+    trimmed_image_points.reserve(active_indices.size());
+    for (int point_index : active_indices) {
+      trimmed_object_points.push_back(internal_object_points[point_index]);
+      trimmed_image_points.push_back(internal_image_points[point_index]);
+    }
+    Eigen::Isometry3d refit_pose = Eigen::Isometry3d::Identity();
+    double refit_rmse = std::numeric_limits<double>::infinity();
+    if (!EstimatePoseFromObjectPoints(intrinsics, trimmed_object_points,
+                                      trimmed_image_points, &refit_pose,
+                                      &refit_rmse)) {
+      break;
+    }
+    internal_pose = refit_pose;
+    internal_rmse = refit_rmse;
+    ++trimmed_count;
+  }
+  candidate->topology_internal_pose_rmse = internal_rmse;
+  const std::array<Eigen::Vector3d, 4> outer_object_points =
+      BuildOuterCornerPointsForBoard(config, detection->board_id);
+  double outer_squared_error = 0.0;
+  int valid_outer_count = 0;
+  if (camera.IsValid()) {
+    for (int index = 0; index < 4; ++index) {
+      Eigen::Vector2d projected;
+      if (!camera.vsEuclideanToKeypoint(
+              internal_pose *
+                  outer_object_points[static_cast<std::size_t>(index)],
+              &projected)) {
+        continue;
+      }
+      const cv::Point2f& observed =
+          detection->outer_corners[static_cast<std::size_t>(index)];
+      outer_squared_error +=
+          (projected - Eigen::Vector2d(observed.x, observed.y)).squaredNorm();
+      ++valid_outer_count;
+    }
+  }
+  const double outer_rmse =
+      valid_outer_count == 4
+          ? std::sqrt(outer_squared_error / static_cast<double>(valid_outer_count))
+          : std::numeric_limits<double>::infinity();
+  candidate->topology_internal_outer_rmse = outer_rmse;
+
+  const double max_outer_backprojection_rmse = 2.0 * max_internal_rmse;
+  // A large refinement move is not sufficient to reject a recovered board:
+  // wide-angle views can legitimately move a coarse seed by many pixels. The
+  // explicit guard below requires the independently fitted internal pose to
+  // disagree with the same refined outer quad as well. It is disabled when
+  // the existing displacement option is <= 0, preserving the old diagnostic
+  // behavior for ablations and legacy runs.
+  const double configured_displacement_limit =
+      options.geometry_prior_rescue_max_corner_displacement_px;
+  const bool displacement_guard_enabled =
+      std::isfinite(configured_displacement_limit) &&
+      configured_displacement_limit > 0.0;
+  candidate->adaptive_max_corner_displacement_px =
+      displacement_guard_enabled ? configured_displacement_limit
+                                 : std::numeric_limits<double>::quiet_NaN();
+  const double max_recovered_corner_displacement = std::max(
+      candidate->max_corner_displacement_px,
+      candidate->max_refinement_displacement_px);
+  const bool refinement_move_is_large =
+      displacement_guard_enabled &&
+      std::isfinite(max_recovered_corner_displacement) &&
+      max_recovered_corner_displacement > configured_displacement_limit;
+  // Do not reject clipped/unprojectable outer corners here. The final guard
+  // is only for a fully evaluable quad whose internal-pose backprojection is
+  // demonstrably inconsistent.
+  const bool outer_backprojection_inconsistent =
+      valid_outer_count == 4 && std::isfinite(outer_rmse) &&
+      outer_rmse > max_outer_backprojection_rmse;
+  candidate->topology_internal_verification_passed =
+      std::isfinite(internal_rmse) &&
+      internal_rmse <= max_internal_rmse;
+  std::ostringstream stream;
+  stream << "topology_internal_verify passed="
+         << (candidate->topology_internal_verification_passed ? 1 : 0)
+         << " points=" << internal_object_points.size()
+         << " retained_points=" << active_indices.size()
+         << " trimmed_points=" << trimmed_count
+         << " internal_rmse=" << internal_rmse
+         << " max_internal_rmse=" << max_internal_rmse
+         << " outer_backprojection_rmse=" << outer_rmse
+         << " max_outer_backprojection_rmse="
+         << max_outer_backprojection_rmse
+         << " refinement_displacement_limit="
+         << configured_displacement_limit
+         << " refinement_displacement_guard="
+         << (displacement_guard_enabled ? 1 : 0)
+         << " refinement_displacement_large="
+         << (refinement_move_is_large ? 1 : 0)
+         << " outer_backprojection_inconsistent="
+         << (outer_backprojection_inconsistent ? 1 : 0)
+         << " outer_gate=diagnostic_only";
+  candidate->topology_internal_verification_summary = stream.str();
+  if (candidate->topology_internal_verification_passed) {
+    if (trimmed_count > 0) {
+      std::vector<bool> retained(internal_measurements.size(), false);
+      for (int point_index : active_indices) {
+        retained[static_cast<std::size_t>(point_index)] = true;
+      }
+      for (std::size_t point_index = 0; point_index < retained.size();
+           ++point_index) {
+        if (!retained[point_index] && internal_measurements[point_index]->valid) {
+          internal_measurements[point_index]->valid = false;
+          detection->valid_internal_corner_count =
+              std::max(0, detection->valid_internal_corner_count - 1);
+        }
+      }
+    }
+    // The displacement/backprojection pair is intentionally diagnostic-only.
+    // Wide-angle recovery can move a valid seed substantially, and the
+    // candidate selector may have a better independently validated fallback.
+    // Do not invalidate outer or internal measurements here.
+    return true;
+  }
+
+  candidate->accepted_as_rescued_observation = false;
+  candidate->reject_reason =
+      "topology_internal_verification_rejected_inconsistent_grid";
+  detection->success = false;
+  detection->reject_entire_board_observation = true;
+  detection->failure_reason = candidate->reject_reason;
+  return false;
+}
+
+void ReplaceSelectedGeometryPriorCandidate(
+    const GeometryPriorOuterSeedCandidate& selected,
+    std::vector<GeometryPriorOuterSeedCandidate>* candidates) {
+  if (candidates == nullptr) {
+    return;
+  }
+  for (auto it = candidates->rbegin(); it != candidates->rend(); ++it) {
+    if (it->missing_board_id == selected.missing_board_id &&
+        it->prediction_source_label == selected.prediction_source_label) {
+      *it = selected;
+      return;
+    }
+  }
+}
+
 std::string BuildRegenerationFailureWarning(
     const InternalRegenerationFrameInput& frame_input,
     const std::string& state_source_label,
@@ -614,16 +877,20 @@ GeometryPriorRecoverySelection EvaluateGeometryPriorPredictions(
         prediction.wrong_id_proposal;
     std::string effective_prediction_source_label = prediction.source_label;
     std::string topology_association_summary;
+    TopologySlotAssignment topology_assignment;
     if (prediction.wrong_id_proposal != nullptr) {
-      const WrongIdTopologyAssociation association =
-          AssociateWrongIdProposalToTopology(
-              predicted_outer_corners, *prediction.wrong_id_proposal);
-      topology_association_summary = association.summary;
-      std::string unique_slot_summary;
-      const bool unique_slot = IsUniqueWrongIdTopologyAssociation(
-          predicted_outer_corners, *prediction.wrong_id_proposal,
-          prediction.competing_topology_slots, &unique_slot_summary);
-      topology_association_summary = unique_slot_summary;
+      std::vector<std::array<Eigen::Vector2d, 4>> topology_slots;
+      topology_slots.reserve(prediction.competing_topology_slots.size() + 1u);
+      topology_slots.push_back(predicted_outer_corners);
+      topology_slots.insert(topology_slots.end(),
+                            prediction.competing_topology_slots.begin(),
+                            prediction.competing_topology_slots.end());
+      topology_assignment = AssignObservedQuadToTopologySlots(
+          topology_slots, *prediction.wrong_id_proposal);
+      topology_association_summary = topology_assignment.summary;
+      const bool unique_slot =
+          topology_assignment.unique &&
+          topology_assignment.assigned_slot_index == 0;
       if (!unique_slot) {
         GeometryPriorOuterSeedCandidate rejected_candidate =
             BuildGeometryPriorOuterSeedCandidate(
@@ -642,7 +909,8 @@ GeometryPriorRecoverySelection EvaluateGeometryPriorPredictions(
         continue;
       }
       topology_ordered_proposal = *prediction.wrong_id_proposal;
-      topology_ordered_proposal.corners_original_image = association.ordered_corners;
+      topology_ordered_proposal.corners_original_image =
+          topology_assignment.ordered_corners;
       effective_wrong_id_proposal = &topology_ordered_proposal;
       effective_prediction_source_label += "_topology_assoc";
     }
@@ -656,10 +924,23 @@ GeometryPriorRecoverySelection EvaluateGeometryPriorPredictions(
             prediction.frame_pose_refit_source_board_id,
             prediction.frame_pose_refit_outer_rmse,
             frame_normal_outer_refit_rmse_median,
-            original_outer_failure_reason, effective_wrong_id_proposal,
+            original_outer_failure_reason, prediction.competing_topology_slots,
+            effective_wrong_id_proposal,
             &rescued_detection);
     if (!topology_association_summary.empty()) {
       candidate.quad_topology_summary += " " + topology_association_summary;
+      candidate.topology_association_checked = topology_assignment.checked;
+      candidate.topology_association_passed =
+          topology_assignment.unique &&
+          topology_assignment.assigned_slot_index == 0;
+      candidate.topology_assigned_board_id =
+          candidate.topology_association_passed ? board_id : -1;
+      candidate.topology_best_normalized_cost =
+          topology_assignment.best_normalized_cost;
+      candidate.topology_second_best_normalized_cost =
+          topology_assignment.second_best_normalized_cost;
+      candidate.topology_normalized_cost_margin =
+          topology_assignment.normalized_cost_margin;
     }
     candidates->push_back(candidate);
     if (!candidate.accepted_as_rescued_observation) {
@@ -921,6 +1202,8 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
         outer_detection.failure_reason_text.empty()
             ? ToString(outer_detection.failure_reason)
             : outer_detection.failure_reason_text;
+    bool topology_candidate_selected = false;
+    GeometryPriorOuterSeedCandidate selected_topology_candidate;
     if (options_.enable_geometry_prior_outer_seed &&
         !outer_detection.success && pose_prior_available) {
       ApriltagInternalConfig board_config = config_;
@@ -1069,6 +1352,8 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
           options_.geometry_prior_rescue_use_as_observation &&
           !options_.geometry_prior_rescue_diagnostic_only) {
         outer_detection = selected_detection;
+        topology_candidate_selected = true;
+        selected_topology_candidate = selected_rescued_candidate;
         if (selected_rescued_pose_available) {
           T_camera_board = selected_rescued_pose;
         }
@@ -1109,6 +1394,24 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
       measurement.detection = BuildFailedDetectionResult(
           board_id, image.size(), outer_detection, error.what());
     }
+    bool topology_internal_verification_passed = true;
+    if (topology_candidate_selected) {
+      topology_internal_verification_passed =
+          VerifyRecoveredInternalMeasurement(
+              config_, options_, camera_override, &selected_topology_candidate,
+              &measurement.detection);
+      // The final regenerated detection is authoritative.  Keep the
+      // candidate diagnostics synchronized with the observation actually
+      // handed to the backend instead of leaving an earlier candidate-level
+      // "accepted" flag behind after final regeneration fails.
+      topology_internal_verification_passed =
+          topology_internal_verification_passed && measurement.detection.success;
+      selected_topology_candidate.accepted_as_rescued_observation =
+          topology_internal_verification_passed;
+      ReplaceSelectedGeometryPriorCandidate(
+          selected_topology_candidate,
+          &result.geometry_prior_outer_seed_candidates);
+    }
     if (outer_detection.success && !measurement.detection.success &&
         !measurement.detection.failure_reason.empty()) {
       EmitRegenerationWarning(
@@ -1121,7 +1424,7 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
                                &result.runtime_breakdown);
     result.board_measurements.push_back(measurement);
 
-    if (outer_detection.success) {
+    if (outer_detection.success && topology_internal_verification_passed) {
       AppendUniqueBoardId(board_id, &result.visible_board_ids);
     }
   }
@@ -1208,6 +1511,8 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
         outer_detection.failure_reason_text.empty()
             ? ToString(outer_detection.failure_reason)
             : outer_detection.failure_reason_text;
+    bool topology_candidate_selected = false;
+    GeometryPriorOuterSeedCandidate selected_topology_candidate;
     if (options_.enable_geometry_prior_outer_seed &&
         !outer_detection.success && pose_prior_available) {
       ApriltagInternalConfig board_config = config_;
@@ -1340,6 +1645,8 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
           options_.geometry_prior_rescue_use_as_observation &&
           !options_.geometry_prior_rescue_diagnostic_only) {
         outer_detection = selected_detection;
+        topology_candidate_selected = true;
+        selected_topology_candidate = selected_rescued_candidate;
       } else if (any_candidate_accepted &&
                  options_.geometry_prior_rescue_use_as_observation &&
                  options_.geometry_prior_rescue_diagnostic_only) {
@@ -1373,6 +1680,20 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
       measurement.detection = BuildFailedDetectionResult(
           board_id, image.size(), outer_detection, error.what());
     }
+    bool topology_internal_verification_passed = true;
+    if (topology_candidate_selected) {
+      topology_internal_verification_passed =
+          VerifyRecoveredInternalMeasurement(
+              config_, options_, camera_override, &selected_topology_candidate,
+              &measurement.detection);
+      topology_internal_verification_passed =
+          topology_internal_verification_passed && measurement.detection.success;
+      selected_topology_candidate.accepted_as_rescued_observation =
+          topology_internal_verification_passed;
+      ReplaceSelectedGeometryPriorCandidate(
+          selected_topology_candidate,
+          &result.geometry_prior_outer_seed_candidates);
+    }
     if (outer_detection.success && !measurement.detection.success &&
         !measurement.detection.failure_reason.empty()) {
       EmitRegenerationWarning(
@@ -1385,7 +1706,7 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
                                &result.runtime_breakdown);
     result.board_measurements.push_back(measurement);
 
-    if (outer_detection.success) {
+    if (outer_detection.success && topology_internal_verification_passed) {
       AppendUniqueBoardId(board_id, &result.visible_board_ids);
     }
   }

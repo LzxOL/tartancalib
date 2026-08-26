@@ -2,6 +2,7 @@
 #define ASLAM_CAMERAS_APRILTAG_INTERNAL_STAGE5_BENCHMARK_HPP
 
 #include <array>
+#include <map>
 #include <set>
 #include <string>
 #include <utility>
@@ -400,6 +401,10 @@ struct TrialBackendFrameBoardSelectionOptions {
   int intrinsics_release_iteration = 1;
   bool persistent_intrinsics_anchor_prior_enabled = false;
   bool persistent_fix_board_layout = false;
+  // Experimental model-aware coreset: use the active camera family's full
+  // parameter vector and independent frame-board pose-marginalized Fisher
+  // information for frame-level ordering/acceptance diagnostics.
+  bool model_aware_information_coreset = false;
   double persistent_intrinsics_anchor_weight_xi_alpha = 0.0;
   double persistent_intrinsics_anchor_weight_focal = 0.0;
   double persistent_intrinsics_anchor_weight_principal = 0.0;
@@ -509,6 +514,9 @@ struct TrialBackendFrameBoardObservationDecision {
   double intrinsics_jacobian_trace_gain = 0.0;
   double intrinsics_jacobian_rank_gain = 0.0;
   double intrinsics_jacobian_info_term = 0.0;
+  double model_aware_information_gain = 0.0;
+  double model_aware_rank_gain = 0.0;
+  double model_aware_weak_direction_gain = 0.0;
   double frame_completion_bonus = 0.0;
   double new_board_bonus = 0.0;
   double cap_penalty = 0.0;
@@ -745,6 +753,13 @@ struct TrialBackendFrameBoardSelectionResult {
       KalibrStyleBatchAcceptancePolicy::ResidualScore;
   double acceptance_information_gain_threshold = 0.0;
   double acceptance_rank_gain_threshold = 0.0;
+  bool model_aware_information_coreset_enabled = false;
+  int model_aware_parameter_dimension = 0;
+  std::vector<std::string> model_aware_parameter_labels;
+  int model_aware_frame_count_scanned = 0;
+  int model_aware_frame_count_accepted = 0;
+  double model_aware_max_remaining_information_gain = 0.0;
+  double model_aware_seed_fisher_rank = 0.0;
   bool candidate_shuffle_seed_set = false;
   unsigned int candidate_shuffle_seed = 0;
   bool carry_accepted_trial_state = false;
@@ -801,6 +816,7 @@ struct TrialBackendFrameBoardSelectionResult {
   int persistent_incremental_seed_frame_count = 0;
   int persistent_incremental_seed_board_observation_count = 0;
   int persistent_incremental_seed_point_count = 0;
+  bool persistent_incremental_seed_outer_only_residuals = false;
   bool persistent_independent_camera_warmup_requested = false;
   bool persistent_independent_camera_warmup_attempted = false;
   bool persistent_independent_camera_warmup_success = false;
@@ -833,6 +849,9 @@ struct TrialBackendFrameBoardSelectionResult {
   int persistent_incremental_attempted_batch_count = 0;
   int persistent_incremental_accepted_batch_count = 0;
   int persistent_incremental_rejected_batch_count = 0;
+  std::map<std::string, int> persistent_incremental_rejection_reason_counts;
+  std::map<std::string, int>
+      persistent_incremental_rejection_reason_code_counts;
   std::string persistent_incremental_solver_profile_name;
   std::string persistent_incremental_solver_objective_unit;
   int persistent_incremental_solver_max_iterations = 0;
@@ -890,12 +909,16 @@ struct TrialBackendFrameBoardSelectionResult {
   int persistent_incremental_initial_full_training_pose_success_count = 0;
   int persistent_incremental_initial_full_training_pose_total_count = 0;
   int persistent_incremental_initial_full_training_invalid_projection_count = 0;
+  int persistent_incremental_initial_full_training_invalid_outer_projection_count = 0;
+  int persistent_incremental_initial_full_training_invalid_internal_projection_count = 0;
   double persistent_incremental_final_full_training_pixel_rmse = 0.0;
   double persistent_incremental_final_full_training_pixel_p95 = 0.0;
   double persistent_incremental_final_full_training_pose_success_rate = 0.0;
   int persistent_incremental_final_full_training_pose_success_count = 0;
   int persistent_incremental_final_full_training_pose_total_count = 0;
   int persistent_incremental_final_full_training_invalid_projection_count = 0;
+  int persistent_incremental_final_full_training_invalid_outer_projection_count = 0;
+  int persistent_incremental_final_full_training_invalid_internal_projection_count = 0;
   bool persistent_incremental_curated_bundle_state_consistency_pass = true;
   bool persistent_incremental_curated_bundle_shared_scene_health_pass = true;
   bool persistent_incremental_curated_bundle_used_validated_baseline_fallback =

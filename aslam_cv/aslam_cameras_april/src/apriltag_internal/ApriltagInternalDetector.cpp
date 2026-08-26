@@ -416,7 +416,9 @@ std::vector<int> ParseIntList(const std::string& key, const std::string& value) 
 InternalProjectionMode ParseProjectionMode(const std::string& value) {
   const std::string lowered = Lowercase(value);
   if (lowered == "homography") {
-    return InternalProjectionMode::Homography;
+    throw std::runtime_error(
+        "The homography internal-corner generator has been retired. "
+        "Use sphere_border_lattice with a configured camera model.");
   }
   if (lowered == "virtual_pinhole_patch" || lowered == "virtual-pinhole-patch") {
     return InternalProjectionMode::VirtualPinholePatch;
@@ -435,7 +437,9 @@ InternalProjectionMode ParseProjectionMode(const std::string& value) {
       lowered == "pinhole-bootstrap-patch" ||
       lowered == "outer_corner_pinhole_bootstrap_patch" ||
       lowered == "outer-corner-pinhole-bootstrap-patch") {
-    return InternalProjectionMode::PinholeBootstrapPatch;
+    throw std::runtime_error(
+        "The Outer4 homography bootstrap generator has been retired. "
+        "Use sphere_border_lattice with a configured camera model.");
   }
   if (lowered == "sphere_lattice" || lowered == "sphere-lattice") {
     return InternalProjectionMode::SphereLattice;
@@ -5807,8 +5811,12 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
   // At large polar angles it can carry a coherent board-level offset relative
   // to the image-refined boundary lattice, so using it as a second ownership
   // gate incorrectly removes valid, independently refined internal corners.
-  // Keep the finite/image-domain and duplicate checks below; the recovery
-  // path has already performed its board-level identity and pose validation.
+  // Keep the finite/image-domain and slot-ownership checks below; the latter
+  // rejects only a refinement that lands on another lattice point's predicted
+  // slot, rather than treating the pose prediction as an absolute pixel gate.
+  if (options_.enable_internal_lattice_slot_ownership_check) {
+    SuppressWrongLatticeSlotAssignments(&result);
+  }
   SuppressDuplicateRefinedInternalCorners(&result);
   SuppressLocallyInconsistentRecoveredCorners(&result);
   SuppressZeroImageEvidenceRecoveredCorners(&result);

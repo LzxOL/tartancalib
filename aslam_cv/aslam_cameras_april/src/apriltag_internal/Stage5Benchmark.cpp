@@ -20,6 +20,7 @@
 #include <utility>
 
 #include <Eigen/Eigenvalues>
+#include <Eigen/Dense>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
@@ -918,6 +919,8 @@ struct TrialBoardRmseAccumulator {
   int outer_point_count = 0;
   int internal_point_count = 0;
   double squared_error_sum = 0.0;
+  double outer_squared_error_sum = 0.0;
+  double internal_squared_error_sum = 0.0;
 };
 
 struct DenseGridOutlierFilterResult {
@@ -1035,8 +1038,9 @@ struct IntrinsicsInformationGainProxyBreakdown {
 struct IntrinsicsJacobianInformationSummary {
   bool available = false;
   int point_count = 0;
-  Eigen::Matrix<double, 6, 6> fisher =
-      Eigen::Matrix<double, 6, 6>::Zero();
+  int parameter_dimension = 0;
+  std::vector<std::string> parameter_labels;
+  Eigen::MatrixXd fisher;
   double logdet = 0.0;
   double trace = 0.0;
   double rank_proxy = 0.0;
@@ -1518,27 +1522,14 @@ OuterBootstrapCameraIntrinsics PerturbIntrinsicsParameter(
     int parameter_index,
     double delta) {
   OuterBootstrapCameraIntrinsics perturbed = camera;
-  switch (parameter_index) {
-    case 0:
-      perturbed.xi += delta;
-      break;
-    case 1:
-      perturbed.alpha += delta;
-      break;
-    case 2:
-      perturbed.fu += delta;
-      break;
-    case 3:
-      perturbed.fv += delta;
-      break;
-    case 4:
-      perturbed.cu += delta;
-      break;
-    case 5:
-      perturbed.cv += delta;
-      break;
-    default:
-      break;
+  std::vector<double> values = perturbed.CombinedParameterVector();
+  if (parameter_index < 0 ||
+      static_cast<std::size_t>(parameter_index) >= values.size()) {
+    return perturbed;
+  }
+  values[static_cast<std::size_t>(parameter_index)] += delta;
+  if (!perturbed.SetCombinedParameterVector(values)) {
+    return camera;
   }
   return perturbed;
 }
@@ -1546,64 +1537,71 @@ OuterBootstrapCameraIntrinsics PerturbIntrinsicsParameter(
 double IntrinsicsFiniteDifferenceStep(
     const OuterBootstrapCameraIntrinsics& camera,
     int parameter_index) {
-  switch (parameter_index) {
-    case 0:
-    case 1:
-      return 1e-4;
-    case 2:
-    case 3:
-    case 4:
-    case 5:
-      return 1e-2 * std::max(1.0, std::max(camera.fu, camera.fv));
-    default:
-      return 1e-4;
+  const std::vector<std::string> labels = camera.CombinedParameterLabels();
+  const std::string label =
+      parameter_index >= 0 &&
+              static_cast<std::size_t>(parameter_index) < labels.size()
+          ? labels[static_cast<std::size_t>(parameter_index)]
+          : std::string();
+  if (label == "fu" || label == "fv" || label == "cu" || label == "cv") {
+    return 1e-2 * std::max(1.0, std::max(camera.fu, camera.fv));
   }
+  if (label == "xi" || label == "alpha" || label == "beta") {
+    return 1e-4;
+  }
+  return 1e-5;
 }
 
 double IntrinsicsColumnScale(
     const OuterBootstrapCameraIntrinsics& camera,
     int parameter_index) {
-  switch (parameter_index) {
-    case 0:
-    case 1:
-      return 0.05;
-    case 2:
-      return 0.01 * std::max(1, camera.resolution.width);
-    case 3:
-      return 0.01 * std::max(1, camera.resolution.height);
-    case 4:
-      return 0.01 * std::max(1, camera.resolution.width);
-    case 5:
-      return 0.01 * std::max(1, camera.resolution.height);
-    default:
-      return 1.0;
+  const std::vector<std::string> labels = camera.CombinedParameterLabels();
+  const std::string label =
+      parameter_index >= 0 &&
+              static_cast<std::size_t>(parameter_index) < labels.size()
+          ? labels[static_cast<std::size_t>(parameter_index)]
+          : std::string();
+  if (label == "xi" || label == "alpha" || label == "beta") {
+    return 0.05;
   }
+  if (label == "fu" || label == "fv" || label == "cu" || label == "cv") {
+    return 0.01 * std::max(1, std::max(camera.resolution.width,
+                                      camera.resolution.height));
+  }
+  // Distortion parameters have a smaller natural scale than pixel-domain
+  // parameters; this keeps KB's k3/k4 from dominating the information proxy.
+  return 0.1;
 }
 
-double RegularizedFisherLogDet(
-    const Eigen::Matrix<double, 6, 6>& fisher) {
-  const Eigen::Matrix<double, 6, 6> sym =
+double RegularizedFisherLogDet(const Eigen::MatrixXd& fisher) {
+  if (fisher.rows() <= 0 || fisher.rows() != fisher.cols()) {
+    return 0.0;
+  }
+  const Eigen::MatrixXd sym =
       0.5 * (fisher + fisher.transpose());
-  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6> > solver(sym);
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(sym);
   if (solver.info() != Eigen::Success) {
     return 0.0;
   }
   double logdet = 0.0;
-  for (int i = 0; i < 6; ++i) {
+  for (int i = 0; i < solver.eigenvalues().size(); ++i) {
     logdet += std::log1p(std::max(0.0, solver.eigenvalues()[i]));
   }
   return logdet;
 }
 
-double FisherRankProxy(const Eigen::Matrix<double, 6, 6>& fisher) {
-  const Eigen::Matrix<double, 6, 6> sym =
+double FisherRankProxy(const Eigen::MatrixXd& fisher) {
+  if (fisher.rows() <= 0 || fisher.rows() != fisher.cols()) {
+    return 0.0;
+  }
+  const Eigen::MatrixXd sym =
       0.5 * (fisher + fisher.transpose());
-  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6> > solver(sym);
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(sym);
   if (solver.info() != Eigen::Success) {
     return 0.0;
   }
   double rank_proxy = 0.0;
-  for (int i = 0; i < 6; ++i) {
+  for (int i = 0; i < solver.eigenvalues().size(); ++i) {
     const double lambda = std::max(0.0, solver.eigenvalues()[i]);
     rank_proxy += lambda / (lambda + 1.0);
   }
@@ -1612,8 +1610,12 @@ double FisherRankProxy(const Eigen::Matrix<double, 6, 6>& fisher) {
 
 IntrinsicsJacobianInformationSummary ComputeIntrinsicsJacobianInformation(
     const CalibrationStateBundle& bundle,
-    const FrameBoardKey& key) {
+    const FrameBoardKey& key,
+    bool use_independent_pose) {
   IntrinsicsJacobianInformationSummary summary;
+  summary.parameter_labels = bundle.scene_state.camera.CombinedParameterLabels();
+  summary.parameter_dimension =
+      static_cast<int>(summary.parameter_labels.size());
   const JointSceneFrameState* frame_state =
       FindSceneFrameState(bundle, key.first);
   const JointSceneBoardState* board_state =
@@ -1624,16 +1626,53 @@ IntrinsicsJacobianInformationSummary ComputeIntrinsicsJacobianInformation(
     return summary;
   }
 
-  const Eigen::Isometry3d T_camera_reference(
-      frame_state->T_camera_reference);
-  const Eigen::Isometry3d T_reference_board(
-      board_state->T_reference_board);
-  const Eigen::Isometry3d T_camera_board =
-      T_camera_reference * T_reference_board;
   const std::vector<const JointPointObservation*> points =
       CollectFrameBoardPoints(bundle.measurement_dataset, key, true);
-  if (points.empty()) {
+  if (points.empty() || summary.parameter_dimension <= 0) {
     return summary;
+  }
+
+  Eigen::Isometry3d T_camera_board = Eigen::Isometry3d::Identity();
+  if (use_independent_pose) {
+    // The coreset measures camera information independently of the shared
+    // multi-board layout. Fit one temporary pose for this frame-board and use
+    // it only for the Fisher proxy; the shared scene remains the authority for
+    // the final BA.
+    std::vector<Eigen::Vector3d> pose_targets;
+    std::vector<cv::Point2f> pose_pixels;
+    for (const JointPointObservation* point : points) {
+      if (point != nullptr && point->point_type == JointPointType::Outer) {
+        pose_targets.push_back(point->target_xyz_board);
+        pose_pixels.emplace_back(static_cast<float>(point->image_xy.x()),
+                                 static_cast<float>(point->image_xy.y()));
+      }
+    }
+    if (pose_targets.size() < 4) {
+      pose_targets.clear();
+      pose_pixels.clear();
+      for (const JointPointObservation* point : points) {
+        if (point == nullptr) {
+          continue;
+        }
+        pose_targets.push_back(point->target_xyz_board);
+        pose_pixels.emplace_back(static_cast<float>(point->image_xy.x()),
+                                 static_cast<float>(point->image_xy.y()));
+      }
+    }
+    double pose_rmse = 0.0;
+    if (pose_targets.size() < 4 ||
+        !EstimatePoseForBenchmarkRefit(bundle.scene_state.camera,
+                                        pose_targets, pose_pixels,
+                                        &T_camera_board, &pose_rmse) ||
+        !std::isfinite(pose_rmse)) {
+      return summary;
+    }
+  } else {
+    const Eigen::Isometry3d T_camera_reference(
+        frame_state->T_camera_reference);
+    const Eigen::Isometry3d T_reference_board(
+        board_state->T_reference_board);
+    T_camera_board = T_camera_reference * T_reference_board;
   }
 
   const DoubleSphereCameraModel base_model =
@@ -1643,51 +1682,86 @@ IntrinsicsJacobianInformationSummary ComputeIntrinsicsJacobianInformation(
     return summary;
   }
 
-  std::array<DoubleSphereCameraModel, 6> plus_models;
-  std::array<DoubleSphereCameraModel, 6> minus_models;
-  std::array<double, 6> steps{};
-  std::array<double, 6> column_scales{};
-  for (int param = 0; param < 6; ++param) {
+  const int parameter_dimension = summary.parameter_dimension;
+  std::vector<DoubleSphereCameraModel> plus_models;
+  std::vector<DoubleSphereCameraModel> minus_models;
+  plus_models.reserve(parameter_dimension);
+  minus_models.reserve(parameter_dimension);
+  std::vector<double> steps(static_cast<std::size_t>(parameter_dimension), 0.0);
+  std::vector<double> column_scales(
+      static_cast<std::size_t>(parameter_dimension), 0.0);
+  for (int param = 0; param < parameter_dimension; ++param) {
     steps[static_cast<std::size_t>(param)] =
         IntrinsicsFiniteDifferenceStep(bundle.scene_state.camera, param);
     column_scales[static_cast<std::size_t>(param)] =
         IntrinsicsColumnScale(bundle.scene_state.camera, param);
-    plus_models[static_cast<std::size_t>(param)] =
-        DoubleSphereCameraModel::FromConfig(MakeIntermediateCameraConfig(
-            PerturbIntrinsicsParameter(
-                bundle.scene_state.camera, param,
-                steps[static_cast<std::size_t>(param)])));
-    minus_models[static_cast<std::size_t>(param)] =
-        DoubleSphereCameraModel::FromConfig(MakeIntermediateCameraConfig(
-            PerturbIntrinsicsParameter(
-                bundle.scene_state.camera, param,
-                -steps[static_cast<std::size_t>(param)])));
-    if (!plus_models[static_cast<std::size_t>(param)].IsValid() ||
-        !minus_models[static_cast<std::size_t>(param)].IsValid()) {
+    const OuterBootstrapCameraIntrinsics plus_camera =
+        PerturbIntrinsicsParameter(
+            bundle.scene_state.camera, param,
+            steps[static_cast<std::size_t>(param)]);
+    const OuterBootstrapCameraIntrinsics minus_camera =
+        PerturbIntrinsicsParameter(
+            bundle.scene_state.camera, param,
+            -steps[static_cast<std::size_t>(param)]);
+    plus_models.push_back(DoubleSphereCameraModel::FromConfig(
+        MakeIntermediateCameraConfig(plus_camera)));
+    minus_models.push_back(DoubleSphereCameraModel::FromConfig(
+        MakeIntermediateCameraConfig(minus_camera)));
+    if (!plus_models.back().IsValid() || !minus_models.back().IsValid()) {
       return summary;
     }
   }
 
-  Eigen::Matrix<double, 6, 6> Hcc =
-      Eigen::Matrix<double, 6, 6>::Zero();
-  Eigen::Matrix<double, 6, 6> Hcp =
-      Eigen::Matrix<double, 6, 6>::Zero();
+  Eigen::MatrixXd Hcc = Eigen::MatrixXd::Zero(parameter_dimension,
+                                               parameter_dimension);
+  Eigen::MatrixXd Hcp = Eigen::MatrixXd::Zero(parameter_dimension, 6);
   Eigen::Matrix<double, 6, 6> Hpp =
       Eigen::Matrix<double, 6, 6>::Zero();
   constexpr double kTranslationStep = 1e-5;
   constexpr double kRotationStep = 1e-6;
+
+  // Keep the information proxy in the same observation subspace as the
+  // persistent backend.  In particular, a frame-board with dense internal
+  // points must not receive more Fisher mass merely because it has more
+  // samples than its outer-corner counterpart.
+  int outer_count = 0;
+  int internal_count = 0;
   for (const JointPointObservation* point : points) {
     if (point == nullptr) {
       continue;
     }
+    if (point->point_type == JointPointType::Outer) {
+      ++outer_count;
+    } else {
+      ++internal_count;
+    }
+  }
+  const bool has_outer = outer_count > 0;
+  const bool has_internal = internal_count > 0;
+  for (const JointPointObservation* point : points) {
+    if (point == nullptr) {
+      continue;
+    }
+    const int type_count = point->point_type == JointPointType::Outer
+                               ? outer_count
+                               : internal_count;
+    if (type_count <= 0) {
+      continue;
+    }
+    const double type_budget = has_outer && has_internal ? 0.5 : 1.0;
+    const double observation_weight =
+        type_budget / static_cast<double>(type_count) *
+        std::max(0.0, point->final_observation_weight);
+    if (!(observation_weight > 0.0) || !std::isfinite(observation_weight)) {
+      continue;
+    }
     const Eigen::Vector3d point_camera =
         T_camera_board * point->target_xyz_board;
-    Eigen::Matrix<double, 2, 6> jacobian =
-        Eigen::Matrix<double, 2, 6>::Zero();
+    Eigen::MatrixXd jacobian = Eigen::MatrixXd::Zero(2, parameter_dimension);
     Eigen::Matrix<double, 2, 6> pose_jacobian =
         Eigen::Matrix<double, 2, 6>::Zero();
     bool valid_point = true;
-    for (int param = 0; param < 6; ++param) {
+    for (int param = 0; param < parameter_dimension; ++param) {
       Eigen::Vector2d plus = Eigen::Vector2d::Zero();
       Eigen::Vector2d minus = Eigen::Vector2d::Zero();
       if (!plus_models[static_cast<std::size_t>(param)]
@@ -1742,9 +1816,12 @@ IntrinsicsJacobianInformationSummary ComputeIntrinsicsJacobianInformation(
     if (!valid_point || !pose_jacobian.allFinite()) {
       continue;
     }
-    Hcc.noalias() += jacobian.transpose() * jacobian;
-    Hcp.noalias() += jacobian.transpose() * pose_jacobian;
-    Hpp.noalias() += pose_jacobian.transpose() * pose_jacobian;
+    Hcc.noalias() += observation_weight *
+                     (jacobian.transpose() * jacobian);
+    Hcp.noalias() += observation_weight *
+                     (jacobian.transpose() * pose_jacobian);
+    Hpp.noalias() += observation_weight *
+                     (pose_jacobian.transpose() * pose_jacobian);
     ++summary.point_count;
   }
 
@@ -1758,16 +1835,16 @@ IntrinsicsJacobianInformationSummary ComputeIntrinsicsJacobianInformation(
   if (pose_ldlt.info() != Eigen::Success) {
     return IntrinsicsJacobianInformationSummary{};
   }
-  const Eigen::Matrix<double, 6, 6> Hpp_inv_Hpc =
+  const Eigen::MatrixXd Hpp_inv_Hpc =
       pose_ldlt.solve(Hcp.transpose());
   if (!Hpp_inv_Hpc.allFinite()) {
     return IntrinsicsJacobianInformationSummary{};
   }
-  Eigen::Matrix<double, 6, 6> marginalized_fisher =
+  Eigen::MatrixXd marginalized_fisher =
       Hcc - Hcp * Hpp_inv_Hpc;
   marginalized_fisher =
       0.5 * (marginalized_fisher + marginalized_fisher.transpose());
-  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6> > fisher_solver(
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> fisher_solver(
       marginalized_fisher);
   if (fisher_solver.info() != Eigen::Success) {
     return IntrinsicsJacobianInformationSummary{};
@@ -1776,12 +1853,54 @@ IntrinsicsJacobianInformationSummary ComputeIntrinsicsJacobianInformation(
       fisher_solver.eigenvectors() *
       fisher_solver.eigenvalues().cwiseMax(0.0).asDiagonal() *
       fisher_solver.eigenvectors().transpose();
-  summary.fisher /= static_cast<double>(summary.point_count);
   summary.trace = std::max(0.0, summary.fisher.trace());
   summary.logdet = RegularizedFisherLogDet(summary.fisher);
   summary.rank_proxy = FisherRankProxy(summary.fisher);
   summary.available = true;
   return summary;
+}
+
+Eigen::MatrixXd ComputeFrameNormalizedFisher(
+    const std::map<FrameBoardKey, IntrinsicsJacobianInformationSummary>&
+        information_by_key,
+    const std::set<FrameBoardKey>& keys,
+    int parameter_dimension) {
+  Eigen::MatrixXd fisher =
+      Eigen::MatrixXd::Zero(std::max(0, parameter_dimension),
+                            std::max(0, parameter_dimension));
+  if (parameter_dimension <= 0) {
+    return fisher;
+  }
+  std::map<int, int> available_board_count_by_frame;
+  for (const FrameBoardKey& key : keys) {
+    const auto it = information_by_key.find(key);
+    if (it != information_by_key.end() && it->second.available &&
+        it->second.fisher.rows() == parameter_dimension) {
+      ++available_board_count_by_frame[key.first];
+    }
+  }
+  for (const FrameBoardKey& key : keys) {
+    const auto it = information_by_key.find(key);
+    if (it == information_by_key.end() || !it->second.available ||
+        it->second.fisher.rows() != parameter_dimension) {
+      continue;
+    }
+    const int board_count = std::max(1, available_board_count_by_frame[key.first]);
+    fisher.noalias() += it->second.fisher / static_cast<double>(board_count);
+  }
+  return 0.5 * (fisher + fisher.transpose());
+}
+
+double SmallestFisherEigenvalue(const Eigen::MatrixXd& fisher) {
+  if (fisher.rows() <= 0 || fisher.rows() != fisher.cols()) {
+    return 0.0;
+  }
+  const Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(
+      0.5 * (fisher + fisher.transpose()));
+  if (solver.info() != Eigen::Success || solver.eigenvalues().size() == 0) {
+    return 0.0;
+  }
+  return std::max(0.0, solver.eigenvalues()[0]);
 }
 
 std::set<std::pair<int, int> > CollectAcceptedGridCells(
@@ -2588,10 +2707,18 @@ AslamBackendCalibrationResult RunShortTrialBackend(
   BackendProblemOptions trial_backend_options = backend_options;
   trial_backend_options.optimize_frame_poses = true;
   trial_backend_options.optimize_board_poses = true;
+  // With the model-aware coreset, short trials are only for pose/layout
+  // diagnostics and candidate scoring.  The initializer camera is the sole
+  // camera state entering persistent BA; releasing intrinsics here would
+  // recreate the old 1503->1586->1574 state contamination before the
+  // persistent estimator even starts.
+  const bool freeze_camera_for_model_aware_trial =
+      options.model_aware_information_coreset;
   trial_backend_options.optimize_intrinsics =
-      options.optimize_intrinsics_in_trial;
-  trial_backend_options.delayed_intrinsics_release =
       options.optimize_intrinsics_in_trial &&
+      !freeze_camera_for_model_aware_trial;
+  trial_backend_options.delayed_intrinsics_release =
+      trial_backend_options.optimize_intrinsics &&
       options.delayed_intrinsics_release_in_trial;
   trial_backend_options.intrinsics_release_iteration =
       std::max(0, options.intrinsics_release_iteration);
@@ -2768,6 +2895,8 @@ void CopyPersistentIncrementalSummary(
       incremental_result.seed_board_observation_count;
   result->persistent_incremental_seed_point_count =
       incremental_result.seed_point_count;
+  result->persistent_incremental_seed_outer_only_residuals =
+      incremental_result.seed_outer_only_residuals;
   result->persistent_independent_camera_warmup_requested =
       incremental_result.independent_frame_board_camera_warmup_requested;
   result->persistent_independent_camera_warmup_attempted =
@@ -2839,6 +2968,10 @@ void CopyPersistentIncrementalSummary(
       incremental_result.accepted_batch_count;
   result->persistent_incremental_rejected_batch_count =
       incremental_result.rejected_batch_count;
+  result->persistent_incremental_rejection_reason_counts =
+      incremental_result.rejection_reason_counts;
+  result->persistent_incremental_rejection_reason_code_counts =
+      incremental_result.rejection_reason_code_counts;
   result->persistent_incremental_solver_profile_name =
       incremental_result.solver_profile_name;
   result->persistent_incremental_solver_objective_unit =
@@ -2955,6 +3088,10 @@ void CopyPersistentIncrementalSummary(
       incremental_result.initial_full_training_pose_total_count;
   result->persistent_incremental_initial_full_training_invalid_projection_count =
       incremental_result.initial_full_training_invalid_projection_count;
+  result->persistent_incremental_initial_full_training_invalid_outer_projection_count =
+      incremental_result.initial_full_training_invalid_outer_projection_count;
+  result->persistent_incremental_initial_full_training_invalid_internal_projection_count =
+      incremental_result.initial_full_training_invalid_internal_projection_count;
   result->persistent_incremental_final_full_training_pixel_rmse =
       incremental_result.final_full_training_pixel_rmse;
   result->persistent_incremental_final_full_training_pixel_p95 =
@@ -2967,6 +3104,10 @@ void CopyPersistentIncrementalSummary(
       incremental_result.final_full_training_pose_total_count;
   result->persistent_incremental_final_full_training_invalid_projection_count =
       incremental_result.final_full_training_invalid_projection_count;
+  result->persistent_incremental_final_full_training_invalid_outer_projection_count =
+      incremental_result.final_full_training_invalid_outer_projection_count;
+  result->persistent_incremental_final_full_training_invalid_internal_projection_count =
+      incremental_result.final_full_training_invalid_internal_projection_count;
   result->persistent_incremental_curated_bundle_state_consistency_pass =
       incremental_result.curated_bundle_state_consistency_pass;
   result->persistent_incremental_curated_bundle_shared_scene_health_pass =
@@ -3233,7 +3374,7 @@ IntrinsicsInformationGainProxyBreakdown ComputeIntrinsicsInformationGainProxy(
     const std::set<FrameBoardKey>& accepted_keys,
     const std::map<int, int>& accepted_observation_count_by_frame,
     const std::map<int, int>& candidate_pool_board_capacity_by_frame,
-    const Eigen::Matrix<double, 6, 6>& accepted_intrinsics_fisher,
+    const Eigen::MatrixXd& accepted_intrinsics_fisher,
     const IntrinsicsJacobianInformationSummary& candidate_intrinsics_info,
     double min_candidate_score,
     TrialBackendFrameBoardSelectionOptions::InfoGainProxyMode
@@ -3334,7 +3475,7 @@ IntrinsicsInformationGainProxyBreakdown ComputeIntrinsicsInformationGainProxy(
           TrialBackendFrameBoardSelectionOptions::InfoGainProxyMode
               ::IntrinsicsJacobian &&
       candidate_intrinsics_info.available) {
-    const Eigen::Matrix<double, 6, 6> combined_fisher =
+    const Eigen::MatrixXd combined_fisher =
         accepted_intrinsics_fisher + candidate_intrinsics_info.fisher;
     const double accepted_logdet =
         RegularizedFisherLogDet(accepted_intrinsics_fisher);
@@ -3497,8 +3638,12 @@ std::map<FrameBoardKey, TrialBoardRmseAccumulator> ComputeTrialBoardResiduals(
         point.residual_norm * point.residual_norm;
     if (point.point_type == JointPointType::Outer) {
       ++accumulator.outer_point_count;
+      accumulator.outer_squared_error_sum +=
+          point.residual_norm * point.residual_norm;
     } else {
       ++accumulator.internal_point_count;
+      accumulator.internal_squared_error_sum +=
+          point.residual_norm * point.residual_norm;
     }
   }
   return accumulators;
@@ -3646,6 +3791,12 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
   result.checkerboard_force_all_valid_views =
       options.single_board_dense_grid_profile &&
       options.acceptance_information_gain_threshold < 0.0;
+  result.model_aware_information_coreset_enabled =
+      options.model_aware_information_coreset;
+  result.model_aware_parameter_labels =
+      candidate_pool_bundle.scene_state.camera.CombinedParameterLabels();
+  result.model_aware_parameter_dimension =
+      static_cast<int>(result.model_aware_parameter_labels.size());
   result.curated_bundle = baseline_bundle;
   result.input_frame_count =
       candidate_pool_bundle.measurement_dataset.accepted_frame_count;
@@ -3752,6 +3903,40 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
                                       result.robust_sigma_board_rmse))
           : result.threshold_px;
 
+  // A board-level residual gate is deliberately narrower than the ordinary
+  // trial RMSE gate.  It only identifies an isolated outer-corner failure
+  // when the board has enough internal support, the internal points fit under
+  // the existing robust threshold, and the four outer corners are materially
+  // worse.  A generally difficult board therefore remains eligible; only an
+  // outer/internal disagreement can block frame-cohesion restoration.
+  std::set<FrameBoardKey> isolated_outer_internal_mismatch_keys;
+  for (const auto& entry : accumulators) {
+    const TrialBoardRmseAccumulator& accumulator = entry.second;
+    if (accumulator.outer_point_count != 4 ||
+        accumulator.internal_point_count < 8) {
+      continue;
+    }
+    const double internal_rmse = std::sqrt(
+        accumulator.internal_squared_error_sum /
+        static_cast<double>(accumulator.internal_point_count));
+    const double outer_rmse = std::sqrt(
+        accumulator.outer_squared_error_sum /
+        static_cast<double>(accumulator.outer_point_count));
+    if (std::isfinite(internal_rmse) && std::isfinite(outer_rmse) &&
+        internal_rmse <= result.threshold_px &&
+        outer_rmse > result.threshold_px &&
+        outer_rmse > 2.0 * internal_rmse) {
+      isolated_outer_internal_mismatch_keys.insert(entry.first);
+    }
+  }
+  if (!isolated_outer_internal_mismatch_keys.empty()) {
+    std::ostringstream warning;
+    warning << "Blocked frame-cohesion restoration for "
+            << isolated_outer_internal_mismatch_keys.size()
+            << " frame-board observations with isolated outer/internal RMSE mismatch.";
+    result.warnings.push_back(warning.str());
+  }
+
   std::set<FrameBoardKey> baseline_keys =
       CollectAcceptedFrameBoardKeys(baseline_bundle.measurement_dataset);
   const std::set<FrameBoardKey> candidate_pool_keys =
@@ -3780,6 +3965,7 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
           candidate_pool_keys.count(key) == 0 ||
           independent_pose_supported_keys.count(key) == 0 ||
           accumulator.internal_point_count <= 0 ||
+          isolated_outer_internal_mismatch_keys.count(key) > 0 ||
           accumulator.point_count <= 0) {
         continue;
       }
@@ -3794,7 +3980,11 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
     }
     if (!frame_cohesion_seed_keys.empty()) {
       frame_cohesive_baseline_bundle = BuildBundleForAcceptedFrameBoardKeys(
-          candidate_pool_bundle,
+          // Keep the initialized camera/scene state from the selected
+          // baseline. The candidate pool supplies observations only; its
+          // camera may come from the diagnostic full-pool trial backend and
+          // must not leak into persistent incremental BA.
+          frame_cohesive_baseline_bundle,
           candidate_pool_bundle,
           baseline_keys,
           baseline_bundle.measurement_dataset.source_stage_label +
@@ -3862,7 +4052,9 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
         persistent_candidate_pool_keys.end(),
         std::inserter(filtered_seed_keys, filtered_seed_keys.end()));
     persistent_baseline_bundle = BuildBundleForAcceptedFrameBoardKeys(
-        persistent_candidate_pool_bundle,
+        // Preserve the selected baseline camera and scene state. Filtering
+        // changes which observations are active, not the camera seed.
+        frame_cohesive_baseline_bundle,
         persistent_candidate_pool_bundle,
         filtered_seed_keys,
         frame_cohesive_baseline_bundle.measurement_dataset.source_stage_label +
@@ -4164,15 +4356,41 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
       accepted_observation_count_by_frame;
   std::map<FrameBoardKey, IntrinsicsJacobianInformationSummary>
       intrinsics_jacobian_info_by_key;
-  Eigen::Matrix<double, 6, 6> accepted_intrinsics_fisher =
-      Eigen::Matrix<double, 6, 6>::Zero();
+  const int model_parameter_dimension =
+      static_cast<int>(candidate_pool_bundle.scene_state.camera
+                           .CombinedParameterVector()
+                           .size());
+  Eigen::MatrixXd accepted_intrinsics_fisher =
+      Eigen::MatrixXd::Zero(std::max(0, model_parameter_dimension),
+                            std::max(0, model_parameter_dimension));
+  const auto refresh_accepted_information =
+      [&](const std::set<FrameBoardKey>& keys) {
+    if (options.model_aware_information_coreset) {
+      accepted_intrinsics_fisher = ComputeFrameNormalizedFisher(
+          intrinsics_jacobian_info_by_key, keys,
+          model_parameter_dimension);
+    }
+  };
   for (const FrameBoardKey& key : candidate_pool_keys) {
     const IntrinsicsJacobianInformationSummary info =
-        ComputeIntrinsicsJacobianInformation(candidate_pool_bundle, key);
+        ComputeIntrinsicsJacobianInformation(
+            candidate_pool_bundle, key,
+            options.model_aware_information_coreset);
     intrinsics_jacobian_info_by_key[key] = info;
     if (baseline_keys.find(key) != baseline_keys.end() && info.available) {
-      accepted_intrinsics_fisher += info.fisher;
+      if (!options.model_aware_information_coreset) {
+        accepted_intrinsics_fisher += info.fisher;
+      }
     }
+  }
+  if (options.model_aware_information_coreset) {
+    accepted_intrinsics_fisher = ComputeFrameNormalizedFisher(
+        intrinsics_jacobian_info_by_key, baseline_keys,
+        model_parameter_dimension);
+    result.model_aware_seed_fisher_rank =
+        FisherRankProxy(accepted_intrinsics_fisher);
+    result.model_aware_frame_count_scanned =
+        static_cast<int>(candidate_pool_bundle.measurement_dataset.frames.size());
   }
   const bool kalibr_style_batch_mode =
       options.selection_mode ==
@@ -4196,14 +4414,105 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
       result.candidate_order_mode ==
       TrialBackendFrameBoardSelectionOptions::CandidateOrderMode
           ::RandomShuffle;
-  if (result.candidate_order_mode ==
+  if (options.model_aware_information_coreset) {
+    // Model-aware ordering is performed on whole frames. A frame contributes
+    // one normalized Fisher block even when several boards are visible, so a
+    // multi-board frame cannot win merely by having more observations.
+    std::map<int, std::vector<TrialBackendFrameBoardObservationDecision> >
+        candidates_by_frame;
+    for (const TrialBackendFrameBoardObservationDecision& candidate :
+         candidate_decisions) {
+      candidates_by_frame[candidate.frame_index].push_back(candidate);
+    }
+    std::set<int> remaining_frames;
+    for (const auto& entry : candidates_by_frame) {
+      remaining_frames.insert(entry.first);
+    }
+    std::vector<TrialBackendFrameBoardObservationDecision> ordered;
+    ordered.reserve(candidate_decisions.size());
+    Eigen::MatrixXd ordering_fisher = accepted_intrinsics_fisher;
+    while (!remaining_frames.empty()) {
+      const double before_logdet = RegularizedFisherLogDet(ordering_fisher);
+      const double before_rank = FisherRankProxy(ordering_fisher);
+      const double before_weak = SmallestFisherEigenvalue(ordering_fisher);
+      int best_frame = -1;
+      double best_gain = -std::numeric_limits<double>::infinity();
+      double best_rank_gain = -std::numeric_limits<double>::infinity();
+      double best_weak_gain = -std::numeric_limits<double>::infinity();
+      Eigen::MatrixXd best_frame_fisher;
+      for (int frame_index : remaining_frames) {
+        std::set<FrameBoardKey> frame_keys;
+        for (const auto& candidate : candidates_by_frame[frame_index]) {
+          frame_keys.insert(FrameBoardKey(candidate.frame_index,
+                                          candidate.board_id));
+        }
+        const Eigen::MatrixXd frame_fisher = ComputeFrameNormalizedFisher(
+            intrinsics_jacobian_info_by_key, frame_keys,
+            model_parameter_dimension);
+        if (frame_fisher.rows() == 0 || frame_fisher.norm() <= 0.0) {
+          continue;
+        }
+        const Eigen::MatrixXd combined = ordering_fisher + frame_fisher;
+        const double gain = std::max(
+            0.0, RegularizedFisherLogDet(combined) - before_logdet);
+        const double rank_gain = std::max(0.0,
+                                          FisherRankProxy(combined) -
+                                              before_rank);
+        const double weak_gain = std::max(
+            0.0, SmallestFisherEigenvalue(combined) - before_weak);
+        const double tie_score =
+            gain + 0.25 * rank_gain + 0.05 * weak_gain;
+        const double best_tie_score =
+            best_gain + 0.25 * best_rank_gain + 0.05 * best_weak_gain;
+        if (best_frame < 0 || tie_score > best_tie_score + 1e-12 ||
+            (std::abs(tie_score - best_tie_score) <= 1e-12 &&
+             frame_index < best_frame)) {
+          best_frame = frame_index;
+          best_gain = gain;
+          best_rank_gain = rank_gain;
+          best_weak_gain = weak_gain;
+          best_frame_fisher = frame_fisher;
+        }
+      }
+      if (best_frame < 0) {
+        // Candidates with no finite model Jacobian remain eligible for the
+        // normal validity gates, but are placed at the end deterministically.
+        for (int frame_index : remaining_frames) {
+          std::vector<TrialBackendFrameBoardObservationDecision>& members =
+              candidates_by_frame[frame_index];
+          std::sort(members.begin(), members.end(), ScoreSortedBefore);
+          ordered.insert(ordered.end(), members.begin(), members.end());
+        }
+        break;
+      }
+      std::vector<TrialBackendFrameBoardObservationDecision>& members =
+          candidates_by_frame[best_frame];
+      std::sort(members.begin(), members.end(), ScoreSortedBefore);
+      for (TrialBackendFrameBoardObservationDecision& member : members) {
+        member.model_aware_information_gain = best_gain;
+        member.model_aware_rank_gain = best_rank_gain;
+        member.model_aware_weak_direction_gain = best_weak_gain;
+        ordered.push_back(member);
+      }
+      ordering_fisher += best_frame_fisher;
+      remaining_frames.erase(best_frame);
+      ++result.model_aware_frame_count_accepted;
+      result.model_aware_max_remaining_information_gain =
+          std::max(result.model_aware_max_remaining_information_gain,
+                   best_gain);
+    }
+    candidate_decisions.swap(ordered);
+    result.candidate_order_mode =
+        TrialBackendFrameBoardSelectionOptions::CandidateOrderMode::
+            IntrinsicsInformationGreedy;
+  } else if (result.candidate_order_mode ==
       TrialBackendFrameBoardSelectionOptions::CandidateOrderMode::
           IntrinsicsInformationGreedy) {
     std::vector<TrialBackendFrameBoardObservationDecision> remaining =
         candidate_decisions;
     std::vector<TrialBackendFrameBoardObservationDecision> ordered;
     ordered.reserve(remaining.size());
-    Eigen::Matrix<double, 6, 6> ordering_fisher =
+    Eigen::MatrixXd ordering_fisher =
         accepted_intrinsics_fisher;
     while (!remaining.empty()) {
       const double current_logdet =
@@ -4439,25 +4748,30 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
                 ? candidate->intrinsics_jacobian_logdet_gain
                 : gain.information_gain_proxy;
         if (batch_members != nullptr && !batch_members->empty()) {
-          Eigen::Matrix<double, 6, 6> batch_fisher =
-              Eigen::Matrix<double, 6, 6>::Zero();
+          Eigen::MatrixXd batch_fisher =
+              Eigen::MatrixXd::Zero(std::max(0, model_parameter_dimension),
+                                    std::max(0, model_parameter_dimension));
           double aggregate_score_term = 0.0;
           double aggregate_coverage_term = 0.0;
           double aggregate_frame_completion_bonus = 0.0;
           double aggregate_new_board_bonus = 0.0;
           bool aggregate_intrinsics_anchor = false;
           int available_jacobian_count = 0;
+          std::set<FrameBoardKey> batch_keys;
           for (const TrialBackendFrameBoardObservationDecision& member :
                *batch_members) {
             const FrameBoardKey member_key(member.frame_index,
                                            member.board_id);
+            batch_keys.insert(member_key);
             const auto info_it =
                 intrinsics_jacobian_info_by_key.find(member_key);
             IntrinsicsJacobianInformationSummary member_info;
             if (info_it != intrinsics_jacobian_info_by_key.end()) {
               member_info = info_it->second;
               if (member_info.available) {
-                batch_fisher += member_info.fisher;
+                if (!options.model_aware_information_coreset) {
+                  batch_fisher += member_info.fisher;
+                }
                 ++available_jacobian_count;
               }
             }
@@ -4482,10 +4796,15 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
                 aggregate_intrinsics_anchor ||
                 member.intrinsics_diversity_anchor;
           }
+          if (options.model_aware_information_coreset) {
+            batch_fisher = ComputeFrameNormalizedFisher(
+                intrinsics_jacobian_info_by_key, batch_keys,
+                model_parameter_dimension);
+          }
           const double batch_member_count =
               static_cast<double>(std::max<std::size_t>(
                   1u, batch_members->size()));
-          const Eigen::Matrix<double, 6, 6> combined_fisher =
+          const Eigen::MatrixXd combined_fisher =
               accepted_intrinsics_fisher + batch_fisher;
           const double accepted_logdet =
               RegularizedFisherLogDet(accepted_intrinsics_fisher);
@@ -4731,11 +5050,20 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
         persistent_runner_options.residual_model != ResidualModel::ImagePlane ||
         persistent_runner_options.use_point_type_residual_split ||
         persistent_runner_options.angular_auxiliary_enabled;
-    if (!persistent_result.success && persistent_required_for_residual_ablation) {
+    const bool persistent_required_for_model_aware_coreset =
+        options.model_aware_information_coreset;
+    if (!persistent_result.success &&
+        (persistent_required_for_residual_ablation ||
+         persistent_required_for_model_aware_coreset)) {
       result.failure_reason =
-          "Requested backend residual model must be applied inside persistent "
-          "incremental selection BA, but the persistent estimator is not "
-          "compatible: " + persistent_result.fallback_reason;
+          persistent_required_for_model_aware_coreset
+              ? "Model-aware information coreset requires the persistent "
+                "incremental estimator; fallback to short BA is disabled: " +
+                    persistent_result.fallback_reason
+              : "Requested backend residual model must be applied inside "
+                "persistent incremental selection BA, but the persistent "
+                "estimator is not compatible: " +
+                    persistent_result.fallback_reason;
       result.warnings.insert(result.warnings.end(),
                              persistent_result.warnings.begin(),
                              persistent_result.warnings.end());
@@ -5390,7 +5718,11 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
         const auto info_it = intrinsics_jacobian_info_by_key.find(key);
         if (info_it != intrinsics_jacobian_info_by_key.end() &&
             info_it->second.available) {
-          accepted_intrinsics_fisher += info_it->second.fisher;
+          if (options.model_aware_information_coreset) {
+            refresh_accepted_information(accepted_keys);
+          } else {
+            accepted_intrinsics_fisher += info_it->second.fisher;
+          }
         }
         decision_by_key[key] = accepted;
       }
@@ -5412,6 +5744,12 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
        candidate_decisions) {
     const FrameBoardKey key(candidate.frame_index, candidate.board_id);
     if (accepted_keys.find(key) != accepted_keys.end()) {
+      continue;
+    }
+    if (isolated_outer_internal_mismatch_keys.count(key) > 0) {
+      candidate.kept = false;
+      candidate.reason = "rejected_isolated_outer_internal_rmse_mismatch";
+      decision_by_key[key] = candidate;
       continue;
     }
     candidate.attempted_incremental = false;
@@ -5635,7 +5973,11 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
       const auto info_it = intrinsics_jacobian_info_by_key.find(key);
       if (info_it != intrinsics_jacobian_info_by_key.end() &&
           info_it->second.available) {
-        accepted_intrinsics_fisher += info_it->second.fisher;
+        if (options.model_aware_information_coreset) {
+          refresh_accepted_information(accepted_keys);
+        } else {
+          accepted_intrinsics_fisher += info_it->second.fisher;
+        }
       }
       current_metrics = tentative_metrics;
       current_backend = tentative_backend;
@@ -5690,6 +6032,9 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
          candidate_decisions) {
       const FrameBoardKey key(candidate.frame_index, candidate.board_id);
       if (accepted_keys.find(key) != accepted_keys.end()) {
+        continue;
+      }
+      if (isolated_outer_internal_mismatch_keys.count(key) > 0) {
         continue;
       }
       const auto frame_capacity_it =
@@ -5759,6 +6104,14 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
         }
         const FrameBoardKey key(candidate.frame_index, candidate.board_id);
         if (accepted_keys.find(key) != accepted_keys.end()) {
+          continue;
+        }
+        if (isolated_outer_internal_mismatch_keys.count(key) > 0) {
+          candidate.kept = false;
+          candidate.reason =
+              "rejected_isolated_outer_internal_rmse_mismatch";
+          ++result.frame_cohesion_rejected_count;
+          decision_by_key[key] = candidate;
           continue;
         }
         const bool board_cap_exceeded =
@@ -5859,7 +6212,11 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
           const auto info_it = intrinsics_jacobian_info_by_key.find(key);
           if (info_it != intrinsics_jacobian_info_by_key.end() &&
               info_it->second.available) {
-            accepted_intrinsics_fisher += info_it->second.fisher;
+            if (options.model_aware_information_coreset) {
+              refresh_accepted_information(accepted_keys);
+            } else {
+              accepted_intrinsics_fisher += info_it->second.fisher;
+            }
           }
           current_metrics = tentative_metrics;
           current_backend = tentative_backend;
@@ -5922,8 +6279,9 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
     }
 
     std::set<FrameBoardKey> consolidated_keys;
-    Eigen::Matrix<double, 6, 6> consolidated_fisher =
-        Eigen::Matrix<double, 6, 6>::Zero();
+    Eigen::MatrixXd consolidated_fisher =
+        Eigen::MatrixXd::Zero(std::max(0, model_parameter_dimension),
+                              std::max(0, model_parameter_dimension));
     for (const auto& entry : accepted_keys_by_frame) {
       const int frame_index = entry.first;
       if (baseline_frame_indices.count(frame_index) == 0) {
@@ -5950,8 +6308,9 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
       if (frame_it == accepted_keys_by_frame.end()) {
         continue;
       }
-      Eigen::Matrix<double, 6, 6> frame_fisher =
-          Eigen::Matrix<double, 6, 6>::Zero();
+      Eigen::MatrixXd frame_fisher =
+          Eigen::MatrixXd::Zero(std::max(0, model_parameter_dimension),
+                                std::max(0, model_parameter_dimension));
       bool has_information = false;
       bool critical_view = false;
       int board_count = 0;
@@ -5973,7 +6332,7 @@ TrialBackendFrameBoardSelectionResult ApplyTrialBackendFrameBoardSelection(
       const double before_logdet =
           RegularizedFisherLogDet(consolidated_fisher);
       const double before_rank = FisherRankProxy(consolidated_fisher);
-      const Eigen::Matrix<double, 6, 6> candidate_fisher =
+      const Eigen::MatrixXd candidate_fisher =
           consolidated_fisher + frame_fisher;
       const double after_logdet =
           RegularizedFisherLogDet(candidate_fisher);
@@ -7007,6 +7366,8 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
       baseline_options.force_internal_seed_from_prediction;
   detection_options.bypass_internal_seed_filters =
       baseline_options.bypass_internal_seed_filters;
+  detection_options.enable_internal_lattice_slot_ownership_check =
+      baseline_options.enable_internal_lattice_slot_ownership_check;
   detection_options.enable_geometry_prior_outer_seed =
       baseline_options.enable_geometry_prior_outer_seed;
   detection_options.geometry_prior_rescue_diagnostic_only =
@@ -7033,6 +7394,8 @@ CalibrationEvaluationDataset Stage5Benchmark::BuildHoldoutEvaluationDataset(
       baseline_options.geometry_prior_rescue_min_edge_gradient_ratio;
   detection_options.geometry_prior_rescue_accept_max_outer_rmse =
       baseline_options.geometry_prior_rescue_accept_max_outer_rmse;
+  detection_options.geometry_prior_rescue_scale_aware_outer_rmse_gate =
+      baseline_options.geometry_prior_rescue_scale_aware_outer_rmse_gate;
   detection_options.geometry_prior_rescue_accept_max_rotation_error_deg =
       baseline_options.geometry_prior_rescue_accept_max_rotation_error_deg;
   detection_options.geometry_prior_rescue_accept_max_translation_error =
@@ -8277,6 +8640,15 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
   FrozenRound2BaselineOptions baseline_options = input.baseline_options;
   baseline_options.dataset_label = report.dataset_label;
   baseline_options.training_split_signature = report.split.split_signature;
+  if (input.trial_backend_selection_options.model_aware_information_coreset) {
+    // The outer initializer is the only camera initializer in the explicit
+    // model-aware path.  Round 1/2 remain responsible for constructing and
+    // screening observations, but may not silently hand persistent BA a
+    // different camera basin.
+    baseline_options.optimize_intrinsics = false;
+    baseline_options.optimize_bootstrap_intrinsics = false;
+    baseline_options.intermediate_optimize_intrinsics = false;
+  }
   const FrozenRound2BaselinePipeline baseline_pipeline(baseline_options);
   report.baseline_result = input.use_precomputed_training_measurements
                                ? baseline_pipeline.RunPrecomputed(
@@ -8569,6 +8941,8 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
 
   if (input.trial_backend_selection_options.enabled &&
       !single_board_dense_grid_profile &&
+      !input.trial_backend_selection_options
+           .model_aware_information_coreset &&
       !(input.enable_large_intrinsic_perturbation &&
         input.large_intrinsic_perturbation_outer_only_after_application)) {
     const std::set<FrameBoardKey> internally_supported_keys =
@@ -8617,7 +8991,11 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
             std::inserter(filtered_seed_keys, filtered_seed_keys.end()));
       }
       curated_backend_seed_bundle = BuildBundleForAcceptedFrameBoardKeys(
-          trial_candidate_bundle,
+          // The candidate pool contributes the filtered observations, but
+          // the seed must retain the camera/scene state produced by the
+          // initializer. Using trial_candidate_bundle here leaks the
+          // diagnostic full-pool camera into persistent BA.
+          curated_backend_seed_bundle,
           trial_candidate_bundle,
           filtered_seed_keys,
           curated_backend_seed_bundle.measurement_dataset.source_stage_label +
@@ -8750,11 +9128,17 @@ Stage5BenchmarkReport Stage5Benchmark::Run(const Stage5BenchmarkInput& input) co
     if (!selected_seed_keys.empty()) {
       checkerboard_seed_target_frame_count =
           static_cast<int>(selected_seed_keys.size());
-      Eigen::Matrix<double, 6, 6> cumulative_fisher =
-          Eigen::Matrix<double, 6, 6>::Zero();
+      const int cumulative_parameter_dimension =
+          static_cast<int>(trial_candidate_bundle.scene_state.camera
+                               .CombinedParameterVector()
+                               .size());
+      Eigen::MatrixXd cumulative_fisher =
+          Eigen::MatrixXd::Zero(std::max(0, cumulative_parameter_dimension),
+                                std::max(0, cumulative_parameter_dimension));
       for (const FrameBoardKey& key : selected_seed_keys) {
         const IntrinsicsJacobianInformationSummary info =
-            ComputeIntrinsicsJacobianInformation(trial_candidate_bundle, key);
+            ComputeIntrinsicsJacobianInformation(trial_candidate_bundle, key,
+                                                 false);
         if (info.available) {
           cumulative_fisher += info.fisher;
         }

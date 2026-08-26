@@ -15,6 +15,7 @@ namespace apriltag_internal {
 enum class JointFrameSelectionReasonCode {
   None = 0,
   NoUsableBoardObservations,
+  RejectedMissingReferenceBoard,
   AcceptedMinViewsPerBoard,
   AcceptedNewBoardPair,
   AcceptedNewImageCoverage,
@@ -45,6 +46,10 @@ struct JointMeasurementSelectionOptions {
   JointMeasurementSelectionMode selection_mode =
       JointMeasurementSelectionMode::Baseline;
   int reference_board_id = 1;
+  // A frame without the reference board cannot provide the frame anchor used
+  // by the shared-scene BA. Keep this enabled by default; it is an explicit
+  // ablation switch rather than an implicit fallback to another board.
+  bool require_reference_board_per_frame = true;
   int coverage_grid_cols = 4;
   int coverage_grid_rows = 4;
   int min_initial_views_per_board = 3;

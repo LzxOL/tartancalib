@@ -86,6 +86,7 @@ struct CmdArgs {
   std::string stage5_init_refine_mode = "kalibr_outer_lm";
   std::string stage5_init_selection_scorer =
       "pose_marginalized_principal";
+  bool stage5_init_independent_frame_board_poses = false;
   bool stage5_enable_init_principal_profile = false;
   double stage5_init_principal_profile_radius_px = 10.0;
   bool stage5_enable_init_fixed_layout_diagnostic = false;
@@ -134,6 +135,7 @@ struct CmdArgs {
   bool stage5_trial_backend_selection_candidate_order_set = false;
   std::string stage5_trial_backend_selection_info_gain_proxy_mode =
       "intrinsics_jacobian";
+  bool stage5_enable_model_aware_information_coreset = false;
   std::string stage5_trial_backend_selection_batch_granularity =
       "frame";
   std::string stage5_trial_backend_selection_acceptance_policy =
@@ -197,6 +199,8 @@ struct CmdArgs {
   bool ignore_image_evidence_min_quality = false;
   bool force_internal_seed_from_prediction = false;
   bool bypass_internal_seed_filters = false;
+  bool internal_lattice_slot_ownership_check = true;
+  bool internal_lattice_slot_ownership_check_explicitly_disabled = false;
   std::string internal_corner_filter_mode = "sigma";
   double internal_corner_filter_max_reproj_error = -1.0;
   double internal_corner_filter_quality_min = 0.35;
@@ -295,11 +299,16 @@ struct CmdArgs {
   double geometry_prior_rescue_max_corner_displacement_px = 0.0;
   double geometry_prior_rescue_min_corner_response_ratio = 0.03;
   bool geometry_prior_rescue_enable_spherical_refine = true;
+  bool geometry_prior_rescue_enable_spherical_refine_explicitly_disabled =
+      false;
   int geometry_prior_rescue_edge_sample_count = 80;
   int geometry_prior_rescue_edge_search_half_width_px = 6;
   double geometry_prior_rescue_min_edge_support_ratio = 0.45;
   double geometry_prior_rescue_min_edge_gradient_ratio = 0.02;
   double geometry_prior_rescue_accept_max_outer_rmse = 8.0;
+  bool geometry_prior_rescue_scale_aware_outer_rmse_gate = true;
+  bool geometry_prior_rescue_scale_aware_outer_rmse_gate_explicitly_disabled =
+      false;
   double geometry_prior_rescue_accept_max_rotation_error_deg = 5.0;
   double geometry_prior_rescue_accept_max_translation_error = 0.08;
   bool geometry_guided_tag_likelihood_enabled = true;
@@ -619,6 +628,7 @@ struct RequestedExperimentConfig {
   bool trial_backend_selection_candidate_order_set = false;
   std::string trial_backend_selection_info_gain_proxy_mode =
       "intrinsics_jacobian";
+  bool enable_model_aware_information_coreset = false;
   std::string trial_backend_selection_batch_granularity = "frame";
   std::string trial_backend_selection_acceptance_policy =
       "kalibr_information_gain";
@@ -681,6 +691,7 @@ struct RequestedExperimentConfig {
   bool ignore_image_evidence_min_quality = false;
   bool force_internal_seed_from_prediction = false;
   bool bypass_internal_seed_filters = false;
+  bool internal_lattice_slot_ownership_check = true;
   std::string internal_corner_filter_mode = "sigma";
   double internal_corner_filter_max_reproj_error = -1.0;
   double internal_corner_filter_quality_min = 0.35;
@@ -764,11 +775,14 @@ struct RequestedExperimentConfig {
   double geometry_prior_rescue_max_corner_displacement_px = 0.0;
   double geometry_prior_rescue_min_corner_response_ratio = 0.03;
   bool geometry_prior_rescue_enable_spherical_refine = true;
+  bool geometry_prior_rescue_enable_spherical_refine_explicitly_disabled =
+      false;
   int geometry_prior_rescue_edge_sample_count = 80;
   int geometry_prior_rescue_edge_search_half_width_px = 6;
   double geometry_prior_rescue_min_edge_support_ratio = 0.45;
   double geometry_prior_rescue_min_edge_gradient_ratio = 0.02;
   double geometry_prior_rescue_accept_max_outer_rmse = 8.0;
+  bool geometry_prior_rescue_scale_aware_outer_rmse_gate = true;
   double geometry_prior_rescue_accept_max_rotation_error_deg = 5.0;
   double geometry_prior_rescue_accept_max_translation_error = 0.08;
   bool geometry_guided_tag_likelihood_enabled = true;
@@ -1092,6 +1106,7 @@ bool HasAblationOverrides(const RequestedExperimentConfig& config) {
          config.preserve_frame_board_cohesion ||
          config.force_internal_seed_from_prediction ||
          config.bypass_internal_seed_filters ||
+         !config.internal_lattice_slot_ownership_check ||
          config.internal_corner_filter_mode != "sigma" ||
          config.internal_corner_filter_max_reproj_error > 0.0 ||
          std::fabs(config.internal_corner_filter_quality_min - 0.35) > 1e-12 ||
@@ -1104,7 +1119,8 @@ bool HasAblationOverrides(const RequestedExperimentConfig& config) {
 	         !config.backend_optimize_board_poses ||
 	         config.backend_point_budget_control ||
 	         config.backend_max_boards_per_frame_for_ablation > 0 ||
-	         config.backend_fixed_intrinsics ||
+         config.backend_fixed_intrinsics ||
+         config.enable_model_aware_information_coreset ||
          config.backend_polar_angle_weight_mode != "none" ||
          config.backend_multi_board_consistency_weighting ||
          config.backend_consistency_pose_source != "outer_only" ||
@@ -1128,6 +1144,7 @@ bool HasAblationOverrides(const RequestedExperimentConfig& config) {
          !config.geometry_prior_rescue_use_as_observation ||
          config.geometry_prior_rescue_keep_outer_on_internal_failure ||
          !config.geometry_prior_rescue_enable_spherical_refine ||
+         !config.geometry_prior_rescue_scale_aware_outer_rmse_gate ||
          config.enable_outer_only_intermediate_calibration ||
          config.internal_blur_board_weight_mode !=
              ati::InternalBlurBoardWeightMode::Off ||
@@ -1170,6 +1187,12 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
   if (config.bypass_internal_seed_filters) {
     parts.push_back("bypass_internal_seed_filters");
   }
+  if (!config.internal_lattice_slot_ownership_check) {
+    parts.push_back("no_internal_lattice_slot_ownership_check");
+  }
+  if (!config.geometry_prior_rescue_scale_aware_outer_rmse_gate) {
+    parts.push_back("no_scale_aware_outer_rmse_gate");
+  }
   if (config.internal_corner_filter_mode != "sigma") {
     parts.push_back("internal_filter_" + config.internal_corner_filter_mode);
   }
@@ -1199,6 +1222,9 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
   }
   if (config.strict_board_observation_acceptance) {
     parts.push_back("kalibr_style_failed_board_drop");
+  }
+  if (config.enable_model_aware_information_coreset) {
+    parts.push_back("model_aware_information_coreset");
   }
   if (config.internal_blur_filter_mode != ati::InternalBlurFilterMode::Off) {
     parts.push_back("internal_blur_filter_" +
@@ -1562,6 +1588,8 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.stage5_trial_backend_selection_candidate_order_set;
   config.trial_backend_selection_info_gain_proxy_mode =
       args.stage5_trial_backend_selection_info_gain_proxy_mode;
+  config.enable_model_aware_information_coreset =
+      args.stage5_enable_model_aware_information_coreset;
   config.trial_backend_selection_batch_granularity =
       args.stage5_trial_backend_selection_batch_granularity;
   config.trial_backend_selection_acceptance_policy =
@@ -1685,6 +1713,8 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.force_internal_seed_from_prediction;
   config.bypass_internal_seed_filters =
       args.bypass_internal_seed_filters;
+  config.internal_lattice_slot_ownership_check =
+      args.internal_lattice_slot_ownership_check;
   config.internal_corner_filter_mode =
       args.internal_corner_filter_mode;
   config.internal_corner_filter_max_reproj_error =
@@ -1734,6 +1764,8 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.geometry_prior_rescue_min_corner_response_ratio;
   config.geometry_prior_rescue_enable_spherical_refine =
       args.geometry_prior_rescue_enable_spherical_refine;
+  config.geometry_prior_rescue_enable_spherical_refine_explicitly_disabled =
+      args.geometry_prior_rescue_enable_spherical_refine_explicitly_disabled;
   config.geometry_prior_rescue_edge_sample_count =
       args.geometry_prior_rescue_edge_sample_count;
   config.geometry_prior_rescue_edge_search_half_width_px =
@@ -1744,6 +1776,8 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.geometry_prior_rescue_min_edge_gradient_ratio;
   config.geometry_prior_rescue_accept_max_outer_rmse =
       args.geometry_prior_rescue_accept_max_outer_rmse;
+  config.geometry_prior_rescue_scale_aware_outer_rmse_gate =
+      args.geometry_prior_rescue_scale_aware_outer_rmse_gate;
   config.geometry_prior_rescue_accept_max_rotation_error_deg =
       args.geometry_prior_rescue_accept_max_rotation_error_deg;
   config.geometry_prior_rescue_accept_max_translation_error =
@@ -1788,7 +1822,16 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
     config.geometry_prior_rescue_use_as_observation = true;
     config.geometry_prior_rescue_keep_outer_on_internal_failure = false;
     config.geometry_prior_rescue_allow_geometry_only_pose_refit = true;
-    config.geometry_prior_rescue_enable_spherical_refine = true;
+    if (!args.geometry_prior_rescue_enable_spherical_refine_explicitly_disabled) {
+      config.geometry_prior_rescue_enable_spherical_refine = true;
+    }
+    if (!args
+             .geometry_prior_rescue_scale_aware_outer_rmse_gate_explicitly_disabled) {
+      config.geometry_prior_rescue_scale_aware_outer_rmse_gate = true;
+    }
+    if (!args.internal_lattice_slot_ownership_check_explicitly_disabled) {
+      config.internal_lattice_slot_ownership_check = true;
+    }
     // Topology supplies the missing board identity/pose proposal only. The
     // canonical baseline must also require an independently image-supported
     // DS/model-aware payload check before committing that proposal.
@@ -2161,6 +2204,9 @@ void PrintUsage(const char* program) {
       << "  --stage5-init-selection-scorer pose_marginalized_principal|legacy_fixed_pose\n"
       << "                                      Outer-only initialization view scorer;\n"
       << "                                      default pose_marginalized_principal.\n"
+      << "  --stage5-init-independent-frame-board-poses\n"
+      << "                                      Select camera initialization with one pose\n"
+      << "                                      per frame-board; shared layout remains for BA.\n"
       << "  --stage5-enable-init-principal-profile\n"
       << "                                      Diagnostic-only 3x3 fixed-cu/cv profile;\n"
       << "                                      does not update selected intrinsics.\n"
@@ -2200,6 +2246,12 @@ void PrintUsage(const char* program) {
       << "                                      camera-aware rescue, zero-detection atlas,\n"
       << "                                      geometry-prior observation, spherical\n"
       << "                                      refinement, and topology identity rescue.\n"
+      << "  --stage5-disable-internal-lattice-slot-ownership-check\n"
+      << "                                      Ablation: keep refined internal points\n"
+      << "                                      even when they land in another grid slot.\n"
+      << "  --stage5-disable-geometry-prior-scale-aware-outer-rmse-gate\n"
+      << "                                      Ablation: use the legacy fixed-pixel\n"
+      << "                                      recovered-quad pose rollback threshold.\n"
       << "  --stage5-enable-independent-frame-board-camera-warmup\n"
       << "                                      Jointly refine camera intrinsics with one\n"
       << "                                      temporary pose per internally supported board.\n"
@@ -2232,6 +2284,9 @@ void PrintUsage(const char* program) {
       << "  --stage5-trial-backend-selection-budget-mode fixed|adaptive|kalibr_style\n"
       << "  --stage5-trial-backend-selection-candidate-order score_sorted|random_shuffle|intrinsics_information_greedy\n"
       << "  --stage5-trial-backend-selection-info-gain-proxy-mode legacy|intrinsics_jacobian\n"
+      << "  --stage5-enable-model-aware-information-coreset\n"
+      << "                                      Experimental four-model, frame-normalized\n"
+      << "                                      independent-pose information-gain selection.\n"
       << "  --stage5-trial-backend-selection-batch-granularity frame_board|frame|frame_board_then_frame\n"
       << "  --stage5-trial-backend-selection-acceptance-policy residual_score|kalibr_information_gain\n"
       << "  --stage5-trial-backend-selection-mi-tol X\n"
@@ -2403,6 +2458,9 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.stage5_init_refine_mode = argv[++i];
     } else if (token == "--stage5-init-selection-scorer" && i + 1 < argc) {
       args.stage5_init_selection_scorer = argv[++i];
+    } else if (token ==
+               "--stage5-init-independent-frame-board-poses") {
+      args.stage5_init_independent_frame_board_poses = true;
     } else if (token == "--stage5-enable-init-principal-profile") {
       args.stage5_enable_init_principal_profile = true;
     } else if (token == "--stage5-init-principal-profile-radius-px" &&
@@ -2518,6 +2576,9 @@ CmdArgs ParseArgs(int argc, char** argv) {
             "--stage5-trial-backend-selection-info-gain-proxy-mode" &&
         i + 1 < argc) {
       args.stage5_trial_backend_selection_info_gain_proxy_mode = argv[++i];
+    } else if (token ==
+               "--stage5-enable-model-aware-information-coreset") {
+      args.stage5_enable_model_aware_information_coreset = true;
     } else if (
         token ==
             "--stage5-trial-backend-selection-batch-granularity" &&
@@ -3059,6 +3120,14 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.force_internal_seed_from_prediction = true;
     } else if (token == "--stage5-bypass-internal-seed-filters") {
       args.bypass_internal_seed_filters = true;
+    } else if (token ==
+               "--stage5-enable-internal-lattice-slot-ownership-check") {
+      args.internal_lattice_slot_ownership_check = true;
+      args.internal_lattice_slot_ownership_check_explicitly_disabled = false;
+    } else if (token ==
+               "--stage5-disable-internal-lattice-slot-ownership-check") {
+      args.internal_lattice_slot_ownership_check = false;
+      args.internal_lattice_slot_ownership_check_explicitly_disabled = true;
     } else if (token == "--stage5-internal-corner-filter-mode" &&
                i + 1 < argc) {
       args.internal_corner_filter_mode = argv[++i];
@@ -3115,6 +3184,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
     } else if (
         token == "--stage5-geometry-prior-rescue-disable-spherical-refine") {
       args.geometry_prior_rescue_enable_spherical_refine = false;
+      args.geometry_prior_rescue_enable_spherical_refine_explicitly_disabled =
+          true;
     } else if (token ==
                    "--stage5-geometry-prior-rescue-edge-sample-count" &&
                i + 1 < argc) {
@@ -3138,6 +3209,16 @@ CmdArgs ParseArgs(int argc, char** argv) {
                    "--stage5-geometry-prior-rescue-accept-max-outer-rmse" &&
                i + 1 < argc) {
       args.geometry_prior_rescue_accept_max_outer_rmse = std::stod(argv[++i]);
+    } else if (token ==
+               "--stage5-enable-geometry-prior-scale-aware-outer-rmse-gate") {
+      args.geometry_prior_rescue_scale_aware_outer_rmse_gate = true;
+      args.geometry_prior_rescue_scale_aware_outer_rmse_gate_explicitly_disabled =
+          false;
+    } else if (token ==
+               "--stage5-disable-geometry-prior-scale-aware-outer-rmse-gate") {
+      args.geometry_prior_rescue_scale_aware_outer_rmse_gate = false;
+      args.geometry_prior_rescue_scale_aware_outer_rmse_gate_explicitly_disabled =
+          true;
     } else if (token ==
                    "--stage5-geometry-prior-rescue-accept-max-rotation-error-deg" &&
                i + 1 < argc) {
@@ -5836,6 +5917,9 @@ void WriteExperimentConfigSummary(
          << "\n";
   output << "requested_stage5_trial_backend_selection_info_gain_proxy_mode: "
          << requested.trial_backend_selection_info_gain_proxy_mode << "\n";
+  output << "requested_stage5_enable_model_aware_information_coreset: "
+         << (requested.enable_model_aware_information_coreset ? 1 : 0)
+         << "\n";
   output << "requested_stage5_trial_backend_selection_batch_granularity: "
          << requested.trial_backend_selection_batch_granularity << "\n";
   output << "requested_stage5_trial_backend_selection_acceptance_policy: "
@@ -6197,6 +6281,8 @@ void WriteExperimentConfigSummary(
          << (requested.force_internal_seed_from_prediction ? 1 : 0) << "\n";
   output << "requested_bypass_internal_seed_filters: "
          << (requested.bypass_internal_seed_filters ? 1 : 0) << "\n";
+  output << "requested_internal_lattice_slot_ownership_check: "
+         << (requested.internal_lattice_slot_ownership_check ? 1 : 0) << "\n";
   output << "requested_internal_corner_filter_mode: "
          << requested.internal_corner_filter_mode << "\n";
   output << "requested_internal_corner_filter_max_reproj_error: "
@@ -6246,6 +6332,9 @@ void WriteExperimentConfigSummary(
          << requested.geometry_prior_rescue_min_edge_gradient_ratio << "\n";
   output << "requested_geometry_prior_rescue_accept_max_outer_rmse: "
          << requested.geometry_prior_rescue_accept_max_outer_rmse << "\n";
+  output << "requested_geometry_prior_rescue_scale_aware_outer_rmse_gate: "
+         << (requested.geometry_prior_rescue_scale_aware_outer_rmse_gate ? 1 : 0)
+         << "\n";
   output << "requested_geometry_prior_rescue_accept_max_rotation_error_deg: "
          << requested.geometry_prior_rescue_accept_max_rotation_error_deg
          << "\n";
@@ -6700,6 +6789,12 @@ void WriteExperimentConfigSummary(
          << ati::ToString(
                 report.trial_backend_selection_result.info_gain_proxy_mode)
          << "\n";
+  output << "effective_stage5_model_aware_information_coreset: "
+         << (report.trial_backend_selection_result
+                     .model_aware_information_coreset_enabled
+                 ? 1
+                 : 0)
+         << "\n";
   output << "effective_stage5_trial_backend_selection_batch_granularity: "
          << ati::ToString(report.trial_backend_selection_result
                               .candidate_batch_granularity)
@@ -6896,6 +6991,12 @@ void WriteExperimentConfigSummary(
   output << "effective_stage5_persistent_incremental_seed_point_count: "
          << report.trial_backend_selection_result
                 .persistent_incremental_seed_point_count
+         << "\n";
+  output << "effective_stage5_persistent_incremental_seed_outer_only_residuals: "
+         << (report.trial_backend_selection_result
+                     .persistent_incremental_seed_outer_only_residuals
+                 ? 1
+                 : 0)
          << "\n";
   output << "effective_stage5_persistent_incremental_candidate_batch_count: "
          << report.trial_backend_selection_result
@@ -7204,6 +7305,12 @@ void WriteExperimentConfigSummary(
                  ? 1
                  : 0)
          << "\n";
+  output << "effective_internal_lattice_slot_ownership_check: "
+         << (report.baseline_result.effective_options
+                     .enable_internal_lattice_slot_ownership_check
+                 ? 1
+                 : 0)
+         << "\n";
   output << "effective_internal_corner_filter_mode: "
          << report.baseline_result.effective_options
                 .internal_corner_filter_mode
@@ -7282,7 +7389,8 @@ void WriteExperimentConfigSummary(
                 .geometry_prior_rescue_max_corner_displacement_px
          << "\n";
   output << "effective_geometry_prior_corner_displacement_guard_mode: "
-            "diagnostic_only\n";
+         << "diagnostic_only"
+         << "\n";
   output << "effective_geometry_prior_rescue_min_corner_response_ratio: "
          << report.baseline_result.effective_options
                 .geometry_prior_rescue_min_corner_response_ratio
@@ -7318,6 +7426,12 @@ void WriteExperimentConfigSummary(
   output << "effective_geometry_prior_rescue_accept_max_outer_rmse: "
          << report.baseline_result.effective_options
                 .geometry_prior_rescue_accept_max_outer_rmse
+         << "\n";
+  output << "effective_geometry_prior_rescue_scale_aware_outer_rmse_gate: "
+         << (report.baseline_result.effective_options
+                     .geometry_prior_rescue_scale_aware_outer_rmse_gate
+                 ? 1
+                 : 0)
          << "\n";
   output << "effective_geometry_prior_rescue_accept_max_rotation_error_deg: "
          << report.baseline_result.effective_options
@@ -8799,7 +8913,7 @@ void WriteTwoLayerBaSummary(
   output << "intrinsics_layer_pose_mode: independent_frame_board_pose\n";
   output << "layout_layer_pose_mode: reference_chain\n";
   output << "layout_layer_intrinsics_fixed: 1\n";
-  output << "camera_step_policy: training_pareto_min_shared_rmse_with_layout_only_fallback\n";
+  output << "camera_step_policy: training_pareto_min_independent_rmse_with_shared_layout_tiebreak\n";
   output << "shared_objective: unweighted_image_plane_l2\n";
   output << "independent_rmse_policy: non_degrading_with_improvement_preferred\n";
   output << "independent_p95_tolerance_policy: max_0.01_px_or_1_percent\n";
@@ -9188,7 +9302,7 @@ int main(int argc, char** argv) {
     runtime_summary.cache_dir =
         args.cache_dir.empty() ? "result/.stage5_backend_cache" : args.cache_dir;
     runtime_summary.cache_layout_version = ati::Stage5CacheLayoutVersion();
-    if (!use_precomputed) {
+    if (!use_precomputed && !args.stage5_skip_heavy_overlays) {
       const ati::Stage5DatasetCacheIdentity cache_dataset_identity =
           ati::MakeStage5DatasetCacheIdentity(args.image_path);
       runtime_summary.cache_dataset_label =
@@ -9471,6 +9585,8 @@ int main(int argc, char** argv) {
         requested_config.init_refine_mode;
     baseline_options.camera_initialization_selection_scorer =
         requested_config.init_selection_scorer;
+    baseline_options.camera_initialization_use_independent_frame_board_poses =
+        args.stage5_init_independent_frame_board_poses;
     baseline_options.enable_camera_initialization_principal_profile =
         args.stage5_enable_init_principal_profile;
     baseline_options.camera_initialization_principal_profile_radius_px =
@@ -9555,6 +9671,8 @@ int main(int argc, char** argv) {
         requested_config.force_internal_seed_from_prediction;
     baseline_options.bypass_internal_seed_filters =
         requested_config.bypass_internal_seed_filters;
+    baseline_options.enable_internal_lattice_slot_ownership_check =
+        requested_config.internal_lattice_slot_ownership_check;
     baseline_options.internal_corner_filter_mode =
         requested_config.internal_corner_filter_mode;
     baseline_options.internal_corner_filter_max_reproj_error =
@@ -9611,6 +9729,8 @@ int main(int argc, char** argv) {
         requested_config.geometry_prior_rescue_min_edge_gradient_ratio;
     baseline_options.geometry_prior_rescue_accept_max_outer_rmse =
         requested_config.geometry_prior_rescue_accept_max_outer_rmse;
+    baseline_options.geometry_prior_rescue_scale_aware_outer_rmse_gate =
+        requested_config.geometry_prior_rescue_scale_aware_outer_rmse_gate;
     baseline_options.geometry_prior_rescue_accept_max_rotation_error_deg =
         requested_config.geometry_prior_rescue_accept_max_rotation_error_deg;
     baseline_options.geometry_prior_rescue_accept_max_translation_error =
@@ -9987,6 +10107,9 @@ int main(int argc, char** argv) {
     benchmark_input.trial_backend_selection_options.info_gain_proxy_mode =
         ParseTrialBackendFrameBoardInfoGainProxyMode(
             requested_config.trial_backend_selection_info_gain_proxy_mode);
+    benchmark_input.trial_backend_selection_options
+        .model_aware_information_coreset =
+        requested_config.enable_model_aware_information_coreset;
     benchmark_input.trial_backend_selection_options
         .candidate_batch_granularity =
         ParseTrialBackendFrameBoardCandidateBatchGranularity(
@@ -10509,6 +10632,12 @@ int main(int argc, char** argv) {
                       ? 1
                       : 0)
               << "\n";
+      summary << "internal_lattice_slot_ownership_check_effective: "
+              << (report.baseline_result.effective_options
+                          .enable_internal_lattice_slot_ownership_check
+                      ? 1
+                      : 0)
+              << "\n";
       summary << "geometry_guided_tag_likelihood_enabled: "
               << (report.baseline_result.effective_options
                           .geometry_guided_tag_likelihood_enabled
@@ -10914,7 +11043,7 @@ int main(int argc, char** argv) {
           report.diagnostic_compare);
     }
 
-    if (!use_precomputed &&
+    if (!use_precomputed && !args.stage5_skip_heavy_overlays &&
         args.runtime_mode == ati::Stage5RuntimeMode::Research) {
       const cv::Mat projection_compare = benchmark.RenderProjectionComparison(report);
       if (!projection_compare.empty()) {
@@ -11256,6 +11385,8 @@ int main(int argc, char** argv) {
           const std::vector<double> backtracking_scales = {
               0.5, 0.25, 0.125, 0.0625, 0.0};
           bool found_safe_probe = false;
+          double best_safe_probe_independent_rmse =
+              std::numeric_limits<double>::infinity();
           double best_safe_probe_shared_rmse =
               std::numeric_limits<double>::infinity();
           for (double scale : backtracking_scales) {
@@ -11349,10 +11480,30 @@ int main(int argc, char** argv) {
                 probe_numerical_pass, probe_shared_pass,
                 probe_independent_pass, probe_reference_pass,
                 probe_pass);
-            if (probe_pass &&
+            // The camera layer is the purpose of this protected pass.  Among
+            // candidates that preserve the shared-layout and reference-board
+            // health gates, prefer the lowest independent-pose RMSE; using
+            // shared-layout RMSE as the primary objective can select scale=0
+            // and silently discard a valid camera improvement (especially for
+            // UCM's xi/focal weak direction).  Shared RMSE remains the tie
+            // breaker so layout consistency is still preferred when the
+            // independent camera fit is effectively equivalent.
+            const bool better_independent_camera =
+                probe_independent_metrics.overall_rmse <
+                    best_safe_probe_independent_rmse - health_tolerance_px;
+            const bool independent_tie =
+                std::abs(probe_independent_metrics.overall_rmse -
+                         best_safe_probe_independent_rmse) <=
+                health_tolerance_px;
+            const bool better_shared_layout =
                 probe_shared_metrics.overall_rmse <
-                    best_safe_probe_shared_rmse - health_tolerance_px) {
+                    best_safe_probe_shared_rmse - health_tolerance_px;
+            if (probe_pass &&
+                (better_independent_camera ||
+                 (independent_tie && better_shared_layout))) {
               found_safe_probe = true;
+              best_safe_probe_independent_rmse =
+                  probe_independent_metrics.overall_rmse;
               best_safe_probe_shared_rmse =
                   probe_shared_metrics.overall_rmse;
               independent_candidate_result = independent_probe_result;
@@ -11851,7 +12002,8 @@ int main(int argc, char** argv) {
         report.our_holdout_evaluation,
         backend_holdout_evaluation,
         report.kalibr_holdout_evaluation);
-    if (args.export_holdout_reprojection_visualizations) {
+    if (args.export_holdout_reprojection_visualizations &&
+        !args.stage5_skip_heavy_overlays) {
       const auto viz_stage_start = std::chrono::steady_clock::now();
       ExportHoldoutReprojectionVisualizations(
           output_dir,
@@ -11871,6 +12023,10 @@ int main(int argc, char** argv) {
         requested_config.enable_trial_backend_frame_board_selection ||
         requested_config.selection_mode == "kalibr_style_frame_board" ||
         requested_config.selection_mode == "kalibr_style_batch";
+    // Keep the persistent incremental acceptance audit available in lightweight
+    // runs as well.  This writer only emits a text summary; the heavier flow
+    // diagnostics below remain gated by the visualization switch.
+    ati::WriteTrialBackendFrameBoardSelectionDiagnostics(output_dir, report);
     if (!args.stage5_skip_heavy_overlays &&
         (requested_config.internal_regeneration_diagnostics ||
          write_backend_selection_diagnostics)) {

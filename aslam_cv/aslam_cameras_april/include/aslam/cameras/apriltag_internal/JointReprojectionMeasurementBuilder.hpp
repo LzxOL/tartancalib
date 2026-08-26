@@ -58,11 +58,9 @@ struct JointMeasurementBuildOptions {
   double gross_internal_topology_min_reproj_error_px = 8.0;
   double gross_internal_topology_sigma_threshold = 8.0;
   double gross_internal_topology_max_outer_pose_rmse_px = 2.0;
-  // Cross-check the direct outer quad against an independently fitted,
-  // image-refined internal lattice. The check is deliberately conservative:
-  // it only acts when the internal pose is well constrained and either one
-  // isolated outer point disagrees with a 3-corner consensus, or a trusted
-  // direct exact-ID outer quad exposes an internally consistent grid-ID shift.
+  // Fit a robust local topology surface to image-refined internal points and
+  // reject only isolated internal lattice mismatches. The independently
+  // detected outer quad is authoritative and is never rejected by this check.
   bool enable_bidirectional_board_topology_consistency = false;
   int board_topology_min_internal_point_count = 12;
   double board_topology_max_internal_surface_rmse_module_ratio = 0.08;

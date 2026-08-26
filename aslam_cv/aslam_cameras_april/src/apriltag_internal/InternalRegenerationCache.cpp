@@ -20,9 +20,9 @@ namespace {
 namespace fs = boost::filesystem;
 
 constexpr const char kCacheFormatVersion[] =
-      "internal_regeneration_cache_v36_outer_corner_debug";
+    "internal_regeneration_cache_v47_no_partial_unrefined_seed_commit";
 constexpr const char kStageImplementationVersion[] =
-      "internal_refinement_v36_outer_corner_debug";
+    "internal_refinement_v47_no_partial_unrefined_seed_commit";
 constexpr const char kArtifactSchemaVersion[] =
     "internal_regeneration_frame_v2_outer_corner_debug";
 
@@ -1112,6 +1112,8 @@ std::string MakeInternalConfigSignature(
   AppendBool(&stream, "options_force_internal_seed_from_prediction", options.force_internal_seed_from_prediction);
   AppendBool(&stream, "options_enable_internal_structure_correction_after_ss", options.enable_internal_structure_correction_after_ss);
   AppendBool(&stream, "options_bypass_internal_seed_filters", options.bypass_internal_seed_filters);
+  AppendBool(&stream, "options_internal_lattice_slot_ownership_check",
+             options.enable_internal_lattice_slot_ownership_check);
   AppendScalar(&stream, "internal_pose_rescue_mode", static_cast<int>(options.internal_pose_rescue_mode));
   AppendScalar(&stream, "internal_pose_rescue_max_ray_angle_deg", options.internal_pose_rescue_max_ray_angle_deg);
   AppendScalar(&stream, "internal_pose_rescue_accept_max_outer_rmse", options.internal_pose_rescue_accept_max_outer_rmse);
@@ -1128,6 +1130,8 @@ std::string MakeInternalConfigSignature(
   AppendScalar(&stream, "geometry_prior_rescue_min_edge_support_ratio", options.geometry_prior_rescue_min_edge_support_ratio);
   AppendScalar(&stream, "geometry_prior_rescue_min_edge_gradient_ratio", options.geometry_prior_rescue_min_edge_gradient_ratio);
   AppendScalar(&stream, "geometry_prior_rescue_accept_max_outer_rmse", options.geometry_prior_rescue_accept_max_outer_rmse);
+  AppendBool(&stream, "geometry_prior_rescue_scale_aware_outer_rmse_gate",
+             options.geometry_prior_rescue_scale_aware_outer_rmse_gate);
   AppendScalar(&stream, "geometry_prior_rescue_accept_max_rotation_error_deg", options.geometry_prior_rescue_accept_max_rotation_error_deg);
   AppendScalar(&stream, "geometry_prior_rescue_accept_max_translation_error", options.geometry_prior_rescue_accept_max_translation_error);
   AppendBool(&stream, "geometry_guided_tag_likelihood_enabled", options.geometry_guided_tag_likelihood_enabled);

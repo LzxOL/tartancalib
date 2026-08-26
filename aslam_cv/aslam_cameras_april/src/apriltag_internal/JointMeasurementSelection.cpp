@@ -253,6 +253,8 @@ const char* ToString(JointFrameSelectionReasonCode reason_code) {
       return "None";
     case JointFrameSelectionReasonCode::NoUsableBoardObservations:
       return "NoUsableBoardObservations";
+    case JointFrameSelectionReasonCode::RejectedMissingReferenceBoard:
+      return "RejectedMissingReferenceBoard";
     case JointFrameSelectionReasonCode::AcceptedMinViewsPerBoard:
       return "AcceptedMinViewsPerBoard";
     case JointFrameSelectionReasonCode::AcceptedNewBoardPair:
@@ -405,6 +407,13 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
             << (options_.enable_board_pose_fit_gate ? 1 : 0);
     result.warnings.push_back(warning.str());
   }
+  {
+    std::ostringstream warning;
+    warning << "selection require_reference_board_per_frame="
+            << (options_.require_reference_board_per_frame ? 1 : 0)
+            << " reference_board_id=" << scene_state.reference_board_id;
+    result.warnings.push_back(warning.str());
+  }
 
   std::map<std::pair<int, int>, CandidateBoardObservation> candidates;
   for (const JointMeasurementFrameResult& frame_result : measurement_result.frames) {
@@ -532,6 +541,21 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
       frame_decision.reason_codes.push_back(
           JointFrameSelectionReasonCode::NoUsableBoardObservations);
       frame_decision.reason_detail = "no residual-sane board observations";
+      result.frame_decisions.push_back(frame_decision);
+      continue;
+    }
+
+    if (options_.require_reference_board_per_frame &&
+        std::none_of(
+            sane_board_observations.begin(), sane_board_observations.end(),
+            [&](const CandidateBoardObservation& candidate) {
+              return candidate.board_id == scene_state.reference_board_id;
+            })) {
+      frame_decision.accepted = false;
+      frame_decision.reason_codes.push_back(
+          JointFrameSelectionReasonCode::RejectedMissingReferenceBoard);
+      frame_decision.reason_detail =
+          "reference board is absent or not solver-ready for this frame";
       result.frame_decisions.push_back(frame_decision);
       continue;
     }

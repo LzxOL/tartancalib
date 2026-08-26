@@ -187,51 +187,94 @@ WrongIdTopologyAssociation AssociateWrongIdProposalToTopology(
   return association;
 }
 
+TopologySlotAssignment AssignObservedQuadToTopologySlots(
+    const std::vector<std::array<Eigen::Vector2d, 4>>& topology_slots,
+    const OuterWrongIdProposal& proposal) {
+  TopologySlotAssignment assignment;
+  assignment.checked = true;
+  if (topology_slots.empty()) {
+    assignment.summary = "topology_slot_assignment no_slots";
+    return assignment;
+  }
+
+  struct ScoredSlot {
+    int index = -1;
+    double cost = std::numeric_limits<double>::infinity();
+    WrongIdTopologyAssociation association;
+  };
+  std::vector<ScoredSlot> scored_slots;
+  scored_slots.reserve(topology_slots.size());
+  for (std::size_t index = 0; index < topology_slots.size(); ++index) {
+    ScoredSlot scored;
+    scored.index = static_cast<int>(index);
+    scored.association =
+        AssociateWrongIdProposalToTopology(topology_slots[index], proposal);
+    if (scored.association.compatible) {
+      // Corner agreement is the main term. Center and area terms prevent a
+      // similarly shaped neighboring board from winning solely through one
+      // favorable corner ordering.
+      scored.cost = scored.association.normalized_corner_rmse +
+                    0.5 * scored.association.normalized_center_error +
+                    0.25 * std::fabs(std::log(scored.association.area_ratio));
+    }
+    scored_slots.push_back(std::move(scored));
+  }
+  std::sort(scored_slots.begin(), scored_slots.end(),
+            [](const ScoredSlot& lhs, const ScoredSlot& rhs) {
+              if (lhs.cost != rhs.cost) {
+                return lhs.cost < rhs.cost;
+              }
+              return lhs.index < rhs.index;
+            });
+
+  const ScoredSlot& best = scored_slots.front();
+  assignment.compatible = std::isfinite(best.cost);
+  if (assignment.compatible) {
+    assignment.assigned_slot_index = best.index;
+    assignment.ordered_corners = best.association.ordered_corners;
+    assignment.best_normalized_cost = best.cost;
+  }
+  if (scored_slots.size() > 1u) {
+    assignment.second_best_normalized_cost = scored_slots[1].cost;
+  }
+  assignment.normalized_cost_margin =
+      assignment.second_best_normalized_cost - assignment.best_normalized_cost;
+  constexpr double kMinimumSlotCostMargin = 0.02;
+  assignment.unique =
+      assignment.compatible &&
+      (!std::isfinite(assignment.second_best_normalized_cost) ||
+       assignment.normalized_cost_margin >= kMinimumSlotCostMargin);
+
+  std::ostringstream stream;
+  stream << "topology_slot_assignment compatible="
+         << (assignment.compatible ? 1 : 0)
+         << " unique=" << (assignment.unique ? 1 : 0)
+         << " assigned_slot=" << assignment.assigned_slot_index
+         << " best_cost=" << assignment.best_normalized_cost
+         << " second_cost=" << assignment.second_best_normalized_cost
+         << " margin=" << assignment.normalized_cost_margin;
+  if (assignment.compatible) {
+    stream << " best{" << best.association.summary << "}";
+  }
+  assignment.summary = stream.str();
+  return assignment;
+}
+
 bool IsUniqueWrongIdTopologyAssociation(
     const std::array<Eigen::Vector2d, 4>& topology_predicted_corners,
     const OuterWrongIdProposal& proposal,
     const std::vector<std::array<Eigen::Vector2d, 4>>& competing_slots,
     std::string* summary) {
-  const WrongIdTopologyAssociation target =
-      AssociateWrongIdProposalToTopology(topology_predicted_corners, proposal);
-  if (!target.compatible) {
-    if (summary != nullptr) {
-      *summary = target.summary + " unique_slot=0 target_incompatible";
-    }
-    return false;
-  }
-
-  // Keep a small, normalized margin between the requested slot and every
-  // competing missing slot.  This is an identity ambiguity check, not a
-  // corner displacement gate; the existing association compatibility bounds
-  // remain the primary geometric limits.
-  constexpr double kMinimumSlotMargin = 0.02;
-  double best_competing_rmse = std::numeric_limits<double>::infinity();
-  int competing_slot_index = -1;
-  for (std::size_t index = 0; index < competing_slots.size(); ++index) {
-    const WrongIdTopologyAssociation competing =
-        AssociateWrongIdProposalToTopology(competing_slots[index], proposal);
-    if (std::isfinite(competing.normalized_corner_rmse) &&
-        competing.normalized_corner_rmse < best_competing_rmse) {
-      best_competing_rmse = competing.normalized_corner_rmse;
-      competing_slot_index = static_cast<int>(index);
-    }
-  }
-  const bool unique =
-      !std::isfinite(best_competing_rmse) ||
-      target.normalized_corner_rmse + kMinimumSlotMargin <
-          best_competing_rmse;
+  std::vector<std::array<Eigen::Vector2d, 4>> slots;
+  slots.reserve(competing_slots.size() + 1u);
+  slots.push_back(topology_predicted_corners);
+  slots.insert(slots.end(), competing_slots.begin(), competing_slots.end());
+  const TopologySlotAssignment assignment =
+      AssignObservedQuadToTopologySlots(slots, proposal);
+  const bool unique = assignment.unique && assignment.assigned_slot_index == 0;
   if (summary != nullptr) {
-    std::ostringstream stream;
-    stream << target.summary << " unique_slot=" << (unique ? 1 : 0)
-           << " target_rmse=" << target.normalized_corner_rmse
-           << " best_competing_rmse=" << best_competing_rmse
-           << " competing_slot_index=" << competing_slot_index
-           << " slot_margin="
-           << (std::isfinite(best_competing_rmse)
-                   ? best_competing_rmse - target.normalized_corner_rmse
-                   : std::numeric_limits<double>::infinity());
-    *summary = stream.str();
+    *summary = assignment.summary +
+               " target_slot_unique=" + (unique ? "1" : "0");
   }
   return unique;
 }

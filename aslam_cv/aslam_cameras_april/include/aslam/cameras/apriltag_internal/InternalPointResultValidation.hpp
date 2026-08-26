@@ -12,6 +12,8 @@ namespace apriltag_internal {
 // removes duplicate assignments, and recomputes counters.
 void EnforceInternalTopologyAssignment(
     ApriltagInternalDetectionResult* result);
+void SuppressWrongLatticeSlotAssignments(
+    ApriltagInternalDetectionResult* result);
 void SuppressDuplicateRefinedInternalCorners(
     ApriltagInternalDetectionResult* result);
 void SuppressLocallyInconsistentRecoveredCorners(

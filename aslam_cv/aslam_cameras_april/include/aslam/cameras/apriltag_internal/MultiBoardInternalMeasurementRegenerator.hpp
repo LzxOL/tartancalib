@@ -104,6 +104,23 @@ struct GeometryPriorOuterSeedCandidate {
   bool roi_valid = false;
   bool image_evidence_checked = false;
   bool tag_id_validated = false;
+  bool topology_association_checked = false;
+  bool topology_association_passed = false;
+  int topology_assigned_board_id = -1;
+  double topology_best_normalized_cost =
+      std::numeric_limits<double>::infinity();
+  double topology_second_best_normalized_cost =
+      std::numeric_limits<double>::infinity();
+  double topology_normalized_cost_margin =
+      -std::numeric_limits<double>::infinity();
+  bool topology_internal_verification_checked = false;
+  bool topology_internal_verification_passed = false;
+  int topology_internal_verification_point_count = 0;
+  double topology_internal_pose_rmse =
+      std::numeric_limits<double>::infinity();
+  double topology_internal_outer_rmse =
+      std::numeric_limits<double>::infinity();
+  std::string topology_internal_verification_summary;
   bool image_evidence_success = false;
   bool local_redetect_success = false;
   bool local_corner_refine_success = false;

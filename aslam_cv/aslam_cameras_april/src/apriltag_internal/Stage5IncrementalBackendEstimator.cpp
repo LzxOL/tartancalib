@@ -74,6 +74,10 @@ constexpr double kMaxTrustRegionAnchorWeightScale = 4096.0;
 enum class CameraOptimizationPhase {
   kPosePrefitFixedIntrinsics,
   kSeedFixedIntrinsics,
+  // Model-aware selection needs an information baseline before candidates are
+  // tried.  This seed uses the normal shared frame/board state and every
+  // valid observation; it is not an independent-pose or outer-only path.
+  kSeedActiveCamera,
   kCandidateTrustRegion,
 };
 
@@ -1641,10 +1645,18 @@ struct ResidualStats {
   struct KeyStats {
     int count = 0;
     double squared_error = 0.0;
+    int outer_count = 0;
+    double outer_squared_error = 0.0;
 
     double Rmse() const {
       return count > 0
                  ? std::sqrt(squared_error / static_cast<double>(count))
+                 : 0.0;
+    }
+    double OuterRmse() const {
+      return outer_count > 0
+                 ? std::sqrt(outer_squared_error /
+                             static_cast<double>(outer_count))
                  : 0.0;
     }
   };
@@ -1656,6 +1668,8 @@ struct ResidualStats {
   double outer_squared_error = 0.0;
   double internal_squared_error = 0.0;
   int invalid_projection_count = 0;
+  int invalid_outer_projection_count = 0;
+  int invalid_internal_projection_count = 0;
   std::vector<double> residual_norms;
   std::vector<double> outer_residual_norms;
   std::vector<double> internal_residual_norms;
@@ -1721,6 +1735,8 @@ struct ResidualStats {
       ++outer_count;
       outer_squared_error += squared_error;
       outer_residual_norms.push_back(residual_norm);
+      ++key_stats.outer_count;
+      key_stats.outer_squared_error += squared_error;
     } else {
       ++internal_count;
       internal_squared_error += squared_error;
@@ -1732,6 +1748,17 @@ struct ResidualStats {
 struct FullTrainingPoseRefitStats {
   ResidualStats pixel_stats;
   std::map<FrameBoardKey, Eigen::Isometry3d> fitted_poses;
+  // This is deliberately diagnostic-only.  The health gate still evaluates
+  // the same complete observation set; these fields explain a count change
+  // instead of silently interpreting it as a bad frame or a bad camera.
+  std::map<FrameBoardKey, std::string> pose_failure_reasons;
+  std::map<FrameBoardKey, int> point_count_by_key;
+  std::map<FrameBoardKey, int> outer_point_count_by_key;
+  std::map<FrameBoardKey, int> internal_point_count_by_key;
+  std::map<FrameBoardKey, int> invalid_projection_count_by_key;
+  std::map<FrameBoardKey, int> invalid_outer_projection_count_by_key;
+  std::map<FrameBoardKey, int> invalid_internal_projection_count_by_key;
+  std::map<FrameBoardKey, double> pose_rmse_by_key;
   int pose_total_count = 0;
   int pose_success_count = 0;
   int point_total_count = 0;
@@ -1746,7 +1773,7 @@ struct FullTrainingPoseRefitStats {
 
   bool IsUsable() const {
     return camera_valid && pose_total_count > 0 && point_total_count > 0 &&
-           pixel_stats.total_count == point_total_count &&
+           pose_success_count > 0 && pixel_stats.total_count > 0 &&
            std::isfinite(pixel_stats.Rmse()) &&
            std::isfinite(pixel_stats.P95());
   }
@@ -1952,15 +1979,11 @@ bool EstimatePoseFromObjectPointsWithSeed(
     const Eigen::Isometry3d* initial_pose,
     Eigen::Isometry3d* pose,
     double* rmse) {
-  if (initial_pose == nullptr) {
-    return EstimatePoseFromObjectPoints(intrinsics, object_points, image_points,
-                                        pose, rmse);
-  }
   if (pose == nullptr || rmse == nullptr ||
-      object_points.size() != image_points.size() ||
-      object_points.size() < 4u) {
+      object_points.size() != image_points.size() || object_points.size() < 4u) {
     return false;
   }
+
   const DoubleSphereCameraModel camera = DoubleSphereCameraModel::FromConfig(
       MakePersistentIntermediateCameraConfig(intrinsics));
   if (!camera.IsValid()) {
@@ -1975,27 +1998,35 @@ bool EstimatePoseFromObjectPointsWithSeed(
   }
   cv::Mat initial_rvec;
   cv::Mat initial_tvec;
-  if (!ConvertPoseToCv(*initial_pose, &initial_rvec, &initial_tvec)) {
-    return false;
+  const cv::Mat* initial_rvec_ptr = nullptr;
+  const cv::Mat* initial_tvec_ptr = nullptr;
+  if (initial_pose != nullptr) {
+    if (!ConvertPoseToCv(*initial_pose, &initial_rvec, &initial_tvec)) {
+      return false;
+    }
+    initial_rvec_ptr = &initial_rvec;
+    initial_tvec_ptr = &initial_tvec;
   }
   cv::Mat fitted_rvec;
   cv::Mat fitted_tvec;
   if (!camera.estimateTransformation(object_points_cv, image_points,
                                      &fitted_rvec, &fitted_tvec,
-                                     &initial_rvec, &initial_tvec) ||
+                                     initial_rvec_ptr, initial_tvec_ptr) ||
       !ConvertCvToPose(fitted_rvec, fitted_tvec, pose)) {
     return false;
   }
   double squared_error = 0.0;
   for (std::size_t index = 0; index < object_points.size(); ++index) {
+    const Eigen::Vector3d point_camera = (*pose) * object_points[index];
+    if (!point_camera.allFinite() || point_camera.z() <= 0.0) {
+      return false;
+    }
     Eigen::Vector2d predicted = Eigen::Vector2d::Zero();
-    if (!camera.vsEuclideanToKeypoint((*pose) * object_points[index],
-                                      &predicted) ||
+    if (!camera.vsEuclideanToKeypoint(point_camera, &predicted) ||
         !predicted.allFinite()) {
       return false;
     }
-    const Eigen::Vector2d observed(image_points[index].x,
-                                   image_points[index].y);
+    const Eigen::Vector2d observed(image_points[index].x, image_points[index].y);
     squared_error += (predicted - observed).squaredNorm();
   }
   *rmse = std::sqrt(squared_error / static_cast<double>(object_points.size()));
@@ -2050,6 +2081,82 @@ std::string FormatWorstFullTrainingFrameBoards(
   return stream.str();
 }
 
+std::string FormatPoseRefitFailureDelta(
+    const FullTrainingPoseRefitStats& candidate_stats,
+    const FullTrainingPoseRefitStats& reference_stats,
+    int max_entries) {
+  std::vector<FrameBoardKey> newly_failed;
+  std::vector<FrameBoardKey> recovered;
+  for (const auto& entry : candidate_stats.pose_failure_reasons) {
+    if (reference_stats.pose_failure_reasons.count(entry.first) == 0) {
+      newly_failed.push_back(entry.first);
+    }
+  }
+  for (const auto& entry : reference_stats.pose_failure_reasons) {
+    if (candidate_stats.pose_failure_reasons.count(entry.first) == 0) {
+      recovered.push_back(entry.first);
+    }
+  }
+
+  const auto append_key = [](std::ostringstream* stream,
+                             const FrameBoardKey& key,
+                             const FullTrainingPoseRefitStats& stats) {
+    const auto reason_it = stats.pose_failure_reasons.find(key);
+    const auto points_it = stats.point_count_by_key.find(key);
+    const auto outer_it = stats.outer_point_count_by_key.find(key);
+    const auto internal_it = stats.internal_point_count_by_key.find(key);
+    const auto invalid_it = stats.invalid_projection_count_by_key.find(key);
+    *stream << key.first << "/B" << key.second
+            << "(" << (reason_it == stats.pose_failure_reasons.end()
+                              ? "recovered"
+                              : reason_it->second)
+            << ",points="
+            << (points_it == stats.point_count_by_key.end() ? 0
+                                                             : points_it->second)
+            << ",outer="
+            << (outer_it == stats.outer_point_count_by_key.end() ? 0
+                                                                  : outer_it->second)
+            << ",internal="
+            << (internal_it == stats.internal_point_count_by_key.end()
+                    ? 0
+                    : internal_it->second)
+            << ",invalid="
+            << (invalid_it == stats.invalid_projection_count_by_key.end()
+                    ? 0
+                    : invalid_it->second)
+            << ")";
+  };
+
+  std::ostringstream stream;
+  stream << " pose_refit_new_failures=" << newly_failed.size()
+         << " pose_refit_recovered=" << recovered.size();
+  const int new_count =
+      std::min(max_entries, static_cast<int>(newly_failed.size()));
+  if (new_count > 0) {
+    stream << " new_failure_keys=";
+    for (int index = 0; index < new_count; ++index) {
+      if (index > 0) {
+        stream << ";";
+      }
+      append_key(&stream, newly_failed[static_cast<std::size_t>(index)],
+                 candidate_stats);
+    }
+  }
+  const int recovered_count =
+      std::min(max_entries, static_cast<int>(recovered.size()));
+  if (recovered_count > 0) {
+    stream << " recovered_keys=";
+    for (int index = 0; index < recovered_count; ++index) {
+      if (index > 0) {
+        stream << ";";
+      }
+      append_key(&stream, recovered[static_cast<std::size_t>(index)],
+                 reference_stats);
+    }
+  }
+  return stream.str();
+}
+
 double RegressionLimit(double before_rmse,
                        double ratio,
                        double absolute_margin_px) {
@@ -2064,7 +2171,8 @@ bool CheckFullTrainingPoseRefitHealthGate(
     const FullTrainingPoseRefitStats& committed_before_stats,
     const FullTrainingPoseRefitStats& candidate_stats,
     const Stage5IncrementalBackendEstimatorOptions& options,
-    std::string* reason) {
+    std::string* reason,
+    bool include_initial_reference = true) {
   if (!options.use_full_training_pose_refit_health_gate) {
     if (reason != nullptr) {
       reason->clear();
@@ -2114,32 +2222,45 @@ bool CheckFullTrainingPoseRefitHealthGate(
       initial_stats.pixel_stats.P95(),
       options.full_training_pose_refit_max_p95_regression_ratio,
       options.full_training_pose_refit_max_p95_regression_abs_px);
+  const double rmse_limit = include_initial_reference
+                                ? std::min(before_rmse_limit,
+                                           initial_rmse_limit)
+                                : before_rmse_limit;
+  const double p95_limit = include_initial_reference
+                               ? std::min(before_p95_limit,
+                                          initial_p95_limit)
+                               : before_p95_limit;
   const double pose_rate_floor = std::max(
       0.0,
-      std::min(initial_stats.PoseSuccessRate(),
-               committed_before_stats.PoseSuccessRate()) -
+      (include_initial_reference
+           ? std::min(initial_stats.PoseSuccessRate(),
+                      committed_before_stats.PoseSuccessRate())
+           : committed_before_stats.PoseSuccessRate()) -
           options.full_training_pose_refit_max_pose_success_rate_drop);
   const bool pass =
-      candidate_stats.pixel_stats.Rmse() <=
-          std::min(before_rmse_limit, initial_rmse_limit) &&
-      candidate_stats.pixel_stats.P95() <=
-          std::min(before_p95_limit, initial_p95_limit) &&
+      candidate_stats.pixel_stats.Rmse() <= rmse_limit &&
+      candidate_stats.pixel_stats.P95() <= p95_limit &&
       candidate_stats.PoseSuccessRate() >= pose_rate_floor &&
       candidate_stats.pixel_stats.invalid_projection_count <=
-          std::max(initial_stats.pixel_stats.invalid_projection_count,
-                   committed_before_stats.pixel_stats.invalid_projection_count);
+          (include_initial_reference
+               ? std::max(initial_stats.pixel_stats.invalid_projection_count,
+                          committed_before_stats.pixel_stats
+                              .invalid_projection_count)
+               : committed_before_stats.pixel_stats
+                     .invalid_projection_count);
   if (!pass && reason != nullptr) {
     std::ostringstream stream;
-    stream << "full_training_pose_refit_health_gate"
+    stream << "full_training_pose_refit_health_gate_all_points"
            << " initial_rmse=" << initial_stats.pixel_stats.Rmse()
            << " before_rmse=" << committed_before_stats.pixel_stats.Rmse()
            << " candidate_rmse=" << candidate_stats.pixel_stats.Rmse()
-           << " rmse_limit="
-           << std::min(before_rmse_limit, initial_rmse_limit)
+           << " rmse_limit=" << rmse_limit
+           << " include_initial_reference="
+           << (include_initial_reference ? 1 : 0)
            << " initial_p95=" << initial_stats.pixel_stats.P95()
            << " before_p95=" << committed_before_stats.pixel_stats.P95()
            << " candidate_p95=" << candidate_stats.pixel_stats.P95()
-           << " p95_limit=" << std::min(before_p95_limit, initial_p95_limit)
+           << " p95_limit=" << p95_limit
            << " initial_pose_rate=" << initial_stats.PoseSuccessRate()
            << " before_pose_rate="
            << committed_before_stats.PoseSuccessRate()
@@ -2151,6 +2272,10 @@ bool CheckFullTrainingPoseRefitHealthGate(
            << committed_before_stats.pixel_stats.invalid_projection_count
            << " candidate_invalid="
            << candidate_stats.pixel_stats.invalid_projection_count
+           << " candidate_invalid_internal="
+           << candidate_stats.pixel_stats.invalid_internal_projection_count
+           << FormatPoseRefitFailureDelta(
+                  candidate_stats, committed_before_stats, 16)
            << FormatWorstFullTrainingFrameBoards(
                   candidate_stats, committed_before_stats, 8);
     *reason = stream.str();
@@ -2320,47 +2445,49 @@ bool CheckSplitResidualHealthGate(
     return false;
   }
 
-  if (before_stats.total_count > 0 &&
-      candidate_stats.Rmse() >
-          RegressionLimit(before_stats.Rmse(),
-                          options.split_residual_max_rmse_regression_ratio,
-                          SelectionRegressionMargin(options, metric, true))) {
-    if (reason != nullptr) {
-      std::ostringstream stream;
-      stream << "split_residual_health_gate candidate_total_rmse_regression "
-             << "before=" << before_stats.Rmse()
-             << " candidate=" << candidate_stats.Rmse();
-      *reason = stream.str();
+  if (options.use_candidate_relative_residual_gate) {
+    if (before_stats.total_count > 0 &&
+        candidate_stats.Rmse() >
+            RegressionLimit(before_stats.Rmse(),
+                            options.split_residual_max_rmse_regression_ratio,
+                            SelectionRegressionMargin(options, metric, true))) {
+      if (reason != nullptr) {
+        std::ostringstream stream;
+        stream << "split_residual_health_gate candidate_total_rmse_regression "
+               << "before=" << before_stats.Rmse()
+               << " candidate=" << candidate_stats.Rmse();
+        *reason = stream.str();
+      }
+      return false;
     }
-    return false;
-  }
-  if (before_stats.outer_count > 0 && candidate_stats.outer_count > 0 &&
-      candidate_stats.OuterRmse() >
-          RegressionLimit(before_stats.OuterRmse(),
-                          options.split_residual_max_rmse_regression_ratio,
-                          SelectionRegressionMargin(options, metric, false))) {
-    if (reason != nullptr) {
-      std::ostringstream stream;
-      stream << "split_residual_health_gate candidate_outer_rmse_regression "
-             << "before=" << before_stats.OuterRmse()
-             << " candidate=" << candidate_stats.OuterRmse();
-      *reason = stream.str();
+    if (before_stats.outer_count > 0 && candidate_stats.outer_count > 0 &&
+        candidate_stats.OuterRmse() >
+            RegressionLimit(before_stats.OuterRmse(),
+                            options.split_residual_max_rmse_regression_ratio,
+                            SelectionRegressionMargin(options, metric, false))) {
+      if (reason != nullptr) {
+        std::ostringstream stream;
+        stream << "split_residual_health_gate candidate_outer_rmse_regression "
+               << "before=" << before_stats.OuterRmse()
+               << " candidate=" << candidate_stats.OuterRmse();
+        *reason = stream.str();
+      }
+      return false;
     }
-    return false;
-  }
-  if (before_stats.internal_count > 0 && candidate_stats.internal_count > 0 &&
-      candidate_stats.InternalRmse() >
-          RegressionLimit(before_stats.InternalRmse(),
-                          options.split_residual_max_rmse_regression_ratio,
-                          SelectionRegressionMargin(options, metric, true))) {
-    if (reason != nullptr) {
-      std::ostringstream stream;
-      stream << "split_residual_health_gate candidate_internal_rmse_regression "
-             << "before=" << before_stats.InternalRmse()
-             << " candidate=" << candidate_stats.InternalRmse();
-      *reason = stream.str();
+    if (before_stats.internal_count > 0 && candidate_stats.internal_count > 0 &&
+        candidate_stats.InternalRmse() >
+            RegressionLimit(before_stats.InternalRmse(),
+                            options.split_residual_max_rmse_regression_ratio,
+                            SelectionRegressionMargin(options, metric, true))) {
+      if (reason != nullptr) {
+        std::ostringstream stream;
+        stream << "split_residual_health_gate candidate_internal_rmse_regression "
+               << "before=" << before_stats.InternalRmse()
+               << " candidate=" << candidate_stats.InternalRmse();
+        *reason = stream.str();
+      }
+      return false;
     }
-    return false;
   }
 
   if (before_stats.total_count > 0 &&
@@ -2556,6 +2683,14 @@ class PersistentProblemBuilder {
     MaybeAddKbDistortionPrior(camera_phase, camera_anchor_state,
                               kb_release_state, batch,
                               camera_anchor_weight_scale);
+    // A model-aware active-camera seed is a full-dataset camera bootstrap,
+    // not a joint layout refinement.  Keep the rigid board layout fixed at
+    // this stage so a small seed cannot compensate a camera step by moving
+    // the shared board geometry.
+    const bool board_layout_active =
+        !options_.fix_board_layout &&
+        camera_phase != CameraOptimizationPhase::kSeedActiveCamera;
+    SetBoardLayoutActive(board_layout_active);
     AddBoardVariables(batch);
     AddFrameVariables(keys, force_add_frame_variables, batch);
     AddResiduals(keys, batch, residual_counts);
@@ -2726,6 +2861,7 @@ class PersistentProblemBuilder {
           entry.second;
       ++result.pose_total_count;
       result.point_total_count += static_cast<int>(observations.size());
+      result.point_count_by_key[key] = static_cast<int>(observations.size());
 
       std::vector<Eigen::Vector3d> object_points;
       std::vector<cv::Point2f> image_points;
@@ -2740,6 +2876,11 @@ class PersistentProblemBuilder {
         if (observation == nullptr) {
           continue;
         }
+        if (observation->point_type == JointPointType::Outer) {
+          ++result.outer_point_count_by_key[key];
+        } else {
+          ++result.internal_point_count_by_key[key];
+        }
         object_points.push_back(observation->target_xyz_board);
         image_points.emplace_back(
             static_cast<float>(observation->image_xy.x()),
@@ -2747,7 +2888,6 @@ class PersistentProblemBuilder {
       }
 
       Eigen::Isometry3d T_camera_board = Eigen::Isometry3d::Identity();
-      double pose_rmse = 0.0;
       const Eigen::Isometry3d* initial_pose = nullptr;
       if (pose_seed_stats != nullptr) {
         const auto seed_it = pose_seed_stats->fitted_poses.find(key);
@@ -2755,16 +2895,34 @@ class PersistentProblemBuilder {
           initial_pose = &seed_it->second;
         }
       }
-      const bool pose_success =
-          result.camera_valid && finite_observations &&
-          object_points.size() >= 4u &&
-          EstimatePoseFromObjectPointsWithSeed(
-              intrinsics, object_points, image_points, initial_pose,
-              &T_camera_board, &pose_rmse) &&
-          T_camera_board.matrix().allFinite() && std::isfinite(pose_rmse);
+      double pose_rmse = 0.0;
+      bool pose_success = false;
+      std::string pose_failure_reason;
+      if (!result.camera_valid) {
+        pose_failure_reason = "camera_invalid";
+      } else if (!finite_observations) {
+        pose_failure_reason = "nonfinite_observation";
+      } else if (object_points.size() < 4u) {
+        pose_failure_reason = "insufficient_points";
+      } else if (!EstimatePoseFromObjectPointsWithSeed(
+                     intrinsics, object_points, image_points, initial_pose,
+                     &T_camera_board, &pose_rmse)) {
+        // The direct model-aware solver rejects this branch if fitting,
+        // cheirality, or a model projection is invalid.  Keep this category
+        // explicit instead of attributing it to the input frame.
+        pose_failure_reason = "pose_solver_or_projection_validity_failed";
+      } else if (!T_camera_board.matrix().allFinite() ||
+                 !std::isfinite(pose_rmse)) {
+        pose_failure_reason = "nonfinite_pose_or_rmse";
+      } else {
+        pose_success = true;
+      }
       if (pose_success) {
         ++result.pose_success_count;
         result.fitted_poses[key] = T_camera_board;
+        result.pose_rmse_by_key[key] = pose_rmse;
+      } else {
+        result.pose_failure_reasons[key] = pose_failure_reason;
       }
 
       for (std::size_t index = 0; index < observations.size(); ++index) {
@@ -2783,8 +2941,21 @@ class PersistentProblemBuilder {
         if (!valid_projection) {
           residual_norm = invalid_penalty;
           ++result.pixel_stats.invalid_projection_count;
+          ++result.invalid_projection_count_by_key[key];
+          if (observation.point_type == JointPointType::Outer) {
+            ++result.pixel_stats.invalid_outer_projection_count;
+            ++result.invalid_outer_projection_count_by_key[key];
+          } else {
+            ++result.pixel_stats.invalid_internal_projection_count;
+            ++result.invalid_internal_projection_count_by_key[key];
+          }
         }
-        result.pixel_stats.Add(key, observation.point_type, residual_norm);
+        // Invalid projections are audit/health signals, not valid
+        // reprojection observations. Keep their type-specific counters above,
+        // but exclude the penalty value from RMSE/P95 and frame-board stats.
+        if (valid_projection) {
+          result.pixel_stats.Add(key, observation.point_type, residual_norm);
+        }
       }
     }
     return result;
@@ -2800,7 +2971,6 @@ class PersistentProblemBuilder {
 
     std::map<FrameBoardKey, std::vector<const JointPointObservation*> >
         observations_by_key;
-    std::map<FrameBoardKey, int> internal_counts;
     for (const JointPointObservation& observation :
          candidate_pool_bundle_.measurement_dataset.solver_observations) {
       const FrameBoardKey key(observation.frame_index, observation.board_id);
@@ -2809,9 +2979,6 @@ class PersistentProblemBuilder {
         continue;
       }
       observations_by_key[key].push_back(&observation);
-      if (observation.point_type == JointPointType::Internal) {
-        ++internal_counts[key];
-      }
     }
 
     using IndependentPoseMap =
@@ -2819,7 +2986,7 @@ class PersistentProblemBuilder {
     IndependentPoseMap pose_variables;
     const OuterBootstrapCameraIntrinsics intrinsics = CurrentCamera();
     for (const auto& entry : observations_by_key) {
-      if (internal_counts[entry.first] <= 0 || entry.second.size() < 4u) {
+      if (entry.second.size() < 4u) {
         continue;
       }
       std::vector<Eigen::Vector3d> object_points;
@@ -2853,7 +3020,7 @@ class PersistentProblemBuilder {
     result.pose_count = static_cast<int>(pose_variables.size());
     if (pose_variables.empty()) {
       result.failure_reason =
-          "no internally supported frame-board pose could be initialized";
+          "no valid frame-board pose could be initialized";
       return result;
     }
 
@@ -3226,13 +3393,18 @@ class PersistentProblemBuilder {
     for (const auto& entry : snapshot.frame_poses) {
       auto variable_it = frame_variables_.find(entry.first);
       if (variable_it != frame_variables_.end()) {
-        SetPoseVariableFromMatrix(&variable_it->second, entry.second);
+        // Rebuild the expression together with the restored DV values. A
+        // rejected IncrementalEstimator batch can retain expression nodes
+        // that reference the trial linearization; merely writing the matrix
+        // back leaves later residuals evaluating a stale pose expression.
+        InitializePoseVariable(&variable_it->second, entry.second, true);
       }
     }
     for (const auto& entry : snapshot.board_poses) {
       auto variable_it = board_variables_.find(entry.first);
       if (variable_it != board_variables_.end()) {
-        SetPoseVariableFromMatrix(&variable_it->second, entry.second);
+        InitializePoseVariable(&variable_it->second, entry.second,
+                               !options_.fix_board_layout);
       }
     }
   }
@@ -3380,12 +3552,14 @@ class PersistentProblemBuilder {
                           const boost::shared_ptr<CalibrationBatch>& batch) {
     constexpr bool kHasDistortionDv =
         GeometryT::projection_t::distortion_t::DesignVariableDimension > 0;
-    const bool projection_active =
-        camera_phase == CameraOptimizationPhase::kPosePrefitFixedIntrinsics
-            ? false
-            : (camera_phase == CameraOptimizationPhase::kSeedFixedIntrinsics
-                   ? options_.optimize_seed_intrinsics
-                   : options_.optimize_candidate_intrinsics);
+    bool projection_active = options_.optimize_candidate_intrinsics;
+    if (camera_phase == CameraOptimizationPhase::kPosePrefitFixedIntrinsics) {
+      projection_active = false;
+    } else if (camera_phase ==
+               CameraOptimizationPhase::kSeedFixedIntrinsics) {
+      projection_active = options_.optimize_seed_intrinsics;
+    }
+
     camera_dv_.setActive(projection_active,
                          projection_active && kHasDistortionDv,
                          false);
@@ -3397,15 +3571,15 @@ class PersistentProblemBuilder {
                              kCameraInformationGroupId);
   }
 
-	  void MaybeAddCameraAnchorPrior(
+  void MaybeAddCameraAnchorPrior(
       CameraOptimizationPhase camera_phase,
       const StateSnapshot* camera_anchor_state,
       const boost::shared_ptr<CalibrationBatch>& batch,
       double camera_anchor_weight_scale) {
     if (camera_phase != CameraOptimizationPhase::kCandidateTrustRegion ||
+        camera_anchor_state == nullptr ||
         !options_.optimize_candidate_intrinsics ||
         !options_.use_candidate_intrinsics_anchor_prior ||
-        camera_anchor_state == nullptr ||
         camera_anchor_state->projection_parameters.rows() < 4 ||
         camera_anchor_state->projection_parameters.cols() < 1) {
       return;
@@ -3573,6 +3747,13 @@ class PersistentProblemBuilder {
     }
   }
 
+  void SetBoardLayoutActive(bool active) {
+    for (auto& entry : board_variables_) {
+      entry.second.rotation_dv->setActive(active);
+      entry.second.translation_dv->setActive(active);
+    }
+  }
+
   void AddBoardVariables(const boost::shared_ptr<CalibrationBatch>& batch) {
     for (const auto& entry : board_variables_) {
       AddPoseVariableDvs(entry.second, kBoardLayoutGroupId, batch);
@@ -3609,6 +3790,7 @@ class PersistentProblemBuilder {
     }
   }
 
+ private:
   const PoseVariable* FindFrameVariable(int frame_index) const {
     const auto it = frame_variables_.find(frame_index);
     return it == frame_variables_.end() ? nullptr : &it->second;
@@ -3631,6 +3813,8 @@ class PersistentProblemBuilder {
                                    observation.board_id)) == 0) {
         continue;
       }
+      const FrameBoardKey observation_key(observation.frame_index,
+                                          observation.board_id);
       const PoseVariable* frame_variable =
           FindFrameVariable(observation.frame_index);
       if (frame_variable == nullptr) {
@@ -3651,8 +3835,6 @@ class PersistentProblemBuilder {
           observation.target_xyz_board);
       const aslam::backend::HomogeneousExpression point_camera =
           frame_variable->expression * (board_expression * point_board);
-      const FrameBoardKey observation_key(observation.frame_index,
-                                          observation.board_id);
       const auto budget_it = observation_budgets_.find(observation_key);
       const ObservationBudget budget =
           budget_it == observation_budgets_.end() ? ObservationBudget{}
@@ -3883,8 +4065,8 @@ class PersistentProblemBuilder {
 	  CameraDv camera_dv_;
 	  double chordal_reference_focal_px_ = 1.0;
 	  Eigen::MatrixXd initial_distortion_parameters_;
-	  PoseVariableMap frame_variables_;
-	  PoseVariableMap board_variables_;
+  PoseVariableMap frame_variables_;
+  PoseVariableMap board_variables_;
 	};
 
 Stage5IncrementalBackendEstimatorOptions MakeOptions(
@@ -3964,14 +4146,31 @@ Stage5IncrementalBackendEstimatorOptions MakeOptions(
       selection_options.force_include_list_is_exact_input;
   options.independent_frame_board_camera_warmup =
       selection_options.independent_frame_board_camera_warmup &&
-      !selection_options.single_board_dense_grid_profile;
+      !selection_options.single_board_dense_grid_profile &&
+      !selection_options.model_aware_information_coreset;
   options.optimize_candidate_intrinsics =
       selection_options.optimize_intrinsics_in_trial;
   options.fix_board_layout = selection_options.persistent_fix_board_layout;
   options.use_candidate_intrinsics_anchor_prior =
       selection_options.optimize_intrinsics_in_trial &&
       selection_options.persistent_intrinsics_anchor_prior_enabled;
-  options.normalize_information_gain_by_board_observation = false;
+  options.normalize_information_gain_by_board_observation =
+      selection_options.model_aware_information_coreset;
+  options.use_candidate_relative_residual_gate =
+      !selection_options.model_aware_information_coreset;
+  // A model-aware candidate is admitted against its own all-point residuals
+  // and the already committed scene.  Re-fitting every uncommitted training
+  // observation here makes one unrelated difficult board veto every batch;
+  // the full-scene health check remains part of the final backend BA.
+  options.use_full_training_pose_refit_health_gate =
+      !selection_options.model_aware_information_coreset;
+  if (selection_options.model_aware_information_coreset) {
+    // Use one ordinary Kalibr-style solve per candidate batch.  The legacy
+    // five-iteration cap is only a short trial budget and spuriously reports
+    // non-convergence for otherwise healthy model-aware candidates.
+    options.max_iterations = std::max(20, options.max_iterations);
+    options.max_continuation_rounds = 0;
+  }
   options.candidate_intrinsics_anchor_weight_xi_alpha =
       selection_options.persistent_intrinsics_anchor_weight_xi_alpha;
   options.candidate_intrinsics_anchor_weight_focal =
@@ -4428,6 +4627,10 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         initial_full_training_stats.pose_total_count;
     result.initial_full_training_invalid_projection_count =
         initial_full_training_stats.pixel_stats.invalid_projection_count;
+    result.initial_full_training_invalid_outer_projection_count =
+        initial_full_training_stats.pixel_stats.invalid_outer_projection_count;
+    result.initial_full_training_invalid_internal_projection_count =
+        initial_full_training_stats.pixel_stats.invalid_internal_projection_count;
     if (result.full_training_pose_refit_health_gate_enabled &&
         !initial_full_training_stats.IsUsable()) {
       result.failure_reason =
@@ -4671,6 +4874,10 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
       }
     }
 
+    // The initializer owns the incoming camera state.  The persistent seed
+    // only establishes the estimator on the selected observations; it must
+    // not make an unvalidated global camera step before the existing
+    // frame-level health gate can inspect it.
     const std::set<FrameBoardKey> seed_keys = result.accepted_keys;
     result.seed_board_observation_count = static_cast<int>(seed_keys.size());
     std::set<int> seed_frames;
@@ -4756,15 +4963,19 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
     }
     typename PersistentProblemBuilder<GeometryT>::ResidualConstructionCounts
         seed_residual_counts;
-    // Seed and candidate intrinsics have separate responsibilities. In the
-    // perturbation-recovery protocol the seed establishes poses while keeping
-    // the perturbed camera unchanged; candidate batches release intrinsics.
+    // The model-aware path must establish camera information on the already
+    // curated seed, before evaluating any candidate frame.  Letting the first
+    // traversal-order candidate activate the camera makes its admission
+    // privileged and can seed the estimator from an unhealthy view.
+    const bool model_aware_seed_information =
+        estimator_options.normalize_information_gain_by_board_observation;
     const CameraOptimizationPhase seed_camera_phase =
-        CameraOptimizationPhase::kSeedFixedIntrinsics;
-    const typename PersistentProblemBuilder<GeometryT>::StateSnapshot
-        committed_seed_state = builder.CaptureState();
+        model_aware_seed_information
+            ? CameraOptimizationPhase::kSeedActiveCamera
+            : CameraOptimizationPhase::kSeedFixedIntrinsics;
     boost::shared_ptr<CalibrationBatch> seed_batch = builder.BuildBatch(
         seed_keys, true, seed_camera_phase, nullptr, &seed_residual_counts);
+    result.seed_outer_only_residuals = false;
     std::string seed_contract_reason;
     if (!ResidualConstructionMatchesMode(
             estimator_options.residual_model,
@@ -4828,16 +5039,19 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
       result.failure_reason = "forced seed batch was not accepted";
       return result;
     }
+    // The fixed-intrinsics seed preserves the initializer camera, so its
+    // existing independent-pose refit remains a valid reference state.
     const FullTrainingPoseRefitStats seed_batch_full_training_stats =
         builder.EvaluateFullTrainingPoseRefitPixel(
-            &committed_full_training_stats, &result.quarantined_keys);
+            &committed_full_training_stats,
+            &result.quarantined_keys);
     std::string seed_batch_full_training_reason;
     if (!fixed_forced_schedule &&
         !CheckFullTrainingPoseRefitHealthGate(
             health_initial_full_training_stats, committed_full_training_stats,
             seed_batch_full_training_stats, estimator_options,
             &seed_batch_full_training_reason)) {
-      builder.RestoreState(committed_seed_state);
+      builder.RestoreState(seed_state);
       result.failure_reason =
           "forced seed batch violated full-training pose-refit health: " +
           seed_batch_full_training_reason;
@@ -4852,6 +5066,15 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         seed_ret.rankTheta + seed_ret.rankThetaDeficiency > 0;
     bool camera_information_activation_pending = false;
     if (!result.seed_information_baseline_valid) {
+      if (model_aware_seed_information) {
+        std::ostringstream stream;
+        stream << "model-aware active seed did not establish a valid camera "
+                  "information baseline: rankTheta="
+               << seed_ret.rankTheta
+               << " rankThetaDeficiency=" << seed_ret.rankThetaDeficiency;
+        result.failure_reason = stream.str();
+        return result;
+      }
       if (!estimator_options.optimize_seed_intrinsics &&
           estimator_options.optimize_candidate_intrinsics) {
         camera_information_activation_pending = true;
@@ -5003,6 +5226,33 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         tail_ordering_score_threshold;
     int consecutive_nonproductive_batches = 0;
     double cumulative_accepted_information_gain = 0.0;
+    const auto rejection_reason_code = [](const std::string& reason) {
+      if (reason.find("full_training_pose_refit_health") !=
+          std::string::npos) {
+        return std::string("full_training_pose_refit_health_gate");
+      }
+      if (reason.find("optimizer_nonconvergence") != std::string::npos) {
+        return std::string("incremental_optimizer_nonconvergence");
+      }
+      if (reason.find("information_activation") != std::string::npos) {
+        return std::string("camera_information_activation");
+      }
+      if (reason.find("trust_region") != std::string::npos) {
+        return std::string("camera_trust_region");
+      }
+      if (reason.find("residual_health") != std::string::npos ||
+          reason.find("split_residual") != std::string::npos ||
+          reason.find("pixel_safety") != std::string::npos) {
+        return std::string("residual_health_gate");
+      }
+      if (reason.find("ray_curve") != std::string::npos) {
+        return std::string("ray_curve_health_gate");
+      }
+      if (reason.find("objective") != std::string::npos) {
+        return std::string("objective_gate");
+      }
+      return std::string("other");
+    };
 
     for (const Stage5IncrementalBackendBatchInput& raw_input :
          effective_candidate_batches) {
@@ -5123,8 +5373,15 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         continue;
       }
 
+      // Keep the committed scene state separate from the state that the
+      // incremental estimator snapshots internally after the pose prefit.
+      // rejectBatch() restores the latter; a rejected candidate must then
+      // restore the former so the prefit cannot leak into the next batch.
       const typename PersistentProblemBuilder<GeometryT>::StateSnapshot
-          batch_state = builder.CaptureState();
+          committed_batch_state = builder.CaptureState();
+      const ResidualStats committed_before_prefit_pixel_stats =
+          builder.EvaluateAccepted(result.accepted_keys,
+                                   SelectionResidualMetric::kPixel);
       if (estimator_options.residual_model != ResidualModel::ImagePlane) {
         constexpr int kPosePrefitMaximumIterations = 100;
         batch_result.pose_prefit_attempted = true;
@@ -5145,7 +5402,7 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
             std::isfinite(pose_prefit.JFinal) &&
             pose_prefit.JFinal <= pose_prefit.JStart;
         if (!batch_result.pose_prefit_success) {
-          builder.RestoreState(batch_state);
+          builder.RestoreState(committed_batch_state);
           std::ostringstream stream;
           stream << "candidate_pose_prefit_failed iterations="
                  << pose_prefit.iterations
@@ -5163,6 +5420,8 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
           continue;
         }
       }
+      const typename PersistentProblemBuilder<GeometryT>::StateSnapshot
+          batch_state = builder.CaptureState();
       const ResidualStats committed_before_stats =
           builder.EvaluateAccepted(result.accepted_keys, selection_metric);
       const ResidualStats committed_before_pixel_stats =
@@ -5383,7 +5642,7 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
                 residual_counts.angular_residual_count,
                 residual_counts.chordal_residual_count,
                 &residual_contract_reason)) {
-          builder.RestoreState(batch_state);
+          builder.RestoreState(committed_batch_state);
           incremental_accepted = false;
           add_batch_exception = true;
           batch_result.batch_accepted = false;
@@ -5465,7 +5724,7 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
           if (batch) {
             estimator.rejectBatch(batch);
           }
-          builder.RestoreState(batch_state);
+          builder.RestoreState(committed_batch_state);
           incremental_accepted = false;
           add_batch_exception = true;
           batch_result.batch_accepted = false;
@@ -5499,7 +5758,7 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         if (incremental_accepted) {
           estimator.rejectBatch(batch);
         }
-        builder.RestoreState(batch_state);
+        builder.RestoreState(committed_batch_state);
         batch_result.batch_accepted = false;
         batch_result.solution_valid = false;
         batch_result.reject_reason =
@@ -5522,7 +5781,6 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
              active_anchor_weight_scale <
                  kMaxTrustRegionAnchorWeightScale) {
         estimator.rejectBatch(batch);
-        builder.RestoreState(batch_state);
         incremental_accepted = false;
         active_anchor_weight_scale = NextTrustRegionAnchorWeightScale(
             active_anchor_weight_scale, trust_region_violation_ratio);
@@ -5664,6 +5922,9 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         const ResidualStats candidate_only_pixel_stats =
             builder.EvaluateAccepted(input.frame_board_keys,
                                      SelectionResidualMetric::kPixel);
+        const ResidualStats committed_existing_pixel_stats =
+            builder.EvaluateAccepted(result.accepted_keys,
+                                     SelectionResidualMetric::kPixel);
         const ResidualStats committed_candidate_pixel_stats =
             builder.EvaluateAccepted(candidate_accepted_keys,
                                      SelectionResidualMetric::kPixel);
@@ -5714,23 +5975,25 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
           batch_result.pixel_safety_gate_pass =
               CheckSplitResidualHealthGate(
                   committed_before_pixel_stats,
-                  committed_candidate_pixel_stats,
+                  committed_existing_pixel_stats,
                   candidate_only_pixel_stats, estimator_options, input,
                   SelectionResidualMetric::kPixel, &pixel_safety_reason);
           const double seed_rmse_limit = RegressionLimit(
               seed_pixel_stats.Rmse(), 1.35, 0.50);
           const double seed_p95_limit = RegressionLimit(
               seed_pixel_stats.P95(), 1.50, 1.00);
-          if (batch_result.pixel_rmse_after > seed_rmse_limit ||
-              batch_result.pixel_p95_after > seed_p95_limit) {
+          if (committed_existing_pixel_stats.Rmse() > seed_rmse_limit ||
+              committed_existing_pixel_stats.P95() > seed_p95_limit) {
             batch_result.pixel_safety_gate_pass = false;
             std::ostringstream stream;
             stream << "bearing_pixel_safety_global seed_rmse="
                    << seed_pixel_stats.Rmse()
-                   << " after_rmse=" << batch_result.pixel_rmse_after
+                   << " existing_after_rmse="
+                   << committed_existing_pixel_stats.Rmse()
                    << " rmse_limit=" << seed_rmse_limit
                    << " seed_p95=" << seed_pixel_stats.P95()
-                   << " after_p95=" << batch_result.pixel_p95_after
+                   << " existing_after_p95="
+                   << committed_existing_pixel_stats.P95()
                    << " p95_limit=" << seed_p95_limit;
             pixel_safety_reason = stream.str();
           }
@@ -5781,10 +6044,18 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
           batch_result.residual_health_pass = false;
         }
         if (batch_result.batch_accepted) {
+          // Do not compare the mixed seed+candidate residual to the seed
+          // residual. A geometrically valid hard frame naturally has a larger
+          // standalone error and would always make that mixed average rise.
+          // The candidate is checked by its own absolute RMSE/P95 above;
+          // this regression gate protects only observations already committed
+          // before the candidate was introduced.
+          const ResidualStats committed_existing_stats =
+              builder.EvaluateAccepted(result.accepted_keys, selection_metric);
           std::string split_residual_reason;
           batch_result.split_residual_health_pass =
               CheckSplitResidualHealthGate(
-                  committed_before_stats, committed_candidate_stats,
+                  committed_before_stats, committed_existing_stats,
                   candidate_only_stats, estimator_options, input,
                   selection_metric,
                   &split_residual_reason);
@@ -5894,19 +6165,22 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         if (incremental_accepted) {
           estimator.rejectBatch(batch);
         }
-        builder.RestoreState(batch_state);
+        builder.RestoreState(committed_batch_state);
         const ResidualStats rollback_pixel_stats =
             builder.EvaluateAccepted(result.accepted_keys,
                                      SelectionResidualMetric::kPixel);
         const double rollback_tolerance_px = std::max(
-            0.01, 0.001 * std::max(1.0, committed_before_pixel_stats.Rmse()));
+            0.01,
+            0.001 * std::max(1.0,
+                             committed_before_prefit_pixel_stats.Rmse()));
         if (!std::isfinite(rollback_pixel_stats.Rmse()) ||
             std::abs(rollback_pixel_stats.Rmse() -
-                     committed_before_pixel_stats.Rmse()) >
+                     committed_before_prefit_pixel_stats.Rmse()) >
                 rollback_tolerance_px) {
           std::ostringstream stream;
           stream << "persistent batch rollback state mismatch"
-                 << " before_rmse=" << committed_before_pixel_stats.Rmse()
+                 << " before_rmse="
+                 << committed_before_prefit_pixel_stats.Rmse()
                  << " restored_rmse=" << rollback_pixel_stats.Rmse()
                  << " tolerance=" << rollback_tolerance_px
                  << " frame=" << input.frame_index;
@@ -5915,6 +6189,9 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
           return result;
         }
         batch_result.reject_reason = active_reject_reason;
+        ++result.rejection_reason_counts[active_reject_reason];
+        ++result.rejection_reason_code_counts[
+            rejection_reason_code(active_reject_reason)];
         ++result.rejected_batch_count;
         const bool low_information =
             !input.force &&
@@ -6020,6 +6297,10 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
         final_full_training_stats.pose_total_count;
     result.final_full_training_invalid_projection_count =
         final_full_training_stats.pixel_stats.invalid_projection_count;
+    result.final_full_training_invalid_outer_projection_count =
+        final_full_training_stats.pixel_stats.invalid_outer_projection_count;
+    result.final_full_training_invalid_internal_projection_count =
+        final_full_training_stats.pixel_stats.invalid_internal_projection_count;
     const ResidualStats committed_state_pixel_stats =
         builder.EvaluateAccepted(result.accepted_keys,
                                  SelectionResidualMetric::kPixel);
@@ -6095,6 +6376,10 @@ Stage5IncrementalBackendEstimatorResult RunStage5IncrementalBackendEstimatorType
           initial_full_training_stats.pose_total_count;
       result.final_full_training_invalid_projection_count =
           initial_full_training_stats.pixel_stats.invalid_projection_count;
+      result.final_full_training_invalid_outer_projection_count =
+          initial_full_training_stats.pixel_stats.invalid_outer_projection_count;
+      result.final_full_training_invalid_internal_projection_count =
+          initial_full_training_stats.pixel_stats.invalid_internal_projection_count;
     }
     result.success = result.curated_bundle.IsReadyForBackend();
     if (!result.success) {

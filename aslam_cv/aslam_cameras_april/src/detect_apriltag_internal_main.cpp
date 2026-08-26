@@ -259,7 +259,9 @@ ati::InternalProjectionMode ParseProjectionModeOrThrow(const std::string& value)
   std::transform(lowered.begin(), lowered.end(), lowered.begin(),
                  [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
   if (lowered == "homography") {
-    return ati::InternalProjectionMode::Homography;
+    throw std::runtime_error(
+        "--mode homography is retired; use sphere_border_lattice with "
+        "a configured camera model.");
   }
   if (lowered == "virtual_pinhole_patch" || lowered == "virtual-pinhole-patch") {
     return ati::InternalProjectionMode::VirtualPinholePatch;

@@ -252,7 +252,8 @@ bool EvaluatePoseRmseWithSoftPenalty(const OuterBootstrapCameraIntrinsics& intri
     return false;
   }
 
-  const DoubleSphereCameraModel camera = DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
+  const DoubleSphereCameraModel camera =
+      DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
   constexpr double kInvalidProjectionPenalty = 100.0;
   double squared_error_sum = 0.0;
   int valid_projection_count = 0;
@@ -276,11 +277,12 @@ bool EvaluatePoseRmseWithSoftPenalty(const OuterBootstrapCameraIntrinsics& intri
   return true;
 }
 
-bool EstimatePoseFromObjectPointsPinholeFallback(const OuterBootstrapCameraIntrinsics& intrinsics,
-                                                 const std::vector<Eigen::Vector3d>& object_points,
-                                                 const std::vector<cv::Point2f>& image_points,
-                                                 Eigen::Isometry3d* pose,
-                                                 double* rmse) {
+bool EstimatePoseFromObjectPointsPinholeFallback(
+    const OuterBootstrapCameraIntrinsics& intrinsics,
+    const std::vector<Eigen::Vector3d>& object_points,
+    const std::vector<cv::Point2f>& image_points,
+    Eigen::Isometry3d* pose,
+    double* rmse) {
   if (pose == nullptr || rmse == nullptr) {
     throw std::runtime_error(
         "EstimatePoseFromObjectPointsPinholeFallback requires valid output pointers.");
@@ -291,26 +293,30 @@ bool EstimatePoseFromObjectPointsPinholeFallback(const OuterBootstrapCameraIntri
 
   cv::Mat rvec;
   cv::Mat tvec;
-  const cv::Mat camera_matrix = (cv::Mat_<double>(3, 3) << intrinsics.fu, 0.0, intrinsics.cu, 0.0,
-                                 intrinsics.fv, intrinsics.cv, 0.0, 0.0, 1.0);
+  const cv::Mat camera_matrix =
+      (cv::Mat_<double>(3, 3) << intrinsics.fu, 0.0, intrinsics.cu,
+                                  0.0, intrinsics.fv, intrinsics.cv,
+                                  0.0, 0.0, 1.0);
   const cv::Mat dist_coeffs = cv::Mat::zeros(4, 1, CV_64F);
 
   bool success = false;
   const std::vector<cv::Point3f> cv_object_points = ToCvObjectPoints(object_points);
   if (cv_object_points.size() == 4) {
-    success = cv::solvePnP(cv_object_points, image_points, camera_matrix, dist_coeffs, rvec, tvec,
-                           false, cv::SOLVEPNP_IPPE);
+    success = cv::solvePnP(cv_object_points, image_points, camera_matrix,
+                           dist_coeffs, rvec, tvec, false, cv::SOLVEPNP_IPPE);
   }
   if (!success) {
-    success = cv::solvePnP(cv_object_points, image_points, camera_matrix, dist_coeffs, rvec, tvec,
-                           false, cv::SOLVEPNP_ITERATIVE);
+    success = cv::solvePnP(cv_object_points, image_points, camera_matrix,
+                           dist_coeffs, rvec, tvec, false,
+                           cv::SOLVEPNP_ITERATIVE);
   }
   if (!success) {
     return false;
   }
 
-  success = cv::solvePnP(cv_object_points, image_points, camera_matrix, dist_coeffs, rvec, tvec,
-                         true, cv::SOLVEPNP_ITERATIVE);
+  success = cv::solvePnP(cv_object_points, image_points, camera_matrix,
+                         dist_coeffs, rvec, tvec, true,
+                         cv::SOLVEPNP_ITERATIVE);
   if (!success) {
     return false;
   }
@@ -323,8 +329,8 @@ bool EstimatePoseFromObjectPointsPinholeFallback(const OuterBootstrapCameraIntri
 
   const Eigen::Isometry3d candidate_pose = PoseFromCv(rvec, tvec);
   double candidate_rmse = 0.0;
-  if (!EvaluatePoseRmseWithSoftPenalty(intrinsics, object_points, image_points, candidate_pose,
-                                       &candidate_rmse)) {
+  if (!EvaluatePoseRmseWithSoftPenalty(intrinsics, object_points, image_points,
+                                       candidate_pose, &candidate_rmse)) {
     return false;
   }
 
@@ -392,18 +398,20 @@ bool EstimatePoseFromObjectPoints(const OuterBootstrapCameraIntrinsics& intrinsi
     return false;
   }
 
-  const DoubleSphereCameraModel camera = DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
+  const DoubleSphereCameraModel camera =
+      DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
   cv::Mat rvec;
   cv::Mat tvec;
-  if (!camera.estimateTransformation(ToCvObjectPoints(object_points), image_points, &rvec, &tvec)) {
+  if (!camera.estimateTransformation(ToCvObjectPoints(object_points), image_points,
+                                     &rvec, &tvec)) {
     return EstimatePoseFromObjectPointsPinholeFallback(
         intrinsics, object_points, image_points, pose, rmse);
   }
 
-  Eigen::Isometry3d candidate_pose = PoseFromCv(rvec, tvec);
+  const Eigen::Isometry3d candidate_pose = PoseFromCv(rvec, tvec);
   double candidate_rmse = 0.0;
-  if (!EvaluatePoseRmseWithSoftPenalty(intrinsics, object_points, image_points, candidate_pose,
-                                       &candidate_rmse)) {
+  if (!EvaluatePoseRmseWithSoftPenalty(intrinsics, object_points, image_points,
+                                       candidate_pose, &candidate_rmse)) {
     return EstimatePoseFromObjectPointsPinholeFallback(
         intrinsics, object_points, image_points, pose, rmse);
   }
@@ -418,7 +426,8 @@ double ComputeObservationRmse(const OuterBootstrapCameraIntrinsics& intrinsics,
                               const Eigen::Isometry3d& T_reference_board,
                               const std::array<Eigen::Vector3d, 4>& board_points,
                               const std::array<cv::Point2f, 4>& image_points) {
-  const DoubleSphereCameraModel camera = DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
+  const DoubleSphereCameraModel camera =
+      DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
   double squared_error_sum = 0.0;
   for (int index = 0; index < 4; ++index) {
     Eigen::Vector2d projected = Eigen::Vector2d::Zero();
@@ -440,7 +449,8 @@ std::array<Eigen::Vector2d, 4> ComputeObservationCornerResiduals(
     const Eigen::Isometry3d& T_reference_board,
     const std::array<Eigen::Vector3d, 4>& board_points,
     const std::array<cv::Point2f, 4>& image_points) {
-  const DoubleSphereCameraModel camera = DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
+  const DoubleSphereCameraModel camera =
+      DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
   std::array<Eigen::Vector2d, 4> residuals{};
   for (int index = 0; index < 4; ++index) {
     Eigen::Vector2d projected = Eigen::Vector2d::Zero();
@@ -829,9 +839,10 @@ std::string SummarizeBoardInitializationFailure(const SolverState& state,
     return "board missing from solver state";
   }
 
-  const DoubleSphereCameraModel camera = DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
   const std::array<Eigen::Vector3d, 4>& board_points = state.board_corner_points.at(board_id);
   std::vector<Eigen::Vector3d> object_points(board_points.begin(), board_points.end());
+  const DoubleSphereCameraModel camera =
+      DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
 
   int reference_connected_count = 0;
   int initialized_frame_count = 0;
@@ -925,8 +936,9 @@ Eigen::VectorXd BuildBoardPoseResidualVector(const SolverState& state,
     return residuals;
   }
 
-  const DoubleSphereCameraModel camera = DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
   const std::array<Eigen::Vector3d, 4>& board_points = state.board_corner_points.at(board_id);
+  const DoubleSphereCameraModel camera =
+      DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
   int row = 0;
   for (std::size_t observation_offset = 0;
        observation_offset < board_it->second.observation_indices.size();
@@ -1137,9 +1149,10 @@ Eigen::VectorXd BuildResidualVector(const SolverState& state,
     *residual_corner_count = corner_count;
   }
 
-  const DoubleSphereCameraModel camera = DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
   Eigen::VectorXd residuals = Eigen::VectorXd::Zero(2 * corner_count);
   int row = 0;
+  const DoubleSphereCameraModel camera =
+      DoubleSphereCameraModel::FromConfig(MakeCameraConfig(intrinsics));
   for (std::size_t observation_index = 0; observation_index < state.observations.size(); ++observation_index) {
     const ObservationRecord& observation = state.observations[observation_index];
     if (!observation.reference_connected) {
@@ -1546,8 +1559,11 @@ void OptimizeBootstrapState(const OuterBootstrapOptions& options,
       }
     }
 
-    double intrinsics_rmse = previous_rmse;
-    OptimizeIntrinsics(state, *boards, *frames, anchor_intrinsics, intrinsics, &intrinsics_rmse);
+    if (options.optimize_intrinsics) {
+      double intrinsics_rmse = previous_rmse;
+      OptimizeIntrinsics(state, *boards, *frames, anchor_intrinsics, intrinsics,
+                         &intrinsics_rmse);
+    }
 
     const double current_rmse =
         ComputeGlobalRmse(state, *intrinsics, *boards, *frames, nullptr, nullptr);

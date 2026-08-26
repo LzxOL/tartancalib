@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -41,7 +42,7 @@ LocalCornerResponseEvidence EvaluateLocalCornerResponseEvidence(
   if (x < 0 || x >= gray.cols || y < 0 || y >= gray.rows) return evidence;
 
   const int response_radius =
-      std::max(12, std::min(32, std::max(1, subpix_radius) / 3));
+      std::max(8, std::max(1, subpix_radius) / 3);
   const int margin = response_radius + 10;
   const int x0 = std::max(0, x - margin);
   const int y0 = std::max(0, y - margin);
@@ -87,6 +88,10 @@ LocalCornerResponseEvidence EvaluateLocalCornerResponseEvidence(
 }
 
 }  // namespace
+
+double RobustLocalGradientNorm(
+    const cv::Mat& gradient_magnitude,
+    const std::array<cv::Point2f, 4>& corners);
 
 bool HasDirectExactOuterAnchor(
     const InternalRegenerationFrameInput& frame_input,
@@ -263,12 +268,11 @@ int ComputeGeometryPriorRescueSubpixWindowRadius(
 
   const MultiScaleOuterTagDetectorConfig& outer_config =
       options.outer_detector_config;
-  // Match the normal outer-detector subpixel scale convention:
-  //   radius = outer_subpix_scale * (tagSpacing * local_tag_edge_scale)
-  // where tagSpacing is parsed into outer_corner_marker_ratio.
-  //
-  // Geometry-prior rescue does not have a decoded AprilTag quad yet, so its
-  // local scale is estimated from the predicted/refined board quadrilateral.
+  // Keep the normal detector's already scale-adaptive image-domain window.
+  // The dangerous long move in geometry recovery comes from committing a
+  // distant spherical-plane intersection before this stage; that move is
+  // bounded separately below. Retaining this window lets cornerSubPix pull a
+  // valid but imperfect spherical seed back to the observed junction.
   const double marker_width =
       outer_config.outer_corner_marker_ratio > 0.0
           ? outer_config.outer_corner_marker_ratio * local_scale
@@ -694,14 +698,10 @@ std::array<std::vector<cv::Point2f>, 4> CollectRecoveredEdgeSupportPoints(
   cv::Sobel(gray, grad_x, CV_32F, 1, 0, 3);
   cv::Sobel(gray, grad_y, CV_32F, 0, 1, 3);
   cv::magnitude(grad_x, grad_y, grad_mag);
-  double gradient_max = 0.0;
-  cv::minMaxLoc(grad_mag, nullptr, &gradient_max);
-  const double gradient_norm = std::max(1e-12, gradient_max);
+  const double gradient_norm = RobustLocalGradientNorm(grad_mag, corners);
 
   const int sample_count = std::max(
       8, options.geometry_prior_rescue_edge_sample_count);
-  const int search_half_width = std::max(
-      1, options.geometry_prior_rescue_edge_search_half_width_px);
   const double min_gradient_ratio = std::max(
       0.0, options.geometry_prior_rescue_min_edge_gradient_ratio);
   const double tangent_delta = std::max(
@@ -712,6 +712,9 @@ std::array<std::vector<cv::Point2f>, 4> CollectRecoveredEdgeSupportPoints(
         corners[static_cast<std::size_t>(edge_index)];
     const cv::Point2f& edge_end =
         corners[static_cast<std::size_t>((edge_index + 1) % 4)];
+    const int search_half_width = std::max(
+        2, static_cast<int>(std::lround(
+               0.006 * PointDistance(edge_start, edge_end))));
     Eigen::Vector3d start_ray = Eigen::Vector3d::Zero();
     Eigen::Vector3d end_ray = Eigen::Vector3d::Zero();
     if (!camera.keypointToEuclidean(
@@ -795,16 +798,13 @@ bool TryGeometryGuidedEdgeQuadProposal(
   cv::Sobel(gray, grad_y, CV_32F, 0, 1, 3);
   cv::Mat grad_mag;
   cv::magnitude(grad_x, grad_y, grad_mag);
-  double grad_min = 0.0;
-  double grad_max = 0.0;
-  cv::minMaxLoc(grad_mag, &grad_min, &grad_max);
-  const double grad_norm = std::max(1e-12, grad_max);
+  const double grad_norm =
+      RobustLocalGradientNorm(grad_mag, predicted_corners);
 
   const double seed_edge = std::max(1.0, MeanQuadEdgeLength(predicted_corners));
-  const int sample_count =
-      std::max(32, std::min(140, static_cast<int>(std::lround(seed_edge / 4.0))));
-  const int search_half_width =
-      std::max(10, std::min(48, static_cast<int>(std::lround(0.07 * seed_edge))));
+  constexpr int sample_count = 80;
+  const int search_half_width = std::max(
+      2, static_cast<int>(std::lround(0.04 * seed_edge)));
   constexpr double kMinGradientRatio = 0.015;
 
   std::array<FittedImageLine, 4> lines{};
@@ -1643,6 +1643,58 @@ double SampleFloatAt(const cv::Mat& image, const cv::Point2f& point) {
   return static_cast<double>(image.at<float>(y, x));
 }
 
+double RobustLocalGradientNorm(
+    const cv::Mat& gradient_magnitude,
+    const std::array<cv::Point2f, 4>& corners) {
+  if (gradient_magnitude.empty()) return 1e-12;
+  float min_x = std::numeric_limits<float>::infinity();
+  float min_y = std::numeric_limits<float>::infinity();
+  float max_x = -std::numeric_limits<float>::infinity();
+  float max_y = -std::numeric_limits<float>::infinity();
+  double mean_edge_length = 0.0;
+  for (int index = 0; index < 4; ++index) {
+    const cv::Point2f& corner = corners[static_cast<std::size_t>(index)];
+    min_x = std::min(min_x, corner.x);
+    min_y = std::min(min_y, corner.y);
+    max_x = std::max(max_x, corner.x);
+    max_y = std::max(max_y, corner.y);
+    mean_edge_length += PointDistance(
+        corner, corners[static_cast<std::size_t>((index + 1) % 4)]);
+  }
+  mean_edge_length *= 0.25;
+  const int margin =
+      std::max(2, static_cast<int>(std::lround(0.03 * mean_edge_length)));
+  const int x0 = std::max(0, static_cast<int>(std::floor(min_x)) - margin);
+  const int y0 = std::max(0, static_cast<int>(std::floor(min_y)) - margin);
+  const int x1 = std::min(gradient_magnitude.cols,
+                          static_cast<int>(std::ceil(max_x)) + margin + 1);
+  const int y1 = std::min(gradient_magnitude.rows,
+                          static_cast<int>(std::ceil(max_y)) + margin + 1);
+  if (x1 <= x0 || y1 <= y0) return 1e-12;
+
+  const std::int64_t area =
+      static_cast<std::int64_t>(x1 - x0) * static_cast<std::int64_t>(y1 - y0);
+  const int stride = std::max(
+      1, static_cast<int>(std::ceil(std::sqrt(
+             static_cast<double>(area) / 200000.0))));
+  std::vector<float> samples;
+  samples.reserve(static_cast<std::size_t>(std::max<std::int64_t>(1, area /
+                                                                      (stride * stride))));
+  for (int y = y0; y < y1; y += stride) {
+    const float* row = gradient_magnitude.ptr<float>(y);
+    for (int x = x0; x < x1; x += stride) {
+      const float value = row[x];
+      if (std::isfinite(value) && value > 0.0f) samples.push_back(value);
+    }
+  }
+  if (samples.empty()) return 1e-12;
+  const std::size_t percentile_index = static_cast<std::size_t>(
+      std::floor(0.995 * static_cast<double>(samples.size() - 1)));
+  std::nth_element(samples.begin(), samples.begin() + percentile_index,
+                   samples.end());
+  return std::max(1e-12, static_cast<double>(samples[percentile_index]));
+}
+
 struct EdgeEvidenceMetrics {
   double support_ratio = 0.0;
   double mean_gradient_ratio = 0.0;
@@ -1665,10 +1717,7 @@ EdgeEvidenceMetrics EvaluateQuadEdgeEvidence(
   cv::Sobel(gray, grad_y, CV_32F, 0, 1, 3);
   cv::Mat grad_mag;
   cv::magnitude(grad_x, grad_y, grad_mag);
-  double grad_min = 0.0;
-  double grad_max = 0.0;
-  cv::minMaxLoc(grad_mag, &grad_min, &grad_max);
-  const double grad_norm = std::max(1e-12, grad_max);
+  const double grad_norm = RobustLocalGradientNorm(grad_mag, corners);
 
   int total_samples = 0;
   int support_samples = 0;
@@ -1686,7 +1735,14 @@ EdgeEvidenceMetrics EvaluateQuadEdgeEvidence(
                        static_cast<double>(per_edge_samples);
       const cv::Point2f center = a + static_cast<float>(t) * edge;
       double best_ratio = 0.0;
-      for (int offset = -search_half_width; offset <= search_half_width; ++offset) {
+      // Search width is expressed as a fraction of this board edge.  The
+      // two-pixel floor is only the minimum needed for discrete sampling; it
+      // cannot dominate at the large scales where the old fixed +/-6 px gate
+      // produced resolution-dependent false negatives.
+      const int adaptive_search_half_width = std::max(
+          2, static_cast<int>(std::lround(0.006 * edge_len)));
+      for (int offset = -adaptive_search_half_width;
+           offset <= adaptive_search_half_width; ++offset) {
         const cv::Point2f probe =
             center + static_cast<float>(offset) * normal;
         if (!IsInsideImage(probe, gray.size(), 1.0)) {
@@ -2129,10 +2185,17 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
             : "disabled";
   }
 
+  // A locally decoded exact payload is at least as strong an identity signal
+  // as a uniquely assigned topology slot.  Let both kinds of locally observed
+  // quads reach the dense internal-grid verifier instead of rejecting them on
+  // a single weak outer-corner response at this provisional stage.
+  const bool observed_quad_can_defer_to_internal =
+      tag_id_validated || candidate.topology_association_passed;
   if (options.geometry_prior_rescue_enable_spherical_refine &&
       (!candidate.spherical_refine_attempted ||
        !candidate.spherical_refine_success ||
-       candidate.spherical_refine_successful_corner_count != 4)) {
+       candidate.spherical_refine_successful_corner_count != 4) &&
+      !observed_quad_can_defer_to_internal) {
     candidate.reject_reason =
         validation_source + "_image_evidence_failed_incomplete_spherical_refinement";
     return candidate;
@@ -2151,6 +2214,8 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
   std::array<cv::Point2f, 4> refined_corners{};
   double max_prediction_displacement = 0.0;
   double max_refinement_displacement = 0.0;
+  double min_refinement_displacement =
+      std::numeric_limits<double>::infinity();
   for (int index = 0; index < 4; ++index) {
     refined_corners[static_cast<std::size_t>(index)] =
         refined_points[static_cast<std::size_t>(index)];
@@ -2160,10 +2225,13 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
         max_prediction_displacement,
         PointDistance(refined_corners[static_cast<std::size_t>(index)],
                       candidate.predicted_corners[static_cast<std::size_t>(index)]));
-    max_refinement_displacement = std::max(
-        max_refinement_displacement,
-        PointDistance(refined_corners[static_cast<std::size_t>(index)],
-                      initial_corners_input[static_cast<std::size_t>(index)]));
+    const double refinement_displacement = PointDistance(
+        refined_corners[static_cast<std::size_t>(index)],
+        initial_corners_input[static_cast<std::size_t>(index)]);
+    max_refinement_displacement =
+        std::max(max_refinement_displacement, refinement_displacement);
+    min_refinement_displacement =
+        std::min(min_refinement_displacement, refinement_displacement);
   }
   for (const cv::Point2f& corner : refined_corners) {
     if (!std::isfinite(corner.x) || !std::isfinite(corner.y) ||
@@ -2176,6 +2244,20 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
   }
   candidate.max_corner_displacement_px = max_prediction_displacement;
   candidate.max_refinement_displacement_px = max_refinement_displacement;
+  // A recovered seed is only a search hypothesis, never a calibrated image
+  // measurement.  If even one corner remains exactly at that hypothesis, the
+  // complete quad contains an unrefined seed and cannot be committed.  Reject
+  // only the geometry-prior recovery path here; ordinary decoded detections
+  // do not pass through this function.
+  constexpr double kMinimumCommittedRefinementDisplacementPx = 1e-6;
+  if (min_refinement_displacement <=
+      kMinimumCommittedRefinementDisplacementPx) {
+    candidate.local_corner_refine_success = false;
+    candidate.reject_reason =
+        validation_source +
+        "_image_evidence_failed_no_committed_refinement_displacement";
+    return candidate;
+  }
   // Refinement displacement is diagnostic only. A valid image-space edge or
   // decoded-quad observation can legitimately move far from a coarse seed;
   // acceptance is decided by image evidence, quad topology, ID likelihood,
@@ -2219,10 +2301,8 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
 
   cv::Mat corner_response;
   cv::cornerMinEigenVal(gray, corner_response, 3, 3);
-  double response_min = 0.0;
-  double response_max = 0.0;
-  cv::minMaxLoc(corner_response, &response_min, &response_max);
-  const double response_norm = std::max(1e-12, response_max);
+  const double response_norm =
+      RobustLocalGradientNorm(corner_response, refined_corners);
   double min_response_ratio = 1.0;
   for (const cv::Point2f& point : refined_corners) {
     min_response_ratio = std::min(
@@ -2260,7 +2340,8 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
   // weak, highly distorted but visible boards are retained.
   constexpr double kMinimumAtomicCornerResponseBalance = 0.25;
   if (candidate.weakest_to_second_weakest_corner_response_ratio <
-      kMinimumAtomicCornerResponseBalance) {
+          kMinimumAtomicCornerResponseBalance &&
+      !observed_quad_can_defer_to_internal) {
     candidate.local_corner_refine_success = false;
     candidate.reject_reason =
         validation_source +
@@ -2298,7 +2379,8 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
   const bool allow_model_aware_precheck =
       !tag_id_validated && options.geometry_guided_tag_likelihood_enabled &&
       multi_board_context_for_likelihood && weak_but_nonzero_edge_evidence;
-  if (!corner_response_ok && !edge_evidence_ok && !allow_model_aware_precheck) {
+  if (!corner_response_ok && !edge_evidence_ok &&
+      !allow_model_aware_precheck && !observed_quad_can_defer_to_internal) {
     candidate.local_corner_refine_success = false;
     candidate.reject_reason =
         validation_source +
@@ -2364,14 +2446,7 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
       // established only after an observed wrong-ID quad has passed the
       // explicit topology association step (which appends _topology_assoc to
       // the prediction source label).
-      candidate.prediction_source_label.find("_topology_assoc") !=
-          std::string::npos &&
-      // An edge/weak quad is only a geometric image candidate.  It has not
-      // established the payload identity, so it must still pass the
-      // model-aware tag-likelihood check below.  Otherwise a failed exact-ID
-      // fallback could be promoted solely by projected topology, which is
-      // precisely the failure mode seen for recovered B5 in frame 31.
-      !geometry_guided_edge_quad && !weak_quad_alternative;
+      candidate.topology_association_passed;
   const bool single_anchor_context =
       options.geometry_guided_tag_likelihood_allow_single_anchor &&
       candidate.visible_boards_used.size() == 1u &&
@@ -2506,6 +2581,15 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
 
   double accept_max_outer_rmse =
       options.geometry_prior_rescue_accept_max_outer_rmse;
+  if (tag_id_validated || topology_identity_context) {
+    // The four outer corners are only a provisional carrier for a locally
+    // identified observation. Permit a bounded first-stage mismatch so the
+    // dense internal grid can make the final decision. The downstream
+    // recovered-internal gate uses the same 2x outer-backprojection ceiling.
+    accept_max_outer_rmse = std::max(
+        accept_max_outer_rmse,
+        2.0 * options.geometry_prior_rescue_accept_max_outer_rmse);
+  }
   if (std::isfinite(candidate.frame_normal_outer_refit_rmse_median) &&
       candidate.frame_normal_outer_refit_rmse_median > 0.0) {
     if (tag_id_validated) {
@@ -2520,10 +2604,56 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
       }
     }
   }
+  bool scale_aware_outer_rmse_gate_applied = false;
+  double scale_aware_outer_rmse_limit = accept_max_outer_rmse;
+  if (options.geometry_prior_rescue_scale_aware_outer_rmse_gate &&
+      tag_id_validated && std::isfinite(candidate.local_corner_scale_px) &&
+      candidate.local_corner_scale_px > 0.0) {
+    // The legacy gate is expressed in pixels.  A fixed 8/16 px threshold is
+    // appropriate for the ordinary board scales used by the original camera,
+    // but becomes artificially strict for a close board in a higher-resolution
+    // image.  Normalize only the provisional, image-validated recovered quad;
+    // topology-only candidates retain the legacy threshold.  The 2% ratio is
+    // dormant until a board edge exceeds roughly 800 px under the canonical
+    // 16 px identified-candidate gate, and the 2x cap keeps this a bounded
+    // relaxation rather than an unrestricted acceptance path.  Dense internal
+    // grid verification remains mandatory downstream.
+    constexpr double kMaximumOuterRmseToLocalEdgeRatio = 0.02;
+    constexpr double kMaximumScaleAwareRelaxation = 2.0;
+    const double normalized_limit =
+        kMaximumOuterRmseToLocalEdgeRatio * candidate.local_corner_scale_px;
+    const double bounded_limit = std::min(
+        normalized_limit,
+        kMaximumScaleAwareRelaxation * accept_max_outer_rmse);
+    scale_aware_outer_rmse_limit =
+        std::max(accept_max_outer_rmse, bounded_limit);
+    scale_aware_outer_rmse_gate_applied =
+        scale_aware_outer_rmse_limit > accept_max_outer_rmse + 1e-12;
+    accept_max_outer_rmse = scale_aware_outer_rmse_limit;
+  }
   candidate.adaptive_accept_max_outer_rmse = accept_max_outer_rmse;
+  const double refined_outer_rmse_before_fallback = outer_rmse;
+  double fallback_outer_rmse_diagnostic =
+      std::numeric_limits<double>::quiet_NaN();
+  if (outer_rmse > accept_max_outer_rmse && tag_id_validated) {
+    // Keep the pre-refinement pose fit for diagnostics only.  The decoded or
+    // geometry-guided quad is a seed used to find image evidence; it must not
+    // replace a failed refinement and then be labelled refined/valid.  If the
+    // refined observation still fails below, reject this recovered candidate
+    // instead of allowing its seed into initialization, shared layout, or BA.
+    Eigen::Isometry3d fallback_pose = Eigen::Isometry3d::Identity();
+    double fallback_outer_rmse = 0.0;
+    if (EstimatePoseFromObjectPoints(
+            intrinsics, ToVector(object_points_array),
+            ToVector(initial_corners_input), &fallback_pose,
+            &fallback_outer_rmse)) {
+      fallback_outer_rmse_diagnostic = fallback_outer_rmse;
+    }
+  }
   if (outer_rmse > accept_max_outer_rmse) {
     candidate.reject_reason =
-        validation_source + "_pose_refit_rejected_outer_rmse";
+        validation_source +
+        "_pose_refit_rejected_outer_rmse_seed_fallback_disallowed";
     return candidate;
   }
   const double accept_max_rotation_error_deg =
@@ -2542,14 +2672,31 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
                             0.05)
                  : std::min(options.geometry_prior_rescue_accept_max_translation_error,
                             0.03));
+  // The shared-scene pose is still provisional during recovery. A locally
+  // decoded or uniquely topology-assigned quad may disagree moderately with
+  // it even though the image measurement is correct. Keep a finite sanity
+  // bound here; the recovered board is independently checked against its
+  // internal grid before it can become a solver observation.
+  const bool defer_pose_consistency_to_internal =
+      tag_id_validated || topology_identity_context;
+  const double pose_sanity_rotation_error_deg =
+      defer_pose_consistency_to_internal
+          ? std::max(accept_max_rotation_error_deg,
+                     3.0 * options.geometry_prior_rescue_accept_max_rotation_error_deg)
+          : accept_max_rotation_error_deg;
+  const double pose_sanity_translation_error =
+      defer_pose_consistency_to_internal
+          ? std::max(accept_max_translation_error,
+                     3.0 * options.geometry_prior_rescue_accept_max_translation_error)
+          : accept_max_translation_error;
   if (candidate.local_vs_global_rotation_error_deg >
-      accept_max_rotation_error_deg) {
+      pose_sanity_rotation_error_deg) {
     candidate.reject_reason =
         validation_source + "_pose_refit_rejected_rotation_error";
     return candidate;
   }
   if (candidate.local_vs_global_translation_error >
-      accept_max_translation_error) {
+      pose_sanity_translation_error) {
     candidate.reject_reason =
         validation_source + "_pose_refit_rejected_translation_error";
     return candidate;
@@ -2586,6 +2733,16 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
             << " edge_support_ratio=" << edge_metrics.support_ratio
             << " mean_edge_gradient_ratio=" << edge_metrics.mean_gradient_ratio
             << " outer_rmse=" << outer_rmse
+            << " pre_fallback_outer_rmse="
+            << refined_outer_rmse_before_fallback
+            << " fallback_outer_rmse=" << fallback_outer_rmse_diagnostic
+            << " outer_rmse_limit=" << accept_max_outer_rmse
+            << " scale_aware_outer_rmse_gate="
+            << (options.geometry_prior_rescue_scale_aware_outer_rmse_gate ? 1 : 0)
+            << " scale_aware_outer_rmse_gate_applied="
+            << (scale_aware_outer_rmse_gate_applied ? 1 : 0)
+            << " local_corner_scale_px=" << candidate.local_corner_scale_px
+            << " pre_refinement_pose_fallback=0"
             << " rot_err_deg="
             << candidate.local_vs_global_rotation_error_deg
             << " trans_err="
@@ -2615,6 +2772,7 @@ GeometryPriorOuterSeedCandidate EvaluateGeometryPriorOuterSeedCandidate(
     double frame_pose_refit_outer_rmse,
     double frame_normal_outer_refit_rmse_median,
     const std::string& original_failure_reason,
+    const std::vector<std::array<Eigen::Vector2d, 4>>& competing_topology_slots,
     const OuterWrongIdProposal* wrong_id_proposal,
     OuterTagDetectionResult* rescued_detection) {
   std::array<Eigen::Vector2d, 4> effective_predicted_corners = predicted_corners;
@@ -2629,6 +2787,14 @@ GeometryPriorOuterSeedCandidate EvaluateGeometryPriorOuterSeedCandidate(
                                            frame_pose_refit_source_board_id,
                                            frame_pose_refit_outer_rmse,
                                            original_failure_reason);
+  // Wrong-ID proposals are associated before entering this function. Carry
+  // that already validated identity into the finalizer; detailed assignment
+  // costs are filled by the frame orchestrator after this call returns.
+  if (prediction_source_label.find("_topology_assoc") != std::string::npos) {
+    candidate.topology_association_checked = true;
+    candidate.topology_association_passed = true;
+    candidate.topology_assigned_board_id = board_id;
+  }
   candidate.image_evidence_checked = true;
   candidate.frame_normal_outer_refit_rmse_median =
       frame_normal_outer_refit_rmse_median;
@@ -2695,6 +2861,57 @@ GeometryPriorOuterSeedCandidate EvaluateGeometryPriorOuterSeedCandidate(
   }
   candidate.rectified_patch_summary = rectified_patch_summary;
 
+  const auto assign_anonymous_quad_to_topology =
+      [&](const std::array<cv::Point2f, 4>& observed_corners,
+          const std::string& source,
+          GeometryPriorOuterSeedCandidate* topology_candidate,
+          std::array<cv::Point2f, 4>* ordered_corners) {
+        if (topology_candidate == nullptr || ordered_corners == nullptr) {
+          return false;
+        }
+        OuterWrongIdProposal proposal;
+        proposal.detected_tag_id = -1;
+        proposal.hamming = -1;
+        proposal.source = source;
+        for (int index = 0; index < 4; ++index) {
+          const cv::Point2f& corner =
+              observed_corners[static_cast<std::size_t>(index)];
+          proposal.corners_original_image[static_cast<std::size_t>(index)] =
+              Eigen::Vector2d(corner.x, corner.y);
+        }
+        std::vector<std::array<Eigen::Vector2d, 4>> slots;
+        slots.reserve(competing_topology_slots.size() + 1u);
+        slots.push_back(predicted_corners);
+        slots.insert(slots.end(), competing_topology_slots.begin(),
+                     competing_topology_slots.end());
+        const TopologySlotAssignment assignment =
+            AssignObservedQuadToTopologySlots(slots, proposal);
+        topology_candidate->topology_association_checked = assignment.checked;
+        topology_candidate->topology_association_passed =
+            assignment.unique && assignment.assigned_slot_index == 0;
+        topology_candidate->topology_assigned_board_id =
+            topology_candidate->topology_association_passed ? board_id : -1;
+        topology_candidate->topology_best_normalized_cost =
+            assignment.best_normalized_cost;
+        topology_candidate->topology_second_best_normalized_cost =
+            assignment.second_best_normalized_cost;
+        topology_candidate->topology_normalized_cost_margin =
+            assignment.normalized_cost_margin;
+        topology_candidate->quad_topology_summary += " " + assignment.summary;
+        if (!topology_candidate->topology_association_passed) {
+          return false;
+        }
+        for (int index = 0; index < 4; ++index) {
+          const Eigen::Vector2d& corner =
+              assignment.ordered_corners[static_cast<std::size_t>(index)];
+          (*ordered_corners)[static_cast<std::size_t>(index)] =
+              cv::Point2f(static_cast<float>(corner.x()),
+                          static_cast<float>(corner.y()));
+        }
+        topology_candidate->prediction_source_label += "_topology_assoc";
+        return true;
+      };
+
   // A context override may return a geometrically compatible quad decoded as
   // another ID.  It is useful image evidence, but it is not exact-ID
   // validation and must be handled by topology identity association below.
@@ -2733,19 +2950,28 @@ GeometryPriorOuterSeedCandidate EvaluateGeometryPriorOuterSeedCandidate(
     guided_candidate.roi_redetect_detected_tag_id = -4;
     guided_candidate.roi_redetect_hamming = -1;
     guided_candidate.roi_redetect_summary = guided_edge_summary;
-    GeometryPriorOuterSeedCandidate guided_result =
-        FinalizeGeometryPriorOuterSeedCandidate(
-            gray, config, options, camera_config, board_id,
-            frame_input.outer_detections.requested_board_ids, guided_edge_corners,
-            T_camera_board_matrix, false, single_anchor_is_direct_exact,
-            "geometry_guided_edge_quad",
-            guided_candidate, rescued_detection);
-    if (guided_result.accepted_as_rescued_observation) {
-      return guided_result;
+    std::array<cv::Point2f, 4> topology_ordered_guided_corners{};
+    if (!assign_anonymous_quad_to_topology(
+            guided_edge_corners, "geometry_guided_edge_quad",
+            &guided_candidate, &topology_ordered_guided_corners)) {
+      primary_candidate.roi_redetect_summary +=
+          " geometry_guided_edge_quad_reject=topology_id_association_rejected " +
+          guided_candidate.quad_topology_summary;
+    } else {
+      GeometryPriorOuterSeedCandidate guided_result =
+          FinalizeGeometryPriorOuterSeedCandidate(
+              gray, config, options, camera_config, board_id,
+              frame_input.outer_detections.requested_board_ids,
+              topology_ordered_guided_corners, T_camera_board_matrix, false,
+              single_anchor_is_direct_exact, "geometry_guided_edge_quad",
+              guided_candidate, rescued_detection);
+      if (guided_result.accepted_as_rescued_observation) {
+        return guided_result;
+      }
+      primary_candidate.roi_redetect_summary +=
+          " geometry_guided_edge_quad_reject=" + guided_result.reject_reason +
+          " " + guided_edge_summary;
     }
-    primary_candidate.roi_redetect_summary +=
-        " geometry_guided_edge_quad_reject=" + guided_result.reject_reason +
-        " " + guided_edge_summary;
   } else {
     primary_candidate.roi_redetect_summary +=
         " geometry_guided_edge_quad_reject=no_candidate " + guided_edge_summary;
@@ -2773,10 +2999,20 @@ GeometryPriorOuterSeedCandidate EvaluateGeometryPriorOuterSeedCandidate(
   weak_candidate.roi_redetect_hamming = -1;
   weak_candidate.roi_redetect_bbox = weak_roi_bbox;
   weak_candidate.roi_redetect_summary = weak_quad_summary;
+  std::array<cv::Point2f, 4> topology_ordered_weak_corners{};
+  if (!assign_anonymous_quad_to_topology(
+          weak_quad_corners, "weak_quad_alternative", &weak_candidate,
+          &topology_ordered_weak_corners)) {
+    primary_candidate.roi_redetect_summary +=
+        " weak_quad_alternative_reject=topology_id_association_rejected " +
+        weak_candidate.quad_topology_summary;
+    return primary_candidate;
+  }
   GeometryPriorOuterSeedCandidate weak_result =
       FinalizeGeometryPriorOuterSeedCandidate(
           gray, config, options, camera_config, board_id,
-          frame_input.outer_detections.requested_board_ids, weak_quad_corners,
+          frame_input.outer_detections.requested_board_ids,
+          topology_ordered_weak_corners,
           T_camera_board_matrix, false, single_anchor_is_direct_exact,
           "weak_quad_alternative",
           weak_candidate, rescued_detection);

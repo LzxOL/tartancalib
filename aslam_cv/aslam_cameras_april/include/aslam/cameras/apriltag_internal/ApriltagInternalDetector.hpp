@@ -50,6 +50,10 @@ struct ApriltagInternalDetectionOptions {
   // predicted lattice ray. This is intentionally explicit because it bypasses
   // the normal image-evidence seed validation path.
   bool bypass_internal_seed_filters = false;
+  // Reject a refined internal point when it clearly lands in another known
+  // lattice point's predicted slot. This removes the bad point; it does not
+  // attempt geometry-only recovery or reassignment.
+  bool enable_internal_lattice_slot_ownership_check = true;
   InternalPoseRescueMode internal_pose_rescue_mode =
       InternalPoseRescueMode::Enabled;
   double internal_pose_rescue_max_ray_angle_deg = 88.0;
@@ -78,6 +82,11 @@ struct ApriltagInternalDetectionOptions {
   double geometry_prior_rescue_min_edge_support_ratio = 0.45;
   double geometry_prior_rescue_min_edge_gradient_ratio = 0.02;
   double geometry_prior_rescue_accept_max_outer_rmse = 8.0;
+  // Normalize the provisional recovered-quad pose gate by the local board
+  // edge scale. This keeps the legacy pixel threshold for ordinary/small
+  // boards while allowing image-validated large tags to move by the
+  // proportionally larger amount required at higher image resolutions.
+  bool geometry_prior_rescue_scale_aware_outer_rmse_gate = true;
   double geometry_prior_rescue_accept_max_rotation_error_deg = 5.0;
   double geometry_prior_rescue_accept_max_translation_error = 0.08;
   // Opt-in large-tag recovery. A pose hypothesis from at least two visible

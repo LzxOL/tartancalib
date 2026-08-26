@@ -47,6 +47,27 @@ struct WrongIdTopologyAssociation {
   std::string summary;
 };
 
+// Assigns one locally observed quadrilateral to one projected rigid-layout
+// slot. Slot 0 is normally the requested board and the remaining entries are
+// competing boards. The board IDs themselves are deliberately absent from the
+// cost: arbitrary physical layouts are supported and numeric tag order has no
+// spatial meaning.
+struct TopologySlotAssignment {
+  bool checked = false;
+  bool compatible = false;
+  bool unique = false;
+  int assigned_slot_index = -1;
+  std::array<Eigen::Vector2d, 4> ordered_corners{};
+  double best_normalized_cost = std::numeric_limits<double>::infinity();
+  double second_best_normalized_cost = std::numeric_limits<double>::infinity();
+  double normalized_cost_margin = -std::numeric_limits<double>::infinity();
+  std::string summary;
+};
+
+TopologySlotAssignment AssignObservedQuadToTopologySlots(
+    const std::vector<std::array<Eigen::Vector2d, 4>>& topology_slots,
+    const OuterWrongIdProposal& proposal);
+
 WrongIdTopologyAssociation AssociateWrongIdProposalToTopology(
     const std::array<Eigen::Vector2d, 4>& topology_predicted_corners,
     const OuterWrongIdProposal& proposal);

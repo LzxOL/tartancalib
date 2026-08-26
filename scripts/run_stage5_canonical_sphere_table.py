@@ -82,6 +82,17 @@ def parse_args() -> argparse.Namespace:
         help="Image directory, for example stereo_dataset_20260430_144928-clear/right.",
     )
     parser.add_argument(
+        "--test-image",
+        type=Path,
+        help="Optional independent holdout image directory. When provided, all --image frames are used for training and this directory is evaluated as the external holdout.",
+    )
+    parser.add_argument(
+        "--test-max-frames",
+        type=int,
+        default=0,
+        help="Maximum external holdout frames. Frames are selected deterministically and uniformly over time; 0 keeps all frames.",
+    )
+    parser.add_argument(
         "--models",
         "--model",
         dest="models",
@@ -131,6 +142,12 @@ def parse_args() -> argparse.Namespace:
         help="Include canonical Omni-radtan references in the UCM/Mei group.",
     )
     parser.add_argument(
+        "--backend-residual-model",
+        choices=("sphere_angular", "image_plane"),
+        default="sphere_angular",
+        help="Residual model used by Stage5 backend; image_plane is required by the current persistent BA for external holdout runs.",
+    )
+    parser.add_argument(
         "--split-mode",
         default="random_holdout_ratio",
         choices=("random_holdout_ratio", "random_ratio", "random_70_30", "deterministic_stride"),
@@ -147,6 +164,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1337,
         help="Random split seed (default: 1337).",
+    )
+    parser.add_argument(
+        "--no-holdout",
+        action="store_true",
+        help="Use all frames for training and evaluate on the same full frame set.",
     )
     parser.add_argument(
         "--skip-build",
@@ -540,16 +562,54 @@ def run_command(command: list[str], dry_run: bool) -> None:
         subprocess.run(command, cwd=ROOT, check=True)
 
 
+def stage_test_subset(
+    test_image: Path | None, max_frames: int, output_root: Path
+) -> tuple[Path | None, int, int, str]:
+    """Create a reproducible, evenly spaced symlink subset for external holdout."""
+    if test_image is None:
+        if max_frames:
+            raise ValueError("--test-max-frames requires --test-image.")
+        return None, 0, 0, "not_requested"
+    image_paths = sorted(
+        path
+        for path in test_image.iterdir()
+        if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+    )
+    source_count = len(image_paths)
+    if source_count == 0:
+        raise ValueError(f"No image files found in test directory: {test_image}")
+    if max_frames == 0 or source_count <= max_frames:
+        return test_image, source_count, source_count, "all_source_frames"
+    if max_frames < 2:
+        raise ValueError("--test-max-frames must be 0 or at least 2.")
+
+    subset_dir = output_root / "external_test_subset" / test_image.name
+    subset_dir.mkdir(parents=True, exist_ok=True)
+    selected_indices = [
+        (index * (source_count - 1)) // (max_frames - 1)
+        for index in range(max_frames)
+    ]
+    for index in selected_indices:
+        source = image_paths[index].resolve()
+        destination = subset_dir / source.name
+        if not destination.exists():
+            destination.symlink_to(source)
+    return subset_dir, max_frames, source_count, "uniform_temporal_evenly_spaced"
+
+
 def main() -> int:
     args = parse_args()
     models = normalize_models(args.models)
-    if not 0.0 < args.holdout_ratio < 1.0:
+    if not args.no_holdout and not 0.0 < args.holdout_ratio < 1.0:
         raise ValueError("--holdout-ratio must be in (0, 1).")
     image = resolve_repo_path(args.image)
+    test_image = resolve_repo_path(args.test_image) if args.test_image else None
     config = resolve_repo_path(args.config)
     canonical_root = resolve_repo_path(args.canonical_root)
     if not image.is_dir():
         raise ValueError(f"Image directory does not exist: {image}")
+    if test_image is not None and not test_image.is_dir():
+        raise ValueError(f"Test image directory does not exist: {test_image}")
     if not config.is_file():
         raise ValueError(f"Config does not exist: {config}")
     target_dir = resolve_target_dir(canonical_root, args.canonical_target)
@@ -576,6 +636,9 @@ def main() -> int:
             f"Output exists: {output_root}. Pass --overwrite or choose --output."
         )
     output_root.mkdir(parents=True, exist_ok=True)
+    effective_test_image, effective_test_count, source_test_count, test_subset_mode = (
+        stage_test_subset(test_image, args.test_max_frames, output_root)
+    )
 
     binary = ROOT / "build/run_stage5_backend"
     if not args.skip_build:
@@ -590,17 +653,30 @@ def main() -> int:
     rows_by_model: dict[str, list[dict[str, object]]] = {}
     manifest: dict[str, object] = {
         "image": str(image),
+        "test_image": None if test_image is None else str(test_image),
+        "effective_test_image": (
+            None if effective_test_image is None else str(effective_test_image)
+        ),
+        "test_source_frame_count": source_test_count,
+        "test_effective_frame_count": effective_test_count,
+        "test_subset_mode": test_subset_mode,
         "models": models,
         "canonical_root": str(canonical_root),
         "canonical_target": str(target_dir),
         "output_base": str(output_base),
         "run_timestamp": timestamp,
-        "residual_model": "sphere_angular",
+        "residual_model": args.backend_residual_model,
+        "backend_residual_model": args.backend_residual_model,
         "calibration_scope": "training_partition_only",
-        "evaluation_scope": "frozen_random_holdout_partition",
+        "evaluation_scope": (
+            "external_holdout_partition"
+            if test_image is not None
+            else ("all_frames" if args.no_holdout else "frozen_random_holdout_partition")
+        ),
         "split_mode": args.split_mode,
         "holdout_ratio": args.holdout_ratio,
         "split_seed": args.split_seed,
+        "no_holdout": args.no_holdout,
         "inlier_threshold_px": args.inlier_threshold_px,
         "current_baseline_root": str(current_baseline_root),
         "runs": [],
@@ -646,12 +722,20 @@ def main() -> int:
             "--kalibr-camchain",
             str(kalibr.path),
             "--backend-residual-model",
-            "sphere_angular",
+            args.backend_residual_model,
             "--output",
             str(result_dir),
             "--cache-dir",
             str(cache_root / model),
         ]
+        if test_image is not None:
+            command.extend([
+                "--test-image",
+                str(effective_test_image),
+                "--stage5-external-holdout-self-frontend-prepass",
+            ])
+        elif args.no_holdout:
+            command.append("--stage5-no-holdout")
         for camera in references:
             if camera.method != "kalibr":
                 command.extend(

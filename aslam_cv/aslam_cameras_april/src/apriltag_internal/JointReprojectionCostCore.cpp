@@ -383,6 +383,87 @@ bool EstimatePoseFromObjectPoints(const OuterBootstrapCameraIntrinsics& intrinsi
   return true;
 }
 
+bool EstimatePoseFromObjectPointsStrict(
+    const OuterBootstrapCameraIntrinsics& intrinsics,
+    const std::vector<Eigen::Vector3d>& object_points,
+    const std::vector<cv::Point2f>& image_points,
+    double max_rmse,
+    Eigen::Isometry3d* pose,
+    double* rmse) {
+  if (pose == nullptr || rmse == nullptr ||
+      object_points.size() != image_points.size() ||
+      object_points.size() < 4u) {
+    return false;
+  }
+  if (!intrinsics.IsValid() ||
+      (std::isfinite(max_rmse) && max_rmse < 0.0)) {
+    return false;
+  }
+
+  const DoubleSphereCameraModel camera =
+      DoubleSphereCameraModel::FromConfig(MakeIntermediateCameraConfig(intrinsics));
+  if (!camera.IsValid()) {
+    return false;
+  }
+
+  // Do not let estimateTransformation silently discard image points that the
+  // current camera cannot back-project. Initialization must be judged on the
+  // same complete Outer4 set for every candidate.
+  for (std::size_t index = 0; index < object_points.size(); ++index) {
+    if (!object_points[index].allFinite() ||
+        !std::isfinite(static_cast<double>(image_points[index].x)) ||
+        !std::isfinite(static_cast<double>(image_points[index].y))) {
+      return false;
+    }
+    Eigen::Vector3d ray = Eigen::Vector3d::Zero();
+    if (!camera.keypointToEuclidean(
+            Eigen::Vector2d(image_points[index].x, image_points[index].y),
+            &ray) ||
+        !ray.allFinite()) {
+      return false;
+    }
+  }
+
+  cv::Mat rvec;
+  cv::Mat tvec;
+  if (!camera.estimateTransformation(ToCvObjectPoints(object_points),
+                                     image_points, &rvec, &tvec)) {
+    return false;
+  }
+
+  const Eigen::Isometry3d candidate_pose = PoseFromCv(rvec, tvec);
+  if (!candidate_pose.matrix().allFinite()) {
+    return false;
+  }
+
+  double squared_error_sum = 0.0;
+  for (std::size_t index = 0; index < object_points.size(); ++index) {
+    const Eigen::Vector3d point_camera =
+        candidate_pose * object_points[index];
+    if (!point_camera.allFinite() || point_camera.z() <= 0.0) {
+      return false;
+    }
+    Eigen::Vector2d projected = Eigen::Vector2d::Zero();
+    if (!camera.vsEuclideanToKeypoint(point_camera, &projected) ||
+        !projected.allFinite()) {
+      return false;
+    }
+    const Eigen::Vector2d observed(image_points[index].x,
+                                   image_points[index].y);
+    squared_error_sum += (projected - observed).squaredNorm();
+  }
+  const double candidate_rmse = std::sqrt(
+      squared_error_sum / static_cast<double>(object_points.size()));
+  if (!std::isfinite(candidate_rmse) ||
+      (std::isfinite(max_rmse) && candidate_rmse > max_rmse)) {
+    return false;
+  }
+
+  *pose = candidate_pose;
+  *rmse = candidate_rmse;
+  return true;
+}
+
 Eigen::Isometry3d AverageTransforms(const std::vector<TransformCandidate>& candidates) {
   if (candidates.empty()) {
     return Eigen::Isometry3d::Identity();

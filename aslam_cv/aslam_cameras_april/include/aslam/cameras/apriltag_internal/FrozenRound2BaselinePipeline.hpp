@@ -126,6 +126,7 @@ struct FrozenRound2BaselineOptions {
   bool outer_only_ablation_mode = false;
   bool include_internal_points = true;
   bool optimize_intrinsics = false;
+  bool optimize_bootstrap_intrinsics = true;
   int intrinsics_release_iteration = 3;
   bool run_second_pass = true;
   int second_pass_intrinsics_release_iteration = 1;
@@ -143,6 +144,7 @@ struct FrozenRound2BaselineOptions {
   bool ignore_image_evidence_min_quality = false;
   bool force_internal_seed_from_prediction = false;
   bool bypass_internal_seed_filters = false;
+  bool enable_internal_lattice_slot_ownership_check = true;
   std::string internal_corner_filter_mode = "sigma";
   double internal_corner_filter_max_reproj_error = -1.0;
   double internal_corner_filter_quality_min = 0.35;
@@ -156,6 +158,9 @@ struct FrozenRound2BaselineOptions {
       AutoCameraInitializationRefineMode::KalibrOuterLm;
   AutoCameraInitializationSelectionScorer camera_initialization_selection_scorer =
       AutoCameraInitializationSelectionScorer::PoseMarginalizedPrincipal;
+  // Select the initialization camera with one target pose per frame-board.
+  // Scene bootstrap and backend BA still use the shared board layout.
+  bool camera_initialization_use_independent_frame_board_poses = false;
   bool enable_camera_initialization_principal_profile = false;
   double camera_initialization_principal_profile_radius_px = 10.0;
   bool enable_camera_initialization_fixed_layout_diagnostic = false;
@@ -223,6 +228,7 @@ struct FrozenRound2BaselineOptions {
   double geometry_prior_rescue_min_edge_support_ratio = 0.45;
   double geometry_prior_rescue_min_edge_gradient_ratio = 0.02;
   double geometry_prior_rescue_accept_max_outer_rmse = 8.0;
+  bool geometry_prior_rescue_scale_aware_outer_rmse_gate = true;
   double geometry_prior_rescue_accept_max_rotation_error_deg = 5.0;
   double geometry_prior_rescue_accept_max_translation_error = 0.08;
   bool geometry_guided_tag_likelihood_enabled = true;

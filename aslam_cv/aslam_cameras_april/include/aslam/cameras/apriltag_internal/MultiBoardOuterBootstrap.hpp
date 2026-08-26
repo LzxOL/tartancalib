@@ -60,6 +60,7 @@ struct OuterBootstrapOptions {
   int max_coordinate_descent_iterations = 6;
   double convergence_threshold = 1e-3;
   double min_detection_quality = 0.0;
+  bool optimize_intrinsics = true;
 };
 
 struct OuterBootstrapFrameInput {
