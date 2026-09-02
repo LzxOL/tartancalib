@@ -40,6 +40,7 @@ struct CmdArgs {
   std::string frontend_mode = "detector";
   std::string frontend_cache_dir;
   bool all = false;
+  bool outer4_only = false;
   bool export_overlays = false;
   int overlay_top_k = 20;
   int max_images = 0;
@@ -140,6 +141,7 @@ void PrintUsage(const char* program) {
       << "  Repeat --intrinsics-yaml to evaluate multiple camera models with"
       << " one frontend detection pass.\n"
       << "Options:"
+      << " [--outer4-only]"
       << " [--max-images N] [--progress-every N]"
       << " [--export-overlays] [--overlay-top-k N]"
       << " [--enable-geometry-prior-rescue 0|1]"
@@ -173,6 +175,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.frontend_cache_dir = argv[++i];
     } else if (token == "--all") {
       args.all = true;
+    } else if (token == "--outer4-only") {
+      args.outer4_only = true;
     } else if (token == "--export-overlays") {
       args.export_overlays = true;
     } else if (token == "--overlay-top-k" && i + 1 < argc) {
@@ -445,6 +449,7 @@ ati::ApriltagInternalDetectionOptions MakeDetectionOptions(
     const CmdArgs& args) {
   ati::ApriltagInternalDetectionOptions options;
   options.canonical_pixels_per_module = config.canonical_pixels_per_module;
+  options.outer4_only = args.outer4_only;
   options.refinement_window_radius = config.refinement_window_radius;
   options.internal_subpix_window_scale = config.internal_subpix_window_scale;
   options.internal_subpix_window_min = config.internal_subpix_window_min;
@@ -649,6 +654,58 @@ ati::CalibrationEvaluationDataset BuildFrozenRound2EvaluationDataset(
   return dataset;
 }
 
+void RetainOuter4Only(ati::CalibrationEvaluationDataset* dataset) {
+  if (dataset == nullptr) {
+    return;
+  }
+
+  std::vector<ati::CalibrationEvaluationFrameInput> retained_frames;
+  retained_frames.reserve(dataset->frames.size());
+  int board_count = 0;
+  int outer_point_count = 0;
+  for (ati::CalibrationEvaluationFrameInput& frame : dataset->frames) {
+    std::vector<ati::CalibrationEvaluationBoardObservation> retained_boards;
+    retained_boards.reserve(frame.board_observations.size());
+    for (ati::CalibrationEvaluationBoardObservation& board :
+         frame.board_observations) {
+      board.points.erase(
+          std::remove_if(board.points.begin(), board.points.end(),
+                         [](const ati::CalibrationEvaluationPointObservation& point) {
+                           return point.point_type != ati::JointPointType::Outer;
+                         }),
+          board.points.end());
+      board.outer_point_count = static_cast<int>(board.points.size());
+      board.internal_point_count = 0;
+      board.has_pose_fit_outer_points = board.outer_point_count >= 4;
+      if (!board.has_pose_fit_outer_points) {
+        continue;
+      }
+      outer_point_count += board.outer_point_count;
+      ++board_count;
+      retained_boards.push_back(std::move(board));
+    }
+    if (!retained_boards.empty()) {
+      frame.board_observations = std::move(retained_boards);
+      retained_frames.push_back(std::move(frame));
+    }
+  }
+
+  dataset->frames = std::move(retained_frames);
+  dataset->frame_count = static_cast<int>(dataset->frames.size());
+  dataset->board_observation_count = board_count;
+  dataset->outer_point_count = outer_point_count;
+  dataset->internal_point_count = 0;
+  dataset->total_point_count = outer_point_count;
+  dataset->success = dataset->frame_count > 0 && board_count > 0 &&
+                     outer_point_count > 0;
+  if (!dataset->success) {
+    dataset->failure_reason = "Outer4-only evaluation dataset is empty.";
+  }
+  dataset->warnings.push_back(
+      "evaluation_point_scope=outer4_only; generated internal lattice points "
+      "were excluded from all evaluation metrics.");
+}
+
 std::string PointTypeString(ati::JointPointType type) {
   return type == ati::JointPointType::Outer ? "outer" : "internal";
 }
@@ -848,6 +905,9 @@ void WriteSummary(const std::string& path,
   out << "failure_reason: " << evaluation.failure_reason << "\n";
   out << "benchmark_label: " << args.benchmark_label << "\n";
   out << "frontend_mode: " << args.frontend_mode << "\n";
+  out << "evaluation_point_scope: "
+      << (args.outer4_only ? "outer4_only" : "outer_and_generated_internal")
+      << "\n";
   out << "frontend_cache_dir: " << args.frontend_cache_dir << "\n";
   out << "image_path: " << args.image_path << "\n";
   out << "config_path: " << args.config_path << "\n";
@@ -1529,6 +1589,12 @@ int main(int argc, char** argv) {
     }
     if (!dataset.success) {
       throw std::runtime_error(dataset.failure_reason);
+    }
+    if (args.outer4_only) {
+      RetainOuter4Only(&dataset);
+      if (!dataset.success) {
+        throw std::runtime_error(dataset.failure_reason);
+      }
     }
 
     const ati::Stage5Benchmark benchmark;

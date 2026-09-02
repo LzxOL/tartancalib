@@ -659,10 +659,9 @@ bool VerifyRecoveredInternalMeasurement(
         }
       }
     }
-    // The displacement/backprojection pair is intentionally diagnostic-only.
-    // Wide-angle recovery can move a valid seed substantially, and the
-    // candidate selector may have a better independently validated fallback.
-    // Do not invalidate outer or internal measurements here.
+    // The inner-pose-to-Outer4 comparison remains diagnostic-only. It can
+    // reject valid wide-angle observations when the provisional camera is
+    // imperfect, so holdout eligibility is decided by observation provenance.
     return true;
   }
 
@@ -1406,6 +1405,7 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
       // "accepted" flag behind after final regeneration fails.
       topology_internal_verification_passed =
           topology_internal_verification_passed && measurement.detection.success;
+      measurement.detection.geometry_prior_rescue_used = true;
       selected_topology_candidate.accepted_as_rescued_observation =
           topology_internal_verification_passed;
       ReplaceSelectedGeometryPriorCandidate(
@@ -1688,6 +1688,7 @@ InternalRegenerationFrameResult MultiBoardInternalMeasurementRegenerator::Regene
               &measurement.detection);
       topology_internal_verification_passed =
           topology_internal_verification_passed && measurement.detection.success;
+      measurement.detection.geometry_prior_rescue_used = true;
       selected_topology_candidate.accepted_as_rescued_observation =
           topology_internal_verification_passed;
       ReplaceSelectedGeometryPriorCandidate(

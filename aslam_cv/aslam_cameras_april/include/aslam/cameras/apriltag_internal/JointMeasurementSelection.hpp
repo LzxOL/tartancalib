@@ -28,6 +28,7 @@ enum class JointBoardObservationSelectionReasonCode {
   RejectedNotSolverReady,
   RejectedResidualSanity,
   RejectedOuterPoseFit,
+  RejectedUnstableOuterSubpixPoseFit,
   RejectedFrameRejected,
 };
 

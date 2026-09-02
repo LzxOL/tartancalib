@@ -279,6 +279,8 @@ const char* ToString(JointBoardObservationSelectionReasonCode reason_code) {
       return "RejectedResidualSanity";
     case JointBoardObservationSelectionReasonCode::RejectedOuterPoseFit:
       return "RejectedOuterPoseFit";
+    case JointBoardObservationSelectionReasonCode::RejectedUnstableOuterSubpixPoseFit:
+      return "RejectedUnstableOuterSubpixPoseFit";
     case JointBoardObservationSelectionReasonCode::RejectedFrameRejected:
       return "RejectedFrameRejected";
   }
@@ -459,6 +461,27 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
       if (!solver_ready || candidate.point_count <= 0) {
         decision.reason_code = JointBoardObservationSelectionReasonCode::RejectedNotSolverReady;
         decision.reason_detail = "board observation is not solver-ready for Stage 4 selection";
+        result.board_observation_decisions.push_back(decision);
+        continue;
+      }
+
+      // The detector only marks this as a scale-ambiguous close-edge corner.
+      // Drop the whole board only when its four independently detected outer
+      // corners cannot form a pose under the active camera model either. This
+      // uses the existing model-agnostic outer pose health threshold instead
+      // of an additional fixed-pixel detector threshold.
+      if (!options_.preserve_frame_board_cohesion &&
+          board_observation.outer_subpix_scale_disagreement_detected &&
+          (!std::isfinite(candidate.pose_fit_outer_rmse) ||
+           (options_.max_pose_fit_outer_rmse > 0.0 &&
+            candidate.pose_fit_outer_rmse > options_.max_pose_fit_outer_rmse))) {
+        decision.reason_code =
+            JointBoardObservationSelectionReasonCode::RejectedUnstableOuterSubpixPoseFit;
+        std::ostringstream detail;
+        detail << "subpix_scale_disagreement=1 pose_fit_outer_rmse="
+               << candidate.pose_fit_outer_rmse
+               << " threshold=" << options_.max_pose_fit_outer_rmse;
+        decision.reason_detail = detail.str();
         result.board_observation_decisions.push_back(decision);
         continue;
       }

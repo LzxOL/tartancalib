@@ -179,10 +179,10 @@ bool HasAnyMeaningfulDistortionCoefficient(
 bool FixKalibrOuterLmInitializationLabel(const std::string& family,
                                          const std::string& label) {
   if (family == "pinhole-equi") {
-    // With only outer four-corner observations, k1/k2 give the KB seed enough
-    // field-of-view flexibility without letting high-order terms absorb pose
-    // noise before the real Stage5 backend sees internal points.
-    return label == "k3" || label == "k4";
+    // The KB initializer must use the same eight-parameter camera model as
+    // its Fisher scoring and downstream backend. Freezing k3/k4 makes focal
+    // length and low-order terms compensate for real high-order distortion.
+    return false;
   }
   if (family == "omni-radtan") {
     return IsCameraDistortionLabel(label);
@@ -3737,6 +3737,111 @@ struct KalibrOuterLmSchurStep {
   Eigen::VectorXd step;
 };
 
+bool FindFocalParameterIndices(const std::vector<std::string>& labels,
+                               int* fu_index,
+                               int* fv_index) {
+  if (fu_index == nullptr || fv_index == nullptr) {
+    return false;
+  }
+  *fu_index = -1;
+  *fv_index = -1;
+  for (std::size_t index = 0; index < labels.size(); ++index) {
+    if (labels[index] == "fu") {
+      *fu_index = static_cast<int>(index);
+    } else if (labels[index] == "fv") {
+      *fv_index = static_cast<int>(index);
+    }
+  }
+  return *fu_index >= 0 && *fv_index >= 0 && *fu_index != *fv_index;
+}
+
+bool NormalizeSharedFocalInPlace(OuterBootstrapCameraIntrinsics* camera) {
+  if (camera == nullptr) {
+    return false;
+  }
+  const std::vector<std::string> labels = camera->CombinedParameterLabels();
+  std::vector<double> parameters = camera->CombinedParameterVector();
+  int fu_index = -1;
+  int fv_index = -1;
+  if (!FindFocalParameterIndices(labels, &fu_index, &fv_index) ||
+      fu_index >= static_cast<int>(parameters.size()) ||
+      fv_index >= static_cast<int>(parameters.size())) {
+    return false;
+  }
+  const double fu = parameters[static_cast<std::size_t>(fu_index)];
+  const double fv = parameters[static_cast<std::size_t>(fv_index)];
+  if (!std::isfinite(fu) || !std::isfinite(fv) || fu <= 0.0 || fv <= 0.0) {
+    return false;
+  }
+  const double shared_focal = std::sqrt(fu * fv);
+  if (!std::isfinite(shared_focal) || shared_focal <= 0.0) {
+    return false;
+  }
+  parameters[static_cast<std::size_t>(fu_index)] = shared_focal;
+  parameters[static_cast<std::size_t>(fv_index)] = shared_focal;
+  camera->SetCombinedParameterVector(parameters);
+  return ClampIntrinsicsInPlace(camera);
+}
+
+bool SolveCameraSchurStep(const Eigen::MatrixXd& schur_H,
+                          const Eigen::VectorXd& schur_g,
+                          const std::vector<std::string>& camera_labels,
+                          bool shared_focal,
+                          Eigen::VectorXd* camera_step) {
+  if (camera_step == nullptr || schur_H.rows() != schur_H.cols() ||
+      schur_H.rows() != schur_g.rows() || !schur_H.allFinite() ||
+      !schur_g.allFinite()) {
+    return false;
+  }
+  const int parameter_count = static_cast<int>(schur_g.rows());
+  if (!shared_focal) {
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(schur_H);
+    if (ldlt.info() != Eigen::Success) {
+      return false;
+    }
+    *camera_step = ldlt.solve(-schur_g);
+    return camera_step->rows() == parameter_count && camera_step->allFinite();
+  }
+
+  int fu_index = -1;
+  int fv_index = -1;
+  if (!FindFocalParameterIndices(camera_labels, &fu_index, &fv_index) ||
+      parameter_count < 2) {
+    return false;
+  }
+  Eigen::MatrixXd reduction =
+      Eigen::MatrixXd::Zero(parameter_count, parameter_count - 1);
+  int reduced_column = 0;
+  int shared_focal_column = -1;
+  for (int full_column = 0; full_column < parameter_count; ++full_column) {
+    if (full_column == fv_index) {
+      continue;
+    }
+    reduction(full_column, reduced_column) = 1.0;
+    if (full_column == fu_index) {
+      shared_focal_column = reduced_column;
+    }
+    ++reduced_column;
+  }
+  if (shared_focal_column < 0) {
+    return false;
+  }
+  reduction(fv_index, shared_focal_column) = 1.0;
+  const Eigen::MatrixXd reduced_H =
+      reduction.transpose() * schur_H * reduction;
+  const Eigen::VectorXd reduced_g = reduction.transpose() * schur_g;
+  Eigen::LDLT<Eigen::MatrixXd> reduced_ldlt(reduced_H);
+  if (reduced_ldlt.info() != Eigen::Success) {
+    return false;
+  }
+  const Eigen::VectorXd reduced_step = reduced_ldlt.solve(-reduced_g);
+  if (!reduced_step.allFinite()) {
+    return false;
+  }
+  *camera_step = reduction * reduced_step;
+  return camera_step->rows() == parameter_count && camera_step->allFinite();
+}
+
 KalibrOuterLmSchurStep ComputeKalibrOuterLmFrameSchurStep(
     const Eigen::VectorXd& x,
     const OuterBootstrapCameraIntrinsics& camera_prototype,
@@ -3744,7 +3849,8 @@ KalibrOuterLmSchurStep ComputeKalibrOuterLmFrameSchurStep(
     const std::map<int, Eigen::Isometry3d>& T_reference_board_by_id,
     double lambda,
     double robust_loss_delta_pixels,
-    const std::set<std::string>& additional_fixed_camera_labels) {
+    const std::set<std::string>& additional_fixed_camera_labels,
+    bool shared_focal) {
   KalibrOuterLmSchurStep result;
   const int camera_parameter_count =
       static_cast<int>(camera_prototype.CombinedParameterVector().size());
@@ -3911,13 +4017,9 @@ KalibrOuterLmSchurStep ComputeKalibrOuterLmFrameSchurStep(
     schur_H.noalias() -= block.Hpc.transpose() * Hpp_inv_Hpc;
     schur_g.noalias() -= block.Hpc.transpose() * Hpp_inv_gp;
   }
-  Eigen::LDLT<Eigen::MatrixXd> camera_ldlt(schur_H);
-  if (camera_ldlt.info() != Eigen::Success) {
-    return result;
-  }
-  const Eigen::VectorXd camera_step = camera_ldlt.solve(-schur_g);
-  if (camera_step.rows() != camera_parameter_count ||
-      !camera_step.allFinite()) {
+  Eigen::VectorXd camera_step;
+  if (!SolveCameraSchurStep(schur_H, schur_g, camera_labels, shared_focal,
+                            &camera_step)) {
     return result;
   }
   result.step.head(camera_parameter_count) = camera_step;
@@ -3953,7 +4055,8 @@ KalibrOuterLmSchurStep ComputeKalibrOuterLmSchurStep(
     const std::vector<KalibrOuterLmView>& views,
     double lambda,
     double robust_loss_delta_pixels,
-    const std::set<std::string>& additional_fixed_camera_labels) {
+    const std::set<std::string>& additional_fixed_camera_labels,
+    bool shared_focal) {
   KalibrOuterLmSchurStep result;
   const int camera_parameter_count =
       static_cast<int>(camera_prototype.CombinedParameterVector().size());
@@ -4135,13 +4238,9 @@ KalibrOuterLmSchurStep ComputeKalibrOuterLmSchurStep(
   if (!schur_H.allFinite() || !schur_g.allFinite()) {
     return result;
   }
-  Eigen::LDLT<Eigen::MatrixXd> camera_ldlt(schur_H);
-  if (camera_ldlt.info() != Eigen::Success) {
-    return result;
-  }
-  const Eigen::VectorXd camera_step = camera_ldlt.solve(-schur_g);
-  if (camera_step.rows() != camera_parameter_count ||
-      !camera_step.allFinite()) {
+  Eigen::VectorXd camera_step;
+  if (!SolveCameraSchurStep(schur_H, schur_g, camera_labels, shared_focal,
+                            &camera_step)) {
     return result;
   }
 
@@ -4181,9 +4280,14 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrOuterLm(
     const std::set<std::string>& additional_fixed_camera_labels = {},
     const std::map<std::pair<int, int>, double>* observation_weights =
         nullptr,
-    double rescued_observation_lm_weight = 1.0) {
+    double rescued_observation_lm_weight = 1.0,
+    bool shared_focal = false) {
   KalibrOuterLmRefinementResult result;
-  result.camera = initial_camera;
+  OuterBootstrapCameraIntrinsics refinement_camera = initial_camera;
+  if (shared_focal && !NormalizeSharedFocalInPlace(&refinement_camera)) {
+    return result;
+  }
+  result.camera = refinement_camera;
   result.robust_loss_delta_pixels =
       std::max(0.0, robust_loss_delta_pixels);
 
@@ -4193,7 +4297,7 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrOuterLm(
     Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
     double rmse = 0.0;
     if (!EstimatePoseFromObjectPointsStrict(
-            initial_camera, observation.object_points,
+            refinement_camera, observation.object_points,
             observation.image_points, kInitializationPoseMaxRmsePx, &pose,
             &rmse)) {
       continue;
@@ -4222,7 +4326,7 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrOuterLm(
   }
 
   const std::vector<double> camera_parameters =
-      initial_camera.CombinedParameterVector();
+      refinement_camera.CombinedParameterVector();
   const int camera_parameter_count = static_cast<int>(camera_parameters.size());
   const int parameter_count =
       camera_parameter_count + static_cast<int>(views.size()) * 6;
@@ -4235,7 +4339,7 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrOuterLm(
 
   KalibrOuterLmEvaluation current =
       EvaluateKalibrOuterLmState(
-          x, initial_camera, views, result.robust_loss_delta_pixels);
+          x, refinement_camera, views, result.robust_loss_delta_pixels);
   result.initial_rmse = current.rmse;
   result.initial_robust_rmse = current.robust_rmse;
   result.initial_robust_cost = current.robust_cost;
@@ -4249,7 +4353,7 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrOuterLm(
   }
 
   const std::vector<std::string> camera_labels =
-      initial_camera.CombinedParameterLabels();
+      refinement_camera.CombinedParameterLabels();
   double lambda = 1e-3;
   const bool dense_grid = std::any_of(
       observations.begin(), observations.end(),
@@ -4260,9 +4364,9 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrOuterLm(
   for (int iteration = 0; iteration < max_iterations; ++iteration) {
     const KalibrOuterLmSchurStep schur_step =
         ComputeKalibrOuterLmSchurStep(
-            x, initial_camera, views, lambda,
+            x, refinement_camera, views, lambda,
             result.robust_loss_delta_pixels,
-            additional_fixed_camera_labels);
+            additional_fixed_camera_labels, shared_focal);
     if (!schur_step.success ||
         schur_step.step.rows() != parameter_count ||
         !schur_step.step.allFinite()) {
@@ -4279,7 +4383,7 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrOuterLm(
     const double previous_cost = current.robust_cost;
     Eigen::VectorXd candidate_x = x + step;
     KalibrOuterLmEvaluation candidate =
-        EvaluateKalibrOuterLmState(candidate_x, initial_camera, views,
+        EvaluateKalibrOuterLmState(candidate_x, refinement_camera, views,
                                    result.robust_loss_delta_pixels);
     if (candidate.success && std::isfinite(candidate.robust_cost) &&
         candidate.invalid_projection_count <= current.invalid_projection_count &&
@@ -4288,7 +4392,7 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrOuterLm(
       x.head(camera_parameter_count) =
           ToEigenVector(candidate.camera.CombinedParameterVector());
       current = EvaluateKalibrOuterLmState(
-          x, initial_camera, views, result.robust_loss_delta_pixels);
+          x, refinement_camera, views, result.robust_loss_delta_pixels);
       lambda = std::max(1e-9, lambda * 0.3);
       result.iteration_count = iteration + 1;
       const double current_cost = current.robust_cost;
@@ -4952,9 +5056,14 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrFrameCohesionLm(
     const std::vector<KalibrOuterLmFrameView>& frame_views,
     const std::map<int, Eigen::Isometry3d>& T_reference_board_by_id,
     double robust_loss_delta_pixels = 0.0,
-    const std::set<std::string>& additional_fixed_camera_labels = {}) {
+    const std::set<std::string>& additional_fixed_camera_labels = {},
+    bool shared_focal = false) {
   KalibrOuterLmRefinementResult result;
-  result.camera = initial_camera;
+  OuterBootstrapCameraIntrinsics refinement_camera = initial_camera;
+  if (shared_focal && !NormalizeSharedFocalInPlace(&refinement_camera)) {
+    return result;
+  }
+  result.camera = refinement_camera;
   result.robust_loss_delta_pixels =
       std::max(0.0, robust_loss_delta_pixels);
   result.view_count = 0;
@@ -4966,7 +5075,7 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrFrameCohesionLm(
   }
 
   const std::vector<double> camera_parameters =
-      initial_camera.CombinedParameterVector();
+      refinement_camera.CombinedParameterVector();
   const int camera_parameter_count = static_cast<int>(camera_parameters.size());
   const int parameter_count =
       camera_parameter_count + static_cast<int>(frame_views.size()) * 6;
@@ -4980,7 +5089,7 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrFrameCohesionLm(
 
   KalibrOuterLmEvaluation current =
       EvaluateKalibrOuterLmFrameState(
-          x, initial_camera, frame_views, T_reference_board_by_id,
+          x, refinement_camera, frame_views, T_reference_board_by_id,
           result.robust_loss_delta_pixels);
   result.initial_rmse = current.rmse;
   result.initial_robust_rmse = current.robust_rmse;
@@ -5010,9 +5119,9 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrFrameCohesionLm(
   for (int iteration = 0; iteration < max_iterations; ++iteration) {
     const KalibrOuterLmSchurStep schur_step =
         ComputeKalibrOuterLmFrameSchurStep(
-            x, initial_camera, frame_views, T_reference_board_by_id, lambda,
+            x, refinement_camera, frame_views, T_reference_board_by_id, lambda,
             result.robust_loss_delta_pixels,
-            additional_fixed_camera_labels);
+            additional_fixed_camera_labels, shared_focal);
     if (!schur_step.success ||
         schur_step.step.rows() != parameter_count ||
         !schur_step.step.allFinite()) {
@@ -5029,7 +5138,7 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrFrameCohesionLm(
     const Eigen::VectorXd candidate_x = x + step;
     const KalibrOuterLmEvaluation candidate =
         EvaluateKalibrOuterLmFrameState(candidate_x,
-                                        initial_camera,
+                                        refinement_camera,
                                         frame_views,
                                         T_reference_board_by_id,
                                         result.robust_loss_delta_pixels);
@@ -5040,7 +5149,7 @@ KalibrOuterLmRefinementResult RefineCandidateCameraKalibrFrameCohesionLm(
       x.head(camera_parameter_count) =
           ToEigenVector(candidate.camera.CombinedParameterVector());
       current = EvaluateKalibrOuterLmFrameState(
-          x, initial_camera, frame_views, T_reference_board_by_id,
+          x, refinement_camera, frame_views, T_reference_board_by_id,
           result.robust_loss_delta_pixels);
       lambda = std::max(1e-9, lambda * 0.3);
       result.iteration_count = iteration + 1;
@@ -5626,9 +5735,9 @@ std::vector<AutoCameraInitializationCandidate> GenerateCandidateGrid(
           "principal point and an explicit outer-only fisheye focal fallback "
           "because complete target-row circle focal initialization is not "
           "observable from one large tag's four outer corners. The Stage5 "
-          "baseline now uses a compact KB focal/k1 multistart and releases "
-          "k1/k2 in the lightweight outer-only LM; k3/k4 remain fixed until "
-          "the full backend to keep initialization from becoming a dense BA.",
+          "baseline uses a compact KB focal/k1 multistart and then releases "
+          "all four KB distortion coefficients in the outer-only LM so "
+          "selection evaluates the same camera model used by the backend.",
           warnings);
       return candidates;
     }
@@ -5902,6 +6011,8 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
   result.requested_mode = options_.mode;
   result.selected_mode = CameraInitializationMode::Manual;
   result.refine_mode = options_.refine_mode;
+  result.stage5_init_shared_focal_requested =
+      options_.shared_focal_during_outer_lm ? 1 : 0;
   result.image_size = InferImageSize(frames);
   result.stage5_init_seed_method = "not_attempted";
   result.stage5_init_seed_source = "none";
@@ -6326,8 +6437,14 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
         SelectionInformationDiagnostics best_selection_diagnostics;
         int selected_refined_basin_index = -1;
 
-        for (const AutoCameraInitializationCandidate& seed_candidate :
+	        for (const AutoCameraInitializationCandidate& seed_candidate :
 	             candidates) {
+	          OuterBootstrapCameraIntrinsics refinement_seed_camera =
+	              seed_candidate.camera;
+	          if (options_.shared_focal_during_outer_lm &&
+	              !NormalizeSharedFocalInPlace(&refinement_seed_camera)) {
+	            continue;
+	          }
 	          const double max_image_extent = static_cast<double>(
 	              std::max(result.image_size.width, result.image_size.height));
 	          const std::string seed_family =
@@ -6373,7 +6490,7 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
               Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
               double pose_rmse = std::numeric_limits<double>::infinity();
               if (EstimatePoseFromObjectPointsStrict(
-                      seed_candidate.camera, observation.object_points,
+                      refinement_seed_camera, observation.object_points,
                       observation.image_points, kInitializationPoseMaxRmsePx,
                       &pose, &pose_rmse)) {
                 ++selected_pose_success_count;
@@ -6383,7 +6500,7 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
             }
           } else {
             lm_observations = SelectKalibrOuterLmObservations(
-                seed_candidate.camera,
+                refinement_seed_camera,
                 all_observations,
                 options_.selection_scorer,
                 &selected_pose_success_count,
@@ -6391,7 +6508,7 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
                 &selection_diagnostics);
           }
           const PoseFitOutlierGateResult pose_fit_gate =
-              FilterPoseFitOutliersForInitialization(seed_candidate.camera,
+              FilterPoseFitOutliersForInitialization(refinement_seed_camera,
                                                      lm_observations,
                                                      options_.gate_rescued_outer_observations,
                                                      options_.rescued_outer_observation_pose_rmse_gate_pixels);
@@ -6420,13 +6537,14 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
             lm_frame_indices.insert(observation.frame_index);
           }
 	          lm_refined =
-	              RefineCandidateCameraKalibrOuterLm(seed_candidate.camera,
+	              RefineCandidateCameraKalibrOuterLm(refinement_seed_camera,
 	                                                 selected_lm_observations,
 	                                                 dense_grid_lm
 	                                                     ? options_.dense_grid_lm_huber_delta_pixels
 	                                                     : 0.0,
 	                                                 {}, nullptr,
-	                                                 options_.rescued_outer_observation_lm_weight);
+	                                                 options_.rescued_outer_observation_lm_weight,
+	                                                 options_.shared_focal_during_outer_lm);
 
           // Intrinsics refinement can change the independent PnP basin of an
           // otherwise successful observation. Recheck pose health at the
@@ -6470,7 +6588,8 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
                         ? options_.dense_grid_lm_huber_delta_pixels
                         : 0.0,
                     {}, nullptr,
-                    options_.rescued_outer_observation_lm_weight);
+                    options_.rescued_outer_observation_lm_weight,
+                    options_.shared_focal_during_outer_lm);
             cleaned_refinement.initial_rmse =
                 previous_refinement.initial_rmse;
             cleaned_refinement.initial_robust_rmse =
@@ -6538,7 +6657,8 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
                         ? options_.dense_grid_lm_huber_delta_pixels
                         : 0.0,
                     {}, nullptr,
-                    options_.rescued_outer_observation_lm_weight);
+                    options_.rescued_outer_observation_lm_weight,
+                    options_.shared_focal_during_outer_lm);
             reconciled_refinement.initial_rmse =
                 previous_refinement.initial_rmse;
             reconciled_refinement.initial_robust_rmse =
@@ -6577,15 +6697,27 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
           int shared_layout_frame_count = 0;
           int shared_layout_board_count = 0;
           int shared_layout_observation_count = 0;
-          if (!dense_grid_lm && options_.enable_shared_frame_board_constraint) {
+          const bool use_fixed_measured_layout =
+              !options_.fixed_board_layout.empty();
+          if (!dense_grid_lm &&
+              (options_.enable_shared_frame_board_constraint ||
+               use_fixed_measured_layout)) {
             // The independent LM can explain a wrong camera by giving every
             // frame-board pair its own pose.  Re-estimate a common board
             // layout, then optimize one pose per frame.  The resulting
             // camera is used for basin selection; the board layout itself is
             // not committed to the later Stage5 backend.
-            shared_layout = BuildBootstrapLayoutFromCamera(
-                selection_refined.camera, frames, config_,
-                options_.reference_board_id);
+            if (use_fixed_measured_layout) {
+              shared_layout.success = true;
+              shared_layout.T_reference_board_by_id =
+                  options_.fixed_board_layout;
+              shared_layout.used_board_observation_count =
+                  static_cast<int>(all_observations.size());
+            } else {
+              shared_layout = BuildBootstrapLayoutFromCamera(
+                  selection_refined.camera, frames, config_,
+                  options_.reference_board_id);
+            }
             if (shared_layout.success &&
                 !shared_layout.T_reference_board_by_id.empty()) {
               const std::vector<KalibrOuterLmFrameView> shared_frame_views =
@@ -6604,7 +6736,8 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
                 shared_layout_refinement =
                     RefineCandidateCameraKalibrFrameCohesionLm(
                         selection_refined.camera, shared_frame_views,
-                        shared_layout.T_reference_board_by_id, 0.0);
+                        shared_layout.T_reference_board_by_id, 0.0, {},
+                        options_.shared_focal_during_outer_lm);
                 if (shared_layout_refinement.camera.IsValid() &&
                     shared_layout_refinement.residual_count > 0 &&
                     std::isfinite(shared_layout_refinement.final_robust_rmse)) {
@@ -6766,11 +6899,17 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
               std::isfinite(seed_candidate.camera.fv) &&
               std::isfinite(selection_refined.camera.fu) &&
               std::isfinite(selection_refined.camera.fv);
-	          const bool objective_improved_before_near_tie_policy =
-	              selected_refined_basin_index < 0 ||
-	              RefinedOuterEvaluationIsBetter(
-	                  refined_eval, lm_selection_objective, best_candidate,
-	                  best_lm_objective);
+          // A measured layout removes the camera/layout ambiguity. In that
+          // explicit mode rank basins by the one-pose-per-frame objective,
+          // rather than independent frame-board PnP which can hide a wrong
+          // camera behind an independently fitted pose for each board.
+          const bool objective_improved_before_near_tie_policy =
+              selected_refined_basin_index < 0 ||
+              (use_fixed_measured_layout
+                   ? lm_selection_objective + 1e-12 < best_lm_objective
+                   : RefinedOuterEvaluationIsBetter(
+                         refined_eval, lm_selection_objective, best_candidate,
+                         best_lm_objective));
           bool frame_objective_improved =
               objective_improved_before_near_tie_policy;
 		          bool compared_as_near_tie = false;
@@ -6947,6 +7086,10 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
           result.stage5_init_lm_selection_objective =
               selection_objective_label;
           result.selected_candidate_refined = true;
+	          result.stage5_init_shared_focal_effective =
+	              options_.shared_focal_during_outer_lm ? 1 : 0;
+	          result.stage5_init_shared_focal_released_after_initialization =
+	              result.stage5_init_shared_focal_effective;
 	          ++lm_seed_accept_count;
         }
 
@@ -7326,6 +7469,8 @@ AutoCameraInitializationResult OuterOnlyCameraInitializer::Initialize(
         &result);
   }
   if (result.success && result.selected_camera.IsValid()) {
+    result.stage5_init_selected_fu_minus_fv =
+        result.selected_camera.fu - result.selected_camera.fv;
     PopulatePoseExcitationDiagnostic(result.selected_camera,
                                      all_observations,
                                      &result);
@@ -7356,6 +7501,14 @@ void WriteAutoCameraInitializationSummary(
   output << "selected_candidate_refined: "
          << (result.selected_candidate_refined ? 1 : 0) << "\n";
   output << "stage5_init_refine_mode: " << ToString(result.refine_mode) << "\n";
+  output << "stage5_init_shared_focal_requested: "
+         << result.stage5_init_shared_focal_requested << "\n";
+  output << "stage5_init_shared_focal_effective: "
+         << result.stage5_init_shared_focal_effective << "\n";
+  output << "stage5_init_shared_focal_released_after_initialization: "
+         << result.stage5_init_shared_focal_released_after_initialization << "\n";
+  output << "stage5_init_selected_fu_minus_fv: "
+         << result.stage5_init_selected_fu_minus_fv << "\n";
   output << "stage5_init_seed_method: " << result.stage5_init_seed_method << "\n";
   output << "stage5_init_seed_source: " << result.stage5_init_seed_source << "\n";
   output << "stage5_init_omni_gamma: " << result.stage5_init_omni_gamma << "\n";

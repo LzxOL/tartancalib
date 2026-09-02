@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <queue>
@@ -74,6 +75,7 @@ bool RefineBoardPoseFromInitializedFrames(const SolverState& state,
                                           const OuterBootstrapCameraIntrinsics& intrinsics,
                                           const std::vector<FrameNode>& frames,
                                           int board_id,
+                                          bool robust_consensus,
                                           Eigen::Isometry3d* pose,
                                           double* rmse);
 
@@ -467,6 +469,27 @@ std::array<Eigen::Vector2d, 4> ComputeObservationCornerResiduals(
   return residuals;
 }
 
+double Median(std::vector<double> values) {
+  if (values.empty()) {
+    return 0.0;
+  }
+  const std::size_t middle = values.size() / 2;
+  std::nth_element(values.begin(), values.begin() + middle, values.end());
+  const double upper = values[middle];
+  if (values.size() % 2 != 0) {
+    return upper;
+  }
+  std::nth_element(values.begin(), values.begin() + middle - 1, values.end());
+  return 0.5 * (values[middle - 1] + upper);
+}
+
+double RotationDistanceRadians(const Eigen::Isometry3d& lhs,
+                               const Eigen::Isometry3d& rhs) {
+  const Eigen::Matrix3d delta = lhs.linear().transpose() * rhs.linear();
+  const double cosine = std::max(-1.0, std::min(1.0, 0.5 * (delta.trace() - 1.0)));
+  return std::acos(cosine);
+}
+
 Eigen::Isometry3d AverageTransforms(const std::vector<TransformCandidate>& candidates) {
   if (candidates.empty()) {
     return Eigen::Isometry3d::Identity();
@@ -503,6 +526,60 @@ Eigen::Isometry3d AverageTransforms(const std::vector<TransformCandidate>& candi
   averaged.linear() = average_quaternion.toRotationMatrix();
   averaged.translation() = translation_sum / std::max(1e-9, weight_sum);
   return averaged;
+}
+
+Eigen::Isometry3d ConsensusTransform(const std::vector<TransformCandidate>& candidates) {
+  if (candidates.size() < 3) {
+    return AverageTransforms(candidates);
+  }
+
+  std::vector<double> pairwise_rotation;
+  std::vector<double> pairwise_translation;
+  pairwise_rotation.reserve(candidates.size() * (candidates.size() - 1) / 2);
+  pairwise_translation.reserve(candidates.size() * (candidates.size() - 1) / 2);
+  for (std::size_t lhs = 0; lhs < candidates.size(); ++lhs) {
+    for (std::size_t rhs = lhs + 1; rhs < candidates.size(); ++rhs) {
+      pairwise_rotation.push_back(
+          RotationDistanceRadians(candidates[lhs].transform, candidates[rhs].transform));
+      pairwise_translation.push_back(
+          (candidates[lhs].transform.translation() -
+           candidates[rhs].transform.translation()).norm());
+    }
+  }
+
+  // The scales are derived from this board's measurements, rather than a
+  // camera-specific pixel or metric threshold.  The medoid therefore selects
+  // the densest transform cluster when a few independent planar poses branch.
+  const double rotation_scale = std::max(1e-9, Median(pairwise_rotation));
+  const double translation_scale = std::max(1e-9, Median(pairwise_translation));
+  std::size_t best_index = 0;
+  double best_score = std::numeric_limits<double>::infinity();
+  double best_weight = -std::numeric_limits<double>::infinity();
+  for (std::size_t candidate_index = 0;
+       candidate_index < candidates.size(); ++candidate_index) {
+    std::vector<double> distances;
+    distances.reserve(candidates.size() - 1);
+    for (std::size_t other_index = 0; other_index < candidates.size(); ++other_index) {
+      if (candidate_index == other_index) {
+        continue;
+      }
+      const double rotation = RotationDistanceRadians(
+          candidates[candidate_index].transform, candidates[other_index].transform);
+      const double translation =
+          (candidates[candidate_index].transform.translation() -
+           candidates[other_index].transform.translation()).norm();
+      distances.push_back(rotation / rotation_scale + translation / translation_scale);
+    }
+    const double score = Median(distances);
+    const double weight = candidates[candidate_index].weight;
+    if (score < best_score ||
+        (std::abs(score - best_score) < 1e-12 && weight > best_weight)) {
+      best_index = candidate_index;
+      best_score = score;
+      best_weight = weight;
+    }
+  }
+  return candidates[best_index].transform;
 }
 
 std::string JoinBoardIds(const std::vector<int>& board_ids) {
@@ -692,6 +769,7 @@ void MarkReferenceConnectedComponent(int reference_board_id, SolverState* state)
 bool EstimateFramePoseFromInitializedBoards(const SolverState& state,
                                             const OuterBootstrapCameraIntrinsics& intrinsics,
                                             int frame_storage_index,
+                                            int reference_board_id,
                                             const std::map<int, BoardNode>& boards,
                                             Eigen::Isometry3d* pose,
                                             double* rmse) {
@@ -705,11 +783,27 @@ bool EstimateFramePoseFromInitializedBoards(const SolverState& state,
   object_points.reserve(frame.observation_indices.size() * 4);
   image_points.reserve(frame.observation_indices.size() * 4);
 
+  bool has_initialized_reference_observation = false;
+  for (int observation_index : frame.observation_indices) {
+    const ObservationRecord& observation = state.observations[observation_index];
+    const auto board_it = boards.find(observation.board_id);
+    if (observation.reference_connected &&
+        observation.board_id == reference_board_id &&
+        board_it != boards.end() && board_it->second.initialized) {
+      has_initialized_reference_observation = true;
+      break;
+    }
+  }
+
   for (std::size_t observation_offset = 0; observation_offset < frame.observation_indices.size();
        ++observation_offset) {
     const ObservationRecord& observation =
         state.observations[frame.observation_indices[observation_offset]];
     if (!observation.reference_connected) {
+      continue;
+    }
+    if (has_initialized_reference_observation &&
+        observation.board_id != reference_board_id) {
       continue;
     }
     const auto board_it = boards.find(observation.board_id);
@@ -752,6 +846,7 @@ bool EstimateBoardPoseFromInitializedFrames(const SolverState& state,
                                             const std::map<int, BoardNode>& boards,
                                             const std::vector<FrameNode>& frames,
                                             int board_id,
+                                            bool robust_consensus,
                                             Eigen::Isometry3d* pose,
                                             double* rmse) {
   if (pose == nullptr || rmse == nullptr) {
@@ -796,9 +891,12 @@ bool EstimateBoardPoseFromInitializedFrames(const SolverState& state,
     return false;
   }
 
-  *pose = AverageTransforms(candidates);
+  *pose = robust_consensus
+              ? ConsensusTransform(candidates)
+              : AverageTransforms(candidates);
   double refined_rmse = 0.0;
-  if (RefineBoardPoseFromInitializedFrames(state, intrinsics, frames, board_id, pose,
+  if (RefineBoardPoseFromInitializedFrames(state, intrinsics, frames, board_id,
+                                           robust_consensus, pose,
                                            &refined_rmse)) {
     *rmse = refined_rmse;
     return true;
@@ -973,10 +1071,59 @@ Eigen::VectorXd BuildBoardPoseResidualVector(const SolverState& state,
   return residuals;
 }
 
+double RobustBoardPoseScale(const Eigen::VectorXd& residuals) {
+  std::vector<double> observation_rmse;
+  observation_rmse.reserve(static_cast<std::size_t>(residuals.rows() / 8));
+  for (int row = 0; row + 7 < residuals.rows(); row += 8) {
+    observation_rmse.push_back(
+        std::sqrt(residuals.segment(row, 8).squaredNorm() / 4.0));
+  }
+  if (observation_rmse.empty()) {
+    return 1.0;
+  }
+  const double median = Median(observation_rmse);
+  std::vector<double> deviations;
+  deviations.reserve(observation_rmse.size());
+  for (const double value : observation_rmse) {
+    deviations.push_back(std::abs(value - median));
+  }
+  // This scale is wholly data-derived.  The median fallback keeps a compact
+  // inlier set when the MAD is zero because several observations agree nearly
+  // exactly.
+  return std::max(1e-9, std::max(median, 1.4826 * Median(deviations)));
+}
+
+Eigen::VectorXd RobustBoardPoseSqrtWeights(const Eigen::VectorXd& residuals,
+                                           double scale) {
+  Eigen::VectorXd weights = Eigen::VectorXd::Ones(residuals.rows());
+  for (int row = 0; row + 7 < residuals.rows(); row += 8) {
+    const double observation_rmse =
+        std::sqrt(residuals.segment(row, 8).squaredNorm() / 4.0);
+    const double weight = std::min(1.0, scale / std::max(1e-9, observation_rmse));
+    weights.segment(row, 8).setConstant(std::sqrt(weight));
+  }
+  return weights;
+}
+
+double RobustBoardPoseCost(const Eigen::VectorXd& residuals, double scale) {
+  double cost = 0.0;
+  for (int row = 0; row + 7 < residuals.rows(); row += 8) {
+    const double observation_rmse =
+        std::sqrt(residuals.segment(row, 8).squaredNorm() / 4.0);
+    if (observation_rmse <= scale) {
+      cost += 0.5 * observation_rmse * observation_rmse;
+    } else {
+      cost += scale * (observation_rmse - 0.5 * scale);
+    }
+  }
+  return cost;
+}
+
 bool RefineBoardPoseFromInitializedFrames(const SolverState& state,
                                           const OuterBootstrapCameraIntrinsics& intrinsics,
                                           const std::vector<FrameNode>& frames,
                                           int board_id,
+                                          bool robust_consensus,
                                           Eigen::Isometry3d* pose,
                                           double* rmse) {
   if (pose == nullptr || rmse == nullptr) {
@@ -990,9 +1137,16 @@ bool RefineBoardPoseFromInitializedFrames(const SolverState& state,
   }
 
   double lambda = 1e-3;
-  double best_cost = residuals.squaredNorm();
+  double robust_scale = robust_consensus ? RobustBoardPoseScale(residuals) : 0.0;
+  double best_cost = robust_consensus ? RobustBoardPoseCost(residuals, robust_scale)
+                                      : residuals.squaredNorm();
   for (int iteration = 0; iteration < 20; ++iteration) {
     Eigen::MatrixXd jacobian(residuals.rows(), 6);
+    const Eigen::VectorXd sqrt_weights =
+        robust_consensus ? RobustBoardPoseSqrtWeights(residuals, robust_scale)
+                         : Eigen::VectorXd::Ones(residuals.rows());
+    const Eigen::VectorXd weighted_residuals =
+        sqrt_weights.array() * residuals.array();
     for (int column = 0; column < 6; ++column) {
       Eigen::Matrix<double, 6, 1> plus_delta = Eigen::Matrix<double, 6, 1>::Zero();
       Eigen::Matrix<double, 6, 1> minus_delta = Eigen::Matrix<double, 6, 1>::Zero();
@@ -1005,10 +1159,13 @@ bool RefineBoardPoseFromInitializedFrames(const SolverState& state,
            BuildBoardPoseResidualVector(state, intrinsics, frames, board_id,
                                         ApplyPoseDelta(*pose, minus_delta))) /
           (2.0 * step);
+      if (robust_consensus) {
+        jacobian.col(column).array() *= sqrt_weights.array();
+      }
     }
 
     const Eigen::Matrix<double, 6, 6> hessian = jacobian.transpose() * jacobian;
-    const Eigen::Matrix<double, 6, 1> gradient = jacobian.transpose() * residuals;
+    const Eigen::Matrix<double, 6, 1> gradient = jacobian.transpose() * weighted_residuals;
     const Eigen::Matrix<double, 6, 1> delta =
         (hessian + lambda * Eigen::Matrix<double, 6, 6>::Identity()).ldlt().solve(-gradient);
     if (!delta.allFinite()) {
@@ -1018,11 +1175,18 @@ bool RefineBoardPoseFromInitializedFrames(const SolverState& state,
     const Eigen::Isometry3d candidate_pose = ApplyPoseDelta(*pose, delta);
     const Eigen::VectorXd candidate_residuals =
         BuildBoardPoseResidualVector(state, intrinsics, frames, board_id, candidate_pose);
-    const double candidate_cost = candidate_residuals.squaredNorm();
+    const double candidate_cost = robust_consensus
+                                      ? RobustBoardPoseCost(candidate_residuals, robust_scale)
+                                      : candidate_residuals.squaredNorm();
     if (candidate_cost < best_cost) {
       *pose = candidate_pose;
       residuals = candidate_residuals;
-      best_cost = candidate_cost;
+      if (robust_consensus) {
+        robust_scale = RobustBoardPoseScale(residuals);
+        best_cost = RobustBoardPoseCost(residuals, robust_scale);
+      } else {
+        best_cost = candidate_cost;
+      }
       lambda *= 0.5;
       if (delta.norm() < 1e-5) {
         break;
@@ -1057,6 +1221,23 @@ bool InitializeConnectedComponent(const OuterBootstrapOptions& options,
   reference_it->second.T_reference_board = Eigen::Isometry3d::Identity();
   reference_it->second.rmse = 0.0;
 
+  if (!options.fixed_board_layout.empty()) {
+    for (const auto& layout_entry : options.fixed_board_layout) {
+      const auto board_it = boards->find(layout_entry.first);
+      if (board_it == boards->end() ||
+          !board_it->second.reference_connected) {
+        warnings->push_back(
+            "fixed board layout contains board " +
+            std::to_string(layout_entry.first) +
+            " which is not in the reference-connected component");
+        return false;
+      }
+      board_it->second.initialized = true;
+      board_it->second.T_reference_board = layout_entry.second;
+      board_it->second.rmse = 0.0;
+    }
+  }
+
   bool changed = true;
   while (changed) {
     changed = false;
@@ -1071,6 +1252,7 @@ bool InitializeConnectedComponent(const OuterBootstrapOptions& options,
       double frame_rmse = 0.0;
       if (EstimateFramePoseFromInitializedBoards(state, intrinsics,
                                                  static_cast<int>(frame_storage_index),
+                                                 options.reference_board_id,
                                                  *boards, &pose, &frame_rmse)) {
         frame.initialized = true;
         frame.T_camera_reference = pose;
@@ -1088,6 +1270,7 @@ bool InitializeConnectedComponent(const OuterBootstrapOptions& options,
       Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
       double board_rmse = 0.0;
       if (EstimateBoardPoseFromInitializedFrames(state, intrinsics, *boards, *frames, board.board_id,
+                                                 options.robust_board_layout_consensus,
                                                  &pose, &board_rmse)) {
         board.initialized = true;
         board.T_reference_board = pose;
@@ -1538,6 +1721,7 @@ void OptimizeBootstrapState(const OuterBootstrapOptions& options,
       double frame_rmse = frame.rmse;
       if (EstimateFramePoseFromInitializedBoards(state, *intrinsics,
                                                  static_cast<int>(frame_storage_index),
+                                                 options.reference_board_id,
                                                  *boards, &pose, &frame_rmse)) {
         frame.T_camera_reference = pose;
         frame.rmse = frame_rmse;
@@ -1546,14 +1730,17 @@ void OptimizeBootstrapState(const OuterBootstrapOptions& options,
 
     for (auto board_it = boards->begin(); board_it != boards->end(); ++board_it) {
       BoardNode& board = board_it->second;
-      if (!board.initialized || board.board_id == options.reference_board_id) {
+      if (!board.initialized || board.board_id == options.reference_board_id ||
+          !options.fixed_board_layout.empty()) {
         continue;
       }
 
       Eigen::Isometry3d pose = board.T_reference_board;
       double board_rmse = board.rmse;
       if (EstimateBoardPoseFromInitializedFrames(state, *intrinsics, *boards, *frames,
-                                                 board.board_id, &pose, &board_rmse)) {
+                                                 board.board_id,
+                                                 options.robust_board_layout_consensus,
+                                                 &pose, &board_rmse)) {
         board.T_reference_board = pose;
         board.rmse = board_rmse;
       }
@@ -1640,6 +1827,106 @@ OuterBootstrapResult BuildFailureResult(const OuterBootstrapOptions& options,
 }
 
 }  // namespace
+
+bool LoadFixedBoardLayoutCsv(const std::string& path,
+                             int reference_board_id,
+                             FixedBoardLayout* layout,
+                             std::string* failure_reason) {
+  if (layout == nullptr) {
+    if (failure_reason != nullptr) {
+      *failure_reason = "fixed board layout output pointer is null";
+    }
+    return false;
+  }
+  layout->clear();
+  std::ifstream input(path.c_str());
+  if (!input.is_open()) {
+    if (failure_reason != nullptr) {
+      *failure_reason = "could not open fixed board layout CSV: " + path;
+    }
+    return false;
+  }
+
+  std::string line;
+  int line_number = 0;
+  while (std::getline(input, line)) {
+    ++line_number;
+    if (line.empty()) {
+      continue;
+    }
+    std::vector<std::string> fields;
+    std::stringstream line_stream(line);
+    std::string field;
+    while (std::getline(line_stream, field, ',')) {
+      fields.push_back(field);
+    }
+    if (line_number == 1 && !fields.empty() && fields.front() == "board_id") {
+      continue;
+    }
+    if (fields.size() != 20u) {
+      if (failure_reason != nullptr) {
+        *failure_reason = "fixed board layout CSV line " +
+                          std::to_string(line_number) +
+                          " must have board_id, initialized, observation_count, "
+                          "rmse, and 16 matrix values";
+      }
+      layout->clear();
+      return false;
+    }
+    int board_id = -1;
+    Eigen::Matrix4d matrix = Eigen::Matrix4d::Identity();
+    try {
+      board_id = std::stoi(fields[0]);
+      for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+          matrix(row, column) = std::stod(
+              fields[static_cast<std::size_t>(4 + 4 * row + column)]);
+        }
+      }
+    } catch (const std::exception&) {
+      if (failure_reason != nullptr) {
+        *failure_reason = "fixed board layout CSV line " +
+                          std::to_string(line_number) +
+                          " contains an invalid numeric value";
+      }
+      layout->clear();
+      return false;
+    }
+    const Eigen::Matrix3d rotation = matrix.topLeftCorner<3, 3>();
+    const bool rigid = matrix.allFinite() &&
+                       (matrix.row(3) -
+                        Eigen::RowVector4d(0.0, 0.0, 0.0, 1.0)).norm() < 1e-8 &&
+                       (rotation.transpose() * rotation -
+                        Eigen::Matrix3d::Identity()).norm() < 1e-5 &&
+                       std::abs(rotation.determinant() - 1.0) < 1e-5;
+    if (board_id < 0 || !rigid || layout->count(board_id) != 0u) {
+      if (failure_reason != nullptr) {
+        *failure_reason = "fixed board layout CSV line " +
+                          std::to_string(line_number) +
+                          " has a duplicate board id or a non-rigid transform";
+      }
+      layout->clear();
+      return false;
+    }
+    Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
+    transform.matrix() = matrix;
+    layout->emplace(board_id, transform);
+  }
+
+  const auto reference_it = layout->find(reference_board_id);
+  if (layout->empty() || reference_it == layout->end() ||
+      (reference_it->second.matrix() - Eigen::Matrix4d::Identity()).norm() >
+          1e-8) {
+    if (failure_reason != nullptr) {
+      *failure_reason = "fixed board layout must contain the reference board " +
+                        std::to_string(reference_board_id) +
+                        " with an identity transform";
+    }
+    layout->clear();
+    return false;
+  }
+  return true;
+}
 
 MultiBoardOuterBootstrap::MultiBoardOuterBootstrap(
     ApriltagInternalConfig base_config, OuterBootstrapOptions options)

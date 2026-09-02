@@ -53,7 +53,11 @@ struct GeometryPriorOuterSeedCandidate {
   bool quad_topology_preserved = false;
   std::string quad_topology_summary;
   double local_corner_scale_px = 0.0;
+  int initial_subpix_window_radius = 0;
   int subpix_window_radius = 0;
+  bool subpix_expanded_retry_attempted = false;
+  bool subpix_expanded_retry_used = false;
+  int expanded_subpix_window_radius = 0;
   bool spherical_refine_attempted = false;
   bool spherical_refine_success = false;
   int spherical_refine_successful_corner_count = 0;

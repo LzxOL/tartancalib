@@ -157,7 +157,11 @@ struct MultiScaleOuterTagDetectorConfig {
   int outer_subpix_window_radius = 0;
   double outer_subpix_window_scale = 0.015;
   int outer_subpix_window_min = 4;
-  int outer_subpix_window_max = 48;
+  // A positive value is an explicit experimental cap.  The baseline keeps
+  // this unset so the radius remains tied to the observed marker scale; a
+  // fixed pixel cap would otherwise truncate large close-edge tags on a
+  // higher-resolution image.
+  int outer_subpix_window_max = 0;
   double max_outer_refine_displacement = 6.0;
   double outer_refine_displacement_scale = 0.025;
   bool enable_outer_corner_layout_check = false;
@@ -274,6 +278,12 @@ struct OuterCornerVerificationDebugInfo {
   bool subpix_unstable_rollback_detected = false;
   int subpix_unstable_rollback_iteration = 0;
   double subpix_unstable_rollback_max_displacement = 0.0;
+  // Close-edge refinement evaluates both the nominal scale-derived window and
+  // its polar boost. A large disagreement means the local image contains
+  // competing corner responses, so neither endpoint is trusted.
+  int subpix_scale_probe_window_radius = 0;
+  double subpix_scale_probe_endpoint_delta = 0.0;
+  bool subpix_scale_disagreement_detected = false;
   bool scale_adaptive_response_rollback_checked = false;
   bool scale_adaptive_response_rollback_applied = false;
   int scale_adaptive_response_core_radius = 0;

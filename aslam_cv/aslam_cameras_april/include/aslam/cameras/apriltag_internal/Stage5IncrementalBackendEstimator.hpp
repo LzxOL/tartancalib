@@ -19,6 +19,7 @@ struct Stage5IncrementalBackendEstimatorOptions {
   bool enabled = true;
   bool single_board_dense_grid_profile = false;
   double information_gain_threshold = 0.2;
+  bool information_gain_threshold_explicit = false;
   double rank_gain_threshold = 1e-6;
   int max_iterations = 5;
   double convergence_delta_j = 1e-3;
@@ -53,6 +54,24 @@ struct Stage5IncrementalBackendEstimatorOptions {
   bool fix_board_layout = false;
   bool use_candidate_intrinsics_anchor_prior = false;
   bool normalize_information_gain_by_board_observation = false;
+  bool model_aware_ds_independent_seed_camera_stabilization = false;
+  bool model_aware_progressive_seed = false;
+  // Total share assigned to internal points in a mixed frame-board. Values
+  // below 0.5 give Outer4 more influence; 0.5 preserves the old objective.
+  double internal_role_budget_when_mixed = 0.5;
+  // Kalibr parity ablation: every valid control point has unit covariance,
+  // without separately normalizing Outer4 and internal roles per board.
+  bool uniform_control_point_weighting = false;
+  // Training-only checkpoint ablation. Persistent BA still processes views
+  // incrementally, but returns the complete accepted state whose independent
+  // pose-refit metrics are most consistent across deterministic train folds.
+  // No holdout data or final optimization is used.
+  bool training_robust_checkpoint_selection = false;
+  // Optional square-pixel camera prior. For pinhole-equi only, constrain the
+  // two focal lengths to the same physical pixel scale during Persistent BA.
+  bool square_pixel_focal_prior = false;
+  bool align_model_aware_seed_layout_outer = true;
+  bool use_model_aware_candidate_pose_prefit = true;
   bool use_split_residual_health_gate = true;
   // A newly admitted frame has a different observation distribution from the
   // committed seed.  Comparing its standalone RMSE to the seed RMSE rejects
@@ -62,6 +81,14 @@ struct Stage5IncrementalBackendEstimatorOptions {
   bool use_candidate_relative_residual_gate = true;
   bool use_bearing_pixel_safety_gate = true;
   bool use_full_training_pose_refit_health_gate = true;
+  // Model-aware Persistent BA keeps internal points diagnostic-only. Its
+  // whole-training guard therefore monitors the independent Outer4 refit
+  // rather than allowing regenerated internal points to veto a camera step.
+  bool full_training_pose_refit_outer_only_health = false;
+  // Apply the same contract to the local candidate and committed-residual
+  // checks. Internal points remain reported, but cannot veto an Outer4 camera
+  // update in the model-aware path.
+  bool split_residual_outer_only_health = false;
   bool use_kb_distortion_guard = true;
   double candidate_intrinsics_anchor_weight_xi_alpha = 0.0;
   double candidate_intrinsics_anchor_weight_focal = 0.0;
@@ -277,6 +304,11 @@ struct Stage5IncrementalBackendEstimatorResult {
   int seed_frame_count = 0;
   int seed_board_observation_count = 0;
   int seed_point_count = 0;
+  bool progressive_seed_enabled = false;
+  int progressive_seed_source_frame_count = 0;
+  int progressive_seed_moved_frame_count = 0;
+  int progressive_seed_anchor_frame_index = -1;
+  std::string progressive_seed_anchor_frame_label;
   bool seed_outer_only_residuals = false;
   bool independent_frame_board_camera_warmup_requested = false;
   bool independent_frame_board_camera_warmup_attempted = false;
@@ -397,6 +429,17 @@ struct Stage5IncrementalBackendEstimatorResult {
   double adaptive_saturation_tail_ordering_score_threshold = 0.0;
   double adaptive_saturation_next_ordering_score = 0.0;
   std::string adaptive_saturation_stop_reason;
+  bool training_robust_checkpoint_selection_enabled = false;
+  bool square_pixel_focal_prior_enabled = false;
+  bool training_robust_checkpoint_restored = false;
+  int training_robust_checkpoint_attempt_order = -1;
+  int training_robust_checkpoint_accepted_batch_count = 0;
+  int training_robust_checkpoint_discarded_accepted_batch_count = 0;
+  double training_robust_checkpoint_frame_median_rmse = 0.0;
+  double training_robust_checkpoint_frame_p90_rmse = 0.0;
+  double training_robust_checkpoint_huber15_rmse = 0.0;
+  double training_robust_checkpoint_fold_median_mean_rmse = 0.0;
+  double training_robust_checkpoint_fold_median_max_rmse = 0.0;
   double total_elapsed_time_seconds = 0.0;
   CalibrationStateBundle curated_bundle;
   CalibrationSceneState optimized_scene_state;

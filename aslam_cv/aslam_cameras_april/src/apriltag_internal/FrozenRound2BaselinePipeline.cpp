@@ -22,6 +22,7 @@
 #include <tuple>
 
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <aslam/cameras/apriltag_internal/ApriltagInternalDetector.hpp>
 #include <aslam/cameras/apriltag_internal/JointMeasurementSelection.hpp>
@@ -279,8 +280,22 @@ ParallelRegenerationOutput RegenerateFramesInParallel(
             throw std::runtime_error("Failed to read image: " +
                                      frame_sources[frame_index].image_path);
           }
+          // The detector accepts color images, but internal cornerSubPix is
+          // defined only for a single-channel image. Normalize once at the
+          // parallel regeneration boundary so all recovery paths agree.
+          cv::Mat gray;
+          if (image.channels() == 1) {
+            gray = image;
+          } else if (image.channels() == 3) {
+            cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+          } else if (image.channels() == 4) {
+            cv::cvtColor(image, gray, cv::COLOR_BGRA2GRAY);
+          } else {
+            throw std::runtime_error("Unsupported image channel count for internal regeneration: " +
+                                     std::to_string(image.channels()));
+          }
           regeneration_result = regenerate_frame(
-              worker_pipeline, image, regeneration_inputs[frame_index]);
+              worker_pipeline, gray, regeneration_inputs[frame_index]);
           internal_cache_warning.clear();
           if (internal_regeneration_cache.enabled()) {
             std::lock_guard<std::mutex> lock(cache_mutex);
@@ -531,6 +546,10 @@ OuterBootstrapOptions MakeBootstrapOptions(const ApriltagInternalConfig& config,
   bootstrap_options.init_cv_offset = config.sphere_lattice_init_cv_offset;
   bootstrap_options.min_detection_quality = config.outer_detector_config.min_detection_quality;
   bootstrap_options.optimize_intrinsics = options.optimize_bootstrap_intrinsics;
+  bootstrap_options.robust_board_layout_consensus =
+      options.robust_board_layout_consensus;
+  bootstrap_options.fixed_board_layout = options.fixed_board_layout;
+  bootstrap_options.fixed_board_layout_source = options.fixed_board_layout_source;
   return bootstrap_options;
 }
 
@@ -764,6 +783,127 @@ void RecomputeMeasurementCounts(JointMeasurementBuildResult* result) {
   result->used_total_point_count =
       result->used_outer_point_count + result->used_internal_point_count;
   result->success = result->used_total_point_count > 0;
+}
+
+bool HasSolverReadyReferenceBoard(
+    const JointMeasurementFrameResult& frame, int reference_board_id) {
+  for (const JointBoardObservation& board : frame.board_observations) {
+    if (board.board_id != reference_board_id) {
+      continue;
+    }
+    return std::any_of(
+        board.points.begin(), board.points.end(),
+        [](const JointPointObservation& point) {
+          return point.used_in_solver;
+        });
+  }
+  return false;
+}
+
+JointMeasurementBuildResult BuildNonReferenceSupplementMeasurements(
+    const JointMeasurementBuildResult& measurements,
+    int reference_board_id,
+    int* candidate_frame_count = nullptr) {
+  JointMeasurementBuildResult supplement = measurements;
+  supplement.frames.clear();
+  int retained_frame_count = 0;
+  for (const JointMeasurementFrameResult& frame : measurements.frames) {
+    if (HasSolverReadyReferenceBoard(frame, reference_board_id)) {
+      continue;
+    }
+    supplement.frames.push_back(frame);
+    ++retained_frame_count;
+  }
+  RecomputeMeasurementCounts(&supplement);
+  if (candidate_frame_count != nullptr) {
+    *candidate_frame_count = retained_frame_count;
+  }
+  return supplement;
+}
+
+bool SameMeasurementPoint(const JointPointObservation& lhs,
+                          const JointPointObservation& rhs) {
+  return lhs.frame_index == rhs.frame_index &&
+         lhs.board_id == rhs.board_id && lhs.point_id == rhs.point_id &&
+         lhs.source_point_index == rhs.source_point_index &&
+         lhs.source_kind == rhs.source_kind;
+}
+
+JointMeasurementSelectionResult MergeSupplementalSelection(
+    const JointMeasurementSelectionResult& reference_selection,
+    const JointMeasurementSelectionResult& supplement_selection,
+    int supplement_candidate_frame_count) {
+  JointMeasurementSelectionResult merged = reference_selection;
+  std::map<int, const JointMeasurementFrameResult*> supplement_frames;
+  for (const JointMeasurementFrameResult& frame :
+       supplement_selection.selected_measurement_result.frames) {
+    supplement_frames[frame.frame_index] = &frame;
+  }
+  for (JointMeasurementFrameResult& frame :
+       merged.selected_measurement_result.frames) {
+    const auto frame_it = supplement_frames.find(frame.frame_index);
+    if (frame_it == supplement_frames.end()) {
+      continue;
+    }
+    for (JointBoardObservation& board : frame.board_observations) {
+      const JointBoardObservation* supplement_board = nullptr;
+      for (const JointBoardObservation& candidate :
+           frame_it->second->board_observations) {
+        if (candidate.board_id == board.board_id) {
+          supplement_board = &candidate;
+          break;
+        }
+      }
+      if (supplement_board == nullptr) {
+        continue;
+      }
+      for (JointPointObservation& point : board.points) {
+        const auto source_it = std::find_if(
+            supplement_board->points.begin(), supplement_board->points.end(),
+            [&](const JointPointObservation& candidate) {
+              return SameMeasurementPoint(point, candidate);
+            });
+        if (source_it == supplement_board->points.end() ||
+            !source_it->used_in_solver) {
+          continue;
+        }
+        point.used_in_solver = true;
+        point.rejection_reason_code = source_it->rejection_reason_code;
+        point.rejection_detail = source_it->rejection_detail;
+      }
+    }
+  }
+  RecomputeMeasurementCounts(&merged.selected_measurement_result);
+  merged.accepted_frame_indices.insert(
+      supplement_selection.accepted_frame_indices.begin(),
+      supplement_selection.accepted_frame_indices.end());
+  merged.accepted_board_observation_keys.insert(
+      supplement_selection.accepted_board_observation_keys.begin(),
+      supplement_selection.accepted_board_observation_keys.end());
+  merged.frame_decisions.insert(merged.frame_decisions.end(),
+                                supplement_selection.frame_decisions.begin(),
+                                supplement_selection.frame_decisions.end());
+  merged.board_observation_decisions.insert(
+      merged.board_observation_decisions.end(),
+      supplement_selection.board_observation_decisions.begin(),
+      supplement_selection.board_observation_decisions.end());
+  merged.accepted_frame_count =
+      merged.selected_measurement_result.used_frame_count;
+  merged.accepted_board_observation_count =
+      merged.selected_measurement_result.used_board_observation_count;
+  merged.accepted_outer_point_count =
+      merged.selected_measurement_result.used_outer_point_count;
+  merged.accepted_internal_point_count =
+      merged.selected_measurement_result.used_internal_point_count;
+  merged.success = merged.accepted_board_observation_count > 0 &&
+                   merged.selected_measurement_result.used_total_point_count > 0;
+  std::ostringstream warning;
+  warning << "Round 2 supplemental non-reference selection considered "
+          << supplement_candidate_frame_count << " frame(s) and admitted "
+          << supplement_selection.accepted_frame_count
+          << " frame(s) without reselecting reference-supported frames.";
+  AppendUniqueWarning(warning.str(), &merged.warnings);
+  return merged;
 }
 
 std::vector<JointMeasurementFrameInput> BuildOuterOnlyIntermediateInputs(
@@ -1369,9 +1509,14 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   selection_options.preserve_frame_board_cohesion =
       options_.preserve_frame_board_cohesion;
   const JointMeasurementSelection selector(selection_options);
+  JointMeasurementSelectionOptions supplemental_selection_options = selection_options;
+  supplemental_selection_options.require_reference_board_per_frame = false;
+  const JointMeasurementSelection supplemental_selector(supplemental_selection_options);
   JointOptimizationOptions optimization_options;
   optimization_options.reference_board_id = options_.reference_board_id;
   optimization_options.optimize_intrinsics = options_.optimize_intrinsics;
+  optimization_options.optimize_board_poses =
+      options_.fixed_board_layout.empty();
   optimization_options.intrinsics_release_iteration = options_.intrinsics_release_iteration;
   const JointReprojectionOptimizer optimizer(optimization_options);
   const OuterDetectionCache detection_cache(
@@ -1454,6 +1599,11 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
   initialization_options.refine_mode = options_.camera_initialization_refine_mode;
   initialization_options.selection_scorer =
       options_.camera_initialization_selection_scorer;
+  initialization_options.shared_focal_during_outer_lm =
+      options_.camera_initialization_shared_focal;
+  initialization_options.fixed_board_layout = options_.fixed_board_layout;
+  initialization_options.fixed_board_layout_source =
+      options_.fixed_board_layout_source;
   initialization_options.enable_shared_frame_board_constraint =
       !options_.camera_initialization_use_independent_frame_board_poses;
   initialization_options.enable_principal_profile =
@@ -2084,9 +2234,32 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
     {
       const auto stage_start = std::chrono::steady_clock::now();
       progress.StageStart("round2_selection", 1);
-      result.round2.selection_result =
-          selector.Select(result.round2.measurement_result, result.round2.residual_result,
-                          result.round1.optimization_result.optimized_state);
+      result.round2.selection_result = selector.Select(
+          result.round2.measurement_result, result.round2.residual_result,
+          result.round1.optimization_result.optimized_state);
+      if (options_.allow_non_reference_board_frames_after_layout &&
+          result.round2.selection_result.success) {
+        int supplement_candidate_frame_count = 0;
+        const JointMeasurementBuildResult supplement_measurements =
+            BuildNonReferenceSupplementMeasurements(
+                result.round2.measurement_result, options_.reference_board_id,
+                &supplement_candidate_frame_count);
+        const JointMeasurementSelectionResult supplement_selection =
+            supplemental_selector.Select(
+                supplement_measurements, result.round2.residual_result,
+                result.round1.optimization_result.optimized_state);
+        if (supplement_selection.success) {
+          result.round2.selection_result = MergeSupplementalSelection(
+              result.round2.selection_result, supplement_selection,
+              supplement_candidate_frame_count);
+        } else {
+          AppendUniqueWarning(
+              "Round 2 supplemental non-reference selection found no "
+              "admissible reference-free frame; reference-only selection "
+              "was retained.",
+              &result.round2.selection_result.warnings);
+        }
+      }
       result.runtime_breakdown.round2_selection_seconds =
           ElapsedSeconds(stage_start);
       progress.StageEnd("round2_selection", 1,
@@ -2101,6 +2274,9 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
     JointOptimizationOptions second_pass_options = optimization_options;
     second_pass_options.intrinsics_release_iteration =
         options_.second_pass_intrinsics_release_iteration;
+    second_pass_options.optimize_board_poses =
+        options_.fixed_board_layout.empty() &&
+        !options_.allow_non_reference_board_frames_after_layout;
     const JointReprojectionOptimizer round2_optimizer(second_pass_options);
     {
       const auto stage_start = std::chrono::steady_clock::now();
@@ -2140,6 +2316,11 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::Run(
         2,
         metadata);
     result.stage5_bundle_available = result.final_stage5_bundle.success;
+    if (options_.allow_non_reference_board_frames_after_layout) {
+      AppendUniqueWarning(
+          "Round 2 admitted initialized non-reference-only frames after Round 1 layout refinement; shared layout updates are fixed for this supplemental pass.",
+          &result.warnings);
+    }
   }
 
   result.stage42_validation_pass = ComputeStage42ValidationPass(
@@ -2212,6 +2393,11 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::RunPrecomputed(
   initialization_options.refine_mode = options_.camera_initialization_refine_mode;
   initialization_options.selection_scorer =
       options_.camera_initialization_selection_scorer;
+  initialization_options.shared_focal_during_outer_lm =
+      options_.camera_initialization_shared_focal;
+  initialization_options.fixed_board_layout = options_.fixed_board_layout;
+  initialization_options.fixed_board_layout_source =
+      options_.fixed_board_layout_source;
   initialization_options.enable_shared_frame_board_constraint =
       !options_.camera_initialization_use_independent_frame_board_poses;
   initialization_options.enable_principal_profile =
@@ -2396,6 +2582,8 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::RunPrecomputed(
   JointOptimizationOptions optimization_options;
   optimization_options.reference_board_id = options_.reference_board_id;
   optimization_options.optimize_intrinsics = options_.optimize_intrinsics;
+  optimization_options.optimize_board_poses =
+      options_.fixed_board_layout.empty();
   optimization_options.intrinsics_release_iteration =
       options_.intrinsics_release_iteration;
   optimization_options.cost_options.uniform_control_point_mode =
@@ -2449,6 +2637,94 @@ FrozenRound2BaselineResult FrozenRound2BaselinePipeline::RunPrecomputed(
   result.round2_available = false;
   result.stage42_validation_pass = false;
   result.outer_only_intermediate.enabled = false;
+
+  if (options_.allow_non_reference_board_frames_after_layout) {
+    // Precomputed inputs have no image-driven Round 2 regeneration. Reuse the
+    // frozen observations after the anchor-only Round 1 has refined layout.
+    result.round2_available = true;
+    result.round2.measurement_result = result.round1.measurement_result;
+    result.round2.validation_summary = result.round1.validation_summary;
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      result.round2.residual_result = residual_evaluator.Evaluate(
+          result.round2.measurement_result,
+          result.round1.optimization_result.optimized_state);
+      result.runtime_breakdown.round2_residual_evaluation_seconds =
+          ElapsedSeconds(stage_start);
+    }
+    if (!result.round2.residual_result.success) {
+      result.failure_reason = result.round2.residual_result.failure_reason;
+      AppendWarnings(result.round2.residual_result.warnings, &result.warnings);
+      return result;
+    }
+
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      // Preserve the regular reference-supported Round 2 seed.  The optional
+      // selector below may only add frames that do not have such support.
+      result.round2.selection_result = selector.Select(
+          result.round2.measurement_result, result.round2.residual_result,
+          result.round1.optimization_result.optimized_state);
+      if (result.round2.selection_result.success) {
+        int supplement_candidate_frame_count = 0;
+        const JointMeasurementBuildResult supplement_measurements =
+            BuildNonReferenceSupplementMeasurements(
+                result.round2.measurement_result, options_.reference_board_id,
+                &supplement_candidate_frame_count);
+        JointMeasurementSelectionOptions supplemental_selection_options =
+            selection_options;
+        supplemental_selection_options.require_reference_board_per_frame = false;
+        const JointMeasurementSelection supplemental_selector(
+            supplemental_selection_options);
+        const JointMeasurementSelectionResult supplement_selection =
+            supplemental_selector.Select(
+                supplement_measurements, result.round2.residual_result,
+                result.round1.optimization_result.optimized_state);
+        if (supplement_selection.success) {
+          result.round2.selection_result = MergeSupplementalSelection(
+              result.round2.selection_result, supplement_selection,
+              supplement_candidate_frame_count);
+        } else {
+          AppendUniqueWarning(
+              "Round 2 supplemental non-reference selection found no "
+              "admissible reference-free frame; reference-only selection "
+              "was retained.",
+              &result.round2.selection_result.warnings);
+        }
+      }
+      result.runtime_breakdown.round2_selection_seconds = ElapsedSeconds(stage_start);
+    }
+    if (!result.round2.selection_result.success) {
+      result.failure_reason = result.round2.selection_result.failure_reason;
+      AppendWarnings(result.round2.selection_result.warnings, &result.warnings);
+      return result;
+    }
+
+    JointOptimizationOptions supplemental_optimization_options = optimization_options;
+    supplemental_optimization_options.optimize_board_poses = false;
+    const JointReprojectionOptimizer supplemental_optimizer(
+        supplemental_optimization_options);
+    {
+      const auto stage_start = std::chrono::steady_clock::now();
+      result.round2.optimization_result = supplemental_optimizer.Optimize(
+          result.round2.selection_result,
+          result.round1.optimization_result.optimized_state);
+      result.runtime_breakdown.round2_optimization_seconds =
+          ElapsedSeconds(stage_start);
+    }
+    if (!result.round2.optimization_result.success) {
+      result.failure_reason = result.round2.optimization_result.failure_reason;
+      AppendWarnings(result.round2.optimization_result.warnings, &result.warnings);
+      return result;
+    }
+    result.final_stage5_bundle = BuildCalibrationStateBundleFromJointOptimizationResult(
+        result.round2.optimization_result, result.round2.selection_result,
+        result.round2.measurement_result, 2, metadata);
+    result.stage5_bundle_available = result.final_stage5_bundle.success;
+    AppendUniqueWarning(
+        "Precomputed supplemental pass admitted initialized non-reference-only frames after anchor-only layout refinement; shared layout updates are fixed.",
+        &result.warnings);
+  }
 
   AppendUniqueWarning(
       "Stage5 consumed frozen precomputed observations: image detection, internal-point regeneration, and image-driven second pass were not run.",

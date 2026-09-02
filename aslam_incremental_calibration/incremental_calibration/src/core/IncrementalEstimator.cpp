@@ -489,6 +489,90 @@ namespace aslam {
       return ret;
     }
 
+    IncrementalEstimator::ReturnValue
+        IncrementalEstimator::addBatchAtCurrentState(const BatchSP& problem) {
+      const double timeStart = Timestamp::now();
+
+      // A seed can be geometrically valid before any joint solve, while a
+      // forced incremental optimization would move the shared state merely to
+      // initialize its Fisher baseline. Retain that measured state and build
+      // the marginal information directly at its linearization point instead.
+      _problem->add(problem);
+      orderMarginalizedDesignVariables();
+      _problem->saveDesignVariables();
+
+      size_t JCols = 0;
+      for (auto it = _problem->getGroupsOrdering().cbegin();
+          it != _problem->getGroupsOrdering().cend(); ++it)
+        JCols += _problem->getGroupDim(*it);
+      const size_t dim = _problem->getGroupDim(_margGroupId);
+      auto linearSolver = _optimizer->getSolver<LinearSolver>();
+      linearSolver->setMargStartIndex(static_cast<std::ptrdiff_t>(JCols - dim));
+      restoreLinearSolver();
+      linearSolver->analyzeMarginal();
+
+      ReturnValue ret;
+      ret.numIterations = 0;
+      ret.JStart = 0.0;
+      ret.JFinal = 0.0;
+      ret.dXFinal = 0.0;
+      ret.dJFinal = 0.0;
+      ret.linearSolverFailure = false;
+      if (linearSolver->getOptions().columnScaling) {
+        ret.singularValuesScaled = linearSolver->getSingularValues();
+        ret.nobsBasisScaled = linearSolver->getNullSpace();
+        ret.obsBasisScaled = linearSolver->getRowSpace();
+        ret.sigma2ThetaScaled = linearSolver->getCovariance();
+        ret.sigma2ThetaObsScaled = linearSolver->getRowSpaceCovariance();
+      } else {
+        ret.singularValuesScaled.resize(0);
+        ret.nobsBasisScaled.resize(0, 0);
+        ret.obsBasisScaled.resize(0, 0);
+        ret.sigma2ThetaScaled.resize(0, 0);
+        ret.sigma2ThetaObsScaled.resize(0, 0);
+      }
+      ret.rankPsi = linearSolver->getQRRank();
+      ret.rankPsiDeficiency = linearSolver->getQRRankDeficiency();
+      ret.rankTheta = linearSolver->getSVDRank();
+      ret.rankThetaDeficiency = linearSolver->getSVDRankDeficiency();
+      ret.svdTolerance = linearSolver->getSVDTolerance();
+      ret.qrTolerance = linearSolver->getQRTolerance();
+      ret.nobsBasis = linearSolver->getNullSpace();
+      ret.obsBasis = linearSolver->getRowSpace();
+      ret.sigma2Theta = linearSolver->getCovariance();
+      ret.sigma2ThetaObs = linearSolver->getRowSpaceCovariance();
+      ret.singularValues = linearSolver->getSingularValues();
+      const double svLog2Sum = linearSolver->getSingularValuesLog2Sum();
+      ret.informationGain = 0.5 * (svLog2Sum - _svLog2Sum);
+      ret.batchAccepted = true;
+
+      _informationGain = ret.informationGain;
+      _svLog2Sum = svLog2Sum;
+      _nobsBasis = ret.nobsBasis;
+      _nobsBasisScaled = ret.nobsBasisScaled;
+      _obsBasis = ret.obsBasis;
+      _obsBasisScaled = ret.obsBasisScaled;
+      _sigma2Theta = ret.sigma2Theta;
+      _sigma2ThetaScaled = ret.sigma2ThetaScaled;
+      _sigma2ThetaObs = ret.sigma2ThetaObs;
+      _sigma2ThetaObsScaled = ret.sigma2ThetaObsScaled;
+      _singularValues = ret.singularValues;
+      _singularValuesScaled = ret.singularValuesScaled;
+      _svdTolerance = ret.svdTolerance;
+      _qrTolerance = ret.qrTolerance;
+      _rankTheta = ret.rankTheta;
+      _rankThetaDeficiency = ret.rankThetaDeficiency;
+      _rankPsi = ret.rankPsi;
+      _rankPsiDeficiency = ret.rankPsiDeficiency;
+      _peakMemoryUsage = linearSolver->getPeakMemoryUsage();
+      _memoryUsage = linearSolver->getMemoryUsage();
+      _numFlops = linearSolver->getNumFlops();
+      _initialCost = ret.JStart;
+      _finalCost = ret.JFinal;
+      ret.elapsedTime = Timestamp::now() - timeStart;
+      return ret;
+    }
+
     void IncrementalEstimator::removeBatch(size_t idx) {
       // remove the batch
       _problem->remove(idx);
@@ -509,6 +593,19 @@ namespace aslam {
         _problem->restoreDesignVariables();
         _problem->remove(it);
         if (_problem->getNumOptimizationProblems() > 0) {
+          // The rejected batch can own transformation variables. Removing it
+          // changes the total column count, so the marginalization boundary
+          // used while the batch was present is no longer valid. Recompute it
+          // before rebuilding the camera-information baseline.
+          orderMarginalizedDesignVariables();
+          size_t JCols = 0;
+          for (auto groupIt = _problem->getGroupsOrdering().cbegin();
+              groupIt != _problem->getGroupsOrdering().cend(); ++groupIt)
+            JCols += _problem->getGroupDim(*groupIt);
+          const size_t dim = _problem->getGroupDim(_margGroupId);
+          auto linearSolver = _optimizer->getSolver<LinearSolver>();
+          linearSolver->setMargStartIndex(
+            static_cast<std::ptrdiff_t>(JCols - dim));
           restoreLinearSolver();
           synchronizeMarginalInformation();
         }

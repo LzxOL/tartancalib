@@ -127,6 +127,13 @@ struct FrozenRound2BaselineOptions {
   bool include_internal_points = true;
   bool optimize_intrinsics = false;
   bool optimize_bootstrap_intrinsics = true;
+  // Keep disabled for the frozen baseline.  The explicit model-aware path
+  // enables robust shared-layout initialization before Persistent BA.
+  bool robust_board_layout_consensus = false;
+  // Explicit measured-rig mode. Empty keeps the historical self-estimated
+  // shared layout and all baseline behavior unchanged.
+  FixedBoardLayout fixed_board_layout;
+  std::string fixed_board_layout_source;
   int intrinsics_release_iteration = 3;
   bool run_second_pass = true;
   int second_pass_intrinsics_release_iteration = 1;
@@ -139,6 +146,10 @@ struct FrozenRound2BaselineOptions {
   double selection_kalibr_style_outlier_sigma = 4.0;
   double selection_kalibr_style_min_abs_threshold_px = 1.0;
   int selection_kalibr_style_min_views_before_filter = 20;
+  // Round 1 still requires the reference board and refines the shared layout.
+  // When enabled, Round 2 can add initialized non-reference-only frames while
+  // keeping that layout fixed.
+  bool allow_non_reference_board_frames_after_layout = false;
   bool strict_board_observation_acceptance = false;
   bool preserve_frame_board_cohesion = false;
   bool ignore_image_evidence_min_quality = false;
@@ -158,6 +169,7 @@ struct FrozenRound2BaselineOptions {
       AutoCameraInitializationRefineMode::KalibrOuterLm;
   AutoCameraInitializationSelectionScorer camera_initialization_selection_scorer =
       AutoCameraInitializationSelectionScorer::PoseMarginalizedPrincipal;
+  bool camera_initialization_shared_focal = false;
   // Select the initialization camera with one target pose per frame-board.
   // Scene bootstrap and backend BA still use the shared board layout.
   bool camera_initialization_use_independent_frame_board_poses = false;

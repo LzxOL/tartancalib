@@ -18,9 +18,9 @@ namespace {
 namespace fs = boost::filesystem;
 
 constexpr const char kCacheFormatVersion[] =
-    "outer_detection_cache_v11_resolution_invariant_refinement_guard";
+    "outer_detection_cache_v14_close_edge_scale_stability_pose_gate";
 constexpr const char kOuterDetectionStageImplementationVersion[] =
-    "outer_detection_final_v8_resolution_invariant_refinement_guard";
+    "outer_detection_final_v11_close_edge_scale_stability_pose_gate";
 constexpr const char kOuterRescueStageImplementationVersion[] =
     "outer_rescue_v6_spherical_trust_region";
 
@@ -436,6 +436,12 @@ void WriteOuterCornerVerificationDebug(
            << debug.subpix_unstable_rollback_iteration;
   *storage << "subpix_unstable_rollback_max_displacement"
            << debug.subpix_unstable_rollback_max_displacement;
+  *storage << "subpix_scale_probe_window_radius"
+           << debug.subpix_scale_probe_window_radius;
+  *storage << "subpix_scale_probe_endpoint_delta"
+           << debug.subpix_scale_probe_endpoint_delta;
+  *storage << "subpix_scale_disagreement_detected"
+           << (debug.subpix_scale_disagreement_detected ? 1 : 0);
   *storage << "scale_adaptive_response_rollback_checked"
            << (debug.scale_adaptive_response_rollback_checked ? 1 : 0);
   *storage << "scale_adaptive_response_rollback_applied"
@@ -563,6 +569,14 @@ void ReadOuterCornerVerificationDebug(
         static_cast<int>(node["subpix_unstable_rollback_iteration"]);
     debug->subpix_unstable_rollback_max_displacement =
         static_cast<double>(node["subpix_unstable_rollback_max_displacement"]);
+  }
+  if (!node["subpix_scale_probe_window_radius"].empty()) {
+    debug->subpix_scale_probe_window_radius =
+        static_cast<int>(node["subpix_scale_probe_window_radius"]);
+    debug->subpix_scale_probe_endpoint_delta =
+        static_cast<double>(node["subpix_scale_probe_endpoint_delta"]);
+    debug->subpix_scale_disagreement_detected =
+        static_cast<int>(node["subpix_scale_disagreement_detected"]) != 0;
   }
   if (!node["scale_adaptive_response_rollback_checked"].empty()) {
     debug->scale_adaptive_response_rollback_checked =

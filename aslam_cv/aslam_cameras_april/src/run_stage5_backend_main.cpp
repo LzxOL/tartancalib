@@ -86,10 +86,12 @@ struct CmdArgs {
   std::string stage5_init_refine_mode = "kalibr_outer_lm";
   std::string stage5_init_selection_scorer =
       "pose_marginalized_principal";
+  bool stage5_init_shared_focal = false;
   bool stage5_init_independent_frame_board_poses = false;
   bool stage5_enable_init_principal_profile = false;
   double stage5_init_principal_profile_radius_px = 10.0;
   bool stage5_enable_init_fixed_layout_diagnostic = false;
+  std::string stage5_fixed_board_layout_csv;
   bool stage5_enable_init_board_jackknife_diagnostic = false;
   bool stage5_enable_init_coverage_weighted_diagnostic = false;
   bool stage5_init_near_tie_prefer_lower_focal = false;
@@ -127,6 +129,7 @@ struct CmdArgs {
   double stage5_selection_kalibr_style_outlier_sigma = 4.0;
   double stage5_selection_kalibr_style_min_abs_threshold_px = 1.0;
   int stage5_selection_kalibr_style_min_views_before_filter = 20;
+  bool stage5_allow_non_reference_board_frames_after_layout = false;
   bool stage5_enable_trial_backend_frame_board_selection = true;
   std::string stage5_trial_backend_selection_mode = "kalibr_style_batch";
   std::string stage5_trial_backend_selection_budget_mode;
@@ -136,6 +139,10 @@ struct CmdArgs {
   std::string stage5_trial_backend_selection_info_gain_proxy_mode =
       "intrinsics_jacobian";
   bool stage5_enable_model_aware_information_coreset = false;
+  bool stage5_model_aware_progressive_seed = false;
+  bool stage5_model_aware_seed_layout_alignment = false;
+  bool stage5_model_aware_ds_independent_seed_camera_stabilization = false;
+  bool stage5_model_aware_candidate_pose_prefit = true;
   std::string stage5_trial_backend_selection_batch_granularity =
       "frame";
   std::string stage5_trial_backend_selection_acceptance_policy =
@@ -164,6 +171,11 @@ struct CmdArgs {
   double stage5_trial_backend_selection_persistent_max_focal_relative_step = 0.0;
   double stage5_trial_backend_selection_persistent_max_principal_step_px = 0.0;
   double stage5_trial_backend_selection_persistent_max_xi_alpha_step = 0.0;
+  double stage5_trial_backend_selection_persistent_internal_role_budget_when_mixed = 0.5;
+  bool stage5_trial_backend_selection_persistent_uniform_control_point_weighting = false;
+  bool stage5_trial_backend_selection_persistent_training_robust_checkpoint_selection = false;
+  bool stage5_trial_backend_selection_persistent_training_robust_checkpoint_set = false;
+  bool stage5_trial_backend_selection_persistent_square_pixel_focal_prior = false;
   int stage5_trial_backend_selection_max_iterations = 5;
   int stage5_trial_backend_selection_max_candidate_additions = 20;
   double stage5_trial_backend_selection_adaptive_budget_ratio = 0.10;
@@ -578,6 +590,7 @@ struct RequestedExperimentConfig {
   ati::AutoCameraInitializationSelectionScorer init_selection_scorer =
       ati::AutoCameraInitializationSelectionScorer::
           PoseMarginalizedPrincipal;
+  bool init_shared_focal = false;
   ati::CameraInitializationMode camera_init_mode =
       ati::CameraInitializationMode::Auto;
   bool camera_aware_outer_rescue = true;
@@ -620,6 +633,7 @@ struct RequestedExperimentConfig {
   double selection_kalibr_style_outlier_sigma = 4.0;
   double selection_kalibr_style_min_abs_threshold_px = 1.0;
   int selection_kalibr_style_min_views_before_filter = 20;
+  bool allow_non_reference_board_frames_after_layout = false;
   bool enable_trial_backend_frame_board_selection = true;
   std::string trial_backend_selection_mode = "kalibr_style_batch";
   std::string trial_backend_selection_budget_mode;
@@ -629,6 +643,10 @@ struct RequestedExperimentConfig {
   std::string trial_backend_selection_info_gain_proxy_mode =
       "intrinsics_jacobian";
   bool enable_model_aware_information_coreset = false;
+  bool model_aware_progressive_seed = false;
+  bool model_aware_seed_layout_alignment = false;
+  bool model_aware_ds_independent_seed_camera_stabilization = false;
+  bool model_aware_candidate_pose_prefit = true;
   std::string trial_backend_selection_batch_granularity = "frame";
   std::string trial_backend_selection_acceptance_policy =
       "kalibr_information_gain";
@@ -656,6 +674,12 @@ struct RequestedExperimentConfig {
   double trial_backend_selection_persistent_max_focal_relative_step = 0.0;
   double trial_backend_selection_persistent_max_principal_step_px = 0.0;
   double trial_backend_selection_persistent_max_xi_alpha_step = 0.0;
+  double trial_backend_selection_persistent_internal_role_budget_when_mixed = 0.5;
+  bool trial_backend_selection_persistent_uniform_control_point_weighting = false;
+  bool trial_backend_selection_persistent_training_robust_checkpoint_selection = false;
+  bool trial_backend_selection_persistent_training_robust_checkpoint_explicitly_set = false;
+  bool ucm_training_robust_checkpoint_baseline_default_applied = false;
+  bool trial_backend_selection_persistent_square_pixel_focal_prior = false;
   int trial_backend_selection_max_iterations = 5;
   int trial_backend_selection_max_candidate_additions = 20;
   double trial_backend_selection_adaptive_budget_ratio = 0.10;
@@ -1092,6 +1116,7 @@ std::vector<double> ParseCommaSeparatedDoubles(const std::string& values_str,
 
 bool HasAblationOverrides(const RequestedExperimentConfig& config) {
   return config.camera_init_mode != ati::CameraInitializationMode::Auto ||
+         config.init_shared_focal ||
          !config.camera_aware_outer_rescue ||
          !config.camera_aware_outer_rescue_zero_detection_frames ||
          !config.robust_missing_board_recovery ||
@@ -1159,6 +1184,9 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
   if (config.camera_init_mode != ati::CameraInitializationMode::Auto) {
     parts.push_back("caminit_" + std::string(ati::ToString(config.camera_init_mode)));
   }
+  if (config.init_shared_focal) {
+    parts.push_back("init_shared_focal");
+  }
   if (config.outer_only_ablation_mode) {
     parts.push_back("outer_only_ablation");
   }
@@ -1225,6 +1253,9 @@ std::string BuildDeterministicExperimentTag(const RequestedExperimentConfig& con
   }
   if (config.enable_model_aware_information_coreset) {
     parts.push_back("model_aware_information_coreset");
+  }
+  if (config.model_aware_progressive_seed) {
+    parts.push_back("model_aware_progressive_seed");
   }
   if (config.internal_blur_filter_mode != ati::InternalBlurFilterMode::Off) {
     parts.push_back("internal_blur_filter_" +
@@ -1546,6 +1577,7 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
   config.init_selection_scorer =
       ati::ParseAutoCameraInitializationSelectionScorer(
           args.stage5_init_selection_scorer);
+  config.init_shared_focal = args.stage5_init_shared_focal;
   config.camera_aware_outer_rescue =
       args.stage5_camera_aware_outer_rescue;
   config.camera_aware_outer_rescue_zero_detection_frames =
@@ -1574,6 +1606,8 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.stage5_selection_kalibr_style_min_abs_threshold_px;
   config.selection_kalibr_style_min_views_before_filter =
       args.stage5_selection_kalibr_style_min_views_before_filter;
+  config.allow_non_reference_board_frames_after_layout =
+      args.stage5_allow_non_reference_board_frames_after_layout;
   config.enable_trial_backend_frame_board_selection =
       args.stage5_enable_trial_backend_frame_board_selection;
   config.trial_backend_selection_mode =
@@ -1590,6 +1624,14 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.stage5_trial_backend_selection_info_gain_proxy_mode;
   config.enable_model_aware_information_coreset =
       args.stage5_enable_model_aware_information_coreset;
+  config.model_aware_progressive_seed =
+      args.stage5_model_aware_progressive_seed;
+  config.model_aware_seed_layout_alignment =
+      args.stage5_model_aware_seed_layout_alignment;
+  config.model_aware_ds_independent_seed_camera_stabilization =
+      args.stage5_model_aware_ds_independent_seed_camera_stabilization;
+  config.model_aware_candidate_pose_prefit =
+      args.stage5_model_aware_candidate_pose_prefit;
   config.trial_backend_selection_batch_granularity =
       args.stage5_trial_backend_selection_batch_granularity;
   config.trial_backend_selection_acceptance_policy =
@@ -1642,6 +1684,16 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
       args.stage5_trial_backend_selection_persistent_max_principal_step_px;
   config.trial_backend_selection_persistent_max_xi_alpha_step =
       args.stage5_trial_backend_selection_persistent_max_xi_alpha_step;
+  config.trial_backend_selection_persistent_internal_role_budget_when_mixed =
+      args.stage5_trial_backend_selection_persistent_internal_role_budget_when_mixed;
+  config.trial_backend_selection_persistent_uniform_control_point_weighting =
+      args.stage5_trial_backend_selection_persistent_uniform_control_point_weighting;
+  config.trial_backend_selection_persistent_training_robust_checkpoint_selection =
+      args.stage5_trial_backend_selection_persistent_training_robust_checkpoint_selection;
+  config.trial_backend_selection_persistent_training_robust_checkpoint_explicitly_set =
+      args.stage5_trial_backend_selection_persistent_training_robust_checkpoint_set;
+  config.trial_backend_selection_persistent_square_pixel_focal_prior =
+      args.stage5_trial_backend_selection_persistent_square_pixel_focal_prior;
   config.trial_backend_selection_max_iterations =
       args.stage5_trial_backend_selection_max_iterations;
   config.trial_backend_selection_max_candidate_additions =
@@ -1842,6 +1894,16 @@ RequestedExperimentConfig BuildRequestedExperimentConfig(const CmdArgs& args) {
     // pose seed. Recovery remains conservative: the missing board must pass
     // the dedicated exact-ID/Hamming-margin, contrast, and pose-RMSE gates.
     config.geometry_guided_tag_likelihood_allow_single_anchor = true;
+
+    // UCM's xi and focal parameters have a known weak coupling in sparse
+    // multi-board persistent selection.  Keep the training-only checkpoint
+    // safeguard inside the frozen baseline for this model alone.  An explicit
+    // CLI value remains authoritative for reproducible ablations.
+    if (config.models == "omni-none" &&
+        !config.trial_backend_selection_persistent_training_robust_checkpoint_explicitly_set) {
+      config.trial_backend_selection_persistent_training_robust_checkpoint_selection = true;
+      config.ucm_training_robust_checkpoint_baseline_default_applied = true;
+    }
   }
 
   config.enable_outer_only_intermediate_calibration =
@@ -2170,9 +2232,9 @@ void PrintUsage(const char* program) {
       << "                                      Diagnostic control-point scope for the\n"
       << "                                      imported initialization LM; default all.\n"
       << "  --stage5-external-holdout-self-frontend-prepass\n"
-      << "                                      For external --test-image evaluation,\n"
-      << "                                      build test observations from a frozen\n"
-      << "                                      frontend prepass on the test set itself.\n"
+      << "                                      For holdout evaluation, build test\n"
+      << "                                      observations from a frozen frontend\n"
+      << "                                      prepass on the holdout images themselves.\n"
       << "  --stage5-frontend-only               Run detection, initialization, rescue, and\n"
       << "                                      observation regeneration on all frames; skip\n"
       << "                                      selection incremental BA and backend evaluation.\n"
@@ -2204,6 +2266,10 @@ void PrintUsage(const char* program) {
       << "  --stage5-init-selection-scorer pose_marginalized_principal|legacy_fixed_pose\n"
       << "                                      Outer-only initialization view scorer;\n"
       << "                                      default pose_marginalized_principal.\n"
+      << "  --stage5-init-shared-focal 0|1\n"
+      << "                                      Use one shared fu=fv degree of freedom in\n"
+      << "                                      outer-only initialization for every model;\n"
+      << "                                      fu/fv are released afterward. Default 0.\n"
       << "  --stage5-init-independent-frame-board-poses\n"
       << "                                      Select camera initialization with one pose\n"
       << "                                      per frame-board; shared layout remains for BA.\n"
@@ -2215,6 +2281,10 @@ void PrintUsage(const char* program) {
       << "  --stage5-enable-init-fixed-layout-diagnostic\n"
       << "                                      Diagnostic-only frozen-layout/shared-frame\n"
       << "                                      pose LM; never commits intrinsics.\n"
+      << "  --stage5-fixed-board-layout-csv PATH\n"
+      << "                                      Explicit measured board layout exported as\n"
+      << "                                      board_id,...,T_reference_board_16. Locks\n"
+      << "                                      board poses; baseline default is unchanged.\n"
       << "  --stage5-enable-init-board-jackknife-diagnostic\n"
       << "                                      Diagnostic-only leave-one-board-out\n"
       << "                                      camera refinement; never commits.\n"
@@ -2277,6 +2347,10 @@ void PrintUsage(const char* program) {
       << "  --intrinsics-release-mode delayed|immediate|pose_only\n"
       << "  --intrinsics-release-iteration N\n"
       << "  --second-pass-intrinsics-release-iteration N\n\n"
+      << "  --stage5-allow-non-reference-board-frames-after-layout\n"
+      << "                                      After Round 1 anchors the rigid layout, admit\n"
+      << "                                      initialized single-board frames without the\n"
+      << "                                      reference board; their layout remains fixed.\n\n"
       << "Trial backend selection:\n"
       << "  --stage5-enable-trial-backend-frame-board-selection\n"
       << "  --stage5-trial-backend-selection-mode strict_rmse|kalibr_style_batch"
@@ -2287,6 +2361,19 @@ void PrintUsage(const char* program) {
       << "  --stage5-enable-model-aware-information-coreset\n"
       << "                                      Experimental four-model, frame-normalized\n"
       << "                                      independent-pose information-gain selection.\n"
+      << "  --stage5-model-aware-progressive-seed\n"
+      << "                                      Experimental Kalibr-style one-frame seed;\n"
+      << "                                      remaining selected seed frames enter incrementally.\n"
+      << "  --stage5-model-aware-seed-layout-alignment 0|1\n"
+      << "                                      Align the model-aware seed layout with Outer4\n"
+      << "                                      while camera intrinsics stay fixed (default 0; use as a\n"
+      << "                                      startup-failure fallback).\n"
+      << "  --stage5-model-aware-ds-independent-seed-camera-stabilization\n"
+      << "                                      Experimental DS-only selected-seed camera stabilization\n"
+      << "                                      using independent frame-board poses.\n"
+      << "  --stage5-model-aware-candidate-pose-prefit 0|1\n"
+      << "                                      Pose-only prefit before each model-aware camera\n"
+      << "                                      trial (default 1).\n"
       << "  --stage5-trial-backend-selection-batch-granularity frame_board|frame|frame_board_then_frame\n"
       << "  --stage5-trial-backend-selection-acceptance-policy residual_score|kalibr_information_gain\n"
       << "  --stage5-trial-backend-selection-mi-tol X\n"
@@ -2321,6 +2408,15 @@ void PrintUsage(const char* program) {
       << "  --stage5-trial-backend-selection-persistent-max-focal-relative-step R\n"
       << "  --stage5-trial-backend-selection-persistent-max-principal-step-px PX\n"
       << "  --stage5-trial-backend-selection-persistent-max-xi-alpha-step X\n"
+      << "  --stage5-trial-backend-selection-persistent-internal-role-budget B\n"
+      << " (mixed-view internal-point total weight; default 0.5)\n"
+      << "  --stage5-trial-backend-selection-persistent-uniform-control-point-weighting 0|1\n"
+      << " (Kalibr-style unit covariance per valid control point; default 0)\n"
+      << "  --stage5-trial-backend-selection-persistent-training-robust-checkpoint 0|1\n"
+      << " (training-only rollback to the best complete accepted state; no final BA; "
+         "UCM frozen baseline default 1, otherwise default 0)\n"
+      << "  --stage5-trial-backend-selection-persistent-square-pixel-focal-prior 0|1\n"
+      << " (pinhole-equi Persistent BA only; constrain fu and fv to one pixel scale; default 0)\n"
       << "  --stage5-trial-backend-selection-max-candidate-additions N\n"
       << "  --stage5-trial-backend-selection-adaptive-budget-ratio R\n"
       << "  --stage5-trial-backend-selection-adaptive-budget-min N\n"
@@ -2458,6 +2554,12 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.stage5_init_refine_mode = argv[++i];
     } else if (token == "--stage5-init-selection-scorer" && i + 1 < argc) {
       args.stage5_init_selection_scorer = argv[++i];
+    } else if (token == "--stage5-init-shared-focal" && i + 1 < argc) {
+      args.stage5_init_shared_focal = ParseBooleanFlagValue(argv[++i]);
+    } else if (token == "--stage5-enable-init-shared-focal") {
+      args.stage5_init_shared_focal = true;
+    } else if (token == "--stage5-disable-init-shared-focal") {
+      args.stage5_init_shared_focal = false;
     } else if (token ==
                "--stage5-init-independent-frame-board-poses") {
       args.stage5_init_independent_frame_board_poses = true;
@@ -2468,6 +2570,8 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.stage5_init_principal_profile_radius_px = std::stod(argv[++i]);
     } else if (token == "--stage5-enable-init-fixed-layout-diagnostic") {
       args.stage5_enable_init_fixed_layout_diagnostic = true;
+    } else if (token == "--stage5-fixed-board-layout-csv" && i + 1 < argc) {
+      args.stage5_fixed_board_layout_csv = argv[++i];
     } else if (token == "--stage5-enable-init-board-jackknife-diagnostic") {
       args.stage5_enable_init_board_jackknife_diagnostic = true;
     } else if (token == "--stage5-enable-init-coverage-weighted-diagnostic") {
@@ -2557,6 +2661,9 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.stage5_selection_kalibr_style_min_views_before_filter =
           std::stoi(argv[++i]);
     } else if (token ==
+               "--stage5-allow-non-reference-board-frames-after-layout") {
+      args.stage5_allow_non_reference_board_frames_after_layout = true;
+    } else if (token ==
                "--stage5-enable-trial-backend-frame-board-selection") {
       args.stage5_enable_trial_backend_frame_board_selection = true;
     } else if (token == "--stage5-trial-backend-selection-mode" &&
@@ -2579,6 +2686,19 @@ CmdArgs ParseArgs(int argc, char** argv) {
     } else if (token ==
                "--stage5-enable-model-aware-information-coreset") {
       args.stage5_enable_model_aware_information_coreset = true;
+    } else if (token == "--stage5-model-aware-progressive-seed") {
+      args.stage5_model_aware_progressive_seed = true;
+    } else if (token == "--stage5-model-aware-seed-layout-alignment" &&
+               i + 1 < argc) {
+      args.stage5_model_aware_seed_layout_alignment =
+          std::stoi(argv[++i]) != 0;
+    } else if (token ==
+               "--stage5-model-aware-ds-independent-seed-camera-stabilization") {
+      args.stage5_model_aware_ds_independent_seed_camera_stabilization = true;
+    } else if (token == "--stage5-model-aware-candidate-pose-prefit" &&
+               i + 1 < argc) {
+      args.stage5_model_aware_candidate_pose_prefit =
+          std::stoi(argv[++i]) != 0;
     } else if (
         token ==
             "--stage5-trial-backend-selection-batch-granularity" &&
@@ -2698,6 +2818,31 @@ CmdArgs ParseArgs(int argc, char** argv) {
         i + 1 < argc) {
       args.stage5_trial_backend_selection_persistent_max_xi_alpha_step =
           std::stod(argv[++i]);
+    } else if (
+        token ==
+            "--stage5-trial-backend-selection-persistent-internal-role-budget" &&
+        i + 1 < argc) {
+      args.stage5_trial_backend_selection_persistent_internal_role_budget_when_mixed =
+          std::stod(argv[++i]);
+    } else if (
+        token ==
+            "--stage5-trial-backend-selection-persistent-uniform-control-point-weighting" &&
+        i + 1 < argc) {
+      args.stage5_trial_backend_selection_persistent_uniform_control_point_weighting =
+          std::stoi(argv[++i]) != 0;
+    } else if (
+        token ==
+            "--stage5-trial-backend-selection-persistent-training-robust-checkpoint" &&
+        i + 1 < argc) {
+      args.stage5_trial_backend_selection_persistent_training_robust_checkpoint_selection =
+          std::stoi(argv[++i]) != 0;
+      args.stage5_trial_backend_selection_persistent_training_robust_checkpoint_set = true;
+    } else if (
+        token ==
+            "--stage5-trial-backend-selection-persistent-square-pixel-focal-prior" &&
+        i + 1 < argc) {
+      args.stage5_trial_backend_selection_persistent_square_pixel_focal_prior =
+          std::stoi(argv[++i]) != 0;
     } else if (token ==
                    "--stage5-trial-backend-selection-max-iterations" &&
                i + 1 < argc) {
@@ -5285,6 +5430,113 @@ void WriteIntermediateCameraYaml(
   output << "cv: " << camera.cv << "\n";
 }
 
+void WriteFinalBackendCameraYaml(
+    const fs::path& path,
+    const ati::OuterBootstrapCameraIntrinsics& camera,
+    const std::string& artifact_comment =
+        "Final Stage5 backend camera after all enabled baseline steps.") {
+  if (!camera.IsValid()) {
+    throw std::runtime_error("cannot export invalid final Stage5 camera");
+  }
+  std::ofstream output(path.string().c_str());
+  if (!output.is_open()) {
+    throw std::runtime_error("cannot open final Stage5 camera YAML: " +
+                             path.string());
+  }
+  output << std::setprecision(17);
+  output << "# " << artifact_comment << "\n";
+  output << "cam0:\n";
+  output << "  cam_overlaps: []\n";
+  output << "  camera_model: " << camera.camera_model << "\n";
+  // Stage5 uses the short internal name "equi".  Camchain/catalog YAMLs
+  // use Kalibr's external spelling, which lets the fixed-intrinsics
+  // evaluator parse this artifact without a model-specific exception.
+  const std::string yaml_distortion_model =
+      camera.distortion_model == "equi" ? "equidistant"
+                                         : camera.distortion_model;
+  output << "  distortion_model: " << yaml_distortion_model << "\n";
+  output << "  intrinsics: [";
+  const std::vector<double> intrinsics = camera.IntrinsicsVector();
+  for (std::size_t index = 0; index < intrinsics.size(); ++index) {
+    if (index != 0u) {
+      output << ", ";
+    }
+    output << intrinsics[index];
+  }
+  output << "]\n";
+  output << "  distortion_coeffs: [";
+  const std::vector<double> distortion = camera.DistortionVector();
+  for (std::size_t index = 0; index < distortion.size(); ++index) {
+    if (index != 0u) {
+      output << ", ";
+    }
+    output << distortion[index];
+  }
+  output << "]\n";
+  output << "  resolution: [" << camera.resolution.width << ", "
+         << camera.resolution.height << "]\n";
+}
+
+void WriteDiagnosticInitializerCameraArtifacts(
+    const fs::path& output_dir,
+    const ati::Stage5BenchmarkReport& report) {
+  const ati::OuterBootstrapCameraIntrinsics& camera =
+      report.baseline_result.auto_camera_initialization.selected_camera;
+  if (!camera.IsValid()) {
+    return;
+  }
+
+  const fs::path yaml_path = output_dir / "diagnostic_initializer_camera.yaml";
+  WriteFinalBackendCameraYaml(
+      yaml_path, camera,
+      "Diagnostic initializer camera; not a final shared-layout calibration.");
+
+  const ati::TrialBackendFrameBoardSelectionResult& selection =
+      report.trial_backend_selection_result;
+  std::ofstream summary(
+      (output_dir / "diagnostic_initializer_camera_summary.txt").string().c_str());
+  if (!summary.is_open()) {
+    throw std::runtime_error(
+        "cannot open diagnostic initializer camera summary");
+  }
+  summary << std::setprecision(17);
+  summary << "artifact_status: diagnostic_only\n";
+  summary << "camera_source: auto_camera_initialization.selected_camera\n";
+  summary << "camera_model_family: " << camera.NormalizedFamilyString() << "\n";
+  summary << "eligible_as_final_backend_camera: 0\n";
+  summary << "valid_for_rigid_shared_layout: 0\n";
+  summary << "failure_reason: " << report.failure_reason << "\n";
+  summary << "persistent_candidate_batch_count: "
+          << selection.persistent_incremental_candidate_batch_count << "\n";
+  summary << "persistent_attempted_batch_count: "
+          << selection.persistent_incremental_attempted_batch_count << "\n";
+  summary << "persistent_accepted_batch_count: "
+          << selection.persistent_incremental_accepted_batch_count << "\n";
+  summary << "independent_pose_success_count: "
+          << selection.persistent_incremental_initial_full_training_pose_success_count
+          << "\n";
+  summary << "independent_pose_total_count: "
+          << selection.persistent_incremental_initial_full_training_pose_total_count
+          << "\n";
+  summary << "independent_pose_success_rate: "
+          << selection.persistent_incremental_initial_full_training_pose_success_rate
+          << "\n";
+  summary << "independent_pose_rmse_px: "
+          << selection.persistent_incremental_initial_full_training_pixel_rmse
+          << "\n";
+  summary << "independent_pose_p95_px: "
+          << selection.persistent_incremental_initial_full_training_pixel_p95
+          << "\n";
+  summary << "invalid_outer_projection_count: "
+          << selection
+                 .persistent_incremental_initial_full_training_invalid_outer_projection_count
+          << "\n";
+  summary << "invalid_internal_projection_count: "
+          << selection
+                 .persistent_incremental_initial_full_training_invalid_internal_projection_count
+          << "\n";
+}
+
 void WriteLargePerturbationSceneSnapshot(
     const fs::path& path,
     const ati::CalibrationSceneState& scene) {
@@ -5753,6 +6005,16 @@ void WriteExperimentConfigSummary(
          << ati::ToString(requested.init_refine_mode) << "\n";
   output << "requested_stage5_init_selection_scorer: "
          << ati::ToString(requested.init_selection_scorer) << "\n";
+  output << "requested_stage5_init_shared_focal: "
+         << (requested.init_shared_focal ? 1 : 0) << "\n";
+  output << "effective_stage5_init_shared_focal: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_shared_focal_effective
+         << "\n";
+  output << "effective_stage5_init_shared_focal_released_after_initialization: "
+         << report.baseline_result.auto_camera_initialization
+                .stage5_init_shared_focal_released_after_initialization
+         << "\n";
   output << "requested_camera_init_mode: "
          << ati::ToString(requested.camera_init_mode) << "\n";
   output << "requested_stage5_camera_aware_outer_rescue: "
@@ -5900,6 +6162,9 @@ void WriteExperimentConfigSummary(
          << requested.selection_kalibr_style_min_abs_threshold_px << "\n";
   output << "requested_stage5_selection_kalibr_style_min_views_before_filter: "
          << requested.selection_kalibr_style_min_views_before_filter << "\n";
+  output << "requested_stage5_allow_non_reference_board_frames_after_layout: "
+         << (requested.allow_non_reference_board_frames_after_layout ? 1 : 0)
+         << "\n";
   output << "requested_stage5_enable_trial_backend_frame_board_selection: "
          << (requested.enable_trial_backend_frame_board_selection ? 1 : 0)
          << "\n";
@@ -5920,6 +6185,15 @@ void WriteExperimentConfigSummary(
   output << "requested_stage5_enable_model_aware_information_coreset: "
          << (requested.enable_model_aware_information_coreset ? 1 : 0)
          << "\n";
+  output << "requested_stage5_model_aware_progressive_seed: "
+         << (requested.model_aware_progressive_seed ? 1 : 0) << "\n";
+  output << "requested_stage5_model_aware_seed_layout_alignment: "
+         << (requested.model_aware_seed_layout_alignment ? 1 : 0) << "\n";
+  output << "requested_stage5_model_aware_ds_independent_seed_camera_stabilization: "
+         << (requested.model_aware_ds_independent_seed_camera_stabilization ? 1 : 0)
+         << "\n";
+  output << "requested_stage5_model_aware_candidate_pose_prefit: "
+         << (requested.model_aware_candidate_pose_prefit ? 1 : 0) << "\n";
   output << "requested_stage5_trial_backend_selection_batch_granularity: "
          << requested.trial_backend_selection_batch_granularity << "\n";
   output << "requested_stage5_trial_backend_selection_acceptance_policy: "
@@ -5994,6 +6268,33 @@ void WriteExperimentConfigSummary(
          << "\n";
   output << "requested_stage5_trial_backend_selection_persistent_max_xi_alpha_step: "
          << requested.trial_backend_selection_persistent_max_xi_alpha_step
+         << "\n";
+  output << "requested_stage5_trial_backend_selection_persistent_internal_role_budget_when_mixed: "
+         << requested.trial_backend_selection_persistent_internal_role_budget_when_mixed
+         << "\n";
+  output << "requested_stage5_trial_backend_selection_persistent_uniform_control_point_weighting: "
+         << (requested.trial_backend_selection_persistent_uniform_control_point_weighting
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "requested_stage5_trial_backend_selection_persistent_training_robust_checkpoint: "
+         << (requested.trial_backend_selection_persistent_training_robust_checkpoint_selection
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "requested_stage5_trial_backend_selection_persistent_training_robust_checkpoint_explicitly_set: "
+         << (requested
+                     .trial_backend_selection_persistent_training_robust_checkpoint_explicitly_set
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "ucm_training_robust_checkpoint_baseline_default_applied: "
+         << (requested.ucm_training_robust_checkpoint_baseline_default_applied ? 1 : 0)
+         << "\n";
+  output << "requested_stage5_trial_backend_selection_persistent_square_pixel_focal_prior: "
+         << (requested.trial_backend_selection_persistent_square_pixel_focal_prior
+                 ? 1
+                 : 0)
          << "\n";
   output << "requested_stage5_trial_backend_selection_max_iterations: "
          << requested.trial_backend_selection_max_iterations << "\n";
@@ -6312,6 +6613,11 @@ void WriteExperimentConfigSummary(
          << "\n";
   output << "requested_geometry_prior_rescue_subpix_window_radius: "
          << requested.geometry_prior_rescue_subpix_window_radius << "\n";
+  output << "requested_geometry_prior_rescue_subpix_auto_policy: "
+         << (requested.geometry_prior_rescue_subpix_window_radius == 0
+                 ? "marker_relative_1p5x_scale_capped_0p5_marker_width"
+                 : "manual_override_or_disabled")
+         << "\n";
   output << "requested_geometry_prior_rescue_max_corner_displacement_px: "
          << requested.geometry_prior_rescue_max_corner_displacement_px << "\n";
   output << "requested_geometry_prior_rescue_min_corner_response_ratio: "
@@ -6772,6 +7078,12 @@ void WriteExperimentConfigSummary(
          << report.baseline_result.effective_options
                 .selection_kalibr_style_min_views_before_filter
          << "\n";
+  output << "effective_stage5_allow_non_reference_board_frames_after_layout: "
+         << (report.baseline_result.effective_options
+                     .allow_non_reference_board_frames_after_layout
+                 ? 1
+                 : 0)
+         << "\n";
   output << "effective_stage5_trial_backend_frame_board_selection: "
          << (report.trial_backend_selection_result.enabled ? 1 : 0)
          << "\n";
@@ -6792,6 +7104,12 @@ void WriteExperimentConfigSummary(
   output << "effective_stage5_model_aware_information_coreset: "
          << (report.trial_backend_selection_result
                      .model_aware_information_coreset_enabled
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_stage5_model_aware_progressive_seed: "
+         << (report.trial_backend_selection_result
+                     .model_aware_progressive_seed_enabled
                  ? 1
                  : 0)
          << "\n";
@@ -6900,6 +7218,28 @@ void WriteExperimentConfigSummary(
   output << "effective_stage5_trial_backend_selection_persistent_max_xi_alpha_step: "
          << report.trial_backend_selection_result.persistent_max_xi_alpha_step
          << "\n";
+  output << "effective_stage5_trial_backend_selection_persistent_internal_role_budget_when_mixed: "
+         << report.trial_backend_selection_result
+                .persistent_internal_role_budget_when_mixed
+         << "\n";
+  output << "effective_stage5_trial_backend_selection_persistent_uniform_control_point_weighting: "
+         << (report.trial_backend_selection_result
+                     .persistent_uniform_control_point_weighting
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_stage5_trial_backend_selection_persistent_training_robust_checkpoint: "
+         << (report.trial_backend_selection_result
+                     .persistent_training_robust_checkpoint_selection
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_stage5_trial_backend_selection_persistent_square_pixel_focal_prior: "
+         << (report.trial_backend_selection_result
+                     .persistent_square_pixel_focal_prior
+                 ? 1
+                 : 0)
+         << "\n";
   int trial_optimizer_total_iterations = 0;
   int trial_optimizer_total_failed_iterations = 0;
   int trial_optimizer_linear_solver_failure_count = 0;
@@ -6991,6 +7331,28 @@ void WriteExperimentConfigSummary(
   output << "effective_stage5_persistent_incremental_seed_point_count: "
          << report.trial_backend_selection_result
                 .persistent_incremental_seed_point_count
+         << "\n";
+  output << "effective_stage5_persistent_incremental_progressive_seed_enabled: "
+         << (report.trial_backend_selection_result
+                     .persistent_incremental_progressive_seed_enabled
+                 ? 1
+                 : 0)
+         << "\n";
+  output << "effective_stage5_persistent_incremental_progressive_seed_source_frame_count: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_progressive_seed_source_frame_count
+         << "\n";
+  output << "effective_stage5_persistent_incremental_progressive_seed_moved_frame_count: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_progressive_seed_moved_frame_count
+         << "\n";
+  output << "effective_stage5_persistent_incremental_progressive_seed_anchor_frame_index: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_progressive_seed_anchor_frame_index
+         << "\n";
+  output << "effective_stage5_persistent_incremental_progressive_seed_anchor_frame_label: "
+         << report.trial_backend_selection_result
+                .persistent_incremental_progressive_seed_anchor_frame_label
          << "\n";
   output << "effective_stage5_persistent_incremental_seed_outer_only_residuals: "
          << (report.trial_backend_selection_result
@@ -7383,6 +7745,12 @@ void WriteExperimentConfigSummary(
   output << "effective_geometry_prior_rescue_subpix_window_radius: "
          << report.baseline_result.effective_options
                 .geometry_prior_rescue_subpix_window_radius
+         << "\n";
+  output << "effective_geometry_prior_rescue_subpix_auto_policy: "
+         << (report.baseline_result.effective_options
+                         .geometry_prior_rescue_subpix_window_radius == 0
+                 ? "marker_relative_1p5x_scale_capped_0p5_marker_width"
+                 : "manual_override_or_disabled")
          << "\n";
   output << "effective_geometry_prior_rescue_max_corner_displacement_px: "
          << report.baseline_result.effective_options
@@ -9537,6 +9905,16 @@ int main(int argc, char** argv) {
 
     ati::FrozenRound2BaselineOptions baseline_options;
     baseline_options.config = ati::ApriltagInternalDetector::LoadConfig(args.config_path);
+    if (!args.stage5_fixed_board_layout_csv.empty()) {
+      std::string layout_failure_reason;
+      if (!ati::LoadFixedBoardLayoutCsv(
+              args.stage5_fixed_board_layout_csv, args.reference_board_id,
+              &baseline_options.fixed_board_layout, &layout_failure_reason)) {
+        throw std::runtime_error(layout_failure_reason);
+      }
+      baseline_options.fixed_board_layout_source =
+          args.stage5_fixed_board_layout_csv;
+    }
     ApplyStage5ModelFamily(requested_config.models,
                            &baseline_options.config);
     if (requested_config.camera_aware_outer_rescue_zero_detection_frames_set) {
@@ -9585,8 +9963,15 @@ int main(int argc, char** argv) {
         requested_config.init_refine_mode;
     baseline_options.camera_initialization_selection_scorer =
         requested_config.init_selection_scorer;
+    baseline_options.camera_initialization_shared_focal =
+        requested_config.init_shared_focal;
+    // The model-aware coreset measures camera information after eliminating
+    // each frame-board pose.  Its initializer must use that same ownership
+    // boundary: shared layout remains part of the baseline backend, but it
+    // must not select the camera-intrinsics basin.
     baseline_options.camera_initialization_use_independent_frame_board_poses =
-        args.stage5_init_independent_frame_board_poses;
+        args.stage5_init_independent_frame_board_poses ||
+        requested_config.enable_model_aware_information_coreset;
     baseline_options.enable_camera_initialization_principal_profile =
         args.stage5_enable_init_principal_profile;
     baseline_options.camera_initialization_principal_profile_radius_px =
@@ -9658,6 +10043,8 @@ int main(int argc, char** argv) {
       requested_config.selection_kalibr_style_min_abs_threshold_px;
   baseline_options.selection_kalibr_style_min_views_before_filter =
       requested_config.selection_kalibr_style_min_views_before_filter;
+  baseline_options.allow_non_reference_board_frames_after_layout =
+      requested_config.allow_non_reference_board_frames_after_layout;
   baseline_options.strict_board_observation_acceptance =
       requested_config.strict_board_observation_acceptance;
     baseline_options.preserve_frame_board_cohesion =
@@ -9785,7 +10172,9 @@ int main(int argc, char** argv) {
     ati::BackendProblemOptions backend_options;
     backend_options.reference_board_id = args.reference_board_id;
     backend_options.optimize_frame_poses = true;
-    backend_options.optimize_board_poses = true;
+    backend_options.optimize_board_poses =
+        baseline_options.fixed_board_layout.empty() &&
+        !requested_config.allow_non_reference_board_frames_after_layout;
     backend_options.optimize_intrinsics =
         requested_config.backend_optimize_intrinsics;
     backend_options.delayed_intrinsics_release =
@@ -9795,7 +10184,9 @@ int main(int argc, char** argv) {
     ati::BackendProblemOptions committed_backend_evaluation_options =
         backend_options;
     committed_backend_evaluation_options.optimize_board_poses =
-        requested_config.backend_optimize_board_poses;
+        baseline_options.fixed_board_layout.empty() &&
+        requested_config.backend_optimize_board_poses &&
+        !requested_config.allow_non_reference_board_frames_after_layout;
 
     ati::CalibrationBenchmarkSplitOptions split_options;
     split_options.mode = args.stage5_no_holdout
@@ -10110,6 +10501,17 @@ int main(int argc, char** argv) {
     benchmark_input.trial_backend_selection_options
         .model_aware_information_coreset =
         requested_config.enable_model_aware_information_coreset;
+    benchmark_input.trial_backend_selection_options.model_aware_progressive_seed =
+        requested_config.model_aware_progressive_seed;
+    benchmark_input.trial_backend_selection_options
+        .model_aware_seed_layout_alignment =
+        requested_config.model_aware_seed_layout_alignment;
+    benchmark_input.trial_backend_selection_options
+        .model_aware_ds_independent_seed_camera_stabilization =
+        requested_config.model_aware_ds_independent_seed_camera_stabilization;
+    benchmark_input.trial_backend_selection_options
+        .model_aware_candidate_pose_prefit =
+        requested_config.model_aware_candidate_pose_prefit;
     benchmark_input.trial_backend_selection_options
         .candidate_batch_granularity =
         ParseTrialBackendFrameBoardCandidateBatchGranularity(
@@ -10159,7 +10561,13 @@ int main(int argc, char** argv) {
             .trial_backend_selection_persistent_intrinsics_anchor_prior;
     benchmark_input.trial_backend_selection_options
         .persistent_fix_board_layout =
-        requested_config.trial_backend_selection_persistent_fix_board_layout;
+        requested_config.trial_backend_selection_persistent_fix_board_layout ||
+        !baseline_options.fixed_board_layout.empty() ||
+        requested_config.allow_non_reference_board_frames_after_layout ||
+        requested_config.enable_model_aware_information_coreset;
+    benchmark_input.trial_backend_selection_options
+        .freeze_board_layout_for_non_reference_frames =
+        requested_config.allow_non_reference_board_frames_after_layout;
     benchmark_input.trial_backend_selection_options
         .persistent_intrinsics_anchor_weight_xi_alpha =
         requested_config
@@ -10184,6 +10592,22 @@ int main(int argc, char** argv) {
         .persistent_max_xi_alpha_step =
         requested_config
             .trial_backend_selection_persistent_max_xi_alpha_step;
+    benchmark_input.trial_backend_selection_options
+        .persistent_internal_role_budget_when_mixed =
+        requested_config
+            .trial_backend_selection_persistent_internal_role_budget_when_mixed;
+    benchmark_input.trial_backend_selection_options
+        .persistent_uniform_control_point_weighting =
+        requested_config
+            .trial_backend_selection_persistent_uniform_control_point_weighting;
+    benchmark_input.trial_backend_selection_options
+        .persistent_training_robust_checkpoint_selection =
+        requested_config
+            .trial_backend_selection_persistent_training_robust_checkpoint_selection;
+    benchmark_input.trial_backend_selection_options
+        .persistent_square_pixel_focal_prior =
+        requested_config
+            .trial_backend_selection_persistent_square_pixel_focal_prior;
     benchmark_input.trial_backend_selection_options.max_iterations =
         requested_config.trial_backend_selection_max_iterations;
     benchmark_input.trial_backend_selection_options.max_candidate_additions =
@@ -10304,6 +10728,24 @@ int main(int argc, char** argv) {
 
     const fs::path output_dir(args.output_path);
     EnsureDirectoryExists(output_dir);
+    if (!baseline_options.fixed_board_layout.empty()) {
+      std::ofstream layout_audit(
+          (output_dir / "fixed_board_layout_audit.txt").string().c_str());
+      layout_audit << "enabled: 1\n";
+      layout_audit << "source: "
+                   << baseline_options.fixed_board_layout_source << "\n";
+      layout_audit << "reference_board_id: " << args.reference_board_id
+                   << "\n";
+      layout_audit << "board_count: "
+                   << baseline_options.fixed_board_layout.size() << "\n";
+      layout_audit << "board_ids:";
+      for (const auto& layout_entry : baseline_options.fixed_board_layout) {
+        layout_audit << " " << layout_entry.first;
+      }
+      layout_audit << "\n";
+      layout_audit << "board_layout_updates_disabled: 1\n";
+      layout_audit << "two_layer_shared_layout_disabled: 1\n";
+    }
     const auto write_runtime_summary = [&runtime_summary, &output_dir, &total_start]() {
       runtime_summary.total_runtime_seconds = ElapsedSeconds(total_start);
       ati::WriteStage5RuntimeSummary(
@@ -11053,6 +11495,14 @@ int main(int argc, char** argv) {
     }
 
     if (!report.success) {
+      // Failed model-aware selection must still leave its rejection audit on
+      // disk.  This is a lightweight CSV/TXT writer and does not emit overlays.
+      ati::WriteTrialBackendFrameBoardSelectionDiagnostics(output_dir, report);
+      if (report.failure_reason.rfind("insufficient_persistent_support:", 0) == 0) {
+        // Preserve the independently pose-refitted initializer for diagnosis,
+        // but keep it clearly separate from the final backend camera contract.
+        WriteDiagnosticInitializerCameraArtifacts(output_dir, report);
+      }
       write_runtime_summary();
       std::cout << "Stage 5 benchmark success: 0\n"
                 << "Protocol summary: "
@@ -11209,7 +11659,9 @@ int main(int argc, char** argv) {
                     ElapsedSeconds(backend_stage_start), false);
     PrintBackendResultProgress(backend_result);
 
-    if (backend_result.success && args.stage5_enable_two_layer_ba) {
+    if (backend_result.success && args.stage5_enable_two_layer_ba &&
+        baseline_options.fixed_board_layout.empty() &&
+        !requested_config.allow_non_reference_board_frames_after_layout) {
       PrintProgress(
           "running protected two-layer BA: independent intrinsics then fixed-camera shared layout...");
       const TwoLayerBaMetrics baseline_shared_metrics =
@@ -11648,6 +12100,11 @@ int main(int argc, char** argv) {
                       rollback_reason);
       }
     }
+    if (backend_result.success && args.stage5_enable_two_layer_ba &&
+        requested_config.allow_non_reference_board_frames_after_layout) {
+      PrintProgress(
+          "skipping two-layer shared-layout BA because supplemental non-reference-board frames require the established layout to remain fixed.");
+    }
 
     if (backend_result.success &&
         requested_config.backend_multi_board_consistency_weighting &&
@@ -11713,6 +12170,12 @@ int main(int argc, char** argv) {
           (output_dir / "board_layout_pose_delta.csv").string(),
           backend_result);
     }
+    // The Stage5Benchmark report is intentionally a pre-backend selection
+    // diagnostic. Export the runner's actual final camera separately so
+    // external evaluations cannot accidentally consume that earlier state.
+    WriteFinalBackendCameraYaml(
+        output_dir / "final_backend_camera.yaml",
+        backend_result.optimized_scene_state.camera);
     WriteExperimentConfigSummary(
         (output_dir / "experiment_config_summary.txt").string(),
         requested_config,

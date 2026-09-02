@@ -247,7 +247,8 @@ bool HasExplicitSeedStage(InternalProjectionMode mode) {
 }
 
 cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
-                                 const ApriltagInternalDetectionResult& result) {
+                                 const ApriltagInternalDetectionResult& result,
+                                 bool include_prediction_context) {
   if (result.internal_corner_debug.empty() || image.empty()) {
     return cv::Mat();
   }
@@ -272,7 +273,8 @@ cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
                outer_outline_color, 2, cv::LINE_AA);
     }
   }
-  if (UsesBorderConditionedSeedPipeline(result.projection_mode)) {
+  if (include_prediction_context &&
+      UsesBorderConditionedSeedPipeline(result.projection_mode)) {
     DrawImageBorderCurves(&overlay, result);
   }
 
@@ -305,7 +307,8 @@ cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
                 : (border_seed_ok ? debug.border_seed_image : debug.predicted_image);
     const double module_u_length = std::hypot(debug.module_u_axis.x, debug.module_u_axis.y);
     const double module_v_length = std::hypot(debug.module_v_axis.x, debug.module_v_axis.y);
-    if (module_u_length > 1.0 && module_v_length > 1.0) {
+    if (include_prediction_context && module_u_length > 1.0 &&
+        module_v_length > 1.0) {
       const cv::Point2f unit_u =
           debug.module_u_axis * static_cast<float>(1.0 / std::max(1e-9, module_u_length));
       const cv::Point2f unit_v =
@@ -319,7 +322,7 @@ cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
     }
 
     int search_radius_px = 0;
-    if (UsesSphereSeedPipeline(result.projection_mode)) {
+    if (include_prediction_context && UsesSphereSeedPipeline(result.projection_mode)) {
       const int base_search_radius_px = ComputeSphereSearchRadiusOverlayPx(debug.local_module_scale);
       const double search_scale =
           debug.sphere_search_radius > 1e-9
@@ -333,27 +336,37 @@ cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
                  cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
     }
 
-    cv::drawMarker(overlay, debug.predicted_image, cv::Scalar(255, 255, 255),
-                   cv::MARKER_CROSS, 8, 3, cv::LINE_AA);
-    cv::drawMarker(overlay, debug.predicted_image, kPredictedColor,
-                   cv::MARKER_CROSS, 6, 1, cv::LINE_AA);
-    cv::circle(overlay, debug.predicted_image, 2, cv::Scalar(255, 255, 255), cv::FILLED,
-               cv::LINE_AA);
-    cv::circle(overlay, debug.predicted_image, 1, kPredictedColor, cv::FILLED, cv::LINE_AA);
+    if (include_prediction_context) {
+      cv::drawMarker(overlay, debug.predicted_image, cv::Scalar(255, 255, 255),
+                     cv::MARKER_CROSS, 8, 3, cv::LINE_AA);
+      cv::drawMarker(overlay, debug.predicted_image, kPredictedColor,
+                     cv::MARKER_CROSS, 6, 1, cv::LINE_AA);
+      cv::circle(overlay, debug.predicted_image, 2, cv::Scalar(255, 255, 255), cv::FILLED,
+                 cv::LINE_AA);
+      cv::circle(overlay, debug.predicted_image, 1, kPredictedColor, cv::FILLED, cv::LINE_AA);
+    }
 
     if (border_seed_ok) {
-      cv::arrowedLine(overlay, debug.predicted_image, debug.border_seed_image,
-                      kArrow1Color, 1, cv::LINE_AA, 0, 0.15);
+      if (include_prediction_context) {
+        cv::arrowedLine(overlay, debug.predicted_image, debug.border_seed_image,
+                        kArrow1Color, 1, cv::LINE_AA, 0, 0.15);
+      }
       cv::drawMarker(overlay, debug.border_seed_image, cv::Scalar(255, 255, 255),
                      cv::MARKER_TRIANGLE_UP, 8, 3, cv::LINE_AA);
       cv::drawMarker(overlay, debug.border_seed_image, kBorderSeedColor,
                      cv::MARKER_TRIANGLE_UP, 6, 1, cv::LINE_AA);
     }
     if (seed_ok) {
-      cv::arrowedLine(overlay, border_seed_ok ? debug.border_seed_image : debug.predicted_image,
-                      debug.sphere_seed_image, border_seed_ok ? kArrowBorderColor : kArrow1Color,
-                      1, cv::LINE_AA, 0, 0.15);
-      if (result.projection_mode == InternalProjectionMode::SphereRayRefine &&
+      if (include_prediction_context) {
+        cv::arrowedLine(overlay,
+                        border_seed_ok ? debug.border_seed_image
+                                       : debug.predicted_image,
+                        debug.sphere_seed_image,
+                        border_seed_ok ? kArrowBorderColor : kArrow1Color,
+                        1, cv::LINE_AA, 0, 0.15);
+      }
+      if (include_prediction_context &&
+          result.projection_mode == InternalProjectionMode::SphereRayRefine &&
           debug.ray_refine_trust_radius > 0.0) {
         const int trust_radius_px =
             ComputeRayRefineTrustRadiusOverlayPx(debug.local_module_scale, search_radius_px);
@@ -382,7 +395,10 @@ cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
 
   std::string title;
   std::string legend;
-  if (result.projection_mode == InternalProjectionMode::VirtualPinholePatch) {
+  if (!include_prediction_context) {
+    title = "Internal Image-Evidence Overlay: seed -> refined";
+    legend = "Legend: magenta diamond = sphere-border-lattice seed; green square = cornerSubPix result; no camera projection is drawn";
+  } else if (result.projection_mode == InternalProjectionMode::VirtualPinholePatch) {
     title = "Internal Patch Overlay: P -> R";
     legend =
         "Legend: P orange cross, R green square, gray cross: aligned lattice boundaries";

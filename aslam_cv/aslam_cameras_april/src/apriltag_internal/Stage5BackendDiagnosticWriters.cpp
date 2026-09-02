@@ -868,7 +868,10 @@ void WriteInternalSeedStepOverlaysForRound(
           break;
         }
       }
-      cv::Mat overlay = ati::BuildInternalSeedOverlay(image, detection);
+      // Evidence overlays deliberately omit camera-projection context: their
+      // purpose is to inspect the image-side seed and cornerSubPix result.
+      cv::Mat overlay = ati::BuildInternalSeedOverlay(
+          image, detection, false);
       if (overlay.empty()) {
         continue;
       }
@@ -906,7 +909,7 @@ void WriteInternalSeedStepOverlaysForRound(
                   1, cv::LINE_AA);
       cv::putText(
           overlay,
-          "orange=predicted, blue triangle=border seed, magenta diamond=sphere seed, green square=refined",
+          "blue triangle=border seed, magenta diamond=sphere seed, green square=cornerSubPix result",
           cv::Point(16, 190), cv::FONT_HERSHEY_SIMPLEX, 0.42,
           cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
 
@@ -989,8 +992,8 @@ void WriteInternalSeedStepOverlays(
   std::ofstream summary((overlay_root / "summary.txt").string().c_str());
   summary << "description: detect_apriltag_internal-style internal seed step overlays\n";
   summary << "rendered_overlay_count: " << rendered_count << "\n";
-  summary << "legend: orange=predicted, blue triangle=border seed, magenta diamond=sphere seed, green square=refined\n";
-  summary << "note: border curves and support points are drawn when the border boundary model is available.\n";
+  summary << "legend: blue triangle=border seed, magenta diamond=sphere seed, green square=cornerSubPix result\n";
+  summary << "note: camera projection and border curves are intentionally omitted.\n";
 }
 
 void DrawGeometryPriorSeedCandidate(
@@ -1197,7 +1200,9 @@ void WriteGeometryPriorOuterSeedDiagnostics(
       << "refined_to_predicted_area_ratio,"
       << "predicted_quad_topology_valid,refined_quad_topology_valid,"
       << "quad_topology_preserved,quad_topology_summary,"
-      << "local_corner_scale_px,subpix_window_radius,"
+      << "local_corner_scale_px,initial_subpix_window_radius,subpix_window_radius,"
+      << "subpix_expanded_retry_attempted,subpix_expanded_retry_used,"
+      << "expanded_subpix_window_radius,"
       << "spherical_refine_attempted,spherical_refine_success,"
       << "spherical_refine_successful_corner_count,"
       << "spherical_refine_max_displacement_px,"
@@ -1344,7 +1349,11 @@ void WriteGeometryPriorOuterSeedDiagnostics(
                 << (candidate.quad_topology_preserved ? 1 : 0) << ","
                 << CsvEscape(candidate.quad_topology_summary) << ","
                 << candidate.local_corner_scale_px << ","
+                << candidate.initial_subpix_window_radius << ","
                 << candidate.subpix_window_radius << ","
+                << (candidate.subpix_expanded_retry_attempted ? 1 : 0) << ","
+                << (candidate.subpix_expanded_retry_used ? 1 : 0) << ","
+                << candidate.expanded_subpix_window_radius << ","
                 << (candidate.spherical_refine_attempted ? 1 : 0) << ","
                 << (candidate.spherical_refine_success ? 1 : 0) << ","
                 << candidate.spherical_refine_successful_corner_count << ","
@@ -5292,6 +5301,9 @@ void WriteFrameBoardObservationFlowDiagnostics(
       << "subpix_unstable_rollback_detected,"
       << "subpix_unstable_rollback_iteration,"
       << "subpix_unstable_rollback_max_displacement,"
+      << "subpix_scale_probe_window_radius,"
+      << "subpix_scale_probe_endpoint_delta,"
+      << "subpix_scale_disagreement_detected,"
       << "close_edge_subpix_boost_applied,"
       << "close_edge_subpix_area_ratio,"
       << "close_edge_subpix_max_polar_deg,"
@@ -5342,6 +5354,9 @@ void WriteFrameBoardObservationFlowDiagnostics(
             << (debug.subpix_unstable_rollback_detected ? 1 : 0) << ","
             << debug.subpix_unstable_rollback_iteration << ","
             << debug.subpix_unstable_rollback_max_displacement << ","
+            << debug.subpix_scale_probe_window_radius << ","
+            << debug.subpix_scale_probe_endpoint_delta << ","
+            << (debug.subpix_scale_disagreement_detected ? 1 : 0) << ","
             << (debug.close_edge_subpix_boost_applied ? 1 : 0) << ","
             << debug.close_edge_subpix_area_ratio << ","
             << debug.close_edge_subpix_max_polar_deg << ","
@@ -6623,6 +6638,22 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.model_aware_max_remaining_information_gain << "\n";
   summary << "model_aware_seed_fisher_rank: "
           << result.model_aware_seed_fisher_rank << "\n";
+  summary << "model_aware_fisher_board_contribution_source: "
+          << "candidate_pool_pose_marginalized_frame_normalized\n";
+  summary << "model_aware_global_weakest_direction: ";
+  for (std::size_t index = 0;
+       index < result.model_aware_global_weakest_direction.size(); ++index) {
+    if (index > 0) {
+      summary << ";";
+    }
+    const std::string label =
+        index < result.model_aware_parameter_labels.size()
+            ? result.model_aware_parameter_labels[index]
+            : std::string("parameter_") + std::to_string(index);
+    summary << label << "="
+            << result.model_aware_global_weakest_direction[index];
+  }
+  summary << "\n";
   summary << "info_gain_proxy_mode: "
           << ati::ToString(result.info_gain_proxy_mode) << "\n";
   summary << "candidate_batch_granularity: "
@@ -6724,6 +6755,21 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
           << result.persistent_incremental_seed_board_observation_count << "\n";
   summary << "persistent_incremental_seed_point_count: "
           << result.persistent_incremental_seed_point_count << "\n";
+  summary << "persistent_incremental_progressive_seed_enabled: "
+          << (result.persistent_incremental_progressive_seed_enabled ? 1 : 0)
+          << "\n";
+  summary << "persistent_incremental_progressive_seed_source_frame_count: "
+          << result.persistent_incremental_progressive_seed_source_frame_count
+          << "\n";
+  summary << "persistent_incremental_progressive_seed_moved_frame_count: "
+          << result.persistent_incremental_progressive_seed_moved_frame_count
+          << "\n";
+  summary << "persistent_incremental_progressive_seed_anchor_frame_index: "
+          << result.persistent_incremental_progressive_seed_anchor_frame_index
+          << "\n";
+  summary << "persistent_incremental_progressive_seed_anchor_frame_label: "
+          << result.persistent_incremental_progressive_seed_anchor_frame_label
+          << "\n";
   summary << "persistent_incremental_seed_outer_only_residuals: "
           << (result.persistent_incremental_seed_outer_only_residuals ? 1 : 0)
           << "\n";
@@ -7091,6 +7137,56 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
   summary << "persistent_incremental_adaptive_saturation_stop_reason: "
           << result.persistent_incremental_adaptive_saturation_stop_reason
           << "\n";
+  summary << "persistent_incremental_training_robust_checkpoint_selection_enabled: "
+          << (result
+                      .persistent_incremental_training_robust_checkpoint_selection_enabled
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_incremental_square_pixel_focal_prior_enabled: "
+          << (result
+                      .persistent_incremental_square_pixel_focal_prior_enabled
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_incremental_training_robust_checkpoint_restored: "
+          << (result
+                      .persistent_incremental_training_robust_checkpoint_restored
+                  ? 1
+                  : 0)
+          << "\n";
+  summary << "persistent_incremental_training_robust_checkpoint_attempt_order: "
+          << result
+                 .persistent_incremental_training_robust_checkpoint_attempt_order
+          << "\n";
+  summary << "persistent_incremental_training_robust_checkpoint_accepted_batch_count: "
+          << result
+                 .persistent_incremental_training_robust_checkpoint_accepted_batch_count
+          << "\n";
+  summary << "persistent_incremental_training_robust_checkpoint_discarded_accepted_batch_count: "
+          << result
+                 .persistent_incremental_training_robust_checkpoint_discarded_accepted_batch_count
+          << "\n";
+  summary << "persistent_incremental_training_robust_checkpoint_frame_median_rmse: "
+          << result
+                 .persistent_incremental_training_robust_checkpoint_frame_median_rmse
+          << "\n";
+  summary << "persistent_incremental_training_robust_checkpoint_frame_p90_rmse: "
+          << result
+                 .persistent_incremental_training_robust_checkpoint_frame_p90_rmse
+          << "\n";
+  summary << "persistent_incremental_training_robust_checkpoint_huber15_rmse: "
+          << result
+                 .persistent_incremental_training_robust_checkpoint_huber15_rmse
+          << "\n";
+  summary << "persistent_incremental_training_robust_checkpoint_fold_median_mean_rmse: "
+          << result
+                 .persistent_incremental_training_robust_checkpoint_fold_median_mean_rmse
+          << "\n";
+  summary << "persistent_incremental_training_robust_checkpoint_fold_median_max_rmse: "
+          << result
+                 .persistent_incremental_training_robust_checkpoint_fold_median_max_rmse
+          << "\n";
   summary << "persistent_incremental_objective_decrease_gate_enabled: "
           << (result.selection_is_kalibr_checkerboard_style ? 1 : 0)
           << "\n";
@@ -7284,6 +7380,68 @@ void WriteTrialBackendFrameBoardSelectionDiagnostics(
   summary << "\nwarnings:\n";
   for (const std::string& warning : result.warnings) {
     summary << "  " << warning << "\n";
+  }
+
+  std::ofstream fisher_board_csv(
+      (output_dir / "model_aware_fisher_board_contributions.csv")
+          .string()
+          .c_str());
+  fisher_board_csv
+      << "board_id,frame_board_observation_count,contributing_frame_count,"
+      << "contributing_point_count,trace,logdet,weak_direction_info,"
+      << "weak_direction_fraction";
+  for (std::size_t index = 0;
+       index < result.model_aware_parameter_labels.size(); ++index) {
+    fisher_board_csv << ",diag_"
+                     << result.model_aware_parameter_labels[index];
+  }
+  for (std::size_t index = 0;
+       index < result.model_aware_parameter_labels.size(); ++index) {
+    fisher_board_csv << ",diag_fraction_"
+                     << result.model_aware_parameter_labels[index];
+  }
+  fisher_board_csv << "\n";
+  std::vector<double> diagonal_total(
+      result.model_aware_parameter_labels.size(), 0.0);
+  for (const ati::ModelAwareFisherBoardContribution& contribution :
+       result.model_aware_fisher_board_contributions) {
+    for (std::size_t index = 0;
+         index < contribution.diagonal_information.size() &&
+         index < diagonal_total.size(); ++index) {
+      diagonal_total[index] += contribution.diagonal_information[index];
+    }
+  }
+  for (const ati::ModelAwareFisherBoardContribution& contribution :
+       result.model_aware_fisher_board_contributions) {
+    fisher_board_csv
+        << contribution.board_id << ","
+        << contribution.frame_board_observation_count << ","
+        << contribution.contributing_frame_count << ","
+        << contribution.contributing_point_count << ","
+        << contribution.trace << ","
+        << contribution.logdet << ","
+        << contribution.weakest_direction_quadratic_contribution << ","
+        << contribution.weakest_direction_contribution_fraction;
+    for (std::size_t index = 0;
+         index < result.model_aware_parameter_labels.size(); ++index) {
+      const double value =
+          index < contribution.diagonal_information.size()
+              ? contribution.diagonal_information[index]
+              : 0.0;
+      fisher_board_csv << "," << value;
+    }
+    for (std::size_t index = 0;
+         index < result.model_aware_parameter_labels.size(); ++index) {
+      const double value =
+          index < contribution.diagonal_information.size()
+              ? contribution.diagonal_information[index]
+              : 0.0;
+      fisher_board_csv << ","
+                       << (diagonal_total[index] > 0.0
+                               ? value / diagonal_total[index]
+                               : 0.0);
+    }
+    fisher_board_csv << "\n";
   }
 
   std::ofstream csv(

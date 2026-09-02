@@ -51,6 +51,10 @@ constexpr int kOuterSubpixMaxIterations = 30;
 constexpr double kOuterSubpixEpsilon = 0.1;
 constexpr double kOuterSubpixNoMotionEpsilon = 1e-4;
 constexpr double kOuterSubpixRollbackProbeFraction = 0.5;
+// A close-edge boost is useful only when the same image structure remains the
+// optimum at the nominal scale. This normalized bound avoids a resolution-
+// dependent fixed-pixel rejection.
+constexpr double kOuterSubpixScaleDisagreementFraction = 0.35;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kOuterFixedScaleDivisors[] = {1.0, 1.5, 2.0, 2.5, 3.5, 4.5, 6.0, 8.0, 12.0};
 constexpr int kOuterLocalSpherePatchSize = 640;
@@ -92,54 +96,82 @@ struct RefinedCandidate {
 
 struct CornerSubpixResult {
   cv::Point2f refined_corner{};
+  int window_radius_used = 0;
   bool unstable_rollback_detected = false;
   int rollback_iteration = 0;
   double max_probe_displacement = 0.0;
+  int scale_probe_window_radius = 0;
+  double scale_probe_endpoint_delta = 0.0;
+  bool scale_disagreement_detected = false;
 };
 
 CornerSubpixResult RefineCornerSubpixWithRollbackCheck(
     const cv::Mat& gray,
     const cv::Point2f& seed,
     int radius,
-    bool check_unstable_rollback) {
+    bool check_unstable_rollback,
+    int consistency_probe_radius = 0) {
   CornerSubpixResult result;
   result.refined_corner = seed;
-  const cv::Size window(std::max(2, radius), std::max(2, radius));
+  if (gray.empty() || !std::isfinite(seed.x) || !std::isfinite(seed.y)) {
+    return result;
+  }
+  // cornerSubPix requires a symmetric window fully contained in the image.
+  // Do not manufacture pixels outside the sensor with reflective padding:
+  // for a corner near the border the reflected tag edge can become a false
+  // optimum and move the point tens of pixels toward the boundary.  Keep the
+  // largest symmetric window that the actual image can support instead.
+  const int requested_radius = std::max(2, radius);
+  const double left_support = static_cast<double>(seed.x);
+  const double top_support = static_cast<double>(seed.y);
+  const double right_support =
+      static_cast<double>(gray.cols - 1) - static_cast<double>(seed.x);
+  const double bottom_support =
+      static_cast<double>(gray.rows - 1) - static_cast<double>(seed.y);
+  const double available_support =
+      std::min({left_support, top_support, right_support, bottom_support});
+  const int supported_radius =
+      std::max(0, static_cast<int>(std::floor(available_support)) - 1);
+  const int effective_radius =
+      std::min(requested_radius, supported_radius);
+  result.window_radius_used = effective_radius;
+  if (effective_radius < 2 || !std::isfinite(available_support)) {
+    return result;
+  }
+  const cv::Size window(effective_radius, effective_radius);
   const cv::TermCriteria criteria(
       cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER,
       kOuterSubpixMaxIterations, kOuterSubpixEpsilon);
-  // cornerSubPix expects the full search window to be addressable.  A
-  // decoded tag corner can be genuinely visible while being closer to the
-  // image boundary than that window.  Reflective padding preserves the local
-  // gradient and lets the same OpenCV refinement run without changing the
-  // coordinates returned to the caller.
-  const int padding = std::max(2, radius + 2);
-  const bool needs_padding =
-      seed.x < padding || seed.x > static_cast<float>(gray.cols - 1 - padding) ||
-      seed.y < padding || seed.y > static_cast<float>(gray.rows - 1 - padding);
-  cv::Mat padded_gray;
-  const cv::Mat* refinement_image = &gray;
-  cv::Point2f refinement_seed = seed;
-  if (needs_padding) {
-    cv::copyMakeBorder(gray, padded_gray, padding, padding, padding, padding,
-                       cv::BORDER_REFLECT_101);
-    refinement_image = &padded_gray;
-    refinement_seed += cv::Point2f(static_cast<float>(padding),
-                                   static_cast<float>(padding));
-  }
-  auto ToOriginal = [padding, needs_padding](const cv::Point2f& point) {
-    return needs_padding
-               ? point - cv::Point2f(static_cast<float>(padding),
-                                    static_cast<float>(padding))
-               : point;
-  };
-  std::vector<cv::Point2f> final_point{refinement_seed};
-  cv::cornerSubPix(*refinement_image, final_point, window, cv::Size(-1, -1), criteria);
-  result.refined_corner = ToOriginal(final_point.front());
+  std::vector<cv::Point2f> final_point{seed};
+  cv::cornerSubPix(gray, final_point, window, cv::Size(-1, -1), criteria);
+  result.refined_corner = final_point.front();
   const auto point_distance = [](const cv::Point2f& lhs, const cv::Point2f& rhs) {
     return std::hypot(static_cast<double>(lhs.x - rhs.x),
                       static_cast<double>(lhs.y - rhs.y));
   };
+
+  // Compare the boosted close-edge solution with the nominal scale-derived
+  // window. This is an audit of image ambiguity, not a preference for either
+  // window size. When they disagree, a larger window cannot be assumed right.
+  if (consistency_probe_radius >= 2) {
+    const int probe_requested_radius = std::max(2, consistency_probe_radius);
+    const int probe_effective_radius =
+        std::min(probe_requested_radius, supported_radius);
+    result.scale_probe_window_radius = probe_effective_radius;
+    if (probe_effective_radius >= 2 && probe_effective_radius != effective_radius) {
+      std::vector<cv::Point2f> probe_point{seed};
+      cv::cornerSubPix(gray, probe_point,
+                       cv::Size(probe_effective_radius, probe_effective_radius),
+                       cv::Size(-1, -1), criteria);
+      result.scale_probe_endpoint_delta =
+          point_distance(result.refined_corner, probe_point.front());
+      const double disagreement_limit =
+          kOuterSubpixScaleDisagreementFraction *
+          static_cast<double>(std::max(effective_radius, probe_effective_radius));
+      result.scale_disagreement_detected =
+          result.scale_probe_endpoint_delta > disagreement_limit;
+    }
+  }
 
   // OpenCV restores the original seed when its final iterate leaves the
   // search window. Its API does not expose that status. Probe only the
@@ -152,16 +184,17 @@ CornerSubpixResult RefineCornerSubpixWithRollbackCheck(
 
   bool saw_large_excursion = false;
   for (int iteration = 1; iteration <= kOuterSubpixMaxIterations; ++iteration) {
-    std::vector<cv::Point2f> probe_point{refinement_seed};
+    std::vector<cv::Point2f> probe_point{seed};
     const cv::TermCriteria probe_criteria(
         cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER,
         iteration, kOuterSubpixEpsilon);
-    cv::cornerSubPix(*refinement_image, probe_point, window, cv::Size(-1, -1), probe_criteria);
-    const double displacement = point_distance(ToOriginal(probe_point.front()), seed);
+    cv::cornerSubPix(gray, probe_point, window, cv::Size(-1, -1), probe_criteria);
+    const double displacement = point_distance(probe_point.front(), seed);
     result.max_probe_displacement = std::max(result.max_probe_displacement, displacement);
     saw_large_excursion =
         saw_large_excursion ||
-        displacement > kOuterSubpixRollbackProbeFraction * static_cast<double>(radius);
+        displacement > kOuterSubpixRollbackProbeFraction *
+                           static_cast<double>(effective_radius);
     if (iteration > 1 && saw_large_excursion &&
         displacement <= kOuterSubpixNoMotionEpsilon) {
       result.unstable_rollback_detected = true;
@@ -2956,10 +2989,11 @@ bool RefineCameraAwareRescuedOuterCorners(
 
     const CornerSubpixResult subpix_result = RefineCornerSubpixWithRollbackCheck(
         gray, seed, debug.subpix_window_radius, boost_info.boost);
+    debug.subpix_window_radius = subpix_result.window_radius_used;
     const cv::Point2f refined = subpix_result.refined_corner;
     (*refined_corners)[static_cast<std::size_t>(index)] = refined;
     debug.subpix_corner = refined;
-    debug.subpix_applied = true;
+    debug.subpix_applied = subpix_result.window_radius_used >= 2;
     debug.subpix_unstable_rollback_detected =
         subpix_result.unstable_rollback_detected;
     debug.subpix_unstable_rollback_iteration =
@@ -2978,7 +3012,7 @@ bool RefineCameraAwareRescuedOuterCorners(
                    refined.x <= static_cast<float>(gray.cols) - config.min_border_distance &&
                    refined.y >= config.min_border_distance &&
                    refined.y <= static_cast<float>(gray.rows) - config.min_border_distance);
-    debug.refined_valid = refined_inside &&
+    debug.refined_valid = debug.subpix_applied && refined_inside &&
                           !subpix_result.unstable_rollback_detected;
     debug.verification_passed = debug.refined_valid;
     if (debug.refined_valid && debug.subpix_applied) {
@@ -3707,22 +3741,41 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
           refined_candidate.refined_original[static_cast<std::size_t>(index)];
       const int subpix_radius =
           debug_before_subpix.subpix_window_radius;
+      const int consistency_probe_radius =
+          debug_before_subpix.close_edge_subpix_boost_applied
+              ? debug_before_subpix.pre_boost_subpix_window_radius
+              : 0;
       const CornerSubpixResult subpix_result =
           RefineCornerSubpixWithRollbackCheck(
               gray_original, point_seed, subpix_radius,
-              debug_before_subpix.close_edge_subpix_boost_applied);
+              debug_before_subpix.close_edge_subpix_boost_applied,
+              consistency_probe_radius);
+      debug_before_subpix.subpix_window_radius =
+          subpix_result.window_radius_used;
       const cv::Point2f accepted_subpix = subpix_result.refined_corner;
       refined_candidate.refined_original[static_cast<std::size_t>(index)] = accepted_subpix;
       OuterCornerVerificationDebugInfo& debug_after_subpix =
           refined_candidate.verification_debug[static_cast<std::size_t>(index)];
       debug_after_subpix.subpix_corner = accepted_subpix;
-      debug_after_subpix.subpix_applied = true;
+      debug_after_subpix.subpix_applied =
+          subpix_result.window_radius_used >= 2;
       debug_after_subpix.subpix_unstable_rollback_detected =
           subpix_result.unstable_rollback_detected;
       debug_after_subpix.subpix_unstable_rollback_iteration =
           subpix_result.rollback_iteration;
       debug_after_subpix.subpix_unstable_rollback_max_displacement =
           subpix_result.max_probe_displacement;
+      debug_after_subpix.subpix_scale_probe_window_radius =
+          subpix_result.scale_probe_window_radius;
+      debug_after_subpix.subpix_scale_probe_endpoint_delta =
+          subpix_result.scale_probe_endpoint_delta;
+      debug_after_subpix.subpix_scale_disagreement_detected =
+          subpix_result.scale_disagreement_detected;
+      if (!debug_after_subpix.subpix_applied) {
+        method_valid[static_cast<std::size_t>(index)] = false;
+        debug_after_subpix.failure_reason =
+            "subpix_window_insufficient_for_image_border";
+      }
     }
   }
 
@@ -3770,6 +3823,14 @@ RefinedCandidate RefineCoarseCandidate(const cv::Mat& gray_original,
              << debug.subpix_unstable_rollback_max_displacement
              << ":radius=" << debug.subpix_window_radius;
       debug.failure_reason = stream.str();
+    } else if (refined_valid && debug.subpix_scale_disagreement_detected) {
+      // A window-scale disagreement alone is not enough to discard a board:
+      // a large, distorted tag can have two finite subpixel basins while its
+      // complete Outer4 quad still fits the active camera model accurately.
+      // Preserve the observation and carry this diagnostic to selection,
+      // where it is combined with an independent Outer4 pose-fit check.
+      // This avoids resolution-specific pixel cutoffs and prevents valid
+      // close-range boards from being rejected solely by a probe window.
     } else if (refined_valid &&
         debug.close_edge_subpix_boost_applied &&
         debug.subpix_applied) {

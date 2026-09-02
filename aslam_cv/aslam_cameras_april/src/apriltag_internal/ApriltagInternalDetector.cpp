@@ -5585,6 +5585,13 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
     }
   }
 
+  if (options_.outer4_only) {
+    result.internal_camera_source = "not_requested_outer4_only";
+    result.success = result.valid_corner_count >= 4;
+    result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
+    return result;
+  }
+
   if (board_config.internal_projection_mode == InternalProjectionMode::Homography ||
       board_config.internal_projection_mode ==
           InternalProjectionMode::PinholeBootstrapPatch) {

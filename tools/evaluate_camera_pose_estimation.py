@@ -10,9 +10,11 @@ board and projecting all other visible boards.
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -85,6 +87,32 @@ def camera_from_summary(summary: Dict[str, str], label: str, prefix: str) -> Cam
     return Camera(label=label, family=family, intrinsics=intrinsics, distortion=distortion)
 
 
+def camera_from_yaml(path: Path, label: str) -> Camera:
+    """Read the narrow, canonical cam0 YAML subset used by this evaluator."""
+    text = path.read_text(encoding="utf-8")
+
+    def scalar(name: str) -> str:
+        match = re.search(rf"^\s*{re.escape(name)}:\s*(\S+)\s*$", text, re.MULTILINE)
+        if not match:
+            raise ValueError(f"{path}: missing {name!r}")
+        return match.group(1)
+
+    def values(name: str) -> List[float]:
+        match = re.search(rf"^\s*{re.escape(name)}:\s*(\[[^\n]+\])\s*$", text, re.MULTILINE)
+        if not match:
+            raise ValueError(f"{path}: missing {name!r} list")
+        parsed = ast.literal_eval(match.group(1))
+        return [float(value) for value in parsed]
+
+    if scalar("camera_model") != "pinhole" or scalar("distortion_model") != "equidistant":
+        raise ValueError(f"{path}: only pinhole/equidistant KB YAMLs are supported")
+    intrinsics = values("intrinsics")
+    distortion = values("distortion_coeffs")
+    if len(intrinsics) != 4 or len(distortion) != 4:
+        raise ValueError(f"{path}: expected four intrinsics and four KB coefficients")
+    return Camera(label=label, family="pinhole-equi", intrinsics=intrinsics, distortion=distortion)
+
+
 def load_board_layout(path: Path) -> Dict[int, np.ndarray]:
     boards: Dict[int, np.ndarray] = {}
     with path.open("r", newline="") as f:
@@ -119,6 +147,8 @@ def load_points(path: Path, method: str, boards: Dict[int, np.ndarray]) -> Dict[
         reader = csv.DictReader(f)
         for row in reader:
             if row.get("method", method) != method:
+                continue
+            if row.get("evaluation_included", "1") not in ("1", "true", "True"):
                 continue
             board_id = int(row["board_id"])
             if board_id not in boards:
@@ -191,36 +221,50 @@ def residual_vector(points_ref: np.ndarray, observed: np.ndarray, params: np.nda
     return residual.reshape(-1), failures
 
 
-def initial_pose(points_ref: np.ndarray, observed: np.ndarray, camera: Camera) -> Optional[np.ndarray]:
+def initial_pose_candidates(points_ref: np.ndarray, observed: np.ndarray, camera: Camera) -> List[np.ndarray]:
     if points_ref.shape[0] < 4:
-        return None
+        return []
     fu, fv, cu, cv = camera.intrinsics
     K = np.array([[fu, 0.0, cu], [0.0, fv, cv], [0.0, 0.0, 1.0]], dtype=np.float64)
-    flags = cv2.SOLVEPNP_ITERATIVE
+    points = points_ref.astype(np.float64)
+    image_points = observed.astype(np.float64)
+    distortion = np.zeros((4, 1), dtype=np.float64)
+    candidates: List[np.ndarray] = []
+
+    def append(rvec: np.ndarray, tvec: np.ndarray) -> None:
+        pose = np.concatenate([rvec.reshape(3), tvec.reshape(3)]).astype(np.float64)
+        if np.isfinite(pose).all() and not any(np.linalg.norm(pose - old) < 1e-8 for old in candidates):
+            candidates.append(pose)
+
+    # A planar square has two IPPE solutions. Keep both and let the real KB
+    # projection residual choose, just as the C++ Outer4 pose path does.
+    for flag in (cv2.SOLVEPNP_IPPE, cv2.SOLVEPNP_SQPNP):
+        try:
+            result = cv2.solvePnPGeneric(points, image_points, K, distortion, flags=flag)
+        except cv2.error:
+            continue
+        if result and bool(result[0]):
+            for rvec, tvec in zip(result[1], result[2]):
+                append(rvec, tvec)
     try:
         ok, rvec, tvec = cv2.solvePnP(
-            points_ref.astype(np.float64),
-            observed.astype(np.float64),
-            K,
-            np.zeros((4, 1), dtype=np.float64),
-            flags=flags,
+            points, image_points, K, distortion, flags=cv2.SOLVEPNP_ITERATIVE
         )
+        if ok:
+            append(rvec, tvec)
     except cv2.error:
-        return None
-    if not ok:
-        return None
-    return np.concatenate([rvec.reshape(3), tvec.reshape(3)]).astype(np.float64)
+        pass
+    return candidates
 
 
-def optimize_pose(
+def optimize_pose_from_initial(
     points_ref: np.ndarray,
     observed: np.ndarray,
     camera: Camera,
+    params: np.ndarray,
     max_iterations: int = 50,
 ) -> PoseFit:
-    params = initial_pose(points_ref, observed, camera)
-    if params is None:
-        return PoseFit(False, None, np.array([], dtype=np.float64), 0, 0, "solvePnP_failed")
+    params = params.copy()
     damping = 1e-3
     last_r, last_failures = residual_vector(points_ref, observed, params, camera)
     last_cost = float(last_r @ last_r)
@@ -268,6 +312,31 @@ def optimize_pose(
     return PoseFit(success, params, err, int((~valid).sum()), iterations)
 
 
+def optimize_pose(
+    points_ref: np.ndarray,
+    observed: np.ndarray,
+    camera: Camera,
+    max_iterations: int = 50,
+) -> PoseFit:
+    candidates = initial_pose_candidates(points_ref, observed, camera)
+    if not candidates:
+        return PoseFit(False, None, np.array([], dtype=np.float64), 0, 0, "solvePnP_failed")
+    fits = [
+        optimize_pose_from_initial(points_ref, observed, camera, candidate, max_iterations)
+        for candidate in candidates
+    ]
+    valid_fits = [fit for fit in fits if fit.success and fit.errors.size]
+    if not valid_fits:
+        return PoseFit(False, None, np.array([], dtype=np.float64), 0, 0, "all_pose_hypotheses_failed")
+    return min(
+        valid_fits,
+        key=lambda fit: (
+            fit.projection_failures,
+            float(np.nansum(fit.errors * fit.errors)),
+        ),
+    )
+
+
 def stats(errors: Sequence[float], thresholds: Sequence[float]) -> Dict[str, float]:
     arr = np.asarray([e for e in errors if np.isfinite(e)], dtype=np.float64)
     out: Dict[str, float] = {
@@ -275,6 +344,7 @@ def stats(errors: Sequence[float], thresholds: Sequence[float]) -> Dict[str, flo
         "rmse": float("nan"),
         "mean": float("nan"),
         "median": float("nan"),
+        "p95": float("nan"),
     }
     for tau in thresholds:
         out[f"inlier_ratio_{tau:g}px"] = float("nan")
@@ -284,6 +354,7 @@ def stats(errors: Sequence[float], thresholds: Sequence[float]) -> Dict[str, flo
     out["rmse"] = float(math.sqrt(float(np.mean(arr * arr))))
     out["mean"] = float(np.mean(arr))
     out["median"] = float(np.median(arr))
+    out["p95"] = float(np.percentile(arr, 95.0))
     for tau in thresholds:
         ratio = float(np.mean(arr < tau))
         out[f"inlier_ratio_{tau:g}px"] = ratio
@@ -408,6 +479,101 @@ def evaluate_camera(
     return summary, per_frame_rows
 
 
+def evaluate_camera_per_frame_board_outer_pose(
+    camera: Camera,
+    frames: Dict[int, List[PointObs]],
+    thresholds: Sequence[float],
+) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
+    """Match the Stage5 holdout protocol: Outer4 pose fit, all-point scoring."""
+    all_errors: List[float] = []
+    outer_errors: List[float] = []
+    internal_errors: List[float] = []
+    per_observation_rows: List[Dict[str, object]] = []
+    pose_success = 0
+    pose_attempt = 0
+    projection_failures = 0
+
+    observations = [
+        (frame_index, board_id, [point for point in points if point.board_id == board_id])
+        for frame_index, points in sorted(frames.items())
+        for board_id in sorted({point.board_id for point in points})
+    ]
+    for frame_index, board_id, points in observations:
+        outer = [point for point in points if point.point_type == "outer"]
+        pose_attempt += 1
+        fit = PoseFit(False, None, np.array([], dtype=np.float64), 0, 0, "fewer_than_four_outer_points")
+        if len(outer) >= 4:
+            outer_xyz = np.vstack([point.p_board for point in outer]).astype(np.float64)
+            outer_uv = np.vstack([point.observed for point in outer]).astype(np.float64)
+            fit = optimize_pose(outer_xyz, outer_uv, camera)
+        if fit.success and fit.params is not None:
+            pose_success += 1
+            xyz = np.vstack([point.p_board for point in points]).astype(np.float64)
+            observed = np.vstack([point.observed for point in points]).astype(np.float64)
+            projected, valid = project_kb(xyz, fit.params, camera)
+            errors = np.linalg.norm(projected - observed, axis=1)
+            errors[~valid] = np.nan
+            projection_failures += int((~valid).sum())
+            all_errors.extend(float(error) for error in errors if np.isfinite(error))
+            outer_errors.extend(
+                float(error)
+                for point, error in zip(points, errors)
+                if point.point_type == "outer" and np.isfinite(error)
+            )
+            internal_errors.extend(
+                float(error)
+                for point, error in zip(points, errors)
+                if point.point_type != "outer" and np.isfinite(error)
+            )
+            row_stats = stats([float(error) for error in errors if np.isfinite(error)], thresholds)
+        else:
+            row_stats = stats([], thresholds)
+        row: Dict[str, object] = {
+            "method": camera.label,
+            "frame_index": frame_index,
+            "frame_label": points[0].frame_label if points else "",
+            "board_id": board_id,
+            "point_count": len(points),
+            "outer_point_count": len(outer),
+            "pose_success": int(fit.success),
+            "pose_iterations": fit.iterations,
+            "rmse": row_stats["rmse"],
+            "p95": row_stats["p95"],
+            "projection_failure_count": fit.projection_failures,
+            "failure_reason": fit.failure_reason,
+        }
+        for tau in thresholds:
+            row[f"inl_{tau:g}px_percent"] = row_stats[f"inl_{tau:g}px_percent"]
+        per_observation_rows.append(row)
+
+    all_stats = stats(all_errors, thresholds)
+    outer_stats = stats(outer_errors, thresholds)
+    internal_stats = stats(internal_errors, thresholds)
+    summary: Dict[str, object] = {
+        "method": camera.label,
+        "camera_model_family": camera.family,
+        "camera_intrinsics": camera.intrinsics,
+        "camera_distortion": camera.distortion,
+        "pose_scope": "per_frame_board_outer4_refit",
+        "frame_board_observation_count": len(observations),
+        "pose_success_count": pose_success,
+        "pose_attempt_count": pose_attempt,
+        "pose_success_rate": pose_success / pose_attempt if pose_attempt else float("nan"),
+        "point_count": all_stats["point_count"],
+        "rmse": all_stats["rmse"],
+        "p95": all_stats["p95"],
+        "outer_point_count": outer_stats["point_count"],
+        "outer_rmse": outer_stats["rmse"],
+        "internal_point_count": internal_stats["point_count"],
+        "internal_rmse": internal_stats["rmse"],
+        "projection_failure_count": projection_failures,
+    }
+    for tau in thresholds:
+        summary[f"inlier_ratio_{tau:g}px"] = all_stats[f"inlier_ratio_{tau:g}px"]
+        summary[f"inl_{tau:g}px_percent"] = all_stats[f"inl_{tau:g}px_percent"]
+    return summary, per_observation_rows
+
+
 def write_csv(path: Path, rows: Iterable[Dict[str, object]]) -> None:
     rows = list(rows)
     if not rows:
@@ -432,8 +598,21 @@ def main() -> int:
     parser.add_argument("--summary", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--methods", default="ours,kalibr")
+    parser.add_argument(
+        "--camera-yaml",
+        action="append",
+        default=[],
+        metavar="LABEL:PATH",
+        help="Evaluate an explicit canonical KB YAML; may be repeated.",
+    )
     parser.add_argument("--point-method", default="ours")
     parser.add_argument("--inlier-thresholds", default="1.5,3")
+    parser.add_argument(
+        "--pose-scope",
+        choices=("per_frame_layout", "per_frame_board_outer4"),
+        default="per_frame_layout",
+        help="Use per-frame board layout fitting (legacy) or Stage5-style Outer4 board-pose refits.",
+    )
     args = parser.parse_args()
 
     run_dir = args.run_dir.resolve()
@@ -453,13 +632,27 @@ def main() -> int:
         "tartancalib_kb": "reference_tartancalib_kb",
     }
     requested_methods = [m.strip() for m in args.methods.split(",") if m.strip()]
+    explicit_cameras: List[Camera] = []
+    for spec in args.camera_yaml:
+        if ":" not in spec:
+            raise ValueError(f"--camera-yaml must be LABEL:PATH, got {spec!r}")
+        label, raw_path = spec.split(":", 1)
+        if not label or not raw_path:
+            raise ValueError(f"--camera-yaml must be LABEL:PATH, got {spec!r}")
+        explicit_cameras.append(camera_from_yaml(Path(raw_path).resolve(), label))
     summaries: List[Dict[str, object]] = []
     all_per_frame: List[Dict[str, object]] = []
-    for method in requested_methods:
-        if method not in method_prefixes:
-            raise ValueError(f"Unknown method {method!r}; known={sorted(method_prefixes)}")
-        camera = camera_from_summary(summary_kv, method, method_prefixes[method])
-        method_summary, per_frame = evaluate_camera(camera, frames, thresholds)
+    cameras: List[Camera] = explicit_cameras
+    if not cameras:
+        for method in requested_methods:
+            if method not in method_prefixes:
+                raise ValueError(f"Unknown method {method!r}; known={sorted(method_prefixes)}")
+            cameras.append(camera_from_summary(summary_kv, method, method_prefixes[method]))
+    for camera in cameras:
+        if args.pose_scope == "per_frame_board_outer4":
+            method_summary, per_frame = evaluate_camera_per_frame_board_outer_pose(camera, frames, thresholds)
+        else:
+            method_summary, per_frame = evaluate_camera(camera, frames, thresholds)
         summaries.append(method_summary)
         all_per_frame.extend(per_frame)
 
@@ -470,6 +663,7 @@ def main() -> int:
         "board_layout_optimized": 0,
         "frame_pose_optimized": 1,
         "camera_model": "pinhole-equi / KB",
+        "pose_scope": args.pose_scope,
         "run_dir": str(run_dir),
         "points_csv": str(points_csv),
         "point_method_source": args.point_method,

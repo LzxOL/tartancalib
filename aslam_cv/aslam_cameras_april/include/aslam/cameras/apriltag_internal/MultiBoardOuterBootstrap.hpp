@@ -2,10 +2,12 @@
 #define ASLAM_CAMERAS_APRILTAG_INTERNAL_MULTI_BOARD_OUTER_BOOTSTRAP_HPP
 
 #include <array>
+#include <map>
 #include <string>
 #include <vector>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <opencv2/core.hpp>
 
 #include <aslam/cameras/apriltag_internal/ApriltagCanonicalModel.hpp>
@@ -14,6 +16,16 @@
 namespace aslam {
 namespace cameras {
 namespace apriltag_internal {
+
+// A measured rigid target layout. The reference board must be present with
+// identity transform. This type is intentionally independent of a camera
+// model so it can be used by initialization, bootstrap, and later BA.
+using FixedBoardLayout = std::map<int, Eigen::Isometry3d>;
+
+bool LoadFixedBoardLayoutCsv(const std::string& path,
+                             int reference_board_id,
+                             FixedBoardLayout* layout,
+                             std::string* failure_reason);
 
 struct OuterBootstrapCameraIntrinsics {
   std::string camera_model = "ds";
@@ -61,6 +73,14 @@ struct OuterBootstrapOptions {
   double convergence_threshold = 1e-3;
   double min_detection_quality = 0.0;
   bool optimize_intrinsics = true;
+  // Explicit model-aware opt-in.  Estimate each reference-to-board transform
+  // from its geometrically consistent observation cluster before refinement.
+  // The historical weighted-average path remains the default.
+  bool robust_board_layout_consensus = false;
+  // Explicit opt-in only. When supplied, bootstrap estimates frame poses and
+  // camera intrinsics against this measured rig but never updates board poses.
+  FixedBoardLayout fixed_board_layout;
+  std::string fixed_board_layout_source;
 };
 
 struct OuterBootstrapFrameInput {

@@ -240,6 +240,11 @@ struct AutoCameraInitializationResult {
   bool used_explicit_initial_camera = false;
   bool used_manual_generic_seed = false;
   bool selected_candidate_refined = false;
+  int stage5_init_shared_focal_requested = 0;
+  int stage5_init_shared_focal_effective = 0;
+  int stage5_init_shared_focal_released_after_initialization = 0;
+  double stage5_init_selected_fu_minus_fv =
+      std::numeric_limits<double>::quiet_NaN();
   AutoCameraInitializationRefineMode refine_mode =
       AutoCameraInitializationRefineMode::KalibrOuterLm;
   int lm_frame_count = 0;
@@ -525,6 +530,13 @@ struct AutoCameraInitializationOptions {
       AutoCameraInitializationRefineMode::KalibrOuterLm;
   AutoCameraInitializationSelectionScorer selection_scorer =
       AutoCameraInitializationSelectionScorer::PoseMarginalizedPrincipal;
+  // Optimize one shared focal degree of freedom during outer-only LM. The
+  // normal model-specific fu/fv parameters are released after initialization.
+  bool shared_focal_during_outer_lm = false;
+  // Optional measured rig geometry. Unlike the diagnostic layout, this is
+  // authoritative and is used to score camera basins with one pose per frame.
+  FixedBoardLayout fixed_board_layout;
+  std::string fixed_board_layout_source;
   bool use_explicit_initial_camera = false;
   OuterBootstrapCameraIntrinsics explicit_initial_camera;
   std::string explicit_initial_camera_source_label = "explicit_initial_camera";

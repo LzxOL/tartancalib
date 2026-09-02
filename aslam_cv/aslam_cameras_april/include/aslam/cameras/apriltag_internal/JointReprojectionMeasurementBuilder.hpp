@@ -51,9 +51,10 @@ struct JointMeasurementBuildOptions {
   // deletion pass. The detector-level validity and topology checks remain
   // active; this only removes a duplicated, model-mismatch-prone hard gate.
   bool robust_missing_board_recovery = false;
-  // Keep the robust recovery path permissive for ordinary model mismatch, but
-  // reject isolated identity jumps that are far outside the residual
-  // distribution of the same board observation.
+  // In robust recovery, validate every internal point against the local pose
+  // fitted from the independently observed Outer4.  This is an absolute
+  // gross-error gate so a coherently shifted internal lattice cannot pass by
+  // having a small within-lattice spread.
   bool filter_gross_internal_topology_outliers = true;
   double gross_internal_topology_min_reproj_error_px = 8.0;
   double gross_internal_topology_sigma_threshold = 8.0;
@@ -135,6 +136,12 @@ struct JointPointObservation {
 
 struct JointBoardObservation {
   int board_id = -1;
+  bool geometry_prior_rescue_used = false;
+  // A close-edge corner moved to materially different image locations when
+  // evaluated at the nominal and boosted scale-derived subpixel windows.
+  // This remains diagnostic until the actual camera-model pose fit confirms
+  // that the complete outer quad is also inconsistent.
+  bool outer_subpix_scale_disagreement_detected = false;
   bool frame_bootstrap_initialized = false;
   bool board_bootstrap_initialized = false;
   bool reference_connected = false;

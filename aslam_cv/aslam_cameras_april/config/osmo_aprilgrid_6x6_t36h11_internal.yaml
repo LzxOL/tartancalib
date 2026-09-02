@@ -1,0 +1,38 @@
+# OSMO AprilGrid 6x6 frontend configuration for native 5248x3936 captures.
+# This file is for corner detection/visualization only; it does not change
+# any Stage5 baseline configuration.
+target_type: apriltag_internal
+tagFamily: t36h11
+tagIds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
+tagSize: 0.0352
+tagSpacing: 0.3
+blackBorderBits: 2
+minVisiblePoints: 4
+canonical_pixels_per_module: 24
+refinement_window_radius: 0
+internal_subpix_window_scale: 0.5
+internal_subpix_window_min: 4
+internal_subpix_window_max: 0
+max_subpix_displacement2: 0.0
+internal_subpix_displacement_scale: 0.25
+max_internal_subpix_displacement: 6.0
+enable_debug_output: true
+internal_projection_mode: sphere_border_lattice
+camera_initialization_mode: auto
+resolution: [5248, 3936]
+
+min_border_distance: 0.0
+outer_local_context_scale: 0.05
+enable_outer_spherical_refinement: false
+do_outer_subpix_refinement: true
+outer_subpix_scale: 0.3
+enable_close_edge_outer_subpix_boost: true
+close_edge_outer_subpix_area_ratio: 0.012
+close_edge_outer_subpix_min_polar_deg: 40.0
+close_edge_outer_subpix_full_polar_deg: 78.0
+close_edge_outer_subpix_border_ratio: 0.25
+close_edge_outer_subpix_multiplier: 1.45
+close_edge_outer_subpix_max_multiplier: 2.35
+outer_refine_gate_scale: 0.025
+outer_refine_gate_min: 6.0
+enable_anonymous_tag_like_geometry_rescue: false

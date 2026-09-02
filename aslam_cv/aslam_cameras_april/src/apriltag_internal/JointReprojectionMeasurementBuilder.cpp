@@ -832,19 +832,15 @@ void FilterInternalPointsByReprojectionError(
   const bool use_quality_residual_adaptive =
       options.filter_internal_corner_mode == "quality_residual_adaptive";
   if (gross_topology_only) {
-    const double median_residual = Quantile(residual_norms, 0.5);
-    std::vector<double> absolute_deviations;
-    absolute_deviations.reserve(residual_norms.size());
-    for (double residual : residual_norms) {
-      absolute_deviations.push_back(std::abs(residual - median_residual));
-    }
-    const double robust_sigma =
-        1.4826 * Quantile(absolute_deviations, 0.5);
-    const double robust_scale = std::max(0.25, robust_sigma);
-    effective_threshold = std::max(
-        options.gross_internal_topology_min_reproj_error_px,
-        median_residual +
-            options.gross_internal_topology_sigma_threshold * robust_scale);
+    // Robust recovery intentionally keeps the normal detector path alive,
+    // but a coherent wrong lattice cannot be found by comparing internal
+    // points with one another: all of its residuals can move together.  The
+    // independently observed Outer4 already supplied a local pose, so use
+    // the existing gross-error threshold as an absolute validation gate.
+    // This only rejects an internal observation; it never changes the outer
+    // measurement or uses an outer-plane mapping to generate inner points.
+    effective_threshold =
+        options.gross_internal_topology_min_reproj_error_px;
   } else if (options.filter_internal_corner_mode == "local_residual_cap" &&
       has_absolute_cap) {
     effective_threshold = options.filter_internal_corner_max_reproj_error;
@@ -1100,6 +1096,9 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
       const RegeneratedBoardMeasurement* regenerated_measurement =
           FindRegeneratedBoardMeasurement(frame_input, board_id,
                                           &regenerated_measurement_index);
+      board_observation.geometry_prior_rescue_used =
+          regenerated_measurement != nullptr &&
+          regenerated_measurement->detection.geometry_prior_rescue_used;
       OuterBoardMeasurement regenerated_rescued_outer_measurement;
       if (options_.use_regenerated_rescued_outer_measurements &&
           regenerated_measurement != nullptr &&
@@ -1111,6 +1110,14 @@ JointMeasurementBuildResult JointReprojectionMeasurementBuilder::Build(
                 regenerated_measurement->detection.outer_detection);
         outer_measurement = &regenerated_rescued_outer_measurement;
         outer_measurement_index = regenerated_measurement_index;
+      }
+      if (outer_measurement != nullptr) {
+        for (const OuterCornerVerificationDebugInfo& debug :
+             outer_measurement->corner_verification_debug) {
+          board_observation.outer_subpix_scale_disagreement_detected =
+              board_observation.outer_subpix_scale_disagreement_detected ||
+              debug.subpix_scale_disagreement_detected;
+        }
       }
       // A board observation is only geometrically usable when all four
       // outer corners have passed refinement.  This must apply to direct

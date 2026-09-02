@@ -91,6 +91,10 @@ struct CalibrationEvaluationDataset {
   int outer_point_count = 0;
   int internal_point_count = 0;
   int total_point_count = 0;
+  // External self-frontend holdout metrics exclude board observations whose
+  // outer quad was recovered after direct detection failed. Keep the count in
+  // the dataset so the reported metric scope is explicit and auditable.
+  int geometry_prior_rescued_board_exclusion_count = 0;
   int camera_aware_outer_rescue_attempted_board_count = 0;
   int camera_aware_outer_rescue_used_board_count = 0;
   bool uniform_control_point_mode = false;
@@ -401,13 +405,36 @@ struct TrialBackendFrameBoardSelectionOptions {
   int intrinsics_release_iteration = 1;
   bool persistent_intrinsics_anchor_prior_enabled = false;
   bool persistent_fix_board_layout = false;
+  // Persistent BA's total internal-point share for mixed Outer4/internal
+  // observations. The default retains the historical balanced objective.
+  // Supplemental single-board frames are valid only against an established
+  // layout, so no trial or persistent update may move board poses.
+  bool freeze_board_layout_for_non_reference_frames = false;
   // Experimental model-aware coreset: use the active camera family's full
   // parameter vector and independent frame-board pose-marginalized Fisher
   // information for frame-level ordering/acceptance diagnostics.
   bool model_aware_information_coreset = false;
+  // Experimental Kalibr-style startup: initialize the persistent estimator
+  // from one stable reference-connected frame, then admit the remaining
+  // selected seed frames through the normal incremental gates.
+  bool model_aware_progressive_seed = false;
+  // Optional startup-failure fallback. It aligns the seed's shared rigid
+  // layout with Outer4 while keeping the initialized camera fixed.
+  bool model_aware_seed_layout_alignment = false;
+  // DS-only diagnostic: stabilize the camera on the selected seed with one
+  // temporary frame-board pose per observation before fixed-layout BA.
+  // Disabled by default so baseline behavior is unchanged.
+  bool model_aware_ds_independent_seed_camera_stabilization = false;
+  // Experimental ablation switch. When enabled, stabilize each model-aware
+  // candidate's frame poses before its joint camera trial.
+  bool model_aware_candidate_pose_prefit = true;
   double persistent_intrinsics_anchor_weight_xi_alpha = 0.0;
   double persistent_intrinsics_anchor_weight_focal = 0.0;
   double persistent_intrinsics_anchor_weight_principal = 0.0;
+  double persistent_internal_role_budget_when_mixed = 0.5;
+  bool persistent_uniform_control_point_weighting = false;
+  bool persistent_training_robust_checkpoint_selection = false;
+  bool persistent_square_pixel_focal_prior = false;
   double persistent_max_focal_relative_step = 0.0;
   double persistent_max_principal_step_px = 0.0;
   double persistent_max_xi_alpha_step = 0.0;
@@ -684,6 +711,22 @@ struct TrialBackendOptimizationDiagnostics {
   std::string failure_reason;
 };
 
+// Diagnostic-only decomposition of the same pose-marginalized, frame-normalized
+// Fisher matrix used by the model-aware coreset.  These rows are never read by
+// selection or backend optimization; they make the camera-parameter coverage
+// of a multi-board training set auditable after a run.
+struct ModelAwareFisherBoardContribution {
+  int board_id = -1;
+  int frame_board_observation_count = 0;
+  int contributing_frame_count = 0;
+  int contributing_point_count = 0;
+  double trace = 0.0;
+  double logdet = 0.0;
+  double weakest_direction_quadratic_contribution = 0.0;
+  double weakest_direction_contribution_fraction = 0.0;
+  std::vector<double> diagonal_information;
+};
+
 struct TrialBackendFrameBoardSelectionResult {
   bool enabled = false;
   bool success = false;
@@ -754,12 +797,16 @@ struct TrialBackendFrameBoardSelectionResult {
   double acceptance_information_gain_threshold = 0.0;
   double acceptance_rank_gain_threshold = 0.0;
   bool model_aware_information_coreset_enabled = false;
+  bool model_aware_progressive_seed_enabled = false;
   int model_aware_parameter_dimension = 0;
   std::vector<std::string> model_aware_parameter_labels;
   int model_aware_frame_count_scanned = 0;
   int model_aware_frame_count_accepted = 0;
   double model_aware_max_remaining_information_gain = 0.0;
   double model_aware_seed_fisher_rank = 0.0;
+  std::vector<double> model_aware_global_weakest_direction;
+  std::vector<ModelAwareFisherBoardContribution>
+      model_aware_fisher_board_contributions;
   bool candidate_shuffle_seed_set = false;
   unsigned int candidate_shuffle_seed = 0;
   bool carry_accepted_trial_state = false;
@@ -770,6 +817,10 @@ struct TrialBackendFrameBoardSelectionResult {
   double persistent_intrinsics_anchor_weight_xi_alpha = 0.0;
   double persistent_intrinsics_anchor_weight_focal = 0.0;
   double persistent_intrinsics_anchor_weight_principal = 0.0;
+  double persistent_internal_role_budget_when_mixed = 0.5;
+  bool persistent_uniform_control_point_weighting = false;
+  bool persistent_training_robust_checkpoint_selection = false;
+  bool persistent_square_pixel_focal_prior = false;
   double persistent_max_focal_relative_step = 0.0;
   double persistent_max_principal_step_px = 0.0;
   double persistent_max_xi_alpha_step = 0.0;
@@ -816,6 +867,11 @@ struct TrialBackendFrameBoardSelectionResult {
   int persistent_incremental_seed_frame_count = 0;
   int persistent_incremental_seed_board_observation_count = 0;
   int persistent_incremental_seed_point_count = 0;
+  bool persistent_incremental_progressive_seed_enabled = false;
+  int persistent_incremental_progressive_seed_source_frame_count = 0;
+  int persistent_incremental_progressive_seed_moved_frame_count = 0;
+  int persistent_incremental_progressive_seed_anchor_frame_index = -1;
+  std::string persistent_incremental_progressive_seed_anchor_frame_label;
   bool persistent_incremental_seed_outer_only_residuals = false;
   bool persistent_independent_camera_warmup_requested = false;
   bool persistent_independent_camera_warmup_attempted = false;
@@ -940,6 +996,17 @@ struct TrialBackendFrameBoardSelectionResult {
   double persistent_incremental_adaptive_saturation_tail_ordering_score_threshold = 0.0;
   double persistent_incremental_adaptive_saturation_next_ordering_score = 0.0;
   std::string persistent_incremental_adaptive_saturation_stop_reason;
+  bool persistent_incremental_training_robust_checkpoint_selection_enabled = false;
+  bool persistent_incremental_square_pixel_focal_prior_enabled = false;
+  bool persistent_incremental_training_robust_checkpoint_restored = false;
+  int persistent_incremental_training_robust_checkpoint_attempt_order = -1;
+  int persistent_incremental_training_robust_checkpoint_accepted_batch_count = 0;
+  int persistent_incremental_training_robust_checkpoint_discarded_accepted_batch_count = 0;
+  double persistent_incremental_training_robust_checkpoint_frame_median_rmse = 0.0;
+  double persistent_incremental_training_robust_checkpoint_frame_p90_rmse = 0.0;
+  double persistent_incremental_training_robust_checkpoint_huber15_rmse = 0.0;
+  double persistent_incremental_training_robust_checkpoint_fold_median_mean_rmse = 0.0;
+  double persistent_incremental_training_robust_checkpoint_fold_median_max_rmse = 0.0;
   double persistent_incremental_total_elapsed_time_seconds = 0.0;
   int frame_cohesion_candidate_count = 0;
   int frame_cohesion_attempted_count = 0;
@@ -1299,7 +1366,8 @@ class Stage5Benchmark {
 
  private:
   CalibrationEvaluationDataset BuildTrainingEvaluationDataset(
-      const CalibrationStateBundle& bundle) const;
+      const CalibrationStateBundle& bundle,
+      bool allow_outer_only_support) const;
   CalibrationEvaluationDataset BuildEvaluationDatasetFromMeasurementResult(
       const JointMeasurementBuildResult& measurement_result,
       const std::vector<InternalRegenerationFrameResult>& regeneration_results,
@@ -1307,7 +1375,8 @@ class Stage5Benchmark {
       const std::string& split_label,
       const std::string& split_signature,
       bool include_points_not_used_in_solver = false,
-      bool require_internal_solver_support = false) const;
+      bool require_internal_solver_support = false,
+      bool exclude_geometry_prior_rescued_boards = false) const;
   std::string FindFrameImagePath(const Stage5BenchmarkReport& report,
                                  int frame_index) const;
 

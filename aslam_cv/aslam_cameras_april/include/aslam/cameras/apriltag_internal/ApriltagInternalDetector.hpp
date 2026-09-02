@@ -28,6 +28,9 @@ InternalPoseRescueMode ParseInternalPoseRescueMode(const std::string& value);
 
 struct ApriltagInternalDetectionOptions {
   bool do_subpix_refinement = true;
+  // Evaluation-only control: return immediately after the four decoded tag
+  // corners have been refined, without synthesizing internal lattice points.
+  bool outer4_only = false;
   double max_subpix_displacement2 = 0.0;
   bool reject_duplicate_ids = true;
   double min_border_distance = 4.0;
@@ -203,6 +206,10 @@ struct ApriltagInternalRuntimeBreakdown {
 
 struct ApriltagInternalDetectionResult {
   bool success = false;
+  // Provenance only. True means the outer quad came from geometry-prior
+  // recovery after normal direct detection failed; it never changes point
+  // generation or refinement.
+  bool geometry_prior_rescue_used = false;
   // In the robust recovery mode a missing boundary model falls back to the
   // ordinary image-refined sphere lattice.  This remains true only when the
   // resulting points pass the current-image refinement and topology checks.

@@ -176,6 +176,10 @@ namespace aslam {
         */
       /// Adds a measurement batch to the estimator
       ReturnValue addBatch(const BatchSP& batch, bool force = false);
+      /// Adds a batch and establishes its marginal information at the current
+      /// design-variable state without running an optimization step. This is
+      /// intended for a validated seed whose state must remain unchanged.
+      ReturnValue addBatchAtCurrentState(const BatchSP& batch);
       /// Removes a measurement batch from the estimator
       void removeBatch(size_t idx);
       /// Removes a measurement batch from the estimator

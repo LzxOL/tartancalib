@@ -277,17 +277,26 @@ int ComputeGeometryPriorRescueSubpixWindowRadius(
       outer_config.outer_corner_marker_ratio > 0.0
           ? outer_config.outer_corner_marker_ratio * local_scale
           : local_scale;
+  // Geometry-prior seeds can be substantially farther from the observed
+  // junction than a decoded-tag corner.  Keep their search radius tied to
+  // the observed marker scale, rather than a fixed image-pixel window: this
+  // preserves the same physical search region across image resolutions.
+  constexpr double kGeometryPriorSubpixSearchMultiplier = 1.5;
   const double scaled_radius =
       outer_config.outer_subpix_scale > 0.0
-          ? outer_config.outer_subpix_scale * marker_width
+          ? kGeometryPriorSubpixSearchMultiplier *
+                outer_config.outer_subpix_scale * marker_width
           : static_cast<double>(outer_config.outer_subpix_window_min);
   const int min_radius = std::max(2, outer_config.outer_subpix_window_min);
-  const int raw_radius = static_cast<int>(std::lround(scaled_radius));
-  if (outer_config.outer_subpix_window_max > 0) {
-    const int max_radius = std::max(min_radius, outer_config.outer_subpix_window_max);
-    return std::max(min_radius, std::min(max_radius, raw_radius));
-  }
-  return std::max(min_radius, raw_radius);
+  // outer_subpix_window_max protects the direct detector, whose decoded seed
+  // is already local.  It must not turn into a resolution-dependent cap for
+  // a geometry-prior recovery seed.  The marker-relative cap limits the
+  // search to one half of the local marker width instead.
+  const int marker_relative_max_radius = std::max(
+      min_radius, static_cast<int>(std::lround(0.5 * marker_width)));
+  const int raw_radius = std::max(
+      min_radius, static_cast<int>(std::lround(scaled_radius)));
+  return std::min(marker_relative_max_radius, raw_radius);
 }
 
 bool IsInsideImage(const cv::Point2f& point,
@@ -2233,6 +2242,68 @@ GeometryPriorOuterSeedCandidate FinalizeGeometryPriorOuterSeedCandidate(
     min_refinement_displacement =
         std::min(min_refinement_displacement, refinement_displacement);
   }
+
+  // A geometry seed may identify the correct board while still being outside
+  // cornerSubPix's local attraction basin. Retry once only when the base
+  // marker-relative window leaves a corner effectively stationary. Direct
+  // decoded tags never execute this recovery-only branch.
+  constexpr double kStagnantRefinementFraction = 0.03;
+  const double stagnant_displacement_px = std::max(
+      1.0, kStagnantRefinementFraction *
+               static_cast<double>(candidate.subpix_window_radius));
+  if (options.geometry_prior_rescue_subpix_window_radius == 0 &&
+      min_refinement_displacement <= stagnant_displacement_px) {
+    const double marker_width =
+        options.outer_detector_config.outer_corner_marker_ratio > 0.0
+            ? options.outer_detector_config.outer_corner_marker_ratio *
+                  candidate.local_corner_scale_px
+            : candidate.local_corner_scale_px;
+    const int max_retry_radius = std::max(
+        candidate.subpix_window_radius,
+        static_cast<int>(std::lround(0.75 * marker_width)));
+    const int retry_radius = std::min(
+        max_retry_radius,
+        std::max(candidate.subpix_window_radius + 1,
+                 static_cast<int>(std::lround(std::max(
+                     1.35 * static_cast<double>(candidate.subpix_window_radius),
+                     0.60 * marker_width)))));
+    if (retry_radius > candidate.subpix_window_radius) {
+      candidate.subpix_expanded_retry_attempted = true;
+      candidate.expanded_subpix_window_radius = retry_radius;
+      std::array<cv::Point2f, 4> retry_corners{};
+      double retry_max_refinement_displacement = 0.0;
+      double retry_min_refinement_displacement =
+          std::numeric_limits<double>::infinity();
+      for (int index = 0; index < 4; ++index) {
+        const cv::Point2f refined = RefineGeometryPriorCornerSubpixWithPadding(
+            gray, initial_corners[static_cast<std::size_t>(index)],
+            retry_radius, options);
+        retry_corners[static_cast<std::size_t>(index)] = refined;
+        const double displacement = PointDistance(
+            refined, initial_corners_input[static_cast<std::size_t>(index)]);
+        retry_max_refinement_displacement = std::max(
+            retry_max_refinement_displacement, displacement);
+        retry_min_refinement_displacement = std::min(
+            retry_min_refinement_displacement, displacement);
+      }
+      if (retry_min_refinement_displacement > min_refinement_displacement) {
+        refined_corners = retry_corners;
+        max_refinement_displacement = retry_max_refinement_displacement;
+        min_refinement_displacement = retry_min_refinement_displacement;
+        max_prediction_displacement = 0.0;
+        for (int index = 0; index < 4; ++index) {
+          candidate.refined_corners[static_cast<std::size_t>(index)] =
+              refined_corners[static_cast<std::size_t>(index)];
+          max_prediction_displacement = std::max(
+              max_prediction_displacement,
+              PointDistance(refined_corners[static_cast<std::size_t>(index)],
+                            candidate.predicted_corners[static_cast<std::size_t>(index)]));
+        }
+        candidate.subpix_window_radius = retry_radius;
+        candidate.subpix_expanded_retry_used = true;
+      }
+    }
+  }
   for (const cv::Point2f& corner : refined_corners) {
     if (!std::isfinite(corner.x) || !std::isfinite(corner.y) ||
         !IsInsideImage(corner, gray.size(), 0.0)) {
@@ -2808,6 +2879,7 @@ GeometryPriorOuterSeedCandidate EvaluateGeometryPriorOuterSeedCandidate(
   const int window_radius = ComputeGeometryPriorRescueSubpixWindowRadius(
       options, candidate.predicted_corners, &local_corner_scale_px);
   candidate.local_corner_scale_px = local_corner_scale_px;
+  candidate.initial_subpix_window_radius = window_radius;
   candidate.subpix_window_radius = window_radius;
   if (window_radius <= 0) {
     candidate.reject_reason = "image_evidence_disabled_subpix_window_radius";

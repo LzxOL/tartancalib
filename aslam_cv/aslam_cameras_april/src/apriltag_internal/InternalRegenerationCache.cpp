@@ -20,9 +20,9 @@ namespace {
 namespace fs = boost::filesystem;
 
 constexpr const char kCacheFormatVersion[] =
-    "internal_regeneration_cache_v47_no_partial_unrefined_seed_commit";
+    "internal_regeneration_cache_v51_border_bounded_outer_subpix";
 constexpr const char kStageImplementationVersion[] =
-    "internal_refinement_v47_no_partial_unrefined_seed_commit";
+    "internal_refinement_v51_border_bounded_outer_subpix";
 constexpr const char kArtifactSchemaVersion[] =
     "internal_regeneration_frame_v2_outer_corner_debug";
 
@@ -297,6 +297,12 @@ void WriteOuterCornerVerificationDebug(
            << debug.subpix_unstable_rollback_iteration;
   *storage << "subpix_unstable_rollback_max_displacement"
            << debug.subpix_unstable_rollback_max_displacement;
+  *storage << "subpix_scale_probe_window_radius"
+           << debug.subpix_scale_probe_window_radius;
+  *storage << "subpix_scale_probe_endpoint_delta"
+           << debug.subpix_scale_probe_endpoint_delta;
+  *storage << "subpix_scale_disagreement_detected"
+           << (debug.subpix_scale_disagreement_detected ? 1 : 0);
   *storage << "close_edge_subpix_boost_applied"
            << (debug.close_edge_subpix_boost_applied ? 1 : 0);
   *storage << "close_edge_subpix_area_ratio"
@@ -531,6 +537,8 @@ void WriteDetection(cv::FileStorage* storage,
                     const ApriltagInternalDetectionResult& detection) {
   *storage << "{";
   *storage << "success" << (detection.success ? 1 : 0);
+  *storage << "geometry_prior_rescue_used"
+           << (detection.geometry_prior_rescue_used ? 1 : 0);
   *storage << "reject_entire_board_observation"
            << (detection.reject_entire_board_observation ? 1 : 0);
   *storage << "tag_detected" << (detection.tag_detected ? 1 : 0);
@@ -728,6 +736,12 @@ void ReadOuterCornerVerificationDebug(
       ReadScalar<int>(node, "subpix_unstable_rollback_iteration", 0);
   debug->subpix_unstable_rollback_max_displacement = ReadScalar<double>(
       node, "subpix_unstable_rollback_max_displacement", 0.0);
+  debug->subpix_scale_probe_window_radius = ReadScalar<int>(
+      node, "subpix_scale_probe_window_radius", 0);
+  debug->subpix_scale_probe_endpoint_delta = ReadScalar<double>(
+      node, "subpix_scale_probe_endpoint_delta", 0.0);
+  debug->subpix_scale_disagreement_detected = ReadScalar<int>(
+      node, "subpix_scale_disagreement_detected", 0) != 0;
   debug->close_edge_subpix_boost_applied =
       ReadScalar<int>(node, "close_edge_subpix_boost_applied", 0) != 0;
   debug->close_edge_subpix_area_ratio =
@@ -772,6 +786,8 @@ void ReadDetection(const cv::FileNode& node,
     return;
   }
   detection->success = ReadScalar<int>(node, "success", 0) != 0;
+  detection->geometry_prior_rescue_used =
+      ReadScalar<int>(node, "geometry_prior_rescue_used", 0) != 0;
   detection->reject_entire_board_observation =
       ReadScalar<int>(node, "reject_entire_board_observation", 0) != 0;
   detection->tag_detected = ReadScalar<int>(node, "tag_detected", 0) != 0;

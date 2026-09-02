@@ -14,7 +14,8 @@ namespace apriltag_internal {
 bool UsesSphereSeedPipeline(InternalProjectionMode mode);
 
 cv::Mat BuildInternalSeedOverlay(const cv::Mat& image,
-                                 const ApriltagInternalDetectionResult& result);
+                                 const ApriltagInternalDetectionResult& result,
+                                 bool include_prediction_context = true);
 
 cv::Mat BuildInternalSphereDebugView(const ApriltagInternalDetectionResult& result);
 

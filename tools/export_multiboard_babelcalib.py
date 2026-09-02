@@ -195,6 +195,12 @@ def load_layout(source_run: Path, reference_board_id: int) -> Dict[int, np.ndarr
         if board_id <= 0:
             continue
         if initialized != 1:
+            # Stage5 writes placeholder rows for configured-but-never-observed
+            # boards. They have no layout to export and must not reject a
+            # valid subset whose actually observed boards are initialized.
+            observation_count = parse_int(row.get("observation_count", "0"))
+            if observation_count == 0:
+                continue
             raise RuntimeError(f"Layout board {board_id} is not initialized in {path}")
         vals: List[float] = []
         if "T_reference_board_16" in row:
@@ -487,7 +493,12 @@ def main() -> None:
         frame_counts[name] = len(labels)
 
     valid_images = all_labels
-    failed_images: List[str] = []
+    source_failed_images = source_run / "failed_images.txt"
+    failed_images = (
+        [line.strip() for line in source_failed_images.read_text().splitlines() if line.strip()]
+        if source_failed_images.exists()
+        else []
+    )
     write_text_lines(output_dir / "valid_images.txt", valid_images)
     write_text_lines(output_dir / "failed_images.txt", failed_images)
 
