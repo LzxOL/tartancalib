@@ -291,6 +291,7 @@ $\{\mathbf{T}_{C_tB_0}\}$, and the static inter-board transforms
 $\{\mathbf{T}_{B_0B_b}\}_{b=1}^{N-1}$.
 
 \subsection{Camera Model Initialization}
+\label{sec:camera_init}
 
 At the beginning of calibration, no reliable camera model is available,
 while a usable initialization is important for nonlinear wide-angle
@@ -361,7 +362,41 @@ are not coupled through the unknown inter-board geometry; each valid
 frame--board observation is assigned an independent pose. The optimized
 parameters $\boldsymbol{\theta}^{*}$ initialize the subsequent complete
 multi-board calibration and serve as the intermediate camera model for
-internal-point recovery.
+the shared-geometry bootstrap described next.
+
+\subsection{Shared Multi-Board Geometry Bootstrap}
+\label{sec:multi_board_bootstrap}
+
+前述相机初始化将每个 frame--board observation
+视为具有独立位姿，以在未知板间布局的情况下获得稳定的中间相机模型。
+然而，后续内部格点恢复需要一个统一的多板几何，以保证不同标定板上的观测
+能够在同一参考坐标系下进行一致预测。
+因此，在获得中间相机参数后，我们进一步利用有效的 Outer4 observations
+恢复共享的刚体多板布局。
+
+以 $B_0$ 为参考板并令
+$\mathbf{T}_{B_0B_0}=\mathbf{I}$。
+对于同时观测到 $B_0$ 和 $B_b$ 的已初始化帧 $t$，
+由前述独立 frame--board 位姿可得到板间变换候选
+\begin{equation}
+\widehat{\mathbf{T}}_{B_0B_b}^{(t)}
+=
+\left(
+\widehat{\mathbf{T}}_{C_tB_0}
+\right)^{-1}
+\widehat{\mathbf{T}}_{C_tB_b}.
+\end{equation}
+我们对同一标定板在多个共视帧中的候选进行鲁棒汇总，
+得到跨帧共享的静态变换 $\mathbf{T}_{B_0B_b}$。
+由此，任一局部板位姿均可统一表示为
+\begin{equation}
+\mathbf{T}_{C_tB_b}
+=
+\mathbf{T}_{C_tB_0}
+\mathbf{T}_{B_0B_b}.
+\end{equation}
+该共享几何随后与中间相机模型共同用于
+Sec.~\ref{sec:internal_point_recovery} 中内部格点的预测与恢复。
 
 \subsection{Internal Lattice Point Recovery}
 \label{sec:internal_point_recovery}
@@ -373,17 +408,17 @@ We therefore use the intermediate model to recover image observations
 for predefined internal lattice points, combining model-guided
 prediction with local image evidence.
 
-Given the intermediate camera parameters $\boldsymbol{\theta}^{*}$,
-we reuse the temporary frame--board pose
-$\widetilde{\mathbf{T}}^{*}_{C_tB_b}$ obtained in Sec.~\ref{sec:camera_init}.
-For an internal lattice point
-$\mathbf{p}_{b,j}$, $j\in\mathcal{C}^{\mathrm{int}}_b$, its direct
-geometric projection
+Given the intermediate camera parameters $\boldsymbol{\theta}^{*}$ and
+the shared multi-board geometry initialized in
+Sec.~\ref{sec:multi_board_bootstrap}, the direct geometric projection
+of an internal lattice point
+$\mathbf{p}_{b,j}$, $j\in\mathcal{C}^{\mathrm{int}}_b$, is
 \begin{equation}
 \widehat{\mathbf{u}}^{\mathrm{nom}}_{t,b,j}
 =
 \pi\!\left(
-\widetilde{\mathbf{T}}^{*}_{C_tB_b}
+\mathbf{T}_{C_tB_0}
+\mathbf{T}_{B_0B_b}
 \mathbf{p}_{b,j};
 \boldsymbol{\theta}^{*}
 \right)
@@ -445,41 +480,62 @@ threshold. Each accepted observation retains its board and lattice-point
 indices and is added to $\mathcal{O}$ for joint optimization together
 with the outer corners.
 
-\subsection{Spherical Bundle Adjustment}
+\subsection{多板联合调整}
 
-Standard bundle adjustment minimizes reprojection errors in the image
-plane. For wide-angle cameras, however, the ray deviation corresponding
-to a pixel residual depends on the image location and the local Jacobian
-of the projection model. We therefore provide optional ray-domain and
-hybrid objectives for final refinement.
+前述步骤依次获得中间相机模型、共享多板几何以及恢复的内部格点观测。
+在最终阶段，我们在统一参考板坐标系下联合细化完整的多板标定状态
+\begin{equation}
+\mathcal{S}
+=
+\left(
+\boldsymbol{\theta},
+\{\mathbf{T}_{C_tB_0}\}_{t},
+\{\mathbf{T}_{B_0B_b}\}_{b=1}^{N-1}
+\right),
+\end{equation}
+其中 $\boldsymbol{\theta}$ 为相机内参，
+$\mathbf{T}_{C_tB_0}$ 为第 $t$ 帧中参考板相对于相机的位姿，
+$\mathbf{T}_{B_0B_b}$ 为标定板 $B_b$ 相对于参考板的静态刚体变换。
+同一帧中的所有标定板共享 $\mathbf{T}_{C_tB_0}$，
+而同一标定板在不同帧中的观测共享 $\mathbf{T}_{B_0B_b}$，
+从而将不同帧和不同标定板上的 Outer4 与内部格点观测统一耦合到同一多板标定状态中。
 
-Given an image observation $\mathbf{u}_{t,b,j}$, we back-project it
-using the current camera parameters and normalize it to obtain the
-observed ray:
+对于前文定义的变换后目标点 $\mathbf{x}_{t,b,j}$，
+标准图像平面重投影残差为
+\begin{equation}
+\mathbf{r}^{\mathrm{px}}_{t,b,j}
+=
+\mathbf{u}_{t,b,j}
+-
+\pi(\mathbf{x}_{t,b,j};\boldsymbol{\theta}).
+\end{equation}
+基于该残差即可完成标准的多板联合束调整。
+
+对于宽视场相机，相同的像素偏差在不同图像位置可能对应不同的视线角偏差。
+为此，我们进一步提供一种可选的球面残差形式。
+给定图像观测 $\mathbf{u}_{t,b,j}$，
+其归一化观测视线为
 \begin{equation}
 \mathbf{d}^{\mathrm{obs}}_{t,b,j}
 =
 \frac{
-\pi^{-1}(\mathbf{u}_{t,b,j};
-\boldsymbol{\theta})
+\pi^{-1}(\mathbf{u}_{t,b,j};\boldsymbol{\theta})
 }{
 \left\|
-\pi^{-1}(\mathbf{u}_{t,b,j};
-\boldsymbol{\theta})
+\pi^{-1}(\mathbf{u}_{t,b,j};\boldsymbol{\theta})
 \right\|_2
-}.
+},
 \end{equation}
-The corresponding predicted ray is obtained from the transformed target
-point defined in Sec.~IV-A:
+对应的预测视线为
 \begin{equation}
 \mathbf{d}^{\mathrm{pred}}_{t,b,j}
 =
 \frac{\mathbf{x}_{t,b,j}}
 {\|\mathbf{x}_{t,b,j}\|_2}.
 \end{equation}
-Let $\mathbf{B}_{t,b,j}\in\mathbb{R}^{3\times2}$ be an orthonormal
-tangent basis at $\mathbf{d}^{\mathrm{obs}}_{t,b,j}$. The local ray
-residual is defined as
+令 $\mathbf{B}_{t,b,j}\in\mathbb{R}^{3\times2}$
+表示 $\mathbf{d}^{\mathrm{obs}}_{t,b,j}$ 处的正交切平面基，
+则局部球面残差定义为
 \begin{equation}
 \mathbf{r}^{\mathrm{ray}}_{t,b,j}
 =
@@ -490,33 +546,45 @@ residual is defined as
 \mathbf{d}^{\mathrm{obs}}_{t,b,j}
 \right).
 \end{equation}
+该二维残差局部近似预测视线与观测视线之间的角度误差。
 
-This two-dimensional residual retains the two tangential degrees of
-freedom of the ray discrepancy and locally approximates its angular
-error. Since the observed ray depends on the camera parameters,
-$\mathbf d^{\mathrm{obs}}_{t,b,j}$ and its tangent basis
-$\mathbf B_{t,b,j}$ are updated during optimization.
-
-We combine the pixel and ray residuals using the normalized hybrid
-residual
+在需要同时兼顾图像平面定位与球面方向一致性时，
+还可进一步采用归一化混合残差
 \begin{equation}
-\mathbf r^{\mathrm{hyb}}_{t,b,j}
+\mathbf{r}^{\mathrm{hyb}}_{t,b,j}
 =
 \begin{bmatrix}
 \sqrt{1-\lambda}\,
-\mathbf r^{\mathrm{px}}_{t,b,j}/s_{\mathrm{px}}
+\mathbf{r}^{\mathrm{px}}_{t,b,j}/s_{\mathrm{px}}
 \\
 \sqrt{\lambda}\,
-\mathbf r^{\mathrm{ray}}_{t,b,j}/s_{\mathrm{ray}}
+\mathbf{r}^{\mathrm{ray}}_{t,b,j}/s_{\mathrm{ray}}
 \end{bmatrix},
-\qquad \lambda\in[0,1],
+\qquad
+\lambda\in[0,1].
 \end{equation}
-where $s_{\mathrm{px}}$ and $s_{\mathrm{ray}}$ are fixed scales
-computed from the median residual magnitudes before final refinement.
-The endpoint settings $\lambda=0$ and $\lambda=1$ correspond to
-pixel-only and ray-only refinement, respectively. We use
-$\lambda=0.5$ by default and examine its sensitivity in
-Sec.~\ref{sec:lambda_sensitivity}.
+其中 $s_{\mathrm{px}}$ 和 $s_{\mathrm{ray}}$
+用于平衡两类残差的量纲。
+$\lambda=0$ 与 $\lambda=1$ 分别退化为纯像素残差与纯球面残差。
+
+最终联合优化可统一写为
+\begin{equation}
+\mathcal{S}^{*}
+=
+\operatorname*{arg\,min}_{\mathcal{S}}
+\sum_{(t,b,j)}
+w_{t,b,j}
+\rho\!\left(
+\left\|
+\mathbf{r}_{t,b,j}(\mathcal{S})
+\right\|_2^2
+\right),
+\end{equation}
+其中 $\mathbf{r}_{t,b,j}$ 可根据具体设置选用
+$\mathbf{r}^{\mathrm{px}}_{t,b,j}$、
+$\mathbf{r}^{\mathrm{ray}}_{t,b,j}$
+或 $\mathbf{r}^{\mathrm{hyb}}_{t,b,j}$。
+有效的 Outer4 与恢复的内部格点均通过相同的残差形式共同约束相机内参、逐帧位姿和共享板间几何。
 
 \section{EXPERIMENT}
 
