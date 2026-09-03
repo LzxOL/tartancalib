@@ -67,7 +67,9 @@ namespace aslam {
       OptimizerOptions& optOptions = _optimizer->options();
       optOptions.linearSystemSolver =
         boost::make_shared<LinearSolver>(linearSolverOptions);
-      optOptions.trustRegionPolicy = boost::make_shared<TrustRegionPolicy>();
+      if (!optOptions.trustRegionPolicy) {
+        optOptions.trustRegionPolicy = boost::make_shared<TrustRegionPolicy>();
+      }
       _optimizer->initializeLinearSolver();
       _optimizer->initializeTrustRegionPolicy();
 
@@ -157,7 +159,7 @@ namespace aslam {
       return _informationGain;
     }
 
-    const aslam::backend::CompressedColumnMatrix<std::ptrdiff_t>&
+    const aslam::backend::CompressedColumnMatrix<int64_t>&
         IncrementalEstimator::getJacobianTranspose() const {
       return _optimizer->getSolver<LinearSolver>()->getJacobianTranspose();
     }
@@ -331,6 +333,9 @@ namespace aslam {
       ret.numIterations = srv.iterations;
       ret.JStart = _initialCost;
       ret.JFinal = _finalCost;
+      ret.dXFinal = srv.dXFinal;
+      ret.dJFinal = srv.dJFinal;
+      ret.linearSolverFailure = srv.linearSolverFailure;
       ret.elapsedTime = Timestamp::now() - timeStart;
       return ret;
     }
@@ -360,7 +365,19 @@ namespace aslam {
       linearSolver->setMargStartIndex(static_cast<std::ptrdiff_t>(JCols - dim));
 
       // optimize
-      aslam::backend::SolutionReturnValue srv = _optimizer->optimize();
+      aslam::backend::SolutionReturnValue srv;
+      try {
+        srv = _optimizer->optimize();
+      }
+      catch (...) {
+        if (!force) {
+          _problem->restoreDesignVariables();
+          _problem->remove(problem);
+          if (_problem->getNumOptimizationProblems() > 0)
+            restoreLinearSolver();
+        }
+        throw;
+      }
 
       // return value
       ReturnValue ret;
@@ -369,6 +386,9 @@ namespace aslam {
       ret.numIterations = srv.iterations;
       ret.JStart = srv.JStart;
       ret.JFinal = srv.JFinal;
+      ret.dXFinal = srv.dXFinal;
+      ret.dJFinal = srv.dJFinal;
+      ret.linearSolverFailure = srv.linearSolverFailure;
 
       // grep the scaled singular values if scaling enabled
       if (linearSolver->getOptions().columnScaling) {
@@ -469,6 +489,90 @@ namespace aslam {
       return ret;
     }
 
+    IncrementalEstimator::ReturnValue
+        IncrementalEstimator::addBatchAtCurrentState(const BatchSP& problem) {
+      const double timeStart = Timestamp::now();
+
+      // A seed can be geometrically valid before any joint solve, while a
+      // forced incremental optimization would move the shared state merely to
+      // initialize its Fisher baseline. Retain that measured state and build
+      // the marginal information directly at its linearization point instead.
+      _problem->add(problem);
+      orderMarginalizedDesignVariables();
+      _problem->saveDesignVariables();
+
+      size_t JCols = 0;
+      for (auto it = _problem->getGroupsOrdering().cbegin();
+          it != _problem->getGroupsOrdering().cend(); ++it)
+        JCols += _problem->getGroupDim(*it);
+      const size_t dim = _problem->getGroupDim(_margGroupId);
+      auto linearSolver = _optimizer->getSolver<LinearSolver>();
+      linearSolver->setMargStartIndex(static_cast<std::ptrdiff_t>(JCols - dim));
+      restoreLinearSolver();
+      linearSolver->analyzeMarginal();
+
+      ReturnValue ret;
+      ret.numIterations = 0;
+      ret.JStart = 0.0;
+      ret.JFinal = 0.0;
+      ret.dXFinal = 0.0;
+      ret.dJFinal = 0.0;
+      ret.linearSolverFailure = false;
+      if (linearSolver->getOptions().columnScaling) {
+        ret.singularValuesScaled = linearSolver->getSingularValues();
+        ret.nobsBasisScaled = linearSolver->getNullSpace();
+        ret.obsBasisScaled = linearSolver->getRowSpace();
+        ret.sigma2ThetaScaled = linearSolver->getCovariance();
+        ret.sigma2ThetaObsScaled = linearSolver->getRowSpaceCovariance();
+      } else {
+        ret.singularValuesScaled.resize(0);
+        ret.nobsBasisScaled.resize(0, 0);
+        ret.obsBasisScaled.resize(0, 0);
+        ret.sigma2ThetaScaled.resize(0, 0);
+        ret.sigma2ThetaObsScaled.resize(0, 0);
+      }
+      ret.rankPsi = linearSolver->getQRRank();
+      ret.rankPsiDeficiency = linearSolver->getQRRankDeficiency();
+      ret.rankTheta = linearSolver->getSVDRank();
+      ret.rankThetaDeficiency = linearSolver->getSVDRankDeficiency();
+      ret.svdTolerance = linearSolver->getSVDTolerance();
+      ret.qrTolerance = linearSolver->getQRTolerance();
+      ret.nobsBasis = linearSolver->getNullSpace();
+      ret.obsBasis = linearSolver->getRowSpace();
+      ret.sigma2Theta = linearSolver->getCovariance();
+      ret.sigma2ThetaObs = linearSolver->getRowSpaceCovariance();
+      ret.singularValues = linearSolver->getSingularValues();
+      const double svLog2Sum = linearSolver->getSingularValuesLog2Sum();
+      ret.informationGain = 0.5 * (svLog2Sum - _svLog2Sum);
+      ret.batchAccepted = true;
+
+      _informationGain = ret.informationGain;
+      _svLog2Sum = svLog2Sum;
+      _nobsBasis = ret.nobsBasis;
+      _nobsBasisScaled = ret.nobsBasisScaled;
+      _obsBasis = ret.obsBasis;
+      _obsBasisScaled = ret.obsBasisScaled;
+      _sigma2Theta = ret.sigma2Theta;
+      _sigma2ThetaScaled = ret.sigma2ThetaScaled;
+      _sigma2ThetaObs = ret.sigma2ThetaObs;
+      _sigma2ThetaObsScaled = ret.sigma2ThetaObsScaled;
+      _singularValues = ret.singularValues;
+      _singularValuesScaled = ret.singularValuesScaled;
+      _svdTolerance = ret.svdTolerance;
+      _qrTolerance = ret.qrTolerance;
+      _rankTheta = ret.rankTheta;
+      _rankThetaDeficiency = ret.rankThetaDeficiency;
+      _rankPsi = ret.rankPsi;
+      _rankPsiDeficiency = ret.rankPsiDeficiency;
+      _peakMemoryUsage = linearSolver->getPeakMemoryUsage();
+      _memoryUsage = linearSolver->getMemoryUsage();
+      _numFlops = linearSolver->getNumFlops();
+      _initialCost = ret.JStart;
+      _finalCost = ret.JFinal;
+      ret.elapsedTime = Timestamp::now() - timeStart;
+      return ret;
+    }
+
     void IncrementalEstimator::removeBatch(size_t idx) {
       // remove the batch
       _problem->remove(idx);
@@ -481,6 +585,31 @@ namespace aslam {
       auto it = _problem->getOptimizationProblem(batch);
       if (it != _problem->getOptimizationProblemEnd())
         removeBatch(std::distance(_problem->getOptimizationProblemBegin(), it));
+    }
+
+    void IncrementalEstimator::rejectBatch(const BatchSP& batch) {
+      auto it = _problem->getOptimizationProblem(batch);
+      if (it != _problem->getOptimizationProblemEnd()) {
+        _problem->restoreDesignVariables();
+        _problem->remove(it);
+        if (_problem->getNumOptimizationProblems() > 0) {
+          // The rejected batch can own transformation variables. Removing it
+          // changes the total column count, so the marginalization boundary
+          // used while the batch was present is no longer valid. Recompute it
+          // before rebuilding the camera-information baseline.
+          orderMarginalizedDesignVariables();
+          size_t JCols = 0;
+          for (auto groupIt = _problem->getGroupsOrdering().cbegin();
+              groupIt != _problem->getGroupsOrdering().cend(); ++groupIt)
+            JCols += _problem->getGroupDim(*groupIt);
+          const size_t dim = _problem->getGroupDim(_margGroupId);
+          auto linearSolver = _optimizer->getSolver<LinearSolver>();
+          linearSolver->setMargStartIndex(
+            static_cast<std::ptrdiff_t>(JCols - dim));
+          restoreLinearSolver();
+          synchronizeMarginalInformation();
+        }
+      }
     }
 
     size_t IncrementalEstimator::getNumBatches() const {
@@ -534,6 +663,43 @@ namespace aslam {
 
       // build the system
       linearSolver->buildSystem(_optimizer->options().nThreads, true);
+    }
+
+    void IncrementalEstimator::synchronizeMarginalInformation() {
+      auto linearSolver = _optimizer->getSolver<LinearSolver>();
+      linearSolver->analyzeMarginal();
+
+      if (linearSolver->getOptions().columnScaling) {
+        _singularValuesScaled = linearSolver->getSingularValues();
+        _nobsBasisScaled = linearSolver->getNullSpace();
+        _obsBasisScaled = linearSolver->getRowSpace();
+        _sigma2ThetaScaled = linearSolver->getCovariance();
+        _sigma2ThetaObsScaled = linearSolver->getRowSpaceCovariance();
+      }
+      else {
+        _singularValuesScaled.resize(0);
+        _nobsBasisScaled.resize(0, 0);
+        _obsBasisScaled.resize(0, 0);
+        _sigma2ThetaScaled.resize(0, 0);
+        _sigma2ThetaObsScaled.resize(0, 0);
+      }
+
+      _informationGain = 0.0;
+      _svLog2Sum = linearSolver->getSingularValuesLog2Sum();
+      _nobsBasis = linearSolver->getNullSpace();
+      _obsBasis = linearSolver->getRowSpace();
+      _sigma2Theta = linearSolver->getCovariance();
+      _sigma2ThetaObs = linearSolver->getRowSpaceCovariance();
+      _singularValues = linearSolver->getSingularValues();
+      _svdTolerance = linearSolver->getSVDTolerance();
+      _qrTolerance = linearSolver->getQRTolerance();
+      _rankTheta = linearSolver->getSVDRank();
+      _rankThetaDeficiency = linearSolver->getSVDRankDeficiency();
+      _rankPsi = linearSolver->getQRRank();
+      _rankPsiDeficiency = linearSolver->getQRRankDeficiency();
+      _peakMemoryUsage = linearSolver->getPeakMemoryUsage();
+      _memoryUsage = linearSolver->getMemoryUsage();
+      _numFlops = linearSolver->getNumFlops();
     }
 
   }

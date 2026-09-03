@@ -23,8 +23,9 @@
 #ifndef ASLAM_CALIBRATION_ALGORITHMS_MARGINALIZE_H
 #define ASLAM_CALIBRATION_ALGORITHMS_MARGINALIZE_H
 
-#include <cstdlib>
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 
 #include <Eigen/Core>
 
@@ -59,7 +60,7 @@ namespace aslam {
      * \return sum of the log of the singular values of the marginalized system
      */
     double marginalize(const
-      aslam::backend::CompressedColumnMatrix<std::ptrdiff_t>& Jt, size_t j,
+      aslam::backend::CompressedColumnMatrix<int64_t>& Jt, size_t j,
       Eigen::MatrixXd& NS, Eigen::MatrixXd& CS, Eigen::MatrixXd& Sigma,
       Eigen::MatrixXd& SigmaP, Eigen::MatrixXd& Omega, double normTol = 1e-8,
       double epsTol = 1e-4);

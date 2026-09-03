@@ -1,0 +1,617 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%2345678901234567890123456789012345678901234567890123456789012345678901234567890
+%        1         2         3         4         5         6         7         8
+
+\documentclass[letterpaper, 10 pt, conference]{ieeeconf}  % Comment this line out if you need a4paper
+
+%\documentclass[a4paper, 10pt, conference]{ieeeconf}      % Use this line for a4 paper
+
+\IEEEoverridecommandlockouts                              % This command is only needed if 
+                                                          % you want to use the \thanks command
+
+\overrideIEEEmargins                                      % Needed to meet printer requirements.
+
+%In case you encounter the following error:
+%Error 1010 The PDF file may be corrupt (unable to open PDF file) OR
+%Error 1000 An error occurred while parsing a contents stream. Unable to analyze the PDF file.
+%This is a known problem with pdfLaTeX conversion filter. The file cannot be opened with acrobat reader
+%Please use one of the alternatives below to circumvent this error by uncommenting one or the other
+%\pdfobjcompresslevel=0
+%\pdfminorversion=4
+
+% See the \addtolength command later in the file to balance the column lengths
+% on the last page of the document
+
+% The following packages can be found on http:\\www.ctan.org
+%\usepackage{graphics} % for pdf, bitmapped graphics files
+%\usepackage{epsfig} % for postscript graphics files
+%\usepackage{mathptmx} % assumes new font selection scheme installed
+%\usepackage{times} % assumes new font selection scheme installed
+%\usepackage{amsmath} % assumes amsmath package installed
+%\usepackage{amssymb}  % assumes amsmath package installed
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{cite}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{microtype}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{multirow}
+\usepackage{balance}
+\usepackage{tabularx}
+\usepackage{array}
+
+
+\title{\LARGE \bf
+Preparation of Papers for IEEE Sponsored Conferences \& Symposia*
+}
+
+
+\author{Albert Author$^{1}$ and Bernard D. Researcher$^{2}$% <-this % stops a space
+\thanks{*This work was not supported by any organization}% <-this % stops a space
+\thanks{$^{1}$Albert Author is with Faculty of Electrical Engineering, Mathematics and Computer Science,
+        University of Twente, 7500 AE Enschede, The Netherlands
+        {\tt\small albert.author@papercept.net}}%
+\thanks{$^{2}$Bernard D. Researcheris with the Department of Electrical Engineering, Wright State University,
+        Dayton, OH 45435, USA
+        {\tt\small b.d.researcher@ieee.org}}%
+}
+
+
+\begin{document}
+
+
+
+\maketitle
+\thispagestyle{empty}
+\pagestyle{empty}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{abstract}
+
+This electronic document is a ÒliveÓ template. The various components of your paper [title, text, heads, etc.] are already defined on the style sheet, as illustrated by the portions given in this document.
+
+\end{abstract}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{INTRODUCTION}
+
+In this work, we present a unified multi-board calibration framework for
+wide-angle central cameras. Starting with stable outer-corner observations, we
+initialize a camera model, use it to generate dense internal observations in
+the viewing-ray domain, and optimize the camera parameters and multi-board
+geometry with image-plane and spherical residuals. Our main contributions are:
+
+\begin{itemize}
+\setlength{\itemsep}{1pt}
+\setlength{\parskip}{0pt}
+\setlength{\parsep}{0pt}
+\item We formulate multi-board calibration as a unified optimization problem 
+that estimates camera intrinsics, per-frame poses, and rigid transforms between boards.
+\item We propose an internal-point generation method that uses the initialized
+camera model to turn sparse outer-corner detections into dense observations in
+strongly distorted image regions.
+\item We introduce a polar-aware spherical bundle adjustment objective. It uses
+image-plane residuals near the image center and gives more weight to
+tangent-plane residuals at large polar angles.
+\end{itemize}
+
+Tests on several datasets and camera models cover reprojection error, ablations,
+cross-backend calibration, and held-out pose estimation. The results show
+reliable calibration and competitive accuracy.
+
+
+\section{}
+
+\subsection{Selecting a Template (Heading 2)}
+
+First, confirm that you have the correct template for your paper size. This template has been tailored for output on the US-letter paper size. 
+It may be used for A4 paper size if the paper size setting is suitably modified.
+
+\subsection{Maintaining the Integrity of the Specifications}
+
+The template is used to format your paper and style the text. All margins, column widths, line spaces, and text fonts are prescribed; please do not alter them. You may note peculiarities. For example, the head margin in this template measures proportionately more than is customary. This measurement and others are deliberate, using specifications that anticipate your paper as one part of the entire proceedings, and not as an independent document. Please do not revise any of the current designations
+
+\section{MATH}
+
+Before you begin to format your paper, first write and save the content as a separate text file. Keep your text and graphic files separate until after the text has been formatted and styled. Do not use hard tabs, and limit use of hard returns to only one return at the end of a paragraph. Do not add any kind of pagination anywhere in the paper. Do not number text heads-the template will do that for you.
+
+Finally, complete content and organizational editing before formatting. Please take note of the following items when proofreading spelling and grammar:
+
+\subsection{Abbreviations and Acronyms} Define abbreviations and acronyms the first time they are used in the text, even after they have been defined in the abstract. Abbreviations such as IEEE, SI, MKS, CGS, sc, dc, and rms do not have to be defined. Do not use abbreviations in the title or heads unless they are unavoidable.
+
+\subsection{Units}
+
+\begin{itemize}
+
+\item Use either SI (MKS) or CGS as primary units. (SI units are encouraged.) English units may be used as secondary units (in parentheses). An exception would be the use of English units as identifiers in trade, such as Ò3.5-inch disk driveÓ.
+\item Avoid combining SI and CGS units, such as current in amperes and magnetic field in oersteds. This often leads to confusion because equations do not balance dimensionally. If you must use mixed units, clearly state the units for each quantity that you use in an equation.
+\item Do not mix complete spellings and abbreviations of units: ÒWb/m2Ó or Òwebers per square meterÓ, not Òwebers/m2Ó.  Spell out units when they appear in text: Ò. . . a few henriesÓ, not Ò. . . a few HÓ.
+\item Use a zero before decimal points: Ò0.25Ó, not Ò.25Ó. Use Òcm3Ó, not ÒccÓ. (bullet list)
+
+\end{itemize}
+
+
+\subsection{Equations}
+
+The equations are an exception to the prescribed specifications of this template. You will need to determine whether or not your equation should be typed using either the Times New Roman or the Symbol font (please no other font). To create multileveled equations, it may be necessary to treat the equation as a graphic and insert it into the text after your paper is styled. Number equations consecutively. Equation numbers, within parentheses, are to position flush right, as in (1), using a right tab stop. To make your equations more compact, you may use the solidus ( / ), the exp function, or appropriate exponents. Italicize Roman symbols for quantities and variables, but not Greek symbols. Use a long dash rather than a hyphen for a minus sign. Punctuate equations with commas or periods when they are part of a sentence, as in
+
+$$
+\alpha + \beta = \chi \eqno{(1)}
+$$
+
+Note that the equation is centered using a center tab stop. Be sure that the symbols in your equation have been defined before or immediately following the equation. Use Ò(1)Ó, not ÒEq. (1)Ó or Òequation (1)Ó, except at the beginning of a sentence: ÒEquation (1) is . . .Ó
+
+\subsection{Some Common Mistakes}
+\begin{itemize}
+
+
+\item The word ÒdataÓ is plural, not singular.
+\item The subscript for the permeability of vacuum ?0, and other common scientific constants, is zero with subscript formatting, not a lowercase letter ÒoÓ.
+\item In American English, commas, semi-/colons, periods, question and exclamation marks are located within quotation marks only when a complete thought or name is cited, such as a title or full quotation. When quotation marks are used, instead of a bold or italic typeface, to highlight a word or phrase, punctuation should appear outside of the quotation marks. A parenthetical phrase or statement at the end of a sentence is punctuated outside of the closing parenthesis (like this). (A parenthetical sentence is punctuated within the parentheses.)
+\item A graph within a graph is an ÒinsetÓ, not an ÒinsertÓ. The word alternatively is preferred to the word ÒalternatelyÓ (unless you really mean something that alternates).
+\item Do not use the word ÒessentiallyÓ to mean ÒapproximatelyÓ or ÒeffectivelyÓ.
+\item In your paper title, if the words Òthat usesÓ can accurately replace the word ÒusingÓ, capitalize the ÒuÓ; if not, keep using lower-cased.
+\item Be aware of the different meanings of the homophones ÒaffectÓ and ÒeffectÓ, ÒcomplementÓ and ÒcomplimentÓ, ÒdiscreetÓ and ÒdiscreteÓ, ÒprincipalÓ and ÒprincipleÓ.
+\item Do not confuse ÒimplyÓ and ÒinferÓ.
+\item The prefix ÒnonÓ is not a word; it should be joined to the word it modifies, usually without a hyphen.
+\item There is no period after the ÒetÓ in the Latin abbreviation Òet al.Ó.
+\item The abbreviation Òi.e.Ó means Òthat isÓ, and the abbreviation Òe.g.Ó means Òfor exampleÓ.
+
+\end{itemize}
+
+
+\section{METHOD}
+
+\subsection{Multi-Board Target Formulation}
+
+We use a multi-board calibration target composed of multiple AprilTag boards,
+each identified by a distinct AprilTag ID. We denote the complete target as
+$\mathcal{B}=\{B_0,B_1,\ldots,B_{N-1}\}$, where $B_0$ is the reference
+board. Every other board is represented by a rigid transform relative to
+$B_0$. For board $B_b$, let $\mathcal{F}_{B_b}$ denote its local coordinate
+frame and $\mathbf{p}_{b,j}$ its $j$-th 3D control point. The control points
+include the outer corners of each tag and the internal points generated by our
+method.
+
+We use the reference-board frame $\mathcal{F}_{B_0}$ as the common coordinate
+frame. Let $\mathbf{T}_{B_0B_b}\in SE(3)$ denote the rigid transform from
+board $B_b$ to the reference board $B_0$. For image frame $t$, we denote the
+camera frame by $\mathcal{F}_{C_t}$ and the transform from the reference board
+to the camera by $\mathbf{T}_{C_tB_0}\in SE(3)$. A point $\mathbf{p}_{b,j}$
+on board $B_b$ is therefore expressed in the camera coordinate system as
+\begin{equation}
+\mathbf{x}_{t,b,j}
+=
+\mathbf{T}_{C_tB_0}\mathbf{T}_{B_0B_b}\mathbf{p}_{b,j}.
+\label{eq:multiboard_point}
+\end{equation}
+Given camera model parameters $\boldsymbol{\theta}$ and projection function
+$\pi(\cdot;\boldsymbol{\theta})$, the predicted image location is
+\begin{equation}
+\hat{\mathbf{u}}_{t,b,j}
+=
+\pi\!\left(
+\mathbf{T}_{C_tB_0}\mathbf{T}_{B_0B_b}\mathbf{p}_{b,j};
+\boldsymbol{\theta}
+\right).
+\label{eq:multiboard_projection}
+\end{equation}
+The corresponding image observation is denoted by
+$\mathbf{u}_{t,b,j}\in\mathbb{R}^{2}$. Its reprojection residual is the
+difference between the observed and predicted image positions. We collect all
+valid observations in $\mathcal{O}$, where each entry stores the frame, board,
+and point indices together with its 2D image coordinate. This formulation
+allows the subsequent optimization to jointly estimate the camera parameters,
+per-frame target poses, and the geometry of each board relative to the
+reference board.
+
+\subsection{Camera Model Initialization}
+\label{subsec:camera_model_initialization}
+
+At the beginning of calibration, no reliable camera model is available, yet a
+proper initialization is important for nonlinear optimization. Our multi-board
+AprilTag target provides spatially distributed observations over a large
+portion of the camera field of view. In particular, the outer corners are
+directly determined by the AprilTag boundaries and can be detected reliably
+before internal points are available. We therefore use these widely distributed
+outer-corner observations to constrain the camera model initialization. For the
+selected camera model family, we construct the initial parameter vector
+$\boldsymbol{\theta}^{0}$ from the image resolution and model-specific validity
+constraints. This initialization does not use external calibration results or
+predefined camera intrinsics.
+
+For the outer-corner set $\mathcal{C}_{\mathrm{out}}$ observed on board $B_b$
+in frame $t$, let $\mathbf{p}_{b,j}$ denote the corresponding 3D points and
+$\mathbf{u}_{t,b,j}$ their image observations. Given
+$\boldsymbol{\theta}^{0}$, we obtain the initial board pose in the camera frame
+by minimizing the outer-corner reprojection error:
+\begin{equation}
+\mathbf{T}_{C_tB_b}^{0}
+=
+\underset{\mathbf{T}\in SE(3)}{\arg\min}
+\sum_{j\in\mathcal{C}_{\mathrm{out}}}
+\left\|
+\mathbf{u}_{t,b,j}
+-
+\pi\!\left(\mathbf{T}\mathbf{p}_{b,j};\boldsymbol{\theta}^{0}\right)
+\right\|^{2}.
+\label{eq:outer_pose_init}
+\end{equation}
+We perform this pose initialization independently for each frame-board
+observation and retain solutions with valid poses and acceptable reprojection
+errors. Starting from $\boldsymbol{\theta}^{0}$ and the per-observation poses
+$\mathbf{T}_{C_tB_b}^{0}$, we jointly optimize the camera parameters and all
+board poses:
+\begin{equation}
+\begin{aligned}
+\left\{
+\boldsymbol{\theta}^{\star},
+\mathbf{T}_{C_tB_b}^{\star}
+\right\}
+&=
+\underset{\boldsymbol{\theta},\{\mathbf{T}_{C_tB_b}\}}{\arg\min}
+\sum_{(t,b)\in\mathcal{S}}
+\sum_{j\in\mathcal{C}_{\mathrm{out}}}
+\\[-0.2em]
+&\quad
+\rho\!\Bigl(
+\bigl\|
+\mathbf{u}_{t,b,j}
+-
+\pi\!\left(
+\mathbf{T}_{C_tB_b}\mathbf{p}_{b,j};\boldsymbol{\theta}
+\right)
+\bigr\|^{2}
+\Bigr),
+\end{aligned}
+\label{eq:outer_joint_init}
+\end{equation}
+where $\mathcal{S}$ contains the retained frame-board observations and
+$\rho(\cdot)$ is a robust loss. Unlike the preceding pose-only step, this
+optimization updates the camera parameters. Each frame-board observation
+retains an independent pose variable, so the unknown multi-board layout cannot
+absorb errors in the camera intrinsics. The optimized parameters
+$\boldsymbol{\theta}^{\star}$ provide the initial camera model for the full
+multi-board calibration.
+
+\subsection{Internal Point Generation}
+
+Outer corners provide reliable observations for camera model initialization,
+but four observations per tag remain sparse for calibrating a wide-angle
+camera. We therefore use the model initialized in
+Sec.~\ref{subsec:camera_model_initialization} as an intermediate camera model
+for internal point generation. Together with the estimated board poses, it
+guides seed construction in the viewing-ray domain. The resulting seeds are
+refined locally in the original image to provide denser constraints for
+subsequent calibration.
+
+Let $\boldsymbol{\theta}^{\star}$ denote the initialized camera parameters, and
+consider board $B_b$ observed in frame $t$. We reuse its pose
+$\mathbf{T}_{C_tB_b}^{\star}$ from the outer-corner initialization. For each point
+$\mathbf{p}_{b,j}$ in the internal-point set $\mathcal{C}_{\mathrm{int}}$, we
+first compute the geometric prediction
+\begin{equation}
+\hat{\mathbf{u}}_{t,b,j}^{\mathrm{int}}
+=
+\pi\!\left(
+\mathbf{T}_{C_tB_b}^{\star}\mathbf{p}_{b,j};
+\boldsymbol{\theta}^{\star}
+\right),
+\qquad j\in\mathcal{C}_{\mathrm{int}}.
+\label{eq:internal_prediction}
+\end{equation}
+To account for wide-angle projection geometry, we construct the seed in the
+viewing-ray domain on the unit sphere. We unproject the outer corners and
+boundary observations through the initialized camera model onto $\mathbb{S}^2$,
+forming the four spherical boundary curves $\mathbf{r}_{T}(s)$,
+$\mathbf{r}_{B}(s)$, $\mathbf{r}_{L}(t)$, and $\mathbf{r}_{R}(t)$. For an
+internal point $\mathbf{p}_{b,j}$, let $(s_j,t_j)\in[0,1]^2$ denote its
+normalized horizontal and vertical coordinates in the board lattice. We then
+apply spherical interpolation along opposite boundaries:
+\begin{equation}
+\begin{split}
+\mathbf{r}_{v}
+&=
+\operatorname{slerp}\!\left(
+\mathbf{r}_{T}(s_j),\mathbf{r}_{B}(s_j),t_j
+\right),\\
+\mathbf{r}_{h}
+&=
+\operatorname{slerp}\!\left(
+\mathbf{r}_{L}(t_j),\mathbf{r}_{R}(t_j),s_j
+\right).
+\end{split}
+\label{eq:spherical_boundary_interp}
+\end{equation}
+We combine the two interpolated rays to obtain the internal seed ray and
+project it back to the image plane:
+\begin{equation}
+\tilde{\mathbf{d}}_{t,b,j}^{\mathrm{int}}
+=
+\frac{\mathbf{r}_{v}+\mathbf{r}_{h}}
+{\left\|\mathbf{r}_{v}+\mathbf{r}_{h}\right\|},
+\qquad
+\tilde{\mathbf{u}}_{t,b,j}^{\mathrm{int}}
+=
+\pi\!\left(
+\tilde{\mathbf{d}}_{t,b,j}^{\mathrm{int}};
+\boldsymbol{\theta}^{\star}
+\right).
+\label{eq:spherical_seed}
+\end{equation}
+Using $\tilde{\mathbf{u}}_{t,b,j}^{\mathrm{int}}$ as the initial location,
+we perform subpixel refinement in a local image neighborhood. Let
+$\mathcal{R}(\cdot)$ denote the refinement operator. The final internal point
+observation is
+\begin{equation}
+\mathbf{u}_{t,b,j}^{\mathrm{int}}
+=
+\mathcal{R}\!\left(
+I_t,\tilde{\mathbf{u}}_{t,b,j}^{\mathrm{int}}
+\right),
+\label{eq:internal_refinement}
+\end{equation}
+where $I_t$ is the image at frame $t$. Refinement is restricted to a local
+neighborhood around the seed. We discard an internal point if refinement
+fails, if it falls outside the image, or if it fails the local consistency
+checks.
+
+\subsection{Spherical Bundle Adjustment}
+\label{subsec:spherical_ba}
+
+Standard reprojection error measures the discrepancy between predicted and
+observed points on the image plane. For a wide-angle camera, the same pixel
+error does not represent the same viewing-ray deviation across the field of
+view, especially near the image boundary at a large polar angle. We therefore
+formulate a spherical bundle adjustment objective in the viewing-ray domain.
+
+Given an observed image point $\mathbf{u}_{t,b,j}$, we unproject it through the
+camera model and normalize it to obtain the observed unit ray
+$\mathbf{d}_{t,b,j}^{\mathrm{obs}}$. For the corresponding 3D control point
+$\mathbf{p}_{b,j}$, we apply the multi-board transformation chain and normalize
+the resulting camera-frame point to obtain the predicted unit ray:
+\begin{equation}
+\mathbf{x}_{t,b,j}
+=
+\mathbf{T}_{C_tB_0}\mathbf{T}_{B_0B_b}\mathbf{p}_{b,j},
+\qquad
+\mathbf{d}_{t,b,j}^{\mathrm{pred}}
+=
+\frac{\mathbf{x}_{t,b,j}}{\left\|\mathbf{x}_{t,b,j}\right\|}.
+\label{eq:predicted_ray}
+\end{equation}
+At the observed ray, we construct a local tangent basis
+$\mathbf{B}_{t,b,j}\in\mathbb{R}^{3\times2}$, whose two columns span the plane
+orthogonal to $\mathbf{d}_{t,b,j}^{\mathrm{obs}}$. We define the tangent-plane
+residual as
+\begin{equation}
+\mathbf{r}_{t,b,j}^{\mathrm{ang}}
+=
+\mathbf{B}_{t,b,j}^{\top}
+\left(
+\mathbf{d}_{t,b,j}^{\mathrm{pred}}
+-
+\mathbf{d}_{t,b,j}^{\mathrm{obs}}
+\right).
+\label{eq:tangent_residual}
+\end{equation}
+This representation maps the local viewing-ray deviation to a two-dimensional
+least-squares residual, which can be optimized in the same backend as a
+conventional reprojection residual.
+
+Using only angular residuals may weaken the stable image-plane constraints near
+the image center, whereas pixel residuals do not directly represent
+viewing-ray errors at large polar angles. We therefore define a continuous
+mixing weight from the polar angle $\theta_{t,b,j}$:
+\begin{equation}
+w_{t,b,j}
+=
+\sigma\!\left(
+\frac{\theta_{t,b,j}-\theta_0}{\tau}
+\right),
+\label{eq:polar_weight}
+\end{equation}
+where $\sigma(\cdot)$ is the sigmoid function, $\theta_0$ is the transition
+angle, and $\tau$ controls the transition range. Observations at small polar
+angles are mainly constrained by pixel residuals. The contribution of the
+angular residual increases smoothly with the polar angle.
+
+Because pixel residuals and tangent-plane residuals have different units, we
+keep them as separate residual blocks and introduce the fixed reference focal
+length
+\begin{equation}
+f_{\mathrm{ref}}
+=
+\sqrt{f_x^{(0)}f_y^{(0)}},
+\label{eq:reference_focal}
+\end{equation}
+computed from the initial focal lengths, to bring the angular residual to
+approximately the same scale as the pixel residual. The resulting polar-aware
+hybrid objective is
+\begin{equation}
+\begin{split}
+E_{\mathrm{hyb}}
+=
+\sum_{t,b,j}
+&\rho_{\mathrm{pix}}\!\left(
+\left\|
+\sqrt{1-w_{t,b,j}}\,\mathbf{r}_{t,b,j}^{\mathrm{pix}}
+\right\|_{\boldsymbol{\Sigma}_{\mathrm{pix}}^{-1}}^{2}
+\right)\\
+{}+
+&\rho_{\mathrm{ang}}\!\left(
+\left\|
+f_{\mathrm{ref}}\sqrt{w_{t,b,j}}\,
+\mathbf{r}_{t,b,j}^{\mathrm{ang}}
+\right\|_{\boldsymbol{\Sigma}_{\mathrm{ang}}^{-1}}^{2}
+\right),
+\end{split}
+\label{eq:hybrid_objective}
+\end{equation}
+where $\rho_{\mathrm{pix}}$ and $\rho_{\mathrm{ang}}$ are the robust kernels
+for the pixel and angular terms, and the covariance matrices weight their
+respective residual blocks. This objective preserves the image-plane
+constraint near the image center while increasing the contribution of
+viewing-ray geometry at large polar angles.
+
+\section{EXPERIMENTS}
+
+\subsection{Experimental Setup}
+
+We randomly split each image sequence into 70\% training images and 30\%
+held-out test images using a fixed random seed. All compared methods use the
+same split. Unless stated otherwise, we calibrate on the training images and
+evaluate on the held-out test images using reprojection RMSE and inlier ratio.
+
+\subsection{Reprojection Error}
+
+Table~\ref{tab:reprojection_comparison} compares the reprojection performance
+of the evaluated calibration systems under matched camera-model families and
+test observations. Our method gives the best completed results on both
+multi-board sets. Across the DS, KB, and UCM/Mei families, its RMSE ranges from
+0.520 to 0.523 px on Set 1 and from 0.631 to 0.636 px on Set 2, compared with
+0.583--0.605 px and 0.760--0.816 px for the strongest listed baseline in each
+family. The consistently lower P95 and higher inlier ratio show that the gain
+extends beyond the mean reprojection error.
+
+\input{tables/01_reprojection_comparison}
+
+\subsection{Ablation}
+
+We conduct two ablations to examine the two main components of internal point
+generation. The first removes the generated internal points and retains only
+the four outer corners of each board. The second replaces the proposed
+spherical seed with a local pinhole patch while keeping the subsequent
+refinement and calibration backend unchanged.
+
+\subsubsection{Internal Point Ablation}
+
+We compare \emph{Outer-only} with \emph{Ours: Outer+Internal}. The former uses
+only the four outer corners of each board, whereas the latter also uses the
+internal points generated by our method. Under the same fixed split and
+optimization settings, the two variants obtain nearly identical multi-board
+test RMSEs of 0.5224 and 0.5228 px, respectively. This result suggests that
+reprojection error alone is insufficient to reveal whether the sparse
+Outer-only observations constrain the camera parameters reliably. We therefore
+pass the same observations and target geometry to BabelCalib and re-estimate
+the camera model with an independent backend.
+
+Table~\ref{tab:cross_backend_verification} reports the cross-backend results.
+With outer and internal observations, BabelCalib recovers focal lengths and
+principal points close to ours, with test RMSE differences below 0.011 px. In
+contrast, its Outer-only DS solution attains a similar multi-board RMSE of
+0.5256 px but shifts the focal lengths from approximately 1176 to 1943 px; the
+Outer-only KB model does not yield a valid solution. These results show that a
+low reprojection error can conceal an underconstrained intrinsic
+parameterization, while internal points improve parameter identifiability and
+cross-backend consistency.
+
+\input{tables/02_cross_backend_verification}
+
+\subsubsection{Internal Seed Generation Ablation}
+
+We compare \emph{Local Pinhole Patch} with \emph{Ours: Spherical Seed}. Local
+Pinhole Patch constructs a virtual pinhole patch from the outer corners of each
+board, generates internal points according to the board lattice, and maps them
+back to the original image. Ours uses the intermediate camera model and board
+pose to generate the seeds in the viewing-ray domain, followed by local
+refinement. Both settings use the same backend optimization, so the comparison
+isolates the geometry used for internal seed generation.
+
+Table~\ref{tab:internal_seed_ablation} reports lower holdout and internal-point
+errors for the spherical seed. In contrast, replacing it with the Local Pinhole
+Patch causes a large increase in both errors and produces a substantially worse
+frame--board observation. We therefore use spherical seed generation in the
+remaining experiments.
+
+\input{tables/03_internal_seed_ablation}
+
+\subsection{Spherical Bundle Adjustment Evaluation}
+
+We evaluate the residual design in Sec.~\ref{subsec:spherical_ba} independently
+of observation selection. Under the DS model, we compare three objectives:
+\emph{Pixel} uses only image-plane reprojection residuals, \emph{Spherical}
+uses only tangent-plane residuals, and \emph{Hybrid} applies the proposed
+polar-aware weighting. All variants share the data split, camera
+initialization, frame-board inputs, and frozen close-distance test
+observations. We assess image-plane error, angular error across polar-angle
+bins, cross-capture ray-curve consistency, and optimization time.
+
+\input{tables/04_spherical_ba_ablation}
+
+Table~\ref{tab:spherical_ba_ablation} shows that the three objectives retain
+similar image-plane accuracy. Hybrid gives the lowest mean, tail, and
+outer-corner errors, while Spherical gives the best cross-capture ray-curve
+consistency. Both ray-domain objectives reduce angular error at medium and
+large polar angles relative to Pixel. Hybrid therefore provides the most
+balanced image-plane and ray-domain behavior, although the dynamic ray
+residuals increase the optimization cost. We use Hybrid in the remaining
+experiments.
+
+\subsection{Camera Pose Estimation}
+
+We evaluate camera pose estimation on the held-out test images to test whether
+the calibrated model explains unseen observations. During evaluation, we fix
+the camera intrinsics and multi-board geometry and optimize only the pose from
+the reference board to the camera using all visible board observations and a
+robust reprojection objective. We report reprojection RMSE, mean inlier ratio,
+and pose failures. Because no calibration parameter is updated, this
+experiment measures the geometric consistency of each calibrated model under
+pose-only optimization.
+
+\section{CONCLUSIONS}
+
+A conclusion section is not required. Although a conclusion may review the main points of the paper, do not replicate the abstract as the conclusion. A conclusion might elaborate on the importance of the work or suggest applications and extensions. 
+
+\addtolength{\textheight}{-12cm}   % This command serves to balance the column lengths
+                                  % on the last page of the document manually. It shortens
+                                  % the textheight of the last page by a suitable amount.
+                                  % This command does not take effect until the next page
+                                  % so it should come on the page before the last. Make
+                                  % sure that you do not shorten the textheight too much.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section*{APPENDIX}
+
+Appendixes should appear before the acknowledgment.
+
+\section*{ACKNOWLEDGMENT}
+
+The preferred spelling of the word ÒacknowledgmentÓ in America is without an ÒeÓ after the ÒgÓ. Avoid the stilted expression, ÒOne of us (R. B. G.) thanks . . .Ó  Instead, try ÒR. B. G. thanksÓ. Put sponsor acknowledgments in the unnumbered footnote on the first page.
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+References are important to the reader; therefore, each citation must be complete and correct. If at all possible, references should be commonly available publications.
+
+
+
+\begin{thebibliography}{99}
+
+\bibitem{c1} G. O. Young, ÒSynthetic structure of industrial plastics (Book style with paper title and editor),Ó 	in Plastics, 2nd ed. vol. 3, J. Peters, Ed.  New York: McGraw-Hill, 1964, pp. 15Ð64.
+
+
+\end{thebibliography}
+
+
+
+
+\end{document}

@@ -1,19 +1,25 @@
 #include <aslam/cameras/apriltag_internal/ApriltagInternalDetector.hpp>
 
+#include <aslam/cameras/apriltag_internal/OuterDetectionResultUtils.hpp>
+#include <aslam/cameras/apriltag_internal/InternalPointResultValidation.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <Eigen/Cholesky>
 #include <Eigen/Eigenvalues>
 #include <Eigen/Geometry>
 #include <boost/filesystem.hpp>
@@ -26,6 +32,12 @@ namespace aslam {
 namespace cameras {
 namespace apriltag_internal {
 namespace {
+
+double ElapsedSeconds(const std::chrono::steady_clock::time_point& start_time) {
+  return std::chrono::duration_cast<std::chrono::duration<double> >(
+             std::chrono::steady_clock::now() - start_time)
+      .count();
+}
 
 struct TemplateScore {
   double template_quality = 0.0;
@@ -138,6 +150,8 @@ struct BoardBoundaryEdgeModel {
   bool valid = false;
   std::vector<cv::Point2f> support_points;
   std::vector<Eigen::Vector3d> support_rays;
+  std::vector<double> sample_alphas;
+  std::vector<Eigen::Vector3d> sample_rays;
   Eigen::Vector3d plane_normal = Eigen::Vector3d::Zero();
   Eigen::Vector3d start_ray = Eigen::Vector3d::Zero();
   Eigen::Vector3d end_ray = Eigen::Vector3d::Zero();
@@ -160,7 +174,35 @@ struct BorderConditionedSeed {
   Eigen::Vector3d right_ray = Eigen::Vector3d::Zero();
 };
 
-constexpr double kSphereLatticeSearchRadiusScale = 0.5;
+struct VerticalOnlyImageOffset {
+  bool valid = false;
+  double fallback_delta_v_px = 0.0;
+  double clamp_limit_px = 0.0;
+  int support_count = 0;
+  std::vector<std::pair<int, double> > row_delta_v_px;
+};
+
+struct RowImageEvidenceOffset {
+  bool valid = false;
+  bool group_by_column = false;
+  bool apply_along_x = false;
+  double aggregate_gain = 0.0;
+  int support_count = 0;
+  std::vector<std::pair<int, double> > row_delta_v_px;
+};
+
+struct RowEvidenceSeedSample {
+  int point_id = -1;
+  int row = 0;
+  int col = 0;
+  cv::Point2f seed_image{};
+  cv::Point2f unit_v{};
+  cv::Point2f module_u_axis{};
+  cv::Point2f module_v_axis{};
+  double local_module_scale = 0.0;
+};
+
+constexpr double kSphereLatticeSearchRadiusScale = 1.0;
 constexpr double kSphereLatticeSearchRadiusMin = 1e-3;
 constexpr int kSphereLatticeCoarseGridSize = 9;
 constexpr int kSphereLatticeFineGridSize = 5;
@@ -192,10 +234,72 @@ constexpr double kBorderConditionedPlaneResidualThreshold = 0.035;
 constexpr int kBorderBoundaryCurveSampleCount = 33;
 constexpr double kBorderConditionedSearchRadiusGain = 0.75;
 constexpr double kBorderConditionedSearchRadiusMaxScale = 3.0;
+constexpr int kRescuedBoundaryFallbackSupportSamples = 12;
+constexpr int kVerticalOnlyOffsetMinSupport = 8;
+constexpr int kVerticalOnlyOffsetMinRowSupport = 2;
+constexpr double kVerticalOnlyOffsetClampModuleScale = 0.35;
+constexpr double kVerticalOnlyOffsetMadScale = 3.0;
+constexpr int kRowImageEvidenceMinSupport = 3;
+constexpr double kRowImageEvidenceSearchRadiusScale = 0.45;
+constexpr double kRowImageEvidenceMinGain = 0.02;
+constexpr int kRowStructureMinSupport = 3;
+constexpr double kRowStructureSearchRadiusScale = 0.65;
+constexpr double kRowStructureMinRelativeGain = 0.08;
 
 bool NormalizeRay(Eigen::Vector3d* ray);
 Eigen::Vector3d ProjectOntoTangentPlane(const Eigen::Vector3d& vector,
                                         const Eigen::Vector3d& ray_anchor);
+bool ImageEvidencePassesQualityGate(const ApriltagInternalDetectionOptions& options,
+                                    double image_final_quality) {
+  return options.ignore_image_evidence_min_quality ||
+         image_final_quality >= options.min_quality;
+}
+
+bool IsInsideImage(const cv::Point2f& point, const cv::Size& image_size);
+bool IsInsideImageWithBorder(const cv::Point2f& point,
+                             const cv::Size& image_size,
+                             double border_distance);
+
+bool IsInsideImageForRecovery(const cv::Point2f& point,
+                              const cv::Size& image_size,
+                              const ApriltagInternalDetectionOptions& options) {
+  if (options.outer_detector_config.enable_robust_missing_board_recovery) {
+    return IsInsideImage(point, image_size);
+  }
+  return IsInsideImageWithBorder(point, image_size, options.min_border_distance);
+}
+
+cv::Point2f RefineImageCornerSubpixWithPadding(
+    const cv::Mat& gray, const cv::Point2f& seed, int radius,
+    const ApriltagInternalDetectionOptions& options) {
+  if (gray.empty() || !std::isfinite(seed.x) || !std::isfinite(seed.y)) {
+    return seed;
+  }
+  const int padding = std::max(2, radius + 2);
+  const bool needs_padding =
+      options.outer_detector_config.enable_robust_missing_board_recovery &&
+      (seed.x < padding || seed.x > static_cast<float>(gray.cols - 1 - padding) ||
+       seed.y < padding || seed.y > static_cast<float>(gray.rows - 1 - padding));
+  cv::Mat padded_gray;
+  const cv::Mat* refinement_image = &gray;
+  cv::Point2f refinement_seed = seed;
+  if (needs_padding) {
+    cv::copyMakeBorder(gray, padded_gray, padding, padding, padding, padding,
+                       cv::BORDER_REFLECT_101);
+    refinement_image = &padded_gray;
+    refinement_seed += cv::Point2f(static_cast<float>(padding),
+                                   static_cast<float>(padding));
+  }
+  std::vector<cv::Point2f> corners{refinement_seed};
+  cv::cornerSubPix(
+      *refinement_image, corners, cv::Size(std::max(2, radius), std::max(2, radius)),
+      cv::Size(-1, -1),
+      cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 30, 0.1));
+  return needs_padding
+             ? corners.front() - cv::Point2f(static_cast<float>(padding),
+                                             static_cast<float>(padding))
+             : corners.front();
+}
 bool BuildLocalSphereOffsetRay(const Eigen::Vector3d& anchor_ray,
                                const Eigen::Vector3d& tangent_u,
                                const Eigen::Vector3d& tangent_v,
@@ -312,7 +416,9 @@ std::vector<int> ParseIntList(const std::string& key, const std::string& value) 
 InternalProjectionMode ParseProjectionMode(const std::string& value) {
   const std::string lowered = Lowercase(value);
   if (lowered == "homography") {
-    return InternalProjectionMode::Homography;
+    throw std::runtime_error(
+        "The homography internal-corner generator has been retired. "
+        "Use sphere_border_lattice with a configured camera model.");
   }
   if (lowered == "virtual_pinhole_patch" || lowered == "virtual-pinhole-patch") {
     return InternalProjectionMode::VirtualPinholePatch;
@@ -327,11 +433,31 @@ InternalProjectionMode ParseProjectionMode(const std::string& value) {
       lowered == "virtual-pinhole-patch-edge-seed") {
     return InternalProjectionMode::VirtualPinholePatchBoundarySeed;
   }
+  if (lowered == "pinhole_bootstrap_patch" ||
+      lowered == "pinhole-bootstrap-patch" ||
+      lowered == "outer_corner_pinhole_bootstrap_patch" ||
+      lowered == "outer-corner-pinhole-bootstrap-patch") {
+    throw std::runtime_error(
+        "The Outer4 homography bootstrap generator has been retired. "
+        "Use sphere_border_lattice with a configured camera model.");
+  }
   if (lowered == "sphere_lattice" || lowered == "sphere-lattice") {
     return InternalProjectionMode::SphereLattice;
   }
   if (lowered == "sphere_border_lattice" || lowered == "sphere-border-lattice") {
     return InternalProjectionMode::SphereBorderLattice;
+  }
+  if (lowered == "spherical_intermediate" ||
+      lowered == "spherical-intermediate" ||
+      lowered == "current" ||
+      lowered == "ours") {
+    return InternalProjectionMode::SphereBorderLattice;
+  }
+  if (lowered == "pure_spherical_boundary_seed" ||
+      lowered == "pure-spherical-boundary-seed" ||
+      lowered == "sphere_boundary_seed" ||
+      lowered == "sphere-boundary-seed") {
+    return InternalProjectionMode::PureSphericalBoundarySeed;
   }
   if (lowered == "sphere_ray_refine" || lowered == "sphere-ray-refine") {
     return InternalProjectionMode::SphereRayRefine;
@@ -342,34 +468,27 @@ InternalProjectionMode ParseProjectionMode(const std::string& value) {
 bool UsesSphereSeedPipeline(InternalProjectionMode mode) {
   return mode == InternalProjectionMode::SphereLattice ||
          mode == InternalProjectionMode::SphereBorderLattice ||
+         mode == InternalProjectionMode::PureSphericalBoundarySeed ||
          mode == InternalProjectionMode::SphereRayRefine;
 }
 
 bool UsesBorderConditionedSphereSeed(InternalProjectionMode mode) {
-  return mode == InternalProjectionMode::SphereBorderLattice;
-}
-
-std::string ResolvePath(const std::string& path, const std::string& reference_yaml_path) {
-  const boost::filesystem::path input_path(path);
-  if (input_path.is_absolute()) {
-    return input_path.lexically_normal().string();
-  }
-
-  const boost::filesystem::path reference_dir =
-      boost::filesystem::absolute(boost::filesystem::path(reference_yaml_path)).parent_path();
-  return (reference_dir / input_path).lexically_normal().string();
+  return mode == InternalProjectionMode::SphereBorderLattice ||
+         mode == InternalProjectionMode::PureSphericalBoundarySeed;
 }
 
 void ApplyCameraField(IntermediateCameraConfig* config,
                       const std::string& key,
                       const std::string& value,
-                      const std::string& reference_yaml_path) {
+                      const std::string& /*reference_yaml_path*/) {
   if (config == nullptr) {
     throw std::runtime_error("Camera config output pointer must not be null.");
   }
 
   if (key == "camera_yaml" || key == "intermediate_camera_yaml") {
-    config->camera_yaml = ResolvePath(value, reference_yaml_path);
+    // External camera-parameter files are deliberately unsupported. Camera
+    // parameters must be estimated from the observations of the active run.
+    return;
   } else if (key == "camera_model") {
     config->camera_model = Lowercase(value);
   } else if (key == "distortion_model") {
@@ -381,35 +500,6 @@ void ApplyCameraField(IntermediateCameraConfig* config,
   } else if (key == "resolution") {
     config->resolution = ParseIntList(key, value);
   }
-}
-
-IntermediateCameraConfig LoadExternalCameraConfig(const std::string& camera_yaml_path) {
-  std::ifstream stream(camera_yaml_path);
-  if (!stream.is_open()) {
-    throw std::runtime_error("Could not open camera config file: " + camera_yaml_path);
-  }
-
-  IntermediateCameraConfig config;
-  config.camera_yaml = camera_yaml_path;
-
-  std::string line;
-  while (std::getline(stream, line)) {
-    const std::string cleaned = Trim(RemoveInlineComment(line));
-    if (cleaned.empty()) {
-      continue;
-    }
-
-    const auto colon = cleaned.find(':');
-    if (colon == std::string::npos) {
-      continue;
-    }
-
-    const std::string key = Trim(cleaned.substr(0, colon));
-    const std::string value = Unquote(Trim(cleaned.substr(colon + 1)));
-    ApplyCameraField(&config, key, value, camera_yaml_path);
-  }
-
-  return config;
 }
 
 IntermediateCameraConfig MakeCoarseInitialCameraConfig(
@@ -497,7 +587,10 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
     } else if (key == "tagSize" || key == "tag_size") {
       config.tag_size = ParseDouble(key, value);
     } else if (key == "blackBorderBits" || key == "black_border_bits") {
-      config.black_border_bits = ParseInt(key, value);
+      const int black_border_bits = ParseInt(key, value);
+      config.black_border_bits = black_border_bits;
+      config.outer_detector_config.opencv_apriltag_marker_border_bits =
+          black_border_bits;
     } else if (key == "minVisiblePoints" || key == "min_visible_points") {
       config.min_visible_points = ParseInt(key, value);
     } else if (key == "canonicalPixelsPerModule" || key == "canonical_pixels_per_module") {
@@ -518,11 +611,31 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
     } else if (key == "maxInternalSubpixDisplacement" ||
                key == "max_internal_subpix_displacement") {
       config.max_internal_subpix_displacement = ParseDouble(key, value);
+    } else if (key == "ignoreImageEvidenceMinQuality" ||
+               key == "ignore_image_evidence_min_quality") {
+      config.ignore_image_evidence_min_quality =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "forceInternalSeedFromPrediction" ||
+               key == "force_internal_seed_from_prediction") {
+      config.force_internal_seed_from_prediction =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "bypassInternalSeedFilters" ||
+               key == "bypass_internal_seed_filters") {
+      config.bypass_internal_seed_filters =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "enableInternalStructureCorrectionAfterSs" ||
+               key == "enable_internal_structure_correction_after_ss") {
+      config.enable_internal_structure_correction_after_ss =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
     } else if (key == "enableDebugOutput" || key == "enable_debug_output") {
       config.enable_debug_output =
           Lowercase(value) == "1" || Lowercase(value) == "true" ||
           Lowercase(value) == "yes" || Lowercase(value) == "on";
-    } else if (key == "internal_projection_mode") {
+    } else if (key == "internal_projection_mode" || key == "generation_mode") {
       config.internal_projection_mode = ParseProjectionMode(value);
     } else if (key == "sphereLatticeUseInitialCamera" ||
                key == "sphere_lattice_use_initial_camera") {
@@ -537,6 +650,36 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
     } else if (key == "enableOuterSphericalRefinement" ||
                key == "enable_outer_spherical_refinement") {
       config.outer_detector_config.enable_outer_spherical_refinement =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "enableAnonymousTagLikeGeometryRescue" ||
+               key == "enable_anonymous_tag_like_geometry_rescue") {
+      config.outer_detector_config.enable_anonymous_tag_like_geometry_rescue =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "enableCameraAwareSpherePatchRescue" ||
+               key == "enable_camera_aware_sphere_patch_rescue") {
+      config.outer_detector_config.enable_camera_aware_sphere_patch_rescue =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "cameraAwareSpherePatchMaxHamming" ||
+               key == "camera_aware_sphere_patch_max_hamming") {
+      config.outer_detector_config.camera_aware_sphere_patch_max_hamming =
+          ParseInt(key, value);
+    } else if (key == "cameraAwareSpherePatchCommitMappedCorners" ||
+               key == "camera_aware_sphere_patch_commit_mapped_corners") {
+      config.outer_detector_config.camera_aware_sphere_patch_commit_mapped_corners =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "cameraAwareSpherePatchRescueZeroDetectionFrames" ||
+               key == "camera_aware_sphere_patch_rescue_zero_detection_frames") {
+      config.outer_detector_config
+          .camera_aware_sphere_patch_rescue_zero_detection_frames =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "cameraAwareSpherePatchUseExtendedAtlas" ||
+               key == "camera_aware_sphere_patch_use_extended_atlas") {
+      config.outer_detector_config.camera_aware_sphere_patch_use_extended_atlas =
           Lowercase(value) == "1" || Lowercase(value) == "true" ||
           Lowercase(value) == "yes" || Lowercase(value) == "on";
     } else if (key == "sphereLatticeEnableSeedSearch" ||
@@ -563,6 +706,40 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.outer_detector_config.min_border_distance = ParseDouble(key, value);
     } else if (key == "maxScalesToTry" || key == "max_scales_to_try") {
       config.outer_detector_config.max_scales_to_try = ParseInt(key, value);
+    } else if (key == "enableAdaptiveScaleCascade" ||
+               key == "enable_adaptive_scale_cascade") {
+      config.outer_detector_config.enable_adaptive_scale_cascade =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "adaptiveCoarseScaleDivisors" ||
+               key == "adaptive_coarse_scale_divisors") {
+      config.outer_detector_config.adaptive_coarse_scale_divisors =
+          ParseDoubleList(key, value);
+    } else if (key == "adaptiveFallbackScaleDivisors" ||
+               key == "adaptive_fallback_scale_divisors") {
+      config.outer_detector_config.adaptive_fallback_scale_divisors =
+          ParseDoubleList(key, value);
+    } else if (key == "adaptiveCoarseMaxHamming" ||
+               key == "adaptive_coarse_max_hamming") {
+      config.outer_detector_config.adaptive_coarse_max_hamming =
+          ParseInt(key, value);
+    } else if (key == "enableOpenCvApriltagFallback" ||
+               key == "enable_opencv_apriltag_fallback") {
+      config.outer_detector_config.enable_opencv_apriltag_fallback =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "opencvApriltagFallbackLongestSides" ||
+               key == "opencv_apriltag_fallback_longest_sides") {
+      config.outer_detector_config.opencv_apriltag_fallback_longest_sides =
+          ParseIntList(key, value);
+    } else if (key == "opencvApriltagMarkerBorderBits" ||
+               key == "opencv_apriltag_marker_border_bits") {
+      config.outer_detector_config.opencv_apriltag_marker_border_bits =
+          ParseInt(key, value);
+    } else if (key == "opencvApriltagMinMarkerPerimeterRate" ||
+               key == "opencv_apriltag_min_marker_perimeter_rate") {
+      config.outer_detector_config.opencv_apriltag_min_marker_perimeter_rate =
+          ParseDouble(key, value);
     } else if (key == "outerLocalContextScale" || key == "outer_local_context_scale") {
       config.outer_detector_config.outer_local_context_scale = ParseDouble(key, value);
     } else if (key == "outerCornerMarkerRatio" || key == "outer_corner_marker_ratio" ||
@@ -570,6 +747,35 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
       config.outer_detector_config.outer_corner_marker_ratio = ParseDouble(key, value);
     } else if (key == "outerSubpixScale" || key == "outer_subpix_scale") {
       config.outer_detector_config.outer_subpix_scale = ParseDouble(key, value);
+    } else if (key == "enableCloseEdgeOuterSubpixBoost" ||
+               key == "enable_close_edge_outer_subpix_boost") {
+      config.outer_detector_config.enable_close_edge_outer_subpix_boost =
+          Lowercase(value) == "1" || Lowercase(value) == "true" ||
+          Lowercase(value) == "yes" || Lowercase(value) == "on";
+    } else if (key == "closeEdgeOuterSubpixAreaRatio" ||
+               key == "close_edge_outer_subpix_area_ratio") {
+      config.outer_detector_config.close_edge_outer_subpix_area_ratio =
+          ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixMinPolarDeg" ||
+               key == "close_edge_outer_subpix_min_polar_deg") {
+      config.outer_detector_config.close_edge_outer_subpix_min_polar_deg =
+          ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixFullPolarDeg" ||
+               key == "close_edge_outer_subpix_full_polar_deg") {
+      config.outer_detector_config.close_edge_outer_subpix_full_polar_deg =
+          ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixBorderRatio" ||
+               key == "close_edge_outer_subpix_border_ratio") {
+      config.outer_detector_config.close_edge_outer_subpix_border_ratio =
+          ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixMultiplier" ||
+               key == "close_edge_outer_subpix_multiplier") {
+      config.outer_detector_config.close_edge_outer_subpix_multiplier =
+          ParseDouble(key, value);
+    } else if (key == "closeEdgeOuterSubpixMaxMultiplier" ||
+               key == "close_edge_outer_subpix_max_multiplier") {
+      config.outer_detector_config.close_edge_outer_subpix_max_multiplier =
+          ParseDouble(key, value);
     } else if (key == "outerRefineGateScale" || key == "outer_refine_gate_scale") {
       config.outer_detector_config.outer_refine_gate_scale = ParseDouble(key, value);
     } else if (key == "outerRefineGateMin" || key == "outer_refine_gate_min") {
@@ -678,26 +884,6 @@ ApriltagInternalConfig ParseApriltagInternalConfig(const std::string& yaml_path)
     }
   }
 
-  if (!config.intermediate_camera.camera_yaml.empty()) {
-    IntermediateCameraConfig loaded = LoadExternalCameraConfig(config.intermediate_camera.camera_yaml);
-    if (!config.intermediate_camera.camera_model.empty()) {
-      loaded.camera_model = config.intermediate_camera.camera_model;
-    }
-    if (!config.intermediate_camera.distortion_model.empty()) {
-      loaded.distortion_model = config.intermediate_camera.distortion_model;
-    }
-    if (!config.intermediate_camera.intrinsics.empty()) {
-      loaded.intrinsics = config.intermediate_camera.intrinsics;
-    }
-    if (!config.intermediate_camera.distortion_coeffs.empty()) {
-      loaded.distortion_coeffs = config.intermediate_camera.distortion_coeffs;
-    }
-    if (!config.intermediate_camera.resolution.empty()) {
-      loaded.resolution = config.intermediate_camera.resolution;
-    }
-    config.intermediate_camera = loaded;
-  }
-
   config.tag_ids = NormalizeBoardIds(config.tag_ids, config.tag_id);
   config.tag_id = config.tag_ids.front();
   config.outer_detector_config.tag_id = config.tag_id;
@@ -736,12 +922,14 @@ cv::Rect MakeClampedRoi(const cv::Point2f& center, int radius, const cv::Size& i
 }
 
 int ClampRadiusFromScale(double scale, double local_scale, int min_radius, int max_radius) {
-  if (min_radius <= 0 || max_radius < min_radius) {
+  if (min_radius <= 0 || max_radius < 0 ||
+      (max_radius > 0 && max_radius < min_radius)) {
     throw std::runtime_error("Invalid adaptive radius bounds.");
   }
   const double scaled = scale > 0.0 ? scale * local_scale : static_cast<double>(min_radius);
   const int rounded = static_cast<int>(std::lround(scaled));
-  return std::max(min_radius, std::min(max_radius, rounded));
+  const int radius = std::max(min_radius, rounded);
+  return max_radius > 0 ? std::min(max_radius, radius) : radius;
 }
 
 double ComputeModuleScalePx(const cv::Point2f& module_u_axis,
@@ -790,7 +978,42 @@ int ComputeAdaptiveImageEvidenceSearchRadius(double module_scale_px,
   return std::max(1, 2 * ComputeAdaptiveInternalSubpixRadius(module_scale_px, options));
 }
 
-double MeanIntensity(const cv::Mat& patch, const cv::Point2f& center, int radius) {
+class IntegralMeanImage {
+ public:
+  explicit IntegralMeanImage(const cv::Mat& image) : image_size_(image.size()) {
+    if (image.empty()) {
+      return;
+    }
+    cv::integral(image, integral_, CV_64F);
+  }
+
+  bool valid() const { return !integral_.empty(); }
+
+  double MeanIntensity(const cv::Point2f& center, int radius) const {
+    const cv::Rect roi = MakeClampedRoi(center, radius, image_size_);
+    if (roi.width <= 0 || roi.height <= 0 || integral_.empty()) {
+      return 0.0;
+    }
+
+    const double* top_row = integral_.ptr<double>(roi.y);
+    const double* bottom_row = integral_.ptr<double>(roi.y + roi.height);
+    const double sum = bottom_row[roi.x + roi.width] - bottom_row[roi.x] -
+                       top_row[roi.x + roi.width] + top_row[roi.x];
+    return sum / static_cast<double>(roi.area());
+  }
+
+ private:
+  cv::Size image_size_;
+  cv::Mat integral_;
+};
+
+double MeanIntensity(const cv::Mat& patch,
+                     const cv::Point2f& center,
+                     int radius,
+                     const IntegralMeanImage* integral_image = nullptr) {
+  if (integral_image != nullptr && integral_image->valid()) {
+    return integral_image->MeanIntensity(center, radius);
+  }
   const cv::Rect roi = MakeClampedRoi(center, radius, patch.size());
   if (roi.width <= 0 || roi.height <= 0) {
     return 0.0;
@@ -803,6 +1026,12 @@ double SampleFloatAt(const cv::Mat& image, const cv::Point2f& point) {
     return 0.0;
   }
 
+  // The detector operates on grayscale camera images, which are normally
+  // CV_8UC1, while corner-response maps are CV_32FC1.  This helper is used by
+  // both paths, so reading every matrix as float corrupts the 8-bit path and
+  // triggers OpenCV's elemSize assertion during curved-edge recovery.
+  CV_Assert(image.channels() == 1);
+
   const float x = ClampFloat(point.x, 0.0f, static_cast<float>(image.cols - 1));
   const float y = ClampFloat(point.y, 0.0f, static_cast<float>(image.rows - 1));
 
@@ -813,10 +1042,30 @@ double SampleFloatAt(const cv::Mat& image, const cv::Point2f& point) {
   const float dx = x - static_cast<float>(x0);
   const float dy = y - static_cast<float>(y0);
 
-  const float v00 = image.at<float>(y0, x0);
-  const float v10 = image.at<float>(y0, x1);
-  const float v01 = image.at<float>(y1, x0);
-  const float v11 = image.at<float>(y1, x1);
+  const auto sample = [&image](int row, int col) -> float {
+    switch (image.depth()) {
+      case CV_8U:
+        return static_cast<float>(image.at<std::uint8_t>(row, col));
+      case CV_8S:
+        return static_cast<float>(image.at<std::int8_t>(row, col));
+      case CV_16U:
+        return static_cast<float>(image.at<std::uint16_t>(row, col));
+      case CV_16S:
+        return static_cast<float>(image.at<std::int16_t>(row, col));
+      case CV_32S:
+        return static_cast<float>(image.at<std::int32_t>(row, col));
+      case CV_32F:
+        return image.at<float>(row, col);
+      case CV_64F:
+        return static_cast<float>(image.at<double>(row, col));
+      default:
+        return 0.0f;
+    }
+  };
+  const float v00 = sample(y0, x0);
+  const float v10 = sample(y0, x1);
+  const float v01 = sample(y1, x0);
+  const float v11 = sample(y1, x1);
 
   const float top = v00 * (1.0f - dx) + v10 * dx;
   const float bottom = v01 * (1.0f - dx) + v11 * dx;
@@ -1302,7 +1551,8 @@ TemplateScore ComputeImageEvidenceScoreAtPoint(const cv::Mat& gray,
                                                const cv::Point2f& module_u_axis,
                                                const cv::Point2f& module_v_axis,
                                                double min_template_contrast,
-                                               double sample_radius_scale = 1.0) {
+                                               double sample_radius_scale = 1.0,
+                                               const IntegralMeanImage* gray_integral = nullptr) {
   if (corner_info.corner_type == CornerType::Outer || !corner_info.observable) {
     return {1.0, 1.0};
   }
@@ -1333,10 +1583,10 @@ TemplateScore ComputeImageEvidenceScoreAtPoint(const cv::Mat& gray,
   }
 
   const std::array<double, 4> means{{
-      MeanIntensity(gray, sample_centers[0], sample_radius),
-      MeanIntensity(gray, sample_centers[1], sample_radius),
-      MeanIntensity(gray, sample_centers[2], sample_radius),
-      MeanIntensity(gray, sample_centers[3], sample_radius),
+      MeanIntensity(gray, sample_centers[0], sample_radius, gray_integral),
+      MeanIntensity(gray, sample_centers[1], sample_radius, gray_integral),
+      MeanIntensity(gray, sample_centers[2], sample_radius, gray_integral),
+      MeanIntensity(gray, sample_centers[3], sample_radius, gray_integral),
   }};
 
   const std::pair<std::array<double, 4>::const_iterator, std::array<double, 4>::const_iterator> minmax =
@@ -1377,12 +1627,14 @@ ImageEvidenceScore EvaluateImageEvidenceAroundPoint(const cv::Mat& gray,
                                                     const cv::Point2f& module_v_axis,
                                                     double min_template_contrast,
                                                     double max_center_error2,
-                                                    int search_radius) {
+                                                    int search_radius,
+                                                    const IntegralMeanImage* gray_integral = nullptr) {
   ImageEvidenceScore evidence;
   evidence.best_point = image_point;
   evidence.point_score = ComputeImageEvidenceScoreAtPoint(gray, corner_info, image_point,
                                                           module_u_axis, module_v_axis,
-                                                          min_template_contrast);
+                                                          min_template_contrast, 1.0,
+                                                          gray_integral);
   evidence.best_score = evidence.point_score;
   double best_raw_quality =
       std::min(evidence.best_score.template_quality, evidence.best_score.gradient_quality);
@@ -1398,7 +1650,7 @@ ImageEvidenceScore EvaluateImageEvidenceAroundPoint(const cv::Mat& gray,
           image_point + cv::Point2f(static_cast<float>(dx), static_cast<float>(dy));
       const TemplateScore candidate_score =
           ComputeImageEvidenceScoreAtPoint(gray, corner_info, candidate, module_u_axis, module_v_axis,
-                                           min_template_contrast);
+                                           min_template_contrast, 1.0, gray_integral);
       const double candidate_raw_quality =
           std::min(candidate_score.template_quality, candidate_score.gradient_quality);
       const double candidate_distance2 = static_cast<double>(dx * dx + dy * dy);
@@ -1620,7 +1872,9 @@ bool EstimateTargetPose(const DoubleSphereCameraModel& camera,
                         const std::array<int, 4>& outer_point_ids,
                         const ApriltagCanonicalModel& model,
                         cv::Mat* rvec,
-                        cv::Mat* tvec) {
+                        cv::Mat* tvec,
+                        const cv::Mat* initial_rvec = nullptr,
+                        const cv::Mat* initial_tvec = nullptr) {
   std::vector<cv::Point3f> object_points;
   std::vector<cv::Point2f> image_points;
   object_points.reserve(4);
@@ -1634,7 +1888,299 @@ bool EstimateTargetPose(const DoubleSphereCameraModel& camera,
     image_points.push_back(outer_corners[index]);
   }
 
-  return camera.estimateTransformation(object_points, image_points, rvec, tvec);
+  return camera.estimateTransformation(object_points, image_points, rvec, tvec,
+                                       initial_rvec, initial_tvec);
+}
+
+struct TargetPoseRescueDiagnostics {
+  bool attempted = false;
+  bool success = false;
+  bool used = false;
+  double rmse = 0.0;
+  double max_ray_angle_deg = 0.0;
+  double ray_angle_limit_deg = 0.0;
+  std::string failure_reason;
+};
+
+void BuildTargetPosePointSets(const std::array<cv::Point2f, 4>& outer_corners,
+                              const std::array<int, 4>& outer_point_ids,
+                              const ApriltagCanonicalModel& model,
+                              std::vector<cv::Point3f>* object_points,
+                              std::vector<cv::Point2f>* image_points) {
+  if (object_points == nullptr || image_points == nullptr) {
+    throw std::runtime_error("BuildTargetPosePointSets requires valid output pointers.");
+  }
+  object_points->clear();
+  image_points->clear();
+  object_points->reserve(4);
+  image_points->reserve(4);
+
+  for (int index = 0; index < 4; ++index) {
+    const CanonicalCorner& corner_info = model.corner(outer_point_ids[index]);
+    object_points->emplace_back(static_cast<float>(corner_info.target_xyz.x()),
+                                static_cast<float>(corner_info.target_xyz.y()),
+                                static_cast<float>(corner_info.target_xyz.z()));
+    image_points->push_back(outer_corners[index]);
+  }
+}
+
+bool EvaluateTargetPoseRmse(const DoubleSphereCameraModel& camera,
+                            const std::vector<cv::Point3f>& object_points,
+                            const std::vector<cv::Point2f>& image_points,
+                            const cv::Mat& rvec,
+                            const cv::Mat& tvec,
+                            double* rmse) {
+  if (rmse == nullptr || object_points.size() != image_points.size() ||
+      object_points.empty() || rvec.empty() || tvec.empty()) {
+    return false;
+  }
+
+  cv::Mat rotation_cv;
+  cv::Rodrigues(rvec, rotation_cv);
+  cv::Mat rotation64;
+  cv::Mat tvec64;
+  rotation_cv.convertTo(rotation64, CV_64F);
+  tvec.convertTo(tvec64, CV_64F);
+
+  double squared_error_sum = 0.0;
+  for (std::size_t index = 0; index < object_points.size(); ++index) {
+    const cv::Point3f& point = object_points[index];
+    Eigen::Vector3d point_camera;
+    for (int row = 0; row < 3; ++row) {
+      point_camera[row] =
+          rotation64.at<double>(row, 0) * static_cast<double>(point.x) +
+          rotation64.at<double>(row, 1) * static_cast<double>(point.y) +
+          rotation64.at<double>(row, 2) * static_cast<double>(point.z) +
+          tvec64.at<double>(row, 0);
+    }
+
+    Eigen::Vector2d projected;
+    if (!camera.vsEuclideanToKeypoint(point_camera, &projected)) {
+      squared_error_sum += 1e12;
+      continue;
+    }
+    const Eigen::Vector2d observed(image_points[index].x, image_points[index].y);
+    squared_error_sum += (projected - observed).squaredNorm();
+  }
+  *rmse = std::sqrt(squared_error_sum / static_cast<double>(object_points.size()));
+  return true;
+}
+
+bool TryWideFovTargetPoseRescue(const DoubleSphereCameraModel& camera,
+                                const std::vector<cv::Point3f>& object_points,
+                                const std::vector<cv::Point2f>& image_points,
+                                double max_ray_angle_deg,
+                                cv::Mat* rvec,
+                                cv::Mat* tvec,
+                                TargetPoseRescueDiagnostics* diagnostics) {
+  if (rvec == nullptr || tvec == nullptr || diagnostics == nullptr) {
+    throw std::runtime_error("TryWideFovTargetPoseRescue requires valid output pointers.");
+  }
+  diagnostics->attempted = true;
+  diagnostics->ray_angle_limit_deg = max_ray_angle_deg;
+  diagnostics->failure_reason.clear();
+
+  if (object_points.size() != image_points.size() || object_points.size() < 4) {
+    diagnostics->failure_reason = "insufficient_point_count";
+    return false;
+  }
+
+  const double clamped_angle_deg = std::max(1.0, std::min(179.0, max_ray_angle_deg));
+  const double max_ray_angle_radians =
+      clamped_angle_deg * 3.14159265358979323846 / 180.0;
+  const double min_ray_z = std::cos(max_ray_angle_radians);
+
+  std::vector<cv::Point3f> filtered_object_points;
+  std::vector<cv::Point2f> normalized_points;
+  filtered_object_points.reserve(object_points.size());
+  normalized_points.reserve(image_points.size());
+
+  for (std::size_t index = 0; index < image_points.size(); ++index) {
+    Eigen::Vector3d ray;
+    if (!camera.keypointToEuclidean(
+            Eigen::Vector2d(image_points[index].x, image_points[index].y), &ray)) {
+      continue;
+    }
+    const Eigen::Vector3d direction = ray.normalized();
+    const double clamped_z = std::max(-1.0, std::min(1.0, direction.z()));
+    const double ray_angle_deg =
+        std::acos(clamped_z) * 180.0 / 3.14159265358979323846;
+    diagnostics->max_ray_angle_deg =
+        std::max(diagnostics->max_ray_angle_deg, ray_angle_deg);
+    if (direction.z() <= min_ray_z) {
+      continue;
+    }
+
+    filtered_object_points.push_back(object_points[index]);
+    normalized_points.emplace_back(static_cast<float>(direction.x() / direction.z()),
+                                   static_cast<float>(direction.y() / direction.z()));
+  }
+
+  if (filtered_object_points.size() < 4) {
+    diagnostics->failure_reason = "insufficient_filtered_point_count";
+    return false;
+  }
+
+  const cv::Mat identity_camera = cv::Mat::eye(3, 3, CV_64F);
+  const cv::Mat dist_coeffs = cv::Mat::zeros(4, 1, CV_64F);
+  cv::Mat best_rvec;
+  cv::Mat best_tvec;
+  double best_rmse = std::numeric_limits<double>::infinity();
+
+  auto evaluate_candidate = [&](const cv::Mat& candidate_rvec,
+                                const cv::Mat& candidate_tvec) {
+    if (candidate_rvec.empty() || candidate_tvec.empty()) {
+      return;
+    }
+    cv::Mat candidate_tvec64;
+    candidate_tvec.convertTo(candidate_tvec64, CV_64F);
+    if (candidate_tvec64.at<double>(2, 0) <= 0.0) {
+      return;
+    }
+    double candidate_rmse = 0.0;
+    if (!EvaluateTargetPoseRmse(camera, object_points, image_points,
+                                candidate_rvec, candidate_tvec,
+                                &candidate_rmse)) {
+      return;
+    }
+    if (candidate_rmse < best_rmse) {
+      best_rmse = candidate_rmse;
+      best_rvec = candidate_rvec.clone();
+      best_tvec = candidate_tvec.clone();
+    }
+  };
+
+  auto refine_and_evaluate_candidate = [&](const cv::Mat& seed_rvec,
+                                           const cv::Mat& seed_tvec) {
+    evaluate_candidate(seed_rvec, seed_tvec);
+    cv::Mat refined_rvec = seed_rvec.clone();
+    cv::Mat refined_tvec = seed_tvec.clone();
+    if (cv::solvePnP(filtered_object_points, normalized_points, identity_camera,
+                     dist_coeffs, refined_rvec, refined_tvec, true,
+                     cv::SOLVEPNP_ITERATIVE)) {
+      evaluate_candidate(refined_rvec, refined_tvec);
+    }
+  };
+
+  if (filtered_object_points.size() == 4) {
+    std::vector<cv::Mat> ippe_rvecs;
+    std::vector<cv::Mat> ippe_tvecs;
+    cv::solvePnPGeneric(filtered_object_points, normalized_points, identity_camera,
+                        dist_coeffs, ippe_rvecs, ippe_tvecs, false,
+                        cv::SOLVEPNP_IPPE);
+    for (std::size_t index = 0; index < ippe_rvecs.size(); ++index) {
+      refine_and_evaluate_candidate(ippe_rvecs[index], ippe_tvecs[index]);
+    }
+  }
+
+  cv::Mat iterative_rvec;
+  cv::Mat iterative_tvec;
+  if (cv::solvePnP(filtered_object_points, normalized_points, identity_camera,
+                   dist_coeffs, iterative_rvec, iterative_tvec, false,
+                   cv::SOLVEPNP_ITERATIVE)) {
+    refine_and_evaluate_candidate(iterative_rvec, iterative_tvec);
+  }
+
+  if (!std::isfinite(best_rmse)) {
+    diagnostics->failure_reason = "no_valid_pose_candidate";
+    return false;
+  }
+
+  *rvec = best_rvec;
+  *tvec = best_tvec;
+  diagnostics->success = true;
+  diagnostics->rmse = best_rmse;
+  return true;
+}
+
+void CopyPoseRescueDiagnostics(const TargetPoseRescueDiagnostics& source,
+                               ApriltagInternalDetectionResult* result) {
+  if (result == nullptr) {
+    return;
+  }
+  result->pose_rescue_attempted = source.attempted;
+  result->pose_rescue_success = source.success;
+  result->pose_rescue_used = source.used;
+  result->pose_rescue_rmse = source.rmse;
+  result->pose_rescue_max_ray_angle_deg = source.max_ray_angle_deg;
+  result->pose_rescue_ray_angle_limit_deg = source.ray_angle_limit_deg;
+  result->pose_rescue_failure_reason = source.failure_reason;
+  result->runtime_breakdown.pose_rescue_attempt_count += source.attempted ? 1 : 0;
+  result->runtime_breakdown.pose_rescue_success_count += source.success ? 1 : 0;
+  result->runtime_breakdown.pose_rescue_used_count += source.used ? 1 : 0;
+}
+
+bool EstimateTargetPoseWithOptionalRescue(
+    const DoubleSphereCameraModel& camera,
+    const std::array<cv::Point2f, 4>& outer_corners,
+    const std::array<int, 4>& outer_point_ids,
+    const ApriltagCanonicalModel& model,
+    const ApriltagInternalDetectionOptions& options,
+    cv::Mat* rvec,
+    cv::Mat* tvec,
+    ApriltagInternalDetectionResult* result,
+    const Eigen::Matrix4d* pose_seed) {
+  cv::Mat initial_rvec;
+  cv::Mat initial_tvec;
+  const cv::Mat* initial_rvec_ptr = nullptr;
+  const cv::Mat* initial_tvec_ptr = nullptr;
+  if (pose_seed != nullptr) {
+    const cv::Matx33d rotation = Matrix4dToMatx33d(*pose_seed);
+    cv::Mat rotation_cv(3, 3, CV_64F);
+    for (int row = 0; row < 3; ++row) {
+      for (int column = 0; column < 3; ++column) {
+        rotation_cv.at<double>(row, column) = rotation(row, column);
+      }
+    }
+    cv::Rodrigues(rotation_cv, initial_rvec);
+    const Eigen::Vector3d translation = Matrix4dToTranslation(*pose_seed);
+    initial_tvec = (cv::Mat_<double>(3, 1)
+        << translation.x(), translation.y(), translation.z());
+    initial_rvec_ptr = &initial_rvec;
+    initial_tvec_ptr = &initial_tvec;
+  }
+  if (EstimateTargetPose(camera, outer_corners, outer_point_ids, model, rvec, tvec,
+                         initial_rvec_ptr, initial_tvec_ptr)) {
+    return true;
+  }
+
+  if (options.internal_pose_rescue_mode == InternalPoseRescueMode::Off) {
+    return false;
+  }
+
+  std::vector<cv::Point3f> object_points;
+  std::vector<cv::Point2f> image_points;
+  BuildTargetPosePointSets(outer_corners, outer_point_ids, model,
+                           &object_points, &image_points);
+
+  TargetPoseRescueDiagnostics diagnostics;
+  cv::Mat rescue_rvec;
+  cv::Mat rescue_tvec;
+  const bool rescue_success = TryWideFovTargetPoseRescue(
+      camera, object_points, image_points,
+      options.internal_pose_rescue_max_ray_angle_deg,
+      &rescue_rvec, &rescue_tvec, &diagnostics);
+  if (result != nullptr) {
+    result->pose_rescue_accept_max_outer_rmse =
+        options.internal_pose_rescue_accept_max_outer_rmse;
+  }
+  if (rescue_success &&
+      options.internal_pose_rescue_mode == InternalPoseRescueMode::Enabled) {
+    if (diagnostics.rmse > options.internal_pose_rescue_accept_max_outer_rmse) {
+      diagnostics.failure_reason =
+          "rescue_outer_rmse_above_accept_threshold";
+      CopyPoseRescueDiagnostics(diagnostics, result);
+      return false;
+    }
+    diagnostics.used = true;
+    *rvec = rescue_rvec;
+    *tvec = rescue_tvec;
+    CopyPoseRescueDiagnostics(diagnostics, result);
+    return true;
+  }
+
+  CopyPoseRescueDiagnostics(diagnostics, result);
+  return false;
 }
 
 cv::Point2f ProjectTargetPointToVirtualPatch(const VirtualPatchContext& context,
@@ -1817,6 +2363,9 @@ bool BuildSphereLatticeFrame(const DoubleSphereCameraModel& camera,
                              const Eigen::Vector3d& target_to_camera_translation,
                              const ApriltagCanonicalModel& model,
                              const CanonicalCorner& corner_info,
+                             bool allow_one_sided_axes,
+                             bool allow_forward_ray_recovery,
+                             const cv::Size& image_size,
                              SphereLatticeFrame* frame) {
   if (frame == nullptr) {
     throw std::runtime_error("BuildSphereLatticeFrame requires a valid output pointer.");
@@ -1835,8 +2384,43 @@ bool BuildSphereLatticeFrame(const DoubleSphereCameraModel& camera,
   frame->predicted_image = ProjectTargetPointToImage(camera, target_to_camera_rotation,
                                                      target_to_camera_translation, center,
                                                      &predicted_visible);
-  if (!predicted_visible || !UnprojectImagePointToRay(camera, frame->predicted_image,
-                                                      &frame->predicted_ray)) {
+  const auto has_recovery_image_point =
+      [&](const cv::Point2f& image_point, bool projection_visible) {
+        if (!allow_forward_ray_recovery ||
+            !std::isfinite(image_point.x) || !std::isfinite(image_point.y) ||
+            !IsInsideImage(image_point, image_size)) {
+          return false;
+        }
+        // A successful forward projection can still be outside the DS
+        // inverse domain.  Conversely, a failed projection may leave the
+        // initialized (0, 0) output untouched; do not treat that placeholder
+        // as an image observation.
+        return projection_visible || std::hypot(image_point.x, image_point.y) > 1e-3;
+      };
+  const auto make_forward_ray =
+      [&](const cv::Point3f& target_point, Eigen::Vector3d* ray) {
+        if (ray == nullptr) {
+          return false;
+        }
+        const Eigen::Vector3d point_camera = TargetToCameraPoint(
+            target_point, target_to_camera_rotation, target_to_camera_translation);
+        if (!point_camera.allFinite() || point_camera.z() <= 0.0 ||
+            point_camera.squaredNorm() <= 1e-12) {
+          return false;
+        }
+        *ray = point_camera.normalized();
+        return ray->allFinite();
+      };
+
+  bool predicted_ray_valid =
+      predicted_visible &&
+      UnprojectImagePointToRay(camera, frame->predicted_image,
+                               &frame->predicted_ray);
+  if (!predicted_ray_valid &&
+      has_recovery_image_point(frame->predicted_image, predicted_visible)) {
+    predicted_ray_valid = make_forward_ray(center, &frame->predicted_ray);
+  }
+  if (!predicted_ray_valid) {
     return false;
   }
 
@@ -1856,30 +2440,104 @@ bool BuildSphereLatticeFrame(const DoubleSphereCameraModel& camera,
   const cv::Point2f image_v_plus =
       ProjectTargetPointToImage(camera, target_to_camera_rotation, target_to_camera_translation,
                                 v_plus, &v_plus_visible);
-  if (!(u_minus_visible && u_plus_visible && v_minus_visible && v_plus_visible)) {
-    return false;
-  }
-
+  const bool u_minus_image_visible =
+      u_minus_visible || has_recovery_image_point(image_u_minus, u_minus_visible);
+  const bool u_plus_image_visible =
+      u_plus_visible || has_recovery_image_point(image_u_plus, u_plus_visible);
+  const bool v_minus_image_visible =
+      v_minus_visible || has_recovery_image_point(image_v_minus, v_minus_visible);
+  const bool v_plus_image_visible =
+      v_plus_visible || has_recovery_image_point(image_v_plus, v_plus_visible);
+  Eigen::Vector3d center_ray = frame->predicted_ray;
   Eigen::Vector3d ray_u_minus = Eigen::Vector3d::Zero();
   Eigen::Vector3d ray_u_plus = Eigen::Vector3d::Zero();
   Eigen::Vector3d ray_v_minus = Eigen::Vector3d::Zero();
   Eigen::Vector3d ray_v_plus = Eigen::Vector3d::Zero();
-  if (!UnprojectImagePointToRay(camera, image_u_minus, &ray_u_minus) ||
-      !UnprojectImagePointToRay(camera, image_u_plus, &ray_u_plus) ||
-      !UnprojectImagePointToRay(camera, image_v_minus, &ray_v_minus) ||
-      !UnprojectImagePointToRay(camera, image_v_plus, &ray_v_plus)) {
+  bool u_minus_ray_visible = u_minus_image_visible &&
+                             UnprojectImagePointToRay(camera, image_u_minus,
+                                                      &ray_u_minus);
+  bool u_plus_ray_visible = u_plus_image_visible &&
+                            UnprojectImagePointToRay(camera, image_u_plus,
+                                                     &ray_u_plus);
+  bool v_minus_ray_visible = v_minus_image_visible &&
+                             UnprojectImagePointToRay(camera, image_v_minus,
+                                                      &ray_v_minus);
+  bool v_plus_ray_visible = v_plus_image_visible &&
+                            UnprojectImagePointToRay(camera, image_v_plus,
+                                                     &ray_v_plus);
+  if (!u_minus_ray_visible &&
+      has_recovery_image_point(image_u_minus, u_minus_visible)) {
+    u_minus_ray_visible = make_forward_ray(u_minus, &ray_u_minus);
+  }
+  if (!u_plus_ray_visible &&
+      has_recovery_image_point(image_u_plus, u_plus_visible)) {
+    u_plus_ray_visible = make_forward_ray(u_plus, &ray_u_plus);
+  }
+  if (!v_minus_ray_visible &&
+      has_recovery_image_point(image_v_minus, v_minus_visible)) {
+    v_minus_ray_visible = make_forward_ray(v_minus, &ray_v_minus);
+  }
+  if (!v_plus_ray_visible &&
+      has_recovery_image_point(image_v_plus, v_plus_visible)) {
+    v_plus_ray_visible = make_forward_ray(v_plus, &ray_v_plus);
+  }
+  const bool has_u_axis = u_minus_image_visible && u_plus_image_visible &&
+                          u_minus_ray_visible && u_plus_ray_visible;
+  const bool has_v_axis = v_minus_image_visible && v_plus_image_visible &&
+                          v_minus_ray_visible && v_plus_ray_visible;
+  const bool has_u_one_sided_axis = allow_one_sided_axes &&
+                                    ((u_minus_image_visible && u_minus_ray_visible) ||
+                                     (u_plus_image_visible && u_plus_ray_visible));
+  const bool has_v_one_sided_axis = allow_one_sided_axes &&
+                                    ((v_minus_image_visible && v_minus_ray_visible) ||
+                                     (v_plus_image_visible && v_plus_ray_visible));
+  if ((!has_u_axis && !has_u_one_sided_axis) ||
+      (!has_v_axis && !has_v_one_sided_axis)) {
     return false;
   }
 
-  frame->module_u_axis = image_u_plus - image_u_minus;
-  frame->module_v_axis = image_v_plus - image_v_minus;
+  // At the edge of a heavily distorted image one half-pitch neighbour can be
+  // outside the camera's valid projection domain while the lattice corner
+  // itself is visible.  The recovery path may use the visible side, doubled
+  // about the lattice centre, as a local tangent estimate, but only when the
+  // visible side produced a real camera-model ray.  A failed projection is
+  // never replaced by a pose-only ray.
+  const cv::Point2f image_u_delta =
+      has_u_axis ? (image_u_plus - image_u_minus)
+                 : (u_plus_image_visible && u_plus_ray_visible
+                        ? 2.0f * (image_u_plus - frame->predicted_image)
+                        : 2.0f * (frame->predicted_image - image_u_minus));
+  const cv::Point2f image_v_delta =
+      has_v_axis ? (image_v_plus - image_v_minus)
+                 : (v_plus_image_visible && v_plus_ray_visible
+                        ? 2.0f * (image_v_plus - frame->predicted_image)
+                        : 2.0f * (frame->predicted_image - image_v_minus));
+  Eigen::Vector3d ray_u_delta = Eigen::Vector3d::Zero();
+  if (has_u_axis) {
+    ray_u_delta = ray_u_plus - ray_u_minus;
+  } else if (u_plus_image_visible && u_plus_ray_visible) {
+    ray_u_delta = 2.0 * (ray_u_plus - center_ray);
+  } else {
+    ray_u_delta = 2.0 * (center_ray - ray_u_minus);
+  }
+  Eigen::Vector3d ray_v_delta = Eigen::Vector3d::Zero();
+  if (has_v_axis) {
+    ray_v_delta = ray_v_plus - ray_v_minus;
+  } else if (v_plus_image_visible && v_plus_ray_visible) {
+    ray_v_delta = 2.0 * (ray_v_plus - center_ray);
+  } else {
+    ray_v_delta = 2.0 * (center_ray - ray_v_minus);
+  }
+
+  frame->module_u_axis = image_u_delta;
+  frame->module_v_axis = image_v_delta;
   frame->local_module_scale =
       ComputeModuleScalePx(frame->module_u_axis, frame->module_v_axis, model.Pitch());
 
   Eigen::Vector3d raw_tangent_u =
-      ProjectOntoTangentPlane(ray_u_plus - ray_u_minus, frame->predicted_ray);
+      ProjectOntoTangentPlane(ray_u_delta, frame->predicted_ray);
   Eigen::Vector3d raw_tangent_v =
-      ProjectOntoTangentPlane(ray_v_plus - ray_v_minus, frame->predicted_ray);
+      ProjectOntoTangentPlane(ray_v_delta, frame->predicted_ray);
   if (!NormalizeRay(&raw_tangent_u)) {
     return false;
   }
@@ -1895,8 +2553,18 @@ bool BuildSphereLatticeFrame(const DoubleSphereCameraModel& camera,
 
   frame->tangent_u = raw_tangent_u;
   frame->tangent_v = raw_tangent_v;
-  frame->theta_u = AngleBetweenRays(ray_u_minus, ray_u_plus);
-  frame->theta_v = AngleBetweenRays(ray_v_minus, ray_v_plus);
+  frame->theta_u = has_u_axis
+                       ? AngleBetweenRays(ray_u_minus, ray_u_plus)
+                       : 2.0 * AngleBetweenRays(center_ray,
+                                                u_plus_image_visible && u_plus_ray_visible
+                                                    ? ray_u_plus
+                                                    : ray_u_minus);
+  frame->theta_v = has_v_axis
+                       ? AngleBetweenRays(ray_v_minus, ray_v_plus)
+                       : 2.0 * AngleBetweenRays(center_ray,
+                                                v_plus_image_visible && v_plus_ray_visible
+                                                    ? ray_v_plus
+                                                    : ray_v_minus);
   frame->theta_local = std::min(frame->theta_u, frame->theta_v);
   if (!std::isfinite(frame->theta_local) || frame->theta_local <= 1e-9) {
     return false;
@@ -2402,6 +3070,111 @@ bool FitBoundaryPlaneToRays(const std::vector<Eigen::Vector3d>& rays,
          *rms_residual <= kBorderConditionedPlaneResidualThreshold;
 }
 
+bool HasRayArcSupportCoverage(const std::vector<Eigen::Vector3d>& rays,
+                              const Eigen::Vector3d& start_ray,
+                              const Eigen::Vector3d& end_ray,
+                              double minimum_coverage) {
+  if (rays.size() < static_cast<std::size_t>(kBorderConditionedMinSupportPoints)) {
+    return false;
+  }
+  Eigen::Vector3d start = start_ray;
+  Eigen::Vector3d end = end_ray;
+  if (!NormalizeRay(&start) || !NormalizeRay(&end)) {
+    return false;
+  }
+  const double total_angle = std::acos(std::max(-1.0, std::min(1.0, start.dot(end))));
+  if (!std::isfinite(total_angle) || total_angle < 1e-6) {
+    return false;
+  }
+  double min_parameter = 1.0;
+  double max_parameter = 0.0;
+  int distributed_bins = 0;
+  std::array<bool, 3> bins{{false, false, false}};
+  for (const Eigen::Vector3d& ray_value : rays) {
+    Eigen::Vector3d ray = ray_value;
+    if (!NormalizeRay(&ray)) {
+      continue;
+    }
+    const double angle = std::acos(std::max(-1.0, std::min(1.0, start.dot(ray))));
+    const double parameter = angle / total_angle;
+    if (!std::isfinite(parameter)) {
+      continue;
+    }
+    const double bounded = std::max(0.0, std::min(1.0, parameter));
+    min_parameter = std::min(min_parameter, bounded);
+    max_parameter = std::max(max_parameter, bounded);
+    const int bin = std::min(2, static_cast<int>(std::floor(3.0 * bounded)));
+    bins[static_cast<std::size_t>(bin)] = true;
+  }
+  for (bool present : bins) {
+    distributed_bins += present ? 1 : 0;
+  }
+  return max_parameter - min_parameter >= minimum_coverage && distributed_bins >= 2;
+}
+
+bool FitBoundaryPlaneToRaysHuber(const std::vector<Eigen::Vector3d>& rays,
+                                 Eigen::Vector3d* plane_normal,
+                                 double* rms_residual) {
+  if (plane_normal == nullptr || rms_residual == nullptr ||
+      rays.size() < static_cast<std::size_t>(kBorderConditionedMinSupportPoints)) {
+    return false;
+  }
+  Eigen::Vector3d normal = Eigen::Vector3d::Zero();
+  double initial_rms = 0.0;
+  if (!FitBoundaryPlaneToRays(rays, &normal, &initial_rms)) {
+    // The initial least-squares plane may be pulled above the legacy gate by
+    // one spurious gradient peak.  Use its eigenvector even in that case and
+    // let the bounded Huber iterations reject the outlier.
+    Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+    for (const Eigen::Vector3d& ray : rays) {
+      covariance += ray * ray.transpose();
+    }
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
+    if (solver.info() != Eigen::Success) {
+      return false;
+    }
+    normal = solver.eigenvectors().col(0);
+    if (!NormalizeRay(&normal)) {
+      return false;
+    }
+  }
+
+  constexpr double kHuberDelta = 0.02;
+  for (int iteration = 0; iteration < 5; ++iteration) {
+    Eigen::Matrix3d weighted_covariance = Eigen::Matrix3d::Zero();
+    double weight_sum = 0.0;
+    for (const Eigen::Vector3d& ray : rays) {
+      const double absolute_residual = std::abs(normal.dot(ray));
+      const double weight = absolute_residual <= kHuberDelta
+                                ? 1.0
+                                : kHuberDelta / std::max(1e-9, absolute_residual);
+      weighted_covariance += weight * ray * ray.transpose();
+      weight_sum += weight;
+    }
+    if (weight_sum <= 0.0) {
+      return false;
+    }
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(weighted_covariance);
+    if (solver.info() != Eigen::Success) {
+      return false;
+    }
+    normal = solver.eigenvectors().col(0);
+    if (!NormalizeRay(&normal)) {
+      return false;
+    }
+  }
+
+  double residual_sum_sq = 0.0;
+  for (const Eigen::Vector3d& ray : rays) {
+    const double residual = normal.dot(ray);
+    residual_sum_sq += residual * residual;
+  }
+  *plane_normal = normal;
+  *rms_residual = std::sqrt(residual_sum_sq / static_cast<double>(rays.size()));
+  return std::isfinite(*rms_residual) &&
+         *rms_residual <= kBorderConditionedPlaneResidualThreshold;
+}
+
 bool ProjectRayOntoBoundaryPlane(const Eigen::Vector3d& plane_normal,
                                  const Eigen::Vector3d& reference_ray,
                                  Eigen::Vector3d* projected_ray) {
@@ -2420,14 +3193,98 @@ bool ProjectRayOntoBoundaryPlane(const Eigen::Vector3d& plane_normal,
   return true;
 }
 
-bool BuildBoardSphereBoundaryModel(const DoubleSphereCameraModel& camera,
+// The detector-side branch supports were originally gathered in small
+// straight pixel-line neighborhoods around the two outer corners.  That is a
+// useful fast path, but it is not a faithful model for a large tag near the
+// edge of a wide-angle image.  The physical tag edge is a great-circle arc in
+// ray space, so sample that arc and look for image evidence along its local
+// image normal only when the normal branch did not provide enough supports.
+std::vector<cv::Point2f> CollectCurvedEdgeSupportPoints(
+    const cv::Mat& gray,
+    const DoubleSphereCameraModel& camera,
+    const Eigen::Vector3d& start_ray,
+    const Eigen::Vector3d& end_ray) {
+  std::vector<cv::Point2f> support_points;
+  if (gray.empty()) {
+    return support_points;
+  }
+
+  constexpr int kSamples = 13;
+  constexpr double kRayStep = 0.015;
+  constexpr double kMinNormalGradient = 10.0;
+  constexpr double kImageBorder = 7.0;
+  for (int sample_index = 1; sample_index + 1 < kSamples; ++sample_index) {
+    const double alpha = static_cast<double>(sample_index) /
+                         static_cast<double>(kSamples - 1);
+    Eigen::Vector3d center_ray = Eigen::Vector3d::Zero();
+    Eigen::Vector3d before_ray = Eigen::Vector3d::Zero();
+    Eigen::Vector3d after_ray = Eigen::Vector3d::Zero();
+    if (!SlerpRays(start_ray, end_ray, alpha, &center_ray) ||
+        !SlerpRays(start_ray, end_ray, std::max(0.0, alpha - kRayStep),
+                   &before_ray) ||
+        !SlerpRays(start_ray, end_ray, std::min(1.0, alpha + kRayStep),
+                   &after_ray)) {
+      continue;
+    }
+    cv::Point2f center{};
+    cv::Point2f before{};
+    cv::Point2f after{};
+    if (!ProjectRayToImage(camera, center_ray, &center) ||
+        !ProjectRayToImage(camera, before_ray, &before) ||
+        !ProjectRayToImage(camera, after_ray, &after) ||
+        !IsInsideImageWithBorder(center, gray.size(), kImageBorder)) {
+      continue;
+    }
+    const cv::Point2f tangent = after - before;
+    const double tangent_norm = std::hypot(tangent.x, tangent.y);
+    if (!std::isfinite(tangent_norm) || tangent_norm < 1e-3) {
+      continue;
+    }
+    const cv::Point2f normal(-tangent.y / tangent_norm, tangent.x / tangent_norm);
+    double best_gradient = 0.0;
+    cv::Point2f best_point = center;
+    for (int offset = -4; offset <= 4; ++offset) {
+      const cv::Point2f point = center + static_cast<float>(offset) * normal;
+      const cv::Point2f positive = point + 2.0f * normal;
+      const cv::Point2f negative = point - 2.0f * normal;
+      if (!IsInsideImageWithBorder(positive, gray.size(), 1.0) ||
+          !IsInsideImageWithBorder(negative, gray.size(), 1.0)) {
+        continue;
+      }
+      const double gradient = std::abs(
+          SampleFloatAt(gray, positive) - SampleFloatAt(gray, negative));
+      if (gradient > best_gradient) {
+        best_gradient = gradient;
+        best_point = point;
+      }
+    }
+    if (best_gradient >= kMinNormalGradient) {
+      support_points.push_back(best_point);
+    }
+  }
+  return support_points;
+}
+
+bool BuildBoardSphereBoundaryModel(const cv::Mat& gray,
+                                   const DoubleSphereCameraModel& camera,
                                    const OuterTagDetectionResult& outer_detection,
-                                   BoardSphereBoundaryModel* boundary_model) {
+                                   BoardSphereBoundaryModel* boundary_model,
+                                   std::string* failure_reason = nullptr,
+                                   bool enable_robust_curved_support_recovery = false) {
   if (boundary_model == nullptr) {
     throw std::runtime_error("BuildBoardSphereBoundaryModel requires a valid output pointer.");
   }
 
   *boundary_model = BoardSphereBoundaryModel{};
+  if (failure_reason != nullptr) {
+    failure_reason->clear();
+  }
+  const auto fail = [failure_reason](const std::string& reason) {
+    if (failure_reason != nullptr) {
+      *failure_reason = reason;
+    }
+    return false;
+  };
   for (int corner_index = 0; corner_index < 4; ++corner_index) {
     const Eigen::Vector2d& outer_corner =
         outer_detection.refined_corners_original_image[static_cast<std::size_t>(corner_index)];
@@ -2435,7 +3292,8 @@ bool BuildBoardSphereBoundaryModel(const DoubleSphereCameraModel& camera,
                                   cv::Point2f(static_cast<float>(outer_corner.x()),
                                               static_cast<float>(outer_corner.y())),
                                   &boundary_model->outer_corner_rays[static_cast<std::size_t>(corner_index)])) {
-      return false;
+      return fail("outer_corner_" + std::to_string(corner_index) +
+                  " cannot be unprojected");
     }
   }
 
@@ -2444,11 +3302,76 @@ bool BuildBoardSphereBoundaryModel(const DoubleSphereCameraModel& camera,
   for (int edge_index = 0; edge_index < 4; ++edge_index) {
     BoardBoundaryEdgeModel& edge = boundary_model->edges[static_cast<std::size_t>(edge_index)];
     edge.support_points = CollectBoardEdgeSupportPoints(outer_detection, edge_index);
-    if (!UnprojectSupportPointsToRays(camera, edge.support_points, &edge.support_rays)) {
-      return false;
+    // Keep the established direct-support behavior unchanged.  The curved
+    // search is a fallback for peripheral distortion only and is never used
+    // by the legacy path.
+    // Do not append fallback points before testing the direct fit. This keeps
+    // normal boards byte-for-byte on the established boundary path.
+    const bool direct_support_rays_available =
+        UnprojectSupportPointsToRays(camera, edge.support_points,
+                                     &edge.support_rays);
+    const bool direct_fit_success =
+        direct_support_rays_available &&
+        FitBoundaryPlaneToRays(edge.support_rays, &edge.plane_normal,
+                               &edge.rms_residual);
+    const bool direct_coverage_success =
+        direct_fit_success &&
+        HasRayArcSupportCoverage(
+            edge.support_rays,
+            boundary_model->outer_corner_rays[static_cast<std::size_t>(
+                edge_start_corner[edge_index])],
+            boundary_model->outer_corner_rays[static_cast<std::size_t>(
+                edge_end_corner[edge_index])],
+            0.50);
+    if (!direct_support_rays_available &&
+        !enable_robust_curved_support_recovery) {
+      return fail("edge_" + std::to_string(edge_index) +
+                  " support rays unavailable (support_points=" +
+                  std::to_string(edge.support_points.size()) + ")");
     }
-    if (!FitBoundaryPlaneToRays(edge.support_rays, &edge.plane_normal, &edge.rms_residual)) {
-      return false;
+    bool used_curved_support_fallback = false;
+    if (enable_robust_curved_support_recovery &&
+        (!direct_fit_success || !direct_coverage_success)) {
+      // A peripheral edge can yield a numerically plausible plane from
+      // corner-local supports while those supports cover only its endpoints.
+      // Treat that as incomplete evidence and add model-aware curved samples
+      // before using the plane to seed the full internal lattice.
+      const std::vector<cv::Point2f> curved_supports =
+          CollectCurvedEdgeSupportPoints(
+              gray, camera,
+              boundary_model->outer_corner_rays[static_cast<std::size_t>(
+                  edge_start_corner[edge_index])],
+              boundary_model->outer_corner_rays[static_cast<std::size_t>(
+                  edge_end_corner[edge_index])]);
+      edge.support_points.insert(edge.support_points.end(), curved_supports.begin(),
+                                 curved_supports.end());
+      if (!UnprojectSupportPointsToRays(camera, edge.support_points,
+                                        &edge.support_rays)) {
+        return fail("edge_" + std::to_string(edge_index) +
+                    " curved support rays unavailable (support_points=" +
+                    std::to_string(edge.support_points.size()) + ")");
+      }
+      used_curved_support_fallback = true;
+    }
+    const bool fit_success =
+        used_curved_support_fallback
+            ? FitBoundaryPlaneToRaysHuber(edge.support_rays, &edge.plane_normal,
+                                          &edge.rms_residual)
+            : direct_fit_success;
+    const bool coverage_success =
+        !used_curved_support_fallback ||
+        HasRayArcSupportCoverage(
+            edge.support_rays,
+            boundary_model->outer_corner_rays[static_cast<std::size_t>(
+                edge_start_corner[edge_index])],
+            boundary_model->outer_corner_rays[static_cast<std::size_t>(
+                edge_end_corner[edge_index])],
+            0.50);
+    if (!fit_success || !coverage_success) {
+      return fail("edge_" + std::to_string(edge_index) +
+                  (coverage_success ? " cannot fit boundary plane (support_rays="
+                                     : " support coverage insufficient (support_rays=") +
+                  std::to_string(edge.support_rays.size()) + ")");
     }
     if (!ProjectRayOntoBoundaryPlane(
             edge.plane_normal,
@@ -2458,7 +3381,8 @@ bool BuildBoardSphereBoundaryModel(const DoubleSphereCameraModel& camera,
             edge.plane_normal,
             boundary_model->outer_corner_rays[static_cast<std::size_t>(edge_end_corner[edge_index])],
             &edge.end_ray)) {
-      return false;
+      return fail("edge_" + std::to_string(edge_index) +
+                  " cannot project outer corners onto boundary plane");
     }
     edge.valid = true;
   }
@@ -2483,15 +3407,12 @@ void StoreBoardBoundaryDebugCurves(const BoardSphereBoundaryModel& boundary_mode
   result->border_edge_valid = {{false, false, false, false}};
   result->border_edge_rms_residual = {{0.0, 0.0, 0.0, 0.0}};
   result->border_edge_support_count = {{0, 0, 0, 0}};
+  result->border_edge_support_ray_count = {{0, 0, 0, 0}};
   for (std::size_t edge_index = 0; edge_index < result->border_curves_image.size(); ++edge_index) {
     result->border_support_points[edge_index].clear();
     result->border_curves_image[edge_index].clear();
     result->border_curves_ray[edge_index].clear();
   }
-  if (!boundary_model.valid) {
-    return;
-  }
-
   for (int edge_index = 0; edge_index < 4; ++edge_index) {
     const BoardBoundaryEdgeModel& edge =
         boundary_model.edges[static_cast<std::size_t>(edge_index)];
@@ -2499,7 +3420,13 @@ void StoreBoardBoundaryDebugCurves(const BoardSphereBoundaryModel& boundary_mode
     result->border_edge_rms_residual[static_cast<std::size_t>(edge_index)] = edge.rms_residual;
     result->border_edge_support_count[static_cast<std::size_t>(edge_index)] =
         static_cast<int>(edge.support_points.size());
+    result->border_edge_support_ray_count[static_cast<std::size_t>(edge_index)] =
+        static_cast<int>(edge.support_rays.size());
     result->border_support_points[static_cast<std::size_t>(edge_index)] = edge.support_points;
+
+    if (!boundary_model.valid || !edge.valid) {
+      continue;
+    }
 
     std::vector<cv::Point2f>& image_curve =
         result->border_curves_image[static_cast<std::size_t>(edge_index)];
@@ -2527,7 +3454,7 @@ void StoreBoardBoundaryDebugCurves(const BoardSphereBoundaryModel& boundary_mode
     }
   }
 
-  result->border_boundary_model_valid = true;
+  result->border_boundary_model_valid = boundary_model.valid;
 }
 
 bool SampleBoundaryEdgeRay(const BoardSphereBoundaryModel& boundary_model,
@@ -2588,6 +3515,253 @@ bool BuildBorderConditionedSeed(const BoardSphereBoundaryModel& boundary_model,
   }
 
   border_seed->valid = true;
+  return true;
+}
+
+struct InternalStructureCorrectionSample {
+  int point_id = -1;
+  int row = 0;
+  int col = 0;
+  cv::Point2f seed_image{};
+  cv::Point2f module_u_axis{};
+  cv::Point2f module_v_axis{};
+  double local_module_scale = 0.0;
+  const CanonicalCorner* corner_info = nullptr;
+};
+
+struct InternalStructureCorrectionModel {
+  bool valid = false;
+  bool group_by_column = false;
+  double aggregate_gain = 0.0;
+  std::vector<std::pair<int, double> > group_delta_px;
+};
+
+bool NormalizeImageAxis(const cv::Point2f& axis, cv::Point2f* unit_axis) {
+  if (unit_axis == nullptr) {
+    throw std::runtime_error("NormalizeImageAxis requires an output pointer.");
+  }
+  const double norm = std::hypot(axis.x, axis.y);
+  if (!std::isfinite(norm) || norm <= 1e-9) {
+    return false;
+  }
+  *unit_axis = cv::Point2f(static_cast<float>(axis.x / norm),
+                           static_cast<float>(axis.y / norm));
+  return true;
+}
+
+double InternalStructureRawEvidence(
+    const cv::Mat& gray,
+    const IntegralMeanImage& gray_integral,
+    const InternalStructureCorrectionSample& sample,
+    const cv::Point2f& image_point,
+    double min_template_contrast) {
+  if (sample.corner_info == nullptr) {
+    return 0.0;
+  }
+  const TemplateScore score = ComputeImageEvidenceScoreAtPoint(
+      gray, *sample.corner_info, image_point, sample.module_u_axis,
+      sample.module_v_axis, min_template_contrast, 1.0, &gray_integral);
+  return std::min(score.template_quality, score.gradient_quality);
+}
+
+InternalStructureCorrectionModel EstimateInternalStructureCorrectionModel(
+    const cv::Mat& gray,
+    const IntegralMeanImage& gray_integral,
+    const std::vector<InternalStructureCorrectionSample>& samples,
+    const ApriltagInternalDetectionOptions& options,
+    bool group_by_column) {
+  InternalStructureCorrectionModel model;
+  model.group_by_column = group_by_column;
+  if (samples.empty()) {
+    return model;
+  }
+
+  std::map<int, std::vector<const InternalStructureCorrectionSample*> > groups;
+  for (const InternalStructureCorrectionSample& sample : samples) {
+    groups[group_by_column ? sample.col : sample.row].push_back(&sample);
+  }
+
+  constexpr int kMinGroupSupport = 3;
+  constexpr double kSearchRadiusScale = 0.65;
+  constexpr double kMinAverageGain = 0.015;
+  for (const auto& group_entry : groups) {
+    const std::vector<const InternalStructureCorrectionSample*>& group_samples =
+        group_entry.second;
+    if (group_samples.size() < static_cast<std::size_t>(kMinGroupSupport)) {
+      continue;
+    }
+
+    double median_scale = 0.0;
+    std::vector<double> scales;
+    scales.reserve(group_samples.size());
+    for (const InternalStructureCorrectionSample* sample : group_samples) {
+      scales.push_back(std::max(1.0, sample->local_module_scale));
+    }
+    std::sort(scales.begin(), scales.end());
+    median_scale = scales[scales.size() / 2];
+    const int search_radius =
+        std::max(1, static_cast<int>(std::lround(kSearchRadiusScale * median_scale)));
+
+    double base_sum = 0.0;
+    for (const InternalStructureCorrectionSample* sample : group_samples) {
+      base_sum += InternalStructureRawEvidence(
+          gray, gray_integral, *sample, sample->seed_image,
+          options.min_template_contrast);
+    }
+    const double base_average =
+        base_sum / static_cast<double>(group_samples.size());
+
+    double best_average = base_average;
+    int best_delta = 0;
+    for (int delta = -search_radius; delta <= search_radius; ++delta) {
+      if (delta == 0) {
+        continue;
+      }
+      double score_sum = 0.0;
+      int valid_count = 0;
+      for (const InternalStructureCorrectionSample* sample : group_samples) {
+        cv::Point2f unit_axis{};
+        const cv::Point2f& axis =
+            group_by_column ? sample->module_u_axis : sample->module_v_axis;
+        if (!NormalizeImageAxis(axis, &unit_axis)) {
+          continue;
+        }
+        const cv::Point2f candidate =
+            sample->seed_image +
+            static_cast<float>(delta) * unit_axis;
+        if (!IsInsideImageWithBorder(candidate, gray.size(),
+                                     options.min_border_distance)) {
+          continue;
+        }
+        score_sum += InternalStructureRawEvidence(
+            gray, gray_integral, *sample, candidate,
+            options.min_template_contrast);
+        ++valid_count;
+      }
+      if (valid_count < kMinGroupSupport) {
+        continue;
+      }
+      const double average = score_sum / static_cast<double>(valid_count);
+      if (average > best_average + 1e-9 ||
+          (std::abs(average - best_average) <= 1e-9 &&
+           std::abs(delta) < std::abs(best_delta))) {
+        best_average = average;
+        best_delta = delta;
+      }
+    }
+
+    const double gain = best_average - base_average;
+    if (best_delta != 0 && gain >= kMinAverageGain) {
+      model.group_delta_px.emplace_back(group_entry.first,
+                                        static_cast<double>(best_delta));
+      model.aggregate_gain += gain * static_cast<double>(group_samples.size());
+    }
+  }
+
+  model.valid = model.group_delta_px.size() >= 2;
+  return model;
+}
+
+InternalStructureCorrectionModel EstimateInternalStructureCorrection(
+    const cv::Mat& gray,
+    const IntegralMeanImage& gray_integral,
+    const std::vector<InternalStructureCorrectionSample>& samples,
+    const ApriltagInternalDetectionOptions& options) {
+  const InternalStructureCorrectionModel row_model =
+      EstimateInternalStructureCorrectionModel(gray, gray_integral, samples, options,
+                                               false);
+  const InternalStructureCorrectionModel column_model =
+      EstimateInternalStructureCorrectionModel(gray, gray_integral, samples, options,
+                                               true);
+  if (!row_model.valid) {
+    return column_model;
+  }
+  if (!column_model.valid) {
+    return row_model;
+  }
+  return column_model.aggregate_gain > row_model.aggregate_gain ? column_model
+                                                                : row_model;
+}
+
+bool LookupInternalStructureDelta(const InternalStructureCorrectionModel& model,
+                                  const CanonicalCorner& corner_info,
+                                  double* delta_px) {
+  if (delta_px == nullptr) {
+    throw std::runtime_error("LookupInternalStructureDelta requires output.");
+  }
+  if (!model.valid) {
+    return false;
+  }
+  const int group_key = model.group_by_column
+                            ? static_cast<int>(std::lround(corner_info.lattice_u))
+                            : static_cast<int>(std::lround(corner_info.lattice_v));
+  for (const auto& group_delta : model.group_delta_px) {
+    if (group_delta.first == group_key) {
+      *delta_px = group_delta.second;
+      return true;
+    }
+  }
+  if (model.group_delta_px.size() < 2) {
+    return false;
+  }
+
+  double min_delta = model.group_delta_px.front().second;
+  double max_delta = model.group_delta_px.front().second;
+  int positive_count = 0;
+  int negative_count = 0;
+  for (const auto& group_delta : model.group_delta_px) {
+    min_delta = std::min(min_delta, group_delta.second);
+    max_delta = std::max(max_delta, group_delta.second);
+    positive_count += group_delta.second > 0.0 ? 1 : 0;
+    negative_count += group_delta.second < 0.0 ? 1 : 0;
+  }
+  const bool consistent_direction =
+      positive_count == static_cast<int>(model.group_delta_px.size()) ||
+      negative_count == static_cast<int>(model.group_delta_px.size());
+  if (!consistent_direction || (max_delta - min_delta) > 4.0) {
+    return false;
+  }
+
+  bool found = false;
+  double best_delta = 0.0;
+  int best_distance = std::numeric_limits<int>::max();
+  for (const auto& group_delta : model.group_delta_px) {
+    const int distance = std::abs(group_delta.first - group_key);
+    if (distance < best_distance) {
+      best_distance = distance;
+      best_delta = group_delta.second;
+      found = true;
+    }
+  }
+  if (found) {
+    *delta_px = best_delta;
+    return true;
+  }
+  return false;
+}
+
+bool ApplyInternalStructureCorrection(
+    const InternalStructureCorrectionModel& model,
+    const CanonicalCorner& corner_info,
+    const SphereLatticeFrame& frame,
+    const cv::Point2f& seed_image,
+    cv::Point2f* corrected_image,
+    double* delta_px) {
+  if (corrected_image == nullptr || delta_px == nullptr) {
+    throw std::runtime_error("ApplyInternalStructureCorrection requires outputs.");
+  }
+  double delta = 0.0;
+  if (!LookupInternalStructureDelta(model, corner_info, &delta)) {
+    return false;
+  }
+  const cv::Point2f& axis =
+      model.group_by_column ? frame.module_u_axis : frame.module_v_axis;
+  cv::Point2f unit_axis{};
+  if (!NormalizeImageAxis(axis, &unit_axis)) {
+    return false;
+  }
+  *corrected_image = seed_image + static_cast<float>(delta) * unit_axis;
+  *delta_px = delta;
   return true;
 }
 
@@ -2756,6 +3930,7 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
   if (result == nullptr) {
     throw std::runtime_error("Result pointer must not be null.");
   }
+  const IntegralMeanImage gray_integral(gray);
 
   for (const int point_id : model.VisiblePointIds()) {
     if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) != outer_point_ids.end()) {
@@ -2783,14 +3958,12 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
         ComputeAdaptiveImageEvidenceSearchRadius(module_scale_px, options);
 
     cv::Point2f refined_image = predicted_image;
-    if (IsInsideImageWithBorder(predicted_image, gray.size(), options.min_border_distance) &&
+    bool image_refinement_applied = false;
+    if (IsInsideImageForRecovery(predicted_image, gray.size(), options) &&
         options.do_subpix_refinement) {
-      std::vector<cv::Point2f> corners{refined_image};
-      cv::cornerSubPix(gray, corners,
-                       cv::Size(subpix_window_radius, subpix_window_radius),
-                       cv::Size(-1, -1),
-                       cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 30, 0.1));
-      refined_image = corners.front();
+      refined_image = RefineImageCornerSubpixWithPadding(
+          gray, refined_image, subpix_window_radius, options);
+      image_refinement_applied = true;
     }
 
     const cv::Point2f refined_patch = PerspectiveTransformPoint(image_to_patch, refined_image);
@@ -2810,15 +3983,14 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
         EvaluateImageEvidenceAroundPoint(gray, corner_info, refined_image, module_u_axis, module_v_axis,
                                          options.min_template_contrast,
                                          subpix_displacement_limit * subpix_displacement_limit,
-                                         image_evidence_search_radius);
+                                         image_evidence_search_radius, &gray_integral);
     const double final_quality =
         std::min({template_score.template_quality, template_score.gradient_quality, q_refine});
     const double image_final_quality = image_score.final_quality;
-    const bool valid =
-        IsInsideImageWithBorder(refined_image, gray.size(), options.min_border_distance);
+    const bool valid = IsInsideImageForRecovery(refined_image, gray.size(), options);
     const bool image_evidence_valid =
         IsInsideImageWithBorder(refined_image, gray.size(), options.min_border_distance) &&
-        image_final_quality >= options.min_quality;
+        ImageEvidencePassesQualityGate(options, image_final_quality);
 
     CornerMeasurement& measurement = result->corners[static_cast<std::size_t>(point_id)];
     measurement.image_xy = Eigen::Vector2d(refined_image.x, refined_image.y);
@@ -2832,6 +4004,8 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
 
     InternalCornerDebugInfo debug;
     debug.point_id = point_id;
+    debug.lattice_u = corner_info.lattice_u;
+    debug.lattice_v = corner_info.lattice_v;
     debug.corner_type = corner_info.corner_type;
     debug.predicted_image = predicted_image;
     debug.refined_image = refined_image;
@@ -2852,6 +4026,337 @@ void PopulateInternalCornersFromHomography(const cv::Mat& gray,
     debug.image_centering_quality = image_score.centering_quality;
     debug.image_final_quality = image_final_quality;
     debug.predicted_to_refined_displacement = displacement;
+    debug.image_refinement_applied = image_refinement_applied;
+    debug.valid = valid;
+    debug.image_evidence_valid = image_evidence_valid;
+    result->internal_corner_debug.push_back(debug);
+  }
+}
+
+struct PinholeBootstrapPatchContext {
+  cv::Mat board_to_image;
+  cv::Mat image_to_patch;
+  cv::Mat patch_to_image;
+  cv::Mat patch;
+  cv::Size patch_size;
+  std::array<cv::Point2f, 4> patch_outer_corners{};
+};
+
+PatchSeedCandidate EvaluatePinholeBootstrapPatchCandidate(
+    const cv::Mat& patch,
+    const PinholeBootstrapPatchContext& context,
+    const CanonicalCorner& corner_info,
+    const PatchSeedFrame& frame,
+    const ApriltagInternalDetectionOptions& options,
+    double alpha,
+    double beta) {
+  PatchSeedCandidate candidate;
+  candidate.alpha = alpha;
+  candidate.beta = beta;
+  candidate.patch_point = frame.predicted_patch +
+                          static_cast<float>(alpha) * frame.unit_u +
+                          static_cast<float>(beta) * frame.unit_v;
+  if (!IsInsideImage(candidate.patch_point, context.patch_size)) {
+    return candidate;
+  }
+  candidate.image_point =
+      PerspectiveTransformPoint(context.patch_to_image, candidate.patch_point);
+
+  const TemplateScore score = ComputeBoundaryAlignmentScoreAtPoint(
+      patch, corner_info, candidate.patch_point, frame.module_u_axis,
+      frame.module_v_axis, options.min_template_contrast,
+      kSphereSeedSampleRadiusScale);
+  const double offset = std::hypot(alpha, beta);
+  const double search_radius =
+      std::max(kPatchSeedSearchRadiusMinPx, frame.search_radius);
+  const double normalized_offset = offset / search_radius;
+  const double prior_quality =
+      normalized_offset <= kSphereSeedPriorInnerRatio
+          ? 1.0
+          : ClampUnit(1.0 - (normalized_offset - kSphereSeedPriorInnerRatio) /
+                                 std::max(1e-6, 1.0 - kSphereSeedPriorInnerRatio));
+  const double raw_quality = std::min(score.template_quality, score.gradient_quality);
+
+  double best_neighbor_raw = 0.0;
+  const std::array<cv::Point2f, 8> neighbor_offsets{{
+      cv::Point2f(-1.0f, 0.0f), cv::Point2f(1.0f, 0.0f),
+      cv::Point2f(0.0f, -1.0f), cv::Point2f(0.0f, 1.0f),
+      cv::Point2f(-1.0f, -1.0f), cv::Point2f(1.0f, -1.0f),
+      cv::Point2f(-1.0f, 1.0f), cv::Point2f(1.0f, 1.0f),
+  }};
+  for (const cv::Point2f& neighbor_offset : neighbor_offsets) {
+    const cv::Point2f neighbor_patch = candidate.patch_point + neighbor_offset;
+    if (!IsInsideImage(neighbor_patch, context.patch_size)) {
+      continue;
+    }
+    const TemplateScore neighbor_score = ComputeBoundaryAlignmentScoreAtPoint(
+        patch, corner_info, neighbor_patch, frame.module_u_axis,
+        frame.module_v_axis, options.min_template_contrast,
+        kSphereSeedSampleRadiusScale);
+    best_neighbor_raw =
+        std::max(best_neighbor_raw,
+                 std::min(neighbor_score.template_quality,
+                          neighbor_score.gradient_quality));
+  }
+  const double peak_quality =
+      raw_quality > 1e-9
+          ? ClampUnit(0.5 + 0.5 * (raw_quality - best_neighbor_raw) /
+                                 std::max(raw_quality, 1e-6))
+          : 0.0;
+
+  candidate.valid = true;
+  candidate.template_quality = score.template_quality;
+  candidate.gradient_quality = score.gradient_quality;
+  candidate.prior_quality = prior_quality;
+  candidate.peak_quality = peak_quality;
+  candidate.raw_quality = raw_quality;
+  candidate.final_quality =
+      ClampUnit(kSphereSeedRawWeight * candidate.raw_quality +
+                kSphereSeedPeakWeight * candidate.peak_quality +
+                kSphereSeedPriorWeight * candidate.prior_quality);
+  return candidate;
+}
+
+PatchSeedCandidate SearchPinholeBootstrapPatchSeed(
+    const cv::Mat& patch,
+    const PinholeBootstrapPatchContext& context,
+    const CanonicalCorner& corner_info,
+    const PatchSeedFrame& frame,
+    const ApriltagInternalDetectionOptions& options) {
+  auto search_grid = [&](double center_alpha, double center_beta, double radius,
+                         int grid_size) {
+    PatchSeedCandidate best_candidate =
+        EvaluatePinholeBootstrapPatchCandidate(
+            patch, context, corner_info, frame, options, center_alpha,
+            center_beta);
+    if (grid_size <= 1) {
+      return best_candidate;
+    }
+    const double denominator = static_cast<double>(grid_size - 1);
+    for (int row = 0; row < grid_size; ++row) {
+      for (int col = 0; col < grid_size; ++col) {
+        const double alpha =
+            center_alpha - radius +
+            2.0 * radius * static_cast<double>(col) / denominator;
+        const double beta =
+            center_beta - radius +
+            2.0 * radius * static_cast<double>(row) / denominator;
+        const PatchSeedCandidate candidate =
+            EvaluatePinholeBootstrapPatchCandidate(
+                patch, context, corner_info, frame, options, alpha, beta);
+        if (IsBetterPatchCandidate(candidate, best_candidate)) {
+          best_candidate = candidate;
+        }
+      }
+    }
+    return best_candidate;
+  };
+
+  const PatchSeedCandidate coarse_best =
+      search_grid(0.0, 0.0, frame.search_radius, kPatchSeedCoarseGridSize);
+  const double fine_radius = 0.5 * frame.search_radius;
+  return search_grid(coarse_best.alpha, coarse_best.beta, fine_radius,
+                     kPatchSeedFineGridSize);
+}
+
+bool BuildPinholeBootstrapPatchFrame(
+    const PinholeBootstrapPatchContext& context,
+    int module_dimension,
+    const CanonicalCorner& corner_info,
+    const ApriltagInternalDetectionOptions& options,
+    PatchSeedFrame* frame) {
+  if (frame == nullptr) {
+    throw std::runtime_error("BuildPinholeBootstrapPatchFrame requires output.");
+  }
+  frame->predicted_patch =
+      BoardToPatchPoint(corner_info, module_dimension,
+                        options.canonical_pixels_per_module);
+  frame->predicted_image =
+      PerspectiveTransformPoint(context.patch_to_image, frame->predicted_patch);
+  frame->module_u_axis =
+      cv::Point2f(static_cast<float>(options.canonical_pixels_per_module), 0.0f);
+  frame->module_v_axis =
+      cv::Point2f(0.0f, -static_cast<float>(options.canonical_pixels_per_module));
+  frame->unit_u = cv::Point2f(1.0f, 0.0f);
+  frame->unit_v = cv::Point2f(0.0f, -1.0f);
+  frame->local_module_scale =
+      static_cast<double>(options.canonical_pixels_per_module);
+  frame->search_radius =
+      std::max(kPatchSeedSearchRadiusMinPx,
+               kPatchSeedSearchRadiusScale * frame->local_module_scale);
+  return IsInsideImage(frame->predicted_patch, context.patch_size);
+}
+
+void PopulateInternalCornersFromPinholeBootstrapPatch(
+    const cv::Mat& gray,
+    const PinholeBootstrapPatchContext& context,
+    const std::array<int, 4>& outer_point_ids,
+    const ApriltagCanonicalModel& model,
+    const ApriltagInternalDetectionOptions& options,
+    ApriltagInternalDetectionResult* result) {
+  if (result == nullptr) {
+    throw std::runtime_error("Result pointer must not be null.");
+  }
+  const IntegralMeanImage gray_integral(gray);
+
+  for (const int point_id : model.VisiblePointIds()) {
+    if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) !=
+        outer_point_ids.end()) {
+      continue;
+    }
+
+    const CanonicalCorner& corner_info = model.corner(point_id);
+    PatchSeedFrame patch_frame;
+    const bool has_patch_frame =
+        BuildPinholeBootstrapPatchFrame(context, model.ModuleDimension(),
+                                        corner_info, options,
+                                        &patch_frame);
+    PatchSeedCandidate seed_candidate;
+    if (has_patch_frame) {
+      seed_candidate = SearchPinholeBootstrapPatchSeed(
+          context.patch, context, corner_info, patch_frame, options);
+    }
+
+    cv::Point2f seed_patch = patch_frame.predicted_patch;
+    cv::Point2f seed_image = patch_frame.predicted_image;
+    double seed_template_quality = 1.0;
+    double seed_gradient_quality = 1.0;
+    double seed_prior_quality = 1.0;
+    double seed_peak_quality = 1.0;
+    double seed_raw_quality = 1.0;
+    double seed_quality = 1.0;
+    if (seed_candidate.valid) {
+      seed_patch = seed_candidate.patch_point;
+      seed_image = seed_candidate.image_point;
+      seed_template_quality = seed_candidate.template_quality;
+      seed_gradient_quality = seed_candidate.gradient_quality;
+      seed_prior_quality = seed_candidate.prior_quality;
+      seed_peak_quality = seed_candidate.peak_quality;
+      seed_raw_quality = seed_candidate.raw_quality;
+      seed_quality = seed_candidate.final_quality;
+    }
+
+    const std::pair<cv::Point2f, cv::Point2f> local_axes =
+        ComputeHomographyLocalAxes(context.board_to_image, corner_info);
+    const cv::Point2f image_module_u_axis = local_axes.first;
+    const cv::Point2f image_module_v_axis = local_axes.second;
+    const double image_module_scale_px =
+        ComputeModuleScalePx(image_module_u_axis, image_module_v_axis,
+                             static_cast<double>(
+                                 options.canonical_pixels_per_module));
+    const int subpix_window_radius =
+        ComputeAdaptiveInternalSubpixRadius(image_module_scale_px, options);
+    const double subpix_displacement_limit =
+        ComputeAdaptiveInternalSubpixDisplacementLimit(image_module_scale_px,
+                                                       options);
+    const int image_evidence_search_radius =
+        ComputeAdaptiveImageEvidenceSearchRadius(image_module_scale_px, options);
+
+    cv::Point2f refined_image = seed_image;
+    bool image_refinement_applied = false;
+    if (has_patch_frame &&
+        IsInsideImageForRecovery(seed_image, gray.size(), options) &&
+        options.do_subpix_refinement) {
+      refined_image = RefineImageCornerSubpixWithPadding(
+          gray, refined_image, subpix_window_radius, options);
+      image_refinement_applied = true;
+    }
+
+    cv::Point2f refined_patch = seed_patch;
+    if (IsInsideImageWithBorder(refined_image, gray.size(),
+                                options.min_border_distance)) {
+      refined_patch =
+          PerspectiveTransformPoint(context.image_to_patch, refined_image);
+    }
+
+    const double displacement =
+        std::hypot(refined_image.x - seed_image.x,
+                   refined_image.y - seed_image.y);
+    const double q_refine =
+        has_patch_frame &&
+                IsInsideImageWithBorder(seed_image, gray.size(),
+                                        options.min_border_distance)
+            ? (options.do_subpix_refinement
+                   ? ClampUnit(1.0 -
+                               (displacement * displacement) /
+                                   std::max(1e-9,
+                                            subpix_displacement_limit *
+                                                subpix_displacement_limit))
+                   : 1.0)
+            : 0.0;
+    const TemplateScore patch_score =
+        ComputeTemplateScoreAtPoint(context.patch, corner_info, refined_patch,
+                                    options.canonical_pixels_per_module,
+                                    options.min_template_contrast);
+    const ImageEvidenceScore image_score =
+        EvaluateImageEvidenceAroundPoint(
+            gray, corner_info, refined_image, image_module_u_axis,
+            image_module_v_axis, options.min_template_contrast,
+            subpix_displacement_limit * subpix_displacement_limit,
+            image_evidence_search_radius, &gray_integral);
+    const double image_final_quality = image_score.final_quality;
+    const double final_quality =
+        std::min({seed_quality, q_refine, image_final_quality});
+    const bool valid = has_patch_frame &&
+                       IsInsideImageForRecovery(refined_image, result->image_size,
+                                                options);
+    const bool image_evidence_valid =
+        valid && ImageEvidencePassesQualityGate(options, image_final_quality);
+
+    CornerMeasurement& measurement =
+        result->corners[static_cast<std::size_t>(point_id)];
+    measurement.image_xy = Eigen::Vector2d(refined_image.x, refined_image.y);
+    measurement.quality = final_quality;
+    measurement.valid = valid;
+
+    if (valid) {
+      ++result->valid_corner_count;
+      ++result->valid_internal_corner_count;
+    }
+
+    InternalCornerDebugInfo debug;
+    debug.point_id = point_id;
+    debug.lattice_u = corner_info.lattice_u;
+    debug.lattice_v = corner_info.lattice_v;
+    debug.corner_type = corner_info.corner_type;
+    debug.predicted_image = patch_frame.predicted_image;
+    debug.sphere_seed_image = seed_image;
+    debug.refined_image = refined_image;
+    debug.predicted_patch = patch_frame.predicted_patch;
+    debug.sphere_seed_patch = seed_patch;
+    debug.refined_patch = refined_patch;
+    debug.module_u_axis = image_module_u_axis;
+    debug.module_v_axis = image_module_v_axis;
+    debug.local_module_scale = image_module_scale_px;
+    debug.sphere_search_radius =
+        has_patch_frame ? patch_frame.search_radius : 0.0;
+    debug.sphere_template_quality = seed_template_quality;
+    debug.sphere_gradient_quality = seed_gradient_quality;
+    debug.sphere_prior_quality = seed_prior_quality;
+    debug.sphere_peak_quality = seed_peak_quality;
+    debug.sphere_raw_quality = seed_raw_quality;
+    debug.sphere_seed_quality = seed_quality;
+    debug.subpix_window_radius = subpix_window_radius;
+    debug.subpix_displacement_limit = subpix_displacement_limit;
+    debug.image_evidence_search_radius = image_evidence_search_radius;
+    debug.q_refine = q_refine;
+    debug.template_quality = patch_score.template_quality;
+    debug.gradient_quality = patch_score.gradient_quality;
+    debug.final_quality = final_quality;
+    debug.image_template_quality = image_score.best_score.template_quality;
+    debug.image_gradient_quality = image_score.best_score.gradient_quality;
+    debug.image_centering_quality = image_score.centering_quality;
+    debug.image_final_quality = image_final_quality;
+    debug.predicted_to_seed_displacement =
+        std::hypot(seed_image.x - patch_frame.predicted_image.x,
+                   seed_image.y - patch_frame.predicted_image.y);
+    debug.seed_to_refined_displacement =
+        std::hypot(refined_image.x - seed_image.x,
+                   refined_image.y - seed_image.y);
+    debug.predicted_to_refined_displacement =
+        std::hypot(refined_image.x - patch_frame.predicted_image.x,
+                   refined_image.y - patch_frame.predicted_image.y);
+    debug.image_refinement_applied = image_refinement_applied;
     debug.valid = valid;
     debug.image_evidence_valid = image_evidence_valid;
     result->internal_corner_debug.push_back(debug);
@@ -2869,31 +4374,155 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
                                               bool enable_seed_search,
                                               bool use_border_conditioned_seed,
                                               bool use_ray_domain_refine,
+                                              ApriltagInternalRuntimeBreakdown* runtime_breakdown,
                                               ApriltagInternalDetectionResult* result) {
   if (result == nullptr) {
     throw std::runtime_error("Result pointer must not be null.");
   }
+  const IntegralMeanImage gray_integral(gray);
 
   BoardSphereBoundaryModel boundary_model;
-  const bool has_boundary_model =
-      use_border_conditioned_seed &&
-      BuildBoardSphereBoundaryModel(camera, outer_detection, &boundary_model);
+  bool has_boundary_model = false;
+  std::string boundary_model_failure_reason;
+  if (use_border_conditioned_seed) {
+    const auto boundary_start = std::chrono::steady_clock::now();
+    has_boundary_model =
+        BuildBoardSphereBoundaryModel(gray, camera, outer_detection, &boundary_model,
+                                      &boundary_model_failure_reason,
+                                      options.outer_detector_config
+                                          .enable_robust_missing_board_recovery);
+    if (runtime_breakdown != nullptr) {
+      runtime_breakdown->boundary_model_seconds += ElapsedSeconds(boundary_start);
+      runtime_breakdown->boundary_model_build_count += 1;
+    }
+  }
+  result->border_boundary_model_failure_reason = boundary_model_failure_reason;
   StoreBoardBoundaryDebugCurves(boundary_model, camera, result);
+  const bool allow_forward_ray_recovery =
+      options.outer_detector_config.enable_robust_missing_board_recovery &&
+      outer_detection.used_local_patch_rescue && !has_boundary_model;
+  if (use_border_conditioned_seed && !has_boundary_model) {
+    // Boundary-conditioned seeds are an accuracy improvement, not a board
+    // existence gate.  In the robust recovery mode, retain the trusted outer
+    // quad and run the ordinary sphere-lattice image refinement instead.  A
+    // purely projected point is still not accepted: the fallback below keeps
+    // the normal per-point current-image refinement and topology validation.
+    if (options.outer_detector_config.enable_robust_missing_board_recovery) {
+      use_border_conditioned_seed = false;
+    } else {
+      result->reject_entire_board_observation = true;
+      result->failure_reason =
+          "sphere_border_lattice_boundary_model_unavailable: " +
+          (boundary_model_failure_reason.empty()
+               ? std::string("missing image-derived edge support")
+               : boundary_model_failure_reason);
+      return;
+    }
+  }
+
+  InternalStructureCorrectionModel structure_correction;
+  if (options.enable_internal_structure_correction_after_ss &&
+      !use_ray_domain_refine && enable_seed_search) {
+    std::vector<InternalStructureCorrectionSample> structure_samples;
+    for (const int point_id : model.VisiblePointIds()) {
+      if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) !=
+          outer_point_ids.end()) {
+        continue;
+      }
+      const CanonicalCorner& corner_info = model.corner(point_id);
+      SphereLatticeFrame frame;
+      const bool has_frame =
+          BuildSphereLatticeFrame(camera, target_to_camera_rotation,
+                                  target_to_camera_translation, model,
+                                  corner_info,
+                                  options.outer_detector_config
+                                      .enable_robust_missing_board_recovery,
+                                  allow_forward_ray_recovery,
+                                  gray.size(),
+                                  &frame);
+      if (!has_frame) {
+        continue;
+      }
+
+      SphereLatticeFrame search_frame = frame;
+      bool has_search_anchor = has_frame;
+      if (use_border_conditioned_seed) {
+        has_search_anchor = false;
+        BorderConditionedSeed border_seed;
+        if (has_boundary_model &&
+            BuildBorderConditionedSeed(boundary_model, camera, model, corner_info,
+                                       &border_seed) &&
+            IsInsideImage(border_seed.image_point, gray.size())) {
+          const double adaptive_search_radius =
+              ComputeAdaptiveBorderSeedSearchRadius(frame, border_seed.ray);
+          has_search_anchor = BuildSeedAnchoredSphereLatticeFrame(
+              frame, border_seed.ray, border_seed.image_point,
+              adaptive_search_radius, &search_frame);
+        }
+      }
+      if (!has_search_anchor) {
+        continue;
+      }
+
+      SphereSeedCandidate anchor_candidate =
+          EvaluateSphereSeedCandidate(gray, camera, corner_info, search_frame,
+                                      options, 0.0, 0.0);
+      SphereSeedCandidate seed_candidate =
+          SearchSphereLatticeSeed(gray, camera, corner_info, search_frame,
+                                  options);
+      cv::Point2f seed_image = search_frame.predicted_image;
+      bool has_seed = false;
+      if (anchor_candidate.valid) {
+        seed_image = anchor_candidate.image_point;
+        has_seed = true;
+      }
+      if (seed_candidate.valid) {
+        seed_image = seed_candidate.image_point;
+        has_seed = true;
+      }
+      if (!has_seed || !IsInsideImageForRecovery(seed_image, gray.size(), options)) {
+        continue;
+      }
+
+      InternalStructureCorrectionSample sample;
+      sample.point_id = point_id;
+      sample.row = static_cast<int>(std::lround(corner_info.lattice_v));
+      sample.col = static_cast<int>(std::lround(corner_info.lattice_u));
+      sample.seed_image = seed_image;
+      sample.module_u_axis = frame.module_u_axis;
+      sample.module_v_axis = frame.module_v_axis;
+      sample.local_module_scale = frame.local_module_scale;
+      sample.corner_info = &corner_info;
+      structure_samples.push_back(sample);
+    }
+    structure_correction = EstimateInternalStructureCorrection(
+        gray, gray_integral, structure_samples, options);
+  }
 
   for (const int point_id : model.VisiblePointIds()) {
     if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) != outer_point_ids.end()) {
       continue;
     }
+    if (runtime_breakdown != nullptr) {
+      ++runtime_breakdown->attempted_internal_corner_count;
+    }
 
     const CanonicalCorner& corner_info = model.corner(point_id);
     InternalCornerDebugInfo debug;
     debug.point_id = point_id;
+    debug.lattice_u = corner_info.lattice_u;
+    debug.lattice_v = corner_info.lattice_v;
     debug.corner_type = corner_info.corner_type;
 
     SphereLatticeFrame frame;
     const bool has_frame =
-        BuildSphereLatticeFrame(camera, target_to_camera_rotation, target_to_camera_translation,
-                                model, corner_info, &frame);
+      BuildSphereLatticeFrame(camera, target_to_camera_rotation, target_to_camera_translation,
+                              model, corner_info,
+                              options.outer_detector_config
+                                  .enable_robust_missing_board_recovery,
+                              allow_forward_ray_recovery,
+                              gray.size(),
+                              &frame);
     debug.predicted_image = frame.predicted_image;
     debug.predicted_ray = cv::Vec3d(frame.predicted_ray.x(), frame.predicted_ray.y(),
                                     frame.predicted_ray.z());
@@ -2944,6 +4573,20 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
       }
     }
 
+    // The border-conditioned seed is an optional per-point accuracy aid.  A
+    // trusted outer quad must not make an otherwise visible internal point
+    // disappear merely because this one boundary intersection could not be
+    // constructed.  Keep the normal sphere-lattice search as the narrowly
+    // scoped fallback for robust recovery; ordinary and successful border
+    // conditioned paths are unchanged.
+    if (!has_search_anchor &&
+        options.outer_detector_config.enable_robust_missing_board_recovery &&
+        has_frame && IsInsideImageForRecovery(frame.predicted_image, gray.size(),
+                                              options)) {
+      search_frame = frame;
+      has_search_anchor = true;
+    }
+
     cv::Point2f sphere_seed_image = search_frame.predicted_image;
     Eigen::Vector3d sphere_seed_ray = search_frame.predicted_ray;
     SphereSeedCandidate anchor_candidate;
@@ -2952,15 +4595,21 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     bool has_seed = false;
     if (has_search_anchor) {
       if (use_ray_domain_refine) {
+        const auto ray_refine_start = std::chrono::steady_clock::now();
         ray_refine_result =
             RefineSphereSeedRayLocally(gray, camera, corner_info, search_frame, options,
                                        search_frame.predicted_ray);
+        if (runtime_breakdown != nullptr) {
+          runtime_breakdown->ray_refine_seconds +=
+              ElapsedSeconds(ray_refine_start);
+        }
         if (ray_refine_result.valid) {
           sphere_seed_image = ray_refine_result.refined_image;
           sphere_seed_ray = ray_refine_result.refined_ray;
           has_seed = true;
         }
       } else {
+        const auto search_start = std::chrono::steady_clock::now();
         anchor_candidate =
             EvaluateSphereSeedCandidate(gray, camera, corner_info, search_frame, options, 0.0, 0.0);
         if (anchor_candidate.valid) {
@@ -2972,12 +4621,28 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
                              ? SearchSphereLatticeSeed(gray, camera, corner_info, search_frame,
                                                        options)
                              : anchor_candidate;
+        if (runtime_breakdown != nullptr) {
+          runtime_breakdown->seed_search_seconds +=
+              ElapsedSeconds(search_start);
+        }
         if (seed_candidate.valid) {
           sphere_seed_image = seed_candidate.image_point;
           sphere_seed_ray = seed_candidate.ray;
           has_seed = true;
         }
       }
+    }
+
+    if (!has_seed && has_frame &&
+        IsInsideImageForRecovery(frame.predicted_image, gray.size(), options) &&
+        std::isfinite(frame.predicted_ray.x()) &&
+        std::isfinite(frame.predicted_ray.y()) &&
+        std::isfinite(frame.predicted_ray.z()) &&
+        frame.predicted_ray.squaredNorm() > 1e-12) {
+      sphere_seed_image = frame.predicted_image;
+      sphere_seed_ray = frame.predicted_ray.normalized();
+      has_seed = true;
+      debug.forced_prediction_seed = true;
     }
 
     debug.sphere_seed_image = sphere_seed_image;
@@ -2999,6 +4664,14 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
       debug.sphere_raw_quality = quality_candidate.raw_quality;
       debug.sphere_seed_quality = quality_candidate.final_quality;
     }
+    if (debug.forced_prediction_seed) {
+      debug.sphere_template_quality = 1.0;
+      debug.sphere_gradient_quality = 1.0;
+      debug.sphere_prior_quality = 1.0;
+      debug.sphere_peak_quality = 1.0;
+      debug.sphere_raw_quality = 1.0;
+      debug.sphere_seed_quality = 1.0;
+    }
     debug.border_seed_to_sphere_seed_displacement =
         debug.border_seed_valid
             ? std::hypot(sphere_seed_image.x - debug.border_seed_image.x,
@@ -3007,26 +4680,112 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     debug.predicted_to_seed_displacement =
         std::hypot(sphere_seed_image.x - frame.predicted_image.x,
                    sphere_seed_image.y - frame.predicted_image.y);
-    const int image_evidence_search_radius =
-        ComputeAdaptiveImageEvidenceSearchRadius(frame.local_module_scale, options);
+    cv::Point2f subpix_seed_image = sphere_seed_image;
+    Eigen::Vector3d subpix_seed_ray = sphere_seed_ray;
+    cv::Point2f structure_candidate_image{};
+    Eigen::Vector3d structure_candidate_ray = Eigen::Vector3d::Zero();
+    double structure_candidate_delta_px = 0.0;
+    bool has_structure_candidate = false;
+    if (!use_ray_domain_refine && has_frame && has_seed &&
+        structure_correction.valid) {
+      cv::Point2f corrected_image{};
+      double correction_delta_px = 0.0;
+      if (ApplyInternalStructureCorrection(structure_correction, corner_info,
+                                           frame, sphere_seed_image,
+                                           &corrected_image,
+                                           &correction_delta_px) &&
+          IsInsideImageWithBorder(corrected_image, gray.size(),
+                                  options.min_border_distance)) {
+        Eigen::Vector3d corrected_ray = Eigen::Vector3d::Zero();
+        if (UnprojectImagePointToRay(camera, corrected_image, &corrected_ray)) {
+          structure_candidate_image = corrected_image;
+          structure_candidate_ray = corrected_ray;
+          structure_candidate_delta_px = correction_delta_px;
+          has_structure_candidate = true;
+          debug.structure_corrected_image = corrected_image;
+          debug.structure_correction_group_by_column =
+              structure_correction.group_by_column;
+          debug.structure_correction_delta_px = correction_delta_px;
+          debug.sphere_seed_to_structure_corrected_displacement =
+              std::hypot(corrected_image.x - sphere_seed_image.x,
+                         corrected_image.y - sphere_seed_image.y);
+        }
+      }
+    }
 
-    cv::Point2f refined_image = sphere_seed_image;
-    Eigen::Vector3d refined_ray = sphere_seed_ray;
+    cv::Point2f refined_image = subpix_seed_image;
+    Eigen::Vector3d refined_ray = subpix_seed_ray;
+    bool image_refinement_applied = false;
     const int subpix_window_radius =
         ComputeAdaptiveInternalSubpixRadius(frame.local_module_scale, options);
-    const double subpix_displacement_limit =
-        ComputeAdaptiveInternalSubpixDisplacementLimit(frame.local_module_scale, options);
+    const int image_evidence_search_radius =
+        ComputeAdaptiveImageEvidenceSearchRadius(frame.local_module_scale, options);
+    // cornerSubPix is already bounded by the local half-module window. Do not
+    // apply a second fixed-pixel displacement gate to internal corners.
+    const double subpix_displacement_limit = 0.0;
     double q_refine = 0.0;
     if (use_ray_domain_refine) {
       if (has_frame && has_seed &&
-          IsInsideImageWithBorder(sphere_seed_image, gray.size(), options.min_border_distance) &&
+          IsInsideImageForRecovery(subpix_seed_image, gray.size(), options) &&
           options.do_subpix_refinement) {
-        std::vector<cv::Point2f> corners{refined_image};
-        cv::cornerSubPix(gray, corners,
-                         cv::Size(subpix_window_radius, subpix_window_radius),
-                         cv::Size(-1, -1),
-                         cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 30, 0.1));
-        refined_image = corners.front();
+        const auto subpix_start = std::chrono::steady_clock::now();
+        refined_image = RefineImageCornerSubpixWithPadding(
+            gray, refined_image, subpix_window_radius, options);
+        image_refinement_applied = true;
+        if (runtime_breakdown != nullptr) {
+          runtime_breakdown->subpix_seconds += ElapsedSeconds(subpix_start);
+        }
+      }
+      if (has_frame && has_seed && has_structure_candidate &&
+          IsInsideImageWithBorder(structure_candidate_image, gray.size(),
+                                  options.min_border_distance)) {
+        InternalStructureCorrectionSample evidence_sample;
+        evidence_sample.point_id = point_id;
+        evidence_sample.row = static_cast<int>(std::lround(corner_info.lattice_v));
+        evidence_sample.col = static_cast<int>(std::lround(corner_info.lattice_u));
+        evidence_sample.module_u_axis = frame.module_u_axis;
+        evidence_sample.module_v_axis = frame.module_v_axis;
+        evidence_sample.local_module_scale = frame.local_module_scale;
+        evidence_sample.corner_info = &corner_info;
+
+        evidence_sample.seed_image = subpix_seed_image;
+        const double seed_candidate_evidence = InternalStructureRawEvidence(
+            gray, gray_integral, evidence_sample, subpix_seed_image,
+            options.min_template_contrast);
+        const double seed_path_evidence = InternalStructureRawEvidence(
+            gray, gray_integral, evidence_sample, refined_image,
+            options.min_template_contrast);
+        cv::Point2f structure_refined_image = structure_candidate_image;
+        if (options.do_subpix_refinement) {
+          const auto subpix_start = std::chrono::steady_clock::now();
+          structure_refined_image = RefineImageCornerSubpixWithPadding(
+              gray, structure_refined_image, subpix_window_radius, options);
+          image_refinement_applied = true;
+          if (runtime_breakdown != nullptr) {
+            runtime_breakdown->subpix_seconds += ElapsedSeconds(subpix_start);
+          }
+        }
+
+        evidence_sample.seed_image = structure_candidate_image;
+        const double structure_candidate_evidence = InternalStructureRawEvidence(
+            gray, gray_integral, evidence_sample, structure_candidate_image,
+            options.min_template_contrast);
+        const double structure_path_evidence = InternalStructureRawEvidence(
+            gray, gray_integral, evidence_sample, structure_refined_image,
+            options.min_template_contrast);
+        constexpr double kStructurePathSelectionMargin = 0.005;
+        const bool structure_seed_promising =
+            structure_candidate_evidence + 0.12 >= seed_candidate_evidence;
+        if (structure_seed_promising ||
+            structure_path_evidence > seed_path_evidence +
+                                      kStructurePathSelectionMargin) {
+          subpix_seed_image = structure_candidate_image;
+          subpix_seed_ray = structure_candidate_ray;
+          refined_image = structure_refined_image;
+          debug.structure_correction_valid = true;
+          debug.structure_corrected_image = structure_candidate_image;
+          debug.structure_correction_delta_px = structure_candidate_delta_px;
+        }
       }
       if (IsInsideImage(refined_image, gray.size())) {
         Eigen::Vector3d refined_ray_candidate = Eigen::Vector3d::Zero();
@@ -3034,18 +4793,11 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
           refined_ray = refined_ray_candidate;
         }
       }
-      q_refine =
-          (has_frame && has_seed &&
-           IsInsideImageWithBorder(sphere_seed_image, gray.size(), options.min_border_distance))
-              ? (options.do_subpix_refinement
-                     ? ClampUnit(1.0 - (std::hypot(refined_image.x - sphere_seed_image.x,
-                                                   refined_image.y - sphere_seed_image.y) *
-                                        std::hypot(refined_image.x - sphere_seed_image.x,
-                                                   refined_image.y - sphere_seed_image.y)) /
-                                           std::max(1e-9, subpix_displacement_limit *
-                                                             subpix_displacement_limit))
-                     : 1.0)
-              : 0.0;
+      q_refine = has_frame && has_seed &&
+                         IsInsideImageWithBorder(subpix_seed_image, gray.size(),
+                                                 options.min_border_distance)
+                     ? 1.0
+                     : 0.0;
       debug.ray_refine_edge_quality = ray_refine_result.edge_quality;
       debug.ray_refine_photometric_quality = ray_refine_result.photometric_quality;
       debug.ray_refine_final_quality = ray_refine_result.final_quality;
@@ -3054,14 +4806,15 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
       debug.ray_refine_converged = ray_refine_result.converged;
     } else {
       if (has_frame && has_seed &&
-          IsInsideImageWithBorder(sphere_seed_image, gray.size(), options.min_border_distance) &&
+          IsInsideImageForRecovery(subpix_seed_image, gray.size(), options) &&
           options.do_subpix_refinement) {
-        std::vector<cv::Point2f> corners{refined_image};
-        cv::cornerSubPix(gray, corners,
-                         cv::Size(subpix_window_radius, subpix_window_radius),
-                         cv::Size(-1, -1),
-                         cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 30, 0.1));
-        refined_image = corners.front();
+        const auto subpix_start = std::chrono::steady_clock::now();
+        refined_image = RefineImageCornerSubpixWithPadding(
+            gray, refined_image, subpix_window_radius, options);
+        image_refinement_applied = true;
+        if (runtime_breakdown != nullptr) {
+          runtime_breakdown->subpix_seconds += ElapsedSeconds(subpix_start);
+        }
       }
       if (IsInsideImage(refined_image, gray.size())) {
         Eigen::Vector3d refined_ray_candidate = Eigen::Vector3d::Zero();
@@ -3069,18 +4822,11 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
           refined_ray = refined_ray_candidate;
         }
       }
-      q_refine =
-          (has_frame && has_seed &&
-           IsInsideImageWithBorder(sphere_seed_image, gray.size(), options.min_border_distance))
-              ? (options.do_subpix_refinement
-                     ? ClampUnit(1.0 - (std::hypot(refined_image.x - sphere_seed_image.x,
-                                                   refined_image.y - sphere_seed_image.y) *
-                                        std::hypot(refined_image.x - sphere_seed_image.x,
-                                                   refined_image.y - sphere_seed_image.y)) /
-                                           std::max(1e-9, subpix_displacement_limit *
-                                                             subpix_displacement_limit))
-                     : 1.0)
-              : 0.0;
+      q_refine = has_frame && has_seed &&
+                         IsInsideImageWithBorder(subpix_seed_image, gray.size(),
+                                                 options.min_border_distance)
+                     ? 1.0
+                     : 0.0;
     }
 
     debug.refined_image = refined_image;
@@ -3089,8 +4835,9 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     debug.subpix_displacement_limit = subpix_displacement_limit;
     debug.image_evidence_search_radius = image_evidence_search_radius;
     debug.seed_to_refined_displacement =
-        std::hypot(refined_image.x - sphere_seed_image.x, refined_image.y - sphere_seed_image.y);
-    debug.seed_to_refined_angular = AngleBetweenRays(sphere_seed_ray, refined_ray);
+        std::hypot(refined_image.x - subpix_seed_image.x,
+                   refined_image.y - subpix_seed_image.y);
+    debug.seed_to_refined_angular = AngleBetweenRays(subpix_seed_ray, refined_ray);
     debug.predicted_to_refined_displacement =
         std::hypot(refined_image.x - frame.predicted_image.x,
                    refined_image.y - frame.predicted_image.y);
@@ -3098,11 +4845,16 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
 
     ImageEvidenceScore image_score;
     if (has_frame && has_seed) {
+      const auto image_evidence_start = std::chrono::steady_clock::now();
       image_score = EvaluateImageEvidenceAroundPoint(
           gray, corner_info, refined_image, frame.module_u_axis, frame.module_v_axis,
           options.min_template_contrast,
-          subpix_displacement_limit * subpix_displacement_limit,
-          image_evidence_search_radius);
+          0.0,
+          image_evidence_search_radius, &gray_integral);
+      if (runtime_breakdown != nullptr) {
+        runtime_breakdown->image_evidence_seconds +=
+            ElapsedSeconds(image_evidence_start);
+      }
     }
 
     debug.template_quality = debug.sphere_template_quality;
@@ -3112,17 +4864,21 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     debug.image_centering_quality = image_score.centering_quality;
     debug.image_final_quality = image_score.final_quality;
 
+    const double seed_quality_for_final =
+        debug.forced_prediction_seed ? 1.0 : debug.sphere_seed_quality;
     const double final_quality =
-        std::min({debug.sphere_seed_quality, q_refine, image_score.final_quality});
+        std::min({seed_quality_for_final, q_refine, image_score.final_quality});
     debug.final_quality = final_quality;
 
-    const bool valid =
-        has_frame && has_seed &&
-        IsInsideImageWithBorder(refined_image, gray.size(), options.min_border_distance);
     const bool image_evidence_valid =
         has_frame && has_seed &&
         IsInsideImageWithBorder(refined_image, gray.size(), options.min_border_distance) &&
-        image_score.final_quality >= options.min_quality;
+        ImageEvidencePassesQualityGate(options, image_score.final_quality);
+    // The final image-evidence gate is applied centrally below so every
+    // generation path checks the evidence at its actual refined position.
+    const bool valid = has_frame && has_seed &&
+                       IsInsideImageForRecovery(refined_image, gray.size(), options);
+    debug.image_refinement_applied = image_refinement_applied;
     debug.valid = valid;
     debug.image_evidence_valid = image_evidence_valid;
 
@@ -3134,6 +4890,9 @@ void PopulateInternalCornersFromSphereLattice(const cv::Mat& gray,
     if (valid) {
       ++result->valid_corner_count;
       ++result->valid_internal_corner_count;
+      if (runtime_breakdown != nullptr) {
+        ++runtime_breakdown->valid_internal_corner_count;
+      }
     }
 
     result->internal_corner_debug.push_back(debug);
@@ -3150,6 +4909,7 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
   if (result == nullptr) {
     throw std::runtime_error("Result pointer must not be null.");
   }
+  const IntegralMeanImage gray_integral(gray);
 
   for (const int point_id : model.VisiblePointIds()) {
     if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) != outer_point_ids.end()) {
@@ -3189,6 +4949,7 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
 
     cv::Point2f refined_image = predicted_image;
     bool refined_visible = predicted_image_visible;
+    bool image_refinement_applied = false;
     Eigen::Vector3d refined_point_camera;
     if (predicted_visible &&
         IsInsideImageWithBorder(refined_patch, context.patch_size, options.min_border_distance) &&
@@ -3197,6 +4958,13 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
       refined_visible = camera.vsEuclideanToKeypoint(refined_point_camera, &reprojected_image);
       refined_image =
           cv::Point2f(static_cast<float>(reprojected_image.x()), static_cast<float>(reprojected_image.y()));
+    }
+    if (options.outer_detector_config.enable_robust_missing_board_recovery &&
+        refined_visible && IsInsideImageForRecovery(refined_image, gray.size(), options) &&
+        options.do_subpix_refinement) {
+      refined_image = RefineImageCornerSubpixWithPadding(
+          gray, refined_image, subpix_window_radius, options);
+      image_refinement_applied = true;
     }
 
     const double displacement =
@@ -3230,17 +4998,17 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
                                                options.min_template_contrast,
                                                image_subpix_displacement_limit *
                                                    image_subpix_displacement_limit,
-                                               image_evidence_search_radius)
+                                               image_evidence_search_radius, &gray_integral)
             : ImageEvidenceScore{};
     const double final_quality =
         std::min({template_score.template_quality, template_score.gradient_quality, q_refine});
     const double image_final_quality = image_score.final_quality;
     const bool valid = refined_visible &&
-                       IsInsideImageWithBorder(refined_image, result->image_size, options.min_border_distance);
+                       IsInsideImageForRecovery(refined_image, result->image_size, options);
     const bool image_evidence_valid =
         refined_visible &&
         IsInsideImageWithBorder(refined_image, result->image_size, options.min_border_distance) &&
-        image_final_quality >= options.min_quality;
+        ImageEvidencePassesQualityGate(options, image_final_quality);
 
     CornerMeasurement& measurement = result->corners[static_cast<std::size_t>(point_id)];
     measurement.image_xy = Eigen::Vector2d(refined_image.x, refined_image.y);
@@ -3276,6 +5044,7 @@ void PopulateInternalCornersFromVirtualPatch(const cv::Mat& gray,
     debug.image_centering_quality = image_score.centering_quality;
     debug.image_final_quality = image_final_quality;
     debug.predicted_to_refined_displacement = displacement;
+    debug.image_refinement_applied = image_refinement_applied;
     debug.valid = valid;
     debug.image_evidence_valid = image_evidence_valid;
     result->internal_corner_debug.push_back(debug);
@@ -3293,6 +5062,7 @@ void PopulateInternalCornersFromVirtualPatchImageSubpix(
   if (result == nullptr) {
     throw std::runtime_error("Result pointer must not be null.");
   }
+  const IntegralMeanImage gray_integral(gray);
 
   for (const int point_id : model.VisiblePointIds()) {
     if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) !=
@@ -3332,16 +5102,13 @@ void PopulateInternalCornersFromVirtualPatchImageSubpix(
         ComputeAdaptiveInternalSubpixDisplacementLimit(image_module_scale_px, options);
 
     cv::Point2f refined_image = predicted_image;
+    bool image_refinement_applied = false;
     if (predicted_visible && predicted_image_visible && has_image_axes &&
-        IsInsideImageWithBorder(predicted_image, gray.size(), options.min_border_distance) &&
+        IsInsideImageForRecovery(predicted_image, gray.size(), options) &&
         options.do_subpix_refinement) {
-      std::vector<cv::Point2f> corners{refined_image};
-      cv::cornerSubPix(gray, corners,
-                       cv::Size(subpix_window_radius, subpix_window_radius),
-                       cv::Size(-1, -1),
-                       cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 30,
-                                        0.1));
-      refined_image = corners.front();
+      refined_image = RefineImageCornerSubpixWithPadding(
+          gray, refined_image, subpix_window_radius, options);
+      image_refinement_applied = true;
     }
 
     cv::Point2f refined_patch = predicted_patch;
@@ -3377,17 +5144,16 @@ void PopulateInternalCornersFromVirtualPatchImageSubpix(
                                                module_v_axis, options.min_template_contrast,
                                                subpix_displacement_limit *
                                                    subpix_displacement_limit,
-                                               image_evidence_search_radius)
+                                               image_evidence_search_radius, &gray_integral)
             : ImageEvidenceScore{};
     const double final_quality = std::min(q_refine, image_score.final_quality);
     const double image_final_quality = image_score.final_quality;
-    const bool valid =
-        predicted_visible && predicted_image_visible && has_image_axes &&
-        IsInsideImageWithBorder(refined_image, result->image_size, options.min_border_distance);
+    const bool valid = predicted_visible && predicted_image_visible && has_image_axes &&
+                       IsInsideImageForRecovery(refined_image, result->image_size, options);
     const bool image_evidence_valid =
         predicted_visible && predicted_image_visible && has_image_axes &&
         IsInsideImageWithBorder(refined_image, result->image_size, options.min_border_distance) &&
-        image_final_quality >= options.min_quality;
+        ImageEvidencePassesQualityGate(options, image_final_quality);
 
     CornerMeasurement& measurement = result->corners[static_cast<std::size_t>(point_id)];
     measurement.image_xy = Eigen::Vector2d(refined_image.x, refined_image.y);
@@ -3423,6 +5189,7 @@ void PopulateInternalCornersFromVirtualPatchImageSubpix(
     debug.image_centering_quality = image_score.centering_quality;
     debug.image_final_quality = image_final_quality;
     debug.predicted_to_refined_displacement = displacement;
+    debug.image_refinement_applied = image_refinement_applied;
     debug.valid = valid;
     debug.image_evidence_valid = image_evidence_valid;
     result->internal_corner_debug.push_back(debug);
@@ -3440,6 +5207,7 @@ void PopulateInternalCornersFromVirtualPatchBoundarySeed(
   if (result == nullptr) {
     throw std::runtime_error("Result pointer must not be null.");
   }
+  const IntegralMeanImage gray_integral(gray);
 
   for (const int point_id : model.VisiblePointIds()) {
     if (std::find(outer_point_ids.begin(), outer_point_ids.end(), point_id) !=
@@ -3509,16 +5277,13 @@ void PopulateInternalCornersFromVirtualPatchBoundarySeed(
     }
 
     cv::Point2f refined_image = seed_image;
+    bool image_refinement_applied = false;
     if (predicted_visible && predicted_image_visible && has_image_axes &&
-        IsInsideImageWithBorder(seed_image, gray.size(), options.min_border_distance) &&
+        IsInsideImageForRecovery(seed_image, gray.size(), options) &&
         options.do_subpix_refinement) {
-      std::vector<cv::Point2f> corners{refined_image};
-      cv::cornerSubPix(gray, corners,
-                       cv::Size(subpix_window_radius, subpix_window_radius),
-                       cv::Size(-1, -1),
-                       cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::MAX_ITER, 30,
-                                        0.1));
-      refined_image = corners.front();
+      refined_image = RefineImageCornerSubpixWithPadding(
+          gray, refined_image, subpix_window_radius, options);
+      image_refinement_applied = true;
     }
 
     cv::Point2f refined_patch = seed_patch;
@@ -3549,18 +5314,17 @@ void PopulateInternalCornersFromVirtualPatchBoundarySeed(
                                                options.min_template_contrast,
                                                subpix_displacement_limit *
                                                    subpix_displacement_limit,
-                                               image_evidence_search_radius)
+                                               image_evidence_search_radius, &gray_integral)
             : ImageEvidenceScore{};
     const double final_quality =
         std::min({seed_quality, q_refine, image_score.final_quality});
     const double image_final_quality = image_score.final_quality;
-    const bool valid =
-        predicted_visible && predicted_image_visible && has_image_axes &&
-        IsInsideImageWithBorder(refined_image, result->image_size, options.min_border_distance);
+    const bool valid = predicted_visible && predicted_image_visible && has_image_axes &&
+                       IsInsideImageForRecovery(refined_image, result->image_size, options);
     const bool image_evidence_valid =
         predicted_visible && predicted_image_visible && has_image_axes &&
         IsInsideImageWithBorder(refined_image, result->image_size, options.min_border_distance) &&
-        image_final_quality >= options.min_quality;
+        ImageEvidencePassesQualityGate(options, image_final_quality);
 
     CornerMeasurement& measurement = result->corners[static_cast<std::size_t>(point_id)];
     measurement.image_xy = Eigen::Vector2d(refined_image.x, refined_image.y);
@@ -3610,6 +5374,7 @@ void PopulateInternalCornersFromVirtualPatchBoundarySeed(
         std::hypot(refined_image.x - seed_image.x, refined_image.y - seed_image.y);
     debug.predicted_to_refined_displacement =
         std::hypot(refined_image.x - predicted_image.x, refined_image.y - predicted_image.y);
+    debug.image_refinement_applied = image_refinement_applied;
     debug.valid = valid;
     debug.image_evidence_valid = image_evidence_valid;
     result->internal_corner_debug.push_back(debug);
@@ -3617,6 +5382,34 @@ void PopulateInternalCornersFromVirtualPatchBoundarySeed(
 }
 
 }  // namespace
+
+const char* ToString(InternalPoseRescueMode mode) {
+  switch (mode) {
+    case InternalPoseRescueMode::Off:
+      return "off";
+    case InternalPoseRescueMode::Diagnostic:
+      return "diagnostic";
+    case InternalPoseRescueMode::Enabled:
+      return "enabled";
+  }
+  return "unknown";
+}
+
+InternalPoseRescueMode ParseInternalPoseRescueMode(const std::string& value) {
+  std::string lowered = value;
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  if (lowered == "off") {
+    return InternalPoseRescueMode::Off;
+  }
+  if (lowered == "diagnostic" || lowered == "diag") {
+    return InternalPoseRescueMode::Diagnostic;
+  }
+  if (lowered == "enabled" || lowered == "enable" || lowered == "on") {
+    return InternalPoseRescueMode::Enabled;
+  }
+  throw std::runtime_error("Unsupported internal pose rescue mode: " + value);
+}
 
 ApriltagInternalDetector::ApriltagInternalDetector(
     ApriltagInternalConfig config, ApriltagInternalDetectionOptions options)
@@ -3633,8 +5426,11 @@ ApriltagInternalDetector::ApriltagInternalDetector(
   if (options_.internal_subpix_window_min <= 0) {
     throw std::runtime_error("internal_subpix_window_min must be positive.");
   }
-  if (options_.internal_subpix_window_max < options_.internal_subpix_window_min) {
-    throw std::runtime_error("internal_subpix_window_max must be >= internal_subpix_window_min.");
+  if (options_.internal_subpix_window_max < 0 ||
+      (options_.internal_subpix_window_max > 0 &&
+       options_.internal_subpix_window_max < options_.internal_subpix_window_min)) {
+    throw std::runtime_error(
+        "internal_subpix_window_max must be zero (unbounded) or >= internal_subpix_window_min.");
   }
   if (options_.min_quality < 0.0 || options_.min_quality > 1.0) {
     throw std::runtime_error("min_quality must be in [0, 1].");
@@ -3660,6 +5456,14 @@ ApriltagInternalDetector::ApriltagInternalDetector(
   config_.tag_id = requested_board_ids_.front();
   default_board_index_ = 0;
 
+  options_.ignore_image_evidence_min_quality =
+      config_.ignore_image_evidence_min_quality;
+  options_.force_internal_seed_from_prediction =
+      config_.force_internal_seed_from_prediction;
+  options_.bypass_internal_seed_filters = config_.bypass_internal_seed_filters;
+  options_.enable_internal_structure_correction_after_ss =
+      config_.enable_internal_structure_correction_after_ss;
+
   options_.min_border_distance = config_.outer_detector_config.min_border_distance;
   options_.outer_detector_config = config_.outer_detector_config;
   options_.outer_detector_config.tag_ids = requested_board_ids_;
@@ -3668,8 +5472,7 @@ ApriltagInternalDetector::ApriltagInternalDetector(
   options_.outer_detector_config.do_outer_subpix_refinement =
       options_.do_subpix_refinement && config_.outer_detector_config.do_outer_subpix_refinement;
   IntermediateCameraConfig outer_refine_camera = config_.intermediate_camera;
-  if (config_.outer_spherical_use_initial_camera &&
-      options_.outer_detector_config.enable_outer_spherical_refinement) {
+  if (config_.outer_spherical_use_initial_camera) {
     if (config_.intermediate_camera.resolution.size() != 2) {
       throw std::runtime_error(
           "outer_spherical_use_initial_camera requires a configured image resolution.");
@@ -3719,6 +5522,7 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
     const Eigen::Matrix4d* T_camera_board_prior) const {
   const ApriltagInternalConfig& board_config = board_runtime.config;
   const ApriltagCanonicalModel& model = board_runtime.model;
+  const auto total_start = std::chrono::steady_clock::now();
   ApriltagInternalDetectionResult result;
   result.image_size = gray.size();
   result.board_id = board_config.tag_id;
@@ -3729,6 +5533,7 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
   result.outer_detection = outer_detection;
   if (!result.outer_detection.success) {
     result.failure_reason = result.outer_detection.failure_reason_text;
+    result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
     return result;
   }
 
@@ -3780,7 +5585,17 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
     }
   }
 
-  if (board_config.internal_projection_mode == InternalProjectionMode::Homography) {
+  if (options_.outer4_only) {
+    result.internal_camera_source = "not_requested_outer4_only";
+    result.success = result.valid_corner_count >= 4;
+    result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
+    return result;
+  }
+
+  if (board_config.internal_projection_mode == InternalProjectionMode::Homography ||
+      board_config.internal_projection_mode ==
+          InternalProjectionMode::PinholeBootstrapPatch) {
+    result.internal_camera_source = "not_required";
     std::vector<cv::Point2f> board_outer{
         cv::Point2f(0.0f, 0.0f),
         cv::Point2f(static_cast<float>(model.ModuleDimension()), 0.0f),
@@ -3804,20 +5619,44 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
                         cv::BORDER_CONSTANT, cv::Scalar(255));
 
     result.patch_outer_corners = {patch_outer[0], patch_outer[1], patch_outer[2], patch_outer[3]};
-    PopulateInternalCornersFromHomography(gray, board_to_image, image_to_patch, outer_point_ids, model,
-                                          options_, &result);
+    if (board_config.internal_projection_mode == InternalProjectionMode::Homography) {
+      PopulateInternalCornersFromHomography(gray, board_to_image, image_to_patch,
+                                            outer_point_ids, model, options_,
+                                            &result);
+    } else {
+      PinholeBootstrapPatchContext context;
+      context.board_to_image = board_to_image;
+      context.image_to_patch = image_to_patch;
+      context.patch_to_image = cv::getPerspectiveTransform(patch_outer, image_outer);
+      context.patch = result.canonical_patch;
+      context.patch_size = result.canonical_patch.size();
+      context.patch_outer_corners = result.patch_outer_corners;
+      PopulateInternalCornersFromPinholeBootstrapPatch(
+          gray, context, outer_point_ids, model, options_, &result);
+    }
   } else {
+    const bool has_camera_override =
+        camera_override != nullptr && camera_override->IsConfigured();
     const bool sphere_lattice_has_initial_camera =
         UsesSphereSeedPipeline(board_config.internal_projection_mode) &&
         board_config.sphere_lattice_use_initial_camera;
-    if (!board_config.intermediate_camera.IsConfigured() && !sphere_lattice_has_initial_camera) {
+    result.internal_camera_source =
+        has_camera_override
+            ? "stage5_camera_override"
+            : (sphere_lattice_has_initial_camera
+                   ? "coarse_initial_camera"
+                   : (board_config.intermediate_camera.IsConfigured()
+                          ? "config_intermediate_camera"
+                          : "missing"));
+    if (!has_camera_override && !board_config.intermediate_camera.IsConfigured() &&
+        !sphere_lattice_has_initial_camera) {
       throw std::runtime_error(
           std::string(ToString(board_config.internal_projection_mode)) +
-          " mode requires an intermediate camera model in the config.");
+          " mode requires an intermediate camera model from Stage5 or the config.");
     }
 
     const IntermediateCameraConfig internal_camera_config =
-        camera_override != nullptr && camera_override->IsConfigured()
+        has_camera_override
             ? *camera_override
             : ((UsesSphereSeedPipeline(board_config.internal_projection_mode) &&
                 board_config.sphere_lattice_use_initial_camera)
@@ -3835,18 +5674,53 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
 
     cv::Matx33d target_to_camera_rotation = cv::Matx33d::eye();
     Eigen::Vector3d target_to_camera_translation = Eigen::Vector3d::Zero();
-    if (T_camera_board_prior != nullptr) {
+    const bool use_prior_as_local_seed =
+        T_camera_board_prior != nullptr &&
+        outer_detection.detected_tag_id == board_config.tag_id &&
+        outer_detection.hamming == 0 &&
+        outer_detection.used_local_patch_rescue;
+    if (T_camera_board_prior != nullptr && !use_prior_as_local_seed) {
       target_to_camera_rotation = Matrix4dToMatx33d(*T_camera_board_prior);
       target_to_camera_translation = Matrix4dToTranslation(*T_camera_board_prior);
     } else {
+      const auto pose_start = std::chrono::steady_clock::now();
       cv::Mat rvec;
       cv::Mat tvec;
-      if (!EstimateTargetPose(camera, outer_corners, outer_point_ids, model, &rvec, &tvec)) {
-        result.failure_reason =
-            "Failed to estimate target pose for " +
-            std::string(ToString(board_config.internal_projection_mode)) + " mode.";
-        return result;
+      if (!EstimateTargetPoseWithOptionalRescue(
+              camera, outer_corners, outer_point_ids, model, options_,
+              &rvec, &tvec, &result,
+              use_prior_as_local_seed ? T_camera_board_prior : nullptr)) {
+        if (!use_prior_as_local_seed) {
+          result.failure_reason =
+              "Failed to estimate target pose for " +
+              std::string(ToString(board_config.internal_projection_mode)) + " mode.";
+          result.runtime_breakdown.pose_estimation_seconds +=
+              ElapsedSeconds(pose_start);
+          result.runtime_breakdown.pose_estimation_call_count += 1;
+          result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
+          return result;
+        }
+        // At the extreme image boundary one rescued corner can lie outside
+        // the camera's valid inverse domain, leaving fewer than four rays for
+        // PnP.  In this narrow exact-ID rescue case the scene pose is the
+        // already validated fallback; it is never used when local PnP works.
+        cv::Mat rotation_cv(3, 3, CV_64F);
+        const cv::Matx33d prior_rotation =
+            Matrix4dToMatx33d(*T_camera_board_prior);
+        for (int row = 0; row < 3; ++row) {
+          for (int col = 0; col < 3; ++col) {
+            rotation_cv.at<double>(row, col) = prior_rotation(row, col);
+          }
+        }
+        cv::Rodrigues(rotation_cv, rvec);
+        const Eigen::Vector3d prior_translation =
+            Matrix4dToTranslation(*T_camera_board_prior);
+        tvec = (cv::Mat_<double>(3, 1) << prior_translation.x(),
+                prior_translation.y(), prior_translation.z());
       }
+      result.runtime_breakdown.pose_estimation_seconds +=
+          ElapsedSeconds(pose_start);
+      result.runtime_breakdown.pose_estimation_call_count += 1;
       cv::Rodrigues(rvec, target_to_camera_rotation);
       target_to_camera_translation = MatToEigenVector3d(tvec);
     }
@@ -3860,11 +5734,21 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
                                                    board_config.internal_projection_mode),
                                                board_config.internal_projection_mode ==
                                                    InternalProjectionMode::SphereRayRefine,
+                                               &result.runtime_breakdown,
                                                &result);
+      if (result.reject_entire_board_observation) {
+        result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
+        return result;
+      }
     } else {
       cv::Mat rvec;
       cv::Mat tvec;
-      if (T_camera_board_prior != nullptr) {
+      const bool use_prior_as_local_seed =
+          T_camera_board_prior != nullptr &&
+          outer_detection.detected_tag_id == board_config.tag_id &&
+          outer_detection.hamming == 0 &&
+          outer_detection.used_local_patch_rescue;
+      if (T_camera_board_prior != nullptr && !use_prior_as_local_seed) {
         cv::Mat rotation_cv(3, 3, CV_64F);
         for (int row = 0; row < 3; ++row) {
           for (int col = 0; col < 3; ++col) {
@@ -3875,11 +5759,39 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
         tvec = (cv::Mat_<double>(3, 1) << target_to_camera_translation.x(),
                 target_to_camera_translation.y(),
                 target_to_camera_translation.z());
-      } else if (!EstimateTargetPose(camera, outer_corners, outer_point_ids, model, &rvec, &tvec)) {
-        result.failure_reason =
-            "Failed to estimate target pose for " +
-            std::string(ToString(board_config.internal_projection_mode)) + " mode.";
-        return result;
+      } else {
+        const auto pose_start = std::chrono::steady_clock::now();
+        if (!EstimateTargetPoseWithOptionalRescue(
+                camera, outer_corners, outer_point_ids, model, options_,
+                &rvec, &tvec, &result,
+                use_prior_as_local_seed ? T_camera_board_prior : nullptr)) {
+          if (!use_prior_as_local_seed) {
+            result.failure_reason =
+                "Failed to estimate target pose for " +
+                std::string(ToString(board_config.internal_projection_mode)) + " mode.";
+            result.runtime_breakdown.pose_estimation_seconds +=
+                ElapsedSeconds(pose_start);
+            result.runtime_breakdown.pose_estimation_call_count += 1;
+            result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
+            return result;
+          }
+          cv::Mat rotation_cv(3, 3, CV_64F);
+          const cv::Matx33d prior_rotation =
+              Matrix4dToMatx33d(*T_camera_board_prior);
+          for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 3; ++col) {
+              rotation_cv.at<double>(row, col) = prior_rotation(row, col);
+            }
+          }
+          cv::Rodrigues(rotation_cv, rvec);
+          const Eigen::Vector3d prior_translation =
+              Matrix4dToTranslation(*T_camera_board_prior);
+          tvec = (cv::Mat_<double>(3, 1) << prior_translation.x(),
+                  prior_translation.y(), prior_translation.z());
+        }
+        result.runtime_breakdown.pose_estimation_seconds +=
+            ElapsedSeconds(pose_start);
+        result.runtime_breakdown.pose_estimation_call_count += 1;
       }
       const VirtualPatchContext context =
           BuildVirtualPatchContext(gray, camera, rvec, tvec, model, outer_point_ids, options_);
@@ -3901,9 +5813,51 @@ ApriltagInternalDetectionResult ApriltagInternalDetector::DetectSingleBoardFromO
     }
   }
 
+  EnforceInternalTopologyAssignment(&result);
+  // A local outer-pose prediction is only a seed for the spherical lattice.
+  // At large polar angles it can carry a coherent board-level offset relative
+  // to the image-refined boundary lattice, so using it as a second ownership
+  // gate incorrectly removes valid, independently refined internal corners.
+  // Keep the finite/image-domain and slot-ownership checks below; the latter
+  // rejects only a refinement that lands on another lattice point's predicted
+  // slot, rather than treating the pose prediction as an absolute pixel gate.
+  if (options_.enable_internal_lattice_slot_ownership_check) {
+    SuppressWrongLatticeSlotAssignments(&result);
+  }
+  SuppressDuplicateRefinedInternalCorners(&result);
+  SuppressLocallyInconsistentRecoveredCorners(&result);
+  SuppressZeroImageEvidenceRecoveredCorners(&result);
+  RecomputeCornerCounts(&result);
+
+  // A geometry/topology recovery has no decoded payload. Do not let it enter
+  // calibration without any refined internal image observation. Exact-ID
+  // camera-aware rescues keep the historical behavior; image-evidence scores
+  // stay diagnostic because valid extreme-angle points can score poorly.
+  const bool unvalidated_geometry_rescue =
+      outer_detection.used_local_patch_rescue &&
+      (outer_detection.detected_tag_id != board_config.tag_id ||
+       outer_detection.hamming != 0);
+  if (unvalidated_geometry_rescue) {
+    const int image_evidence_internal_count = static_cast<int>(std::count_if(
+        result.internal_corner_debug.begin(), result.internal_corner_debug.end(),
+        [](const InternalCornerDebugInfo& debug) {
+          return debug.corner_type != CornerType::Outer &&
+                 debug.valid && debug.image_refinement_applied;
+        }));
+    if (image_evidence_internal_count == 0) {
+      result.reject_entire_board_observation = true;
+      result.success = false;
+      result.failure_reason =
+          "geometry_topology_rescue_rejected_no_ds_internal_image_evidence";
+      result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
+      return result;
+    }
+  }
+
   result.success =
       result.valid_internal_corner_count > 0 &&
       result.valid_corner_count >= board_config.min_visible_points;
+  result.runtime_breakdown.total_seconds = ElapsedSeconds(total_start);
   return result;
 }
 
@@ -3941,10 +5895,8 @@ ApriltagInternalMultiDetectionResult ApriltagInternalDetector::DetectMultiple(
           DetectSingleBoardFromOuter(
               gray, runtime, outer_multi_detection.detections[index], nullptr, nullptr));
     } else {
-      OuterTagDetectionResult empty_outer;
-      empty_outer.board_id = board_id;
-      empty_outer.failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
-      empty_outer.failure_reason_text = ToString(empty_outer.failure_reason);
+      const OuterTagDetectionResult empty_outer =
+          MakeMissingOuterTagDetection(board_id);
       result.detections.push_back(
           DetectSingleBoardFromOuter(gray, runtime, empty_outer, nullptr, nullptr));
     }
@@ -3987,13 +5939,11 @@ ApriltagInternalMultiDetectionResult ApriltagInternalDetector::DetectMultipleFro
   for (std::size_t index = 0; index < result.requested_board_ids.size(); ++index) {
     const int board_id = result.requested_board_ids[index];
     const BoardRuntime& runtime = RuntimeForBoardIdOrDefault(board_id);
-    OuterTagDetectionResult outer_detection;
+      OuterTagDetectionResult outer_detection;
     if (index < outer_multi_detection.detections.size()) {
       outer_detection = outer_multi_detection.detections[index];
     } else {
-      outer_detection.board_id = board_id;
-      outer_detection.failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
-      outer_detection.failure_reason_text = ToString(outer_detection.failure_reason);
+      outer_detection = MakeMissingOuterTagDetection(board_id);
     }
 
     const auto prior_it = T_camera_board_priors.find(board_id);
@@ -4042,7 +5992,8 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
   }
 
   if (config_.enable_debug_output) {
-    if (detections.projection_mode == InternalProjectionMode::SphereBorderLattice &&
+    if ((detections.projection_mode == InternalProjectionMode::SphereBorderLattice ||
+         detections.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed) &&
         detections.border_boundary_model_valid) {
       const std::array<cv::Scalar, 4> border_curve_colors{
           cv::Scalar(110, 110, 230),
@@ -4071,9 +6022,10 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
 
     for (const auto& debug : detections.internal_corner_debug) {
       const cv::Scalar predicted_color(0, 165, 255);
-      const cv::Scalar border_seed_color(255, 180, 0);
-      const cv::Scalar seed_color(255, 80, 255);
-      const cv::Scalar refined_color(0, 220, 80);
+  const cv::Scalar border_seed_color(255, 180, 0);
+  const cv::Scalar seed_color(255, 80, 255);
+  const cv::Scalar structure_color(255, 255, 0);
+  const cv::Scalar refined_color(0, 220, 80);
       const cv::Scalar arrow2_color(120, 190, 120);
       const cv::Scalar border_arrow_color(160, 160, 160);
       const cv::Scalar seed_arrow_color(160, 110, 200);
@@ -4082,7 +6034,8 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
           detections.projection_mode ==
               InternalProjectionMode::VirtualPinholePatchBoundarySeed;
       const bool has_border_seed_stage =
-          detections.projection_mode == InternalProjectionMode::SphereBorderLattice &&
+          (detections.projection_mode == InternalProjectionMode::SphereBorderLattice ||
+           detections.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed) &&
           debug.border_seed_valid;
       if (IsInsideImage(debug.predicted_image, detections.image_size)) {
         cv::drawMarker(*output_image, debug.predicted_image, cv::Scalar(255, 255, 255),
@@ -4134,6 +6087,18 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
           cv::drawMarker(*output_image, debug.sphere_seed_image, seed_color,
                          cv::MARKER_DIAMOND, 6, 1, cv::LINE_AA);
         }
+        if (debug.structure_correction_valid &&
+            IsInsideImage(debug.structure_corrected_image, detections.image_size)) {
+          cv::line(*output_image, debug.sphere_seed_image,
+                   debug.structure_corrected_image, structure_color, 1,
+                   cv::LINE_AA);
+          cv::drawMarker(*output_image, debug.structure_corrected_image,
+                         cv::Scalar(255, 255, 255), cv::MARKER_CROSS, 8, 3,
+                         cv::LINE_AA);
+          cv::drawMarker(*output_image, debug.structure_corrected_image,
+                         structure_color, cv::MARKER_CROSS, 6, 1,
+                         cv::LINE_AA);
+        }
         if (has_border_seed_stage &&
             IsInsideImage(debug.border_seed_image, detections.image_size) &&
             IsInsideImage(debug.sphere_seed_image, detections.image_size)) {
@@ -4144,9 +6109,12 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
           cv::line(*output_image, debug.predicted_image, debug.sphere_seed_image,
                    border_arrow_color, 1);
         }
-        if (IsInsideImage(debug.sphere_seed_image, detections.image_size) &&
+        const cv::Point2f refine_start =
+            debug.structure_correction_valid ? debug.structure_corrected_image
+                                             : debug.sphere_seed_image;
+        if (IsInsideImage(refine_start, detections.image_size) &&
             IsInsideImage(debug.refined_image, detections.image_size)) {
-          cv::line(*output_image, debug.sphere_seed_image, debug.refined_image,
+          cv::line(*output_image, refine_start, debug.refined_image,
                    arrow2_color, 1);
         }
         if (IsInsideImage(debug.refined_image, detections.image_size)) {
@@ -4162,14 +6130,29 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
           cv::drawMarker(*output_image, debug.sphere_seed_image, seed_color,
                          cv::MARKER_DIAMOND, 6, 1, cv::LINE_AA);
         }
+        if (debug.structure_correction_valid &&
+            IsInsideImage(debug.structure_corrected_image, detections.image_size)) {
+          cv::line(*output_image, debug.sphere_seed_image,
+                   debug.structure_corrected_image, structure_color, 1,
+                   cv::LINE_AA);
+          cv::drawMarker(*output_image, debug.structure_corrected_image,
+                         cv::Scalar(255, 255, 255), cv::MARKER_CROSS, 8, 3,
+                         cv::LINE_AA);
+          cv::drawMarker(*output_image, debug.structure_corrected_image,
+                         structure_color, cv::MARKER_CROSS, 6, 1,
+                         cv::LINE_AA);
+        }
         if (IsInsideImage(debug.predicted_image, detections.image_size) &&
             IsInsideImage(debug.sphere_seed_image, detections.image_size)) {
           cv::line(*output_image, debug.predicted_image, debug.sphere_seed_image,
                    cv::Scalar(180, 180, 180), 1);
         }
-        if (IsInsideImage(debug.sphere_seed_image, detections.image_size) &&
+        const cv::Point2f refine_start =
+            debug.structure_correction_valid ? debug.structure_corrected_image
+                                             : debug.sphere_seed_image;
+        if (IsInsideImage(refine_start, detections.image_size) &&
             IsInsideImage(debug.refined_image, detections.image_size)) {
-          cv::line(*output_image, debug.sphere_seed_image, debug.refined_image,
+          cv::line(*output_image, refine_start, debug.refined_image,
                    arrow2_color, 1);
         }
         if (IsInsideImage(debug.refined_image, detections.image_size)) {
@@ -4240,7 +6223,8 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
       if (debug_info != nullptr && measurement.corner_type != CornerType::Outer) {
         if (UsesSphereSeedPipeline(detections.projection_mode)) {
           label << ":" << std::lround(measurement.quality * 100.0);
-          if (detections.projection_mode == InternalProjectionMode::SphereBorderLattice &&
+          if ((detections.projection_mode == InternalProjectionMode::SphereBorderLattice ||
+               detections.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed) &&
               debug_info->border_seed_valid) {
             label << " dPB=" << std::fixed << std::setprecision(1)
                   << debug_info->predicted_to_border_seed_displacement;
@@ -4284,9 +6268,10 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
         (UsesSphereSeedPipeline(detections.projection_mode) ||
          detections.projection_mode == InternalProjectionMode::VirtualPinholePatchBoundarySeed)) {
       const std::string legend =
-          detections.projection_mode == InternalProjectionMode::SphereBorderLattice
-              ? "internal legend: P orange cross, BC blue triangle, SS magenta diamond, R green square"
-              : "internal legend: P orange cross, SS magenta diamond, R green square";
+          (detections.projection_mode == InternalProjectionMode::SphereBorderLattice ||
+           detections.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed)
+              ? "internal legend: P orange cross, BC blue triangle, SS magenta diamond, SC cyan cross, R green square"
+              : "internal legend: P orange cross, SS magenta diamond, SC cyan cross, R green square";
       cv::putText(*output_image, legend, cv::Point(20, 112), cv::FONT_HERSHEY_SIMPLEX, 0.48,
                   cv::Scalar(255, 255, 255), 3, cv::LINE_AA);
       cv::putText(*output_image, legend, cv::Point(20, 112), cv::FONT_HERSHEY_SIMPLEX, 0.48,
@@ -4295,7 +6280,8 @@ void ApriltagInternalDetector::DrawDetectionsImpl(
   }
 
   if (config_.enable_debug_output &&
-      detections.projection_mode == InternalProjectionMode::SphereBorderLattice) {
+      (detections.projection_mode == InternalProjectionMode::SphereBorderLattice ||
+       detections.projection_mode == InternalProjectionMode::PureSphericalBoundarySeed)) {
     const std::array<const char*, 4> edge_names{{"T", "R", "B", "L"}};
     int diagnostics_y = static_cast<int>(detections.tag_center.y) - 42;
     diagnostics_y = std::max(diagnostics_y, include_status_text ? 138 : 24);
@@ -4397,9 +6383,10 @@ void ApriltagInternalDetector::DrawDetections(
 
   if (config_.enable_debug_output) {
     const std::string legend =
-        config_.internal_projection_mode == InternalProjectionMode::SphereBorderLattice
-            ? "internal legend: P orange cross, BC blue triangle, SS magenta diamond, R green square"
-            : "internal legend: P orange cross, SS magenta diamond, R green square";
+        (config_.internal_projection_mode == InternalProjectionMode::SphereBorderLattice ||
+         config_.internal_projection_mode == InternalProjectionMode::PureSphericalBoundarySeed)
+            ? "internal legend: P orange cross, BC blue triangle, SS magenta diamond, SC cyan cross, R green square"
+            : "internal legend: P orange cross, SS magenta diamond, SC cyan cross, R green square";
     cv::putText(*output_image, legend, cv::Point(20, 114), cv::FONT_HERSHEY_SIMPLEX, 0.48,
                 cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
   }

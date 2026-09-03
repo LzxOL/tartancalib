@@ -1,7 +1,5 @@
 target_type: apriltag_internal
 tagFamily: t36h11
-tagId: 1
-# When non-empty, tagIds takes precedence over tagId.
 tagIds: [1, 2, 3, 4, 5]
 tagSize: 0.15625
 tagSpacing: 0.25
@@ -11,39 +9,56 @@ canonical_pixels_per_module: 24
 refinement_window_radius: 0
 internal_subpix_window_scale: 0.5
 internal_subpix_window_min: 4
-internal_subpix_window_max: 16
+# 0 means no absolute cap: use half of the locally projected module size.
+internal_subpix_window_max: 0
 max_subpix_displacement2: 0.0
 internal_subpix_displacement_scale: 0.25
 max_internal_subpix_displacement: 6.0
 enable_debug_output: true
 internal_projection_mode: sphere_border_lattice
-# Optional alternatives:
-# internal_projection_mode: sphere_lattice
-# internal_projection_mode: sphere_ray_refine
-sphere_lattice_use_initial_camera: true # 使用粗初始值
-sphere_lattice_init_xi: -0.2
-sphere_lattice_init_alpha: 0.6
-sphere_lattice_init_fu_scale: 0.55
-sphere_lattice_init_fv_scale: 0.55
-sphere_lattice_init_cu_offset: 0.0
-sphere_lattice_init_cv_offset: 0.0
-camera_initialization_mode: auto_with_manual_fallback
+enable_internal_structure_correction_after_ss: true
+camera_initialization_mode: auto
+# Image resolution is detector/frontend metadata only. Stage5 optimized camera
+# model and initialization seeds are selected by --models, not by this YAML.
+resolution: [4512, 4512]
 
 # Outer-tag detector / fixed C-S outer corner pipeline.
 outer_local_context_scale: 0.05
 enable_outer_spherical_refinement: false
-outer_spherical_use_initial_camera: true # 使用粗初始值
 do_outer_subpix_refinement: true
 # If outer subpix is enabled, subpix radius = outer_subpix_scale * (tagSpacing * local_scale)
-outer_subpix_scale: 0.15
+outer_subpix_scale: 0.3
+# Set to 0 to disable the upper clamp; the radius still respects
+# outer_subpix_window_min and the image-border crop.
+outer_subpix_window_max: 0
+# Near-board outer-corner protection: keep normal-area boards on
+# outer_subpix_scale, but enlarge the verification/subpix window when a board
+# occupies a large image footprint.  This primarily handles close-distance
+# frames, where the true outer corner can fall outside the normal local window.
+# High-polar + near-border observations are auxiliary triggers, not mandatory
+# conditions for the boost.
+enable_close_edge_outer_subpix_boost: true
+close_edge_outer_subpix_area_ratio: 0.012
+close_edge_outer_subpix_min_polar_deg: 40.0
+close_edge_outer_subpix_full_polar_deg: 78.0
+close_edge_outer_subpix_border_ratio: 0.25
+close_edge_outer_subpix_multiplier: 1.1
+close_edge_outer_subpix_max_multiplier: 1.8
 outer_refine_gate_scale: 0.025
 outer_refine_gate_min: 6.0
 
-# Manual intermediate camera is now fallback/debug input, not the default primary path.
-# Either keep the inline Kalibr DS model below, or replace it with:
-# intermediate_camera_yaml: /path/to/mono_fisheye_calib_3_25_right-camchain.yaml
-camera_model: ds
-distortion_model: none
-distortion_coeffs: []
-intrinsics: [-0.17867356705653623, 0.6180871263819165, 1193.6021797760475, 1192.9067980786774, 2287.1229862699843, 2191.8264201158163]
-resolution: [4512, 4512]
+# Keep detector-local id-bracket rescue disabled for the multi-board rig.
+# Board ids are not a spatial ordering; layout-aware rescue is handled by
+# Stage5/Stage6 geometry-prior code using T_reference_board(board_id).
+enable_anonymous_tag_like_geometry_rescue: false
+
+# Stage5 baseline camera-aware outer rescue. The first detector pass does not
+# consume camera intrinsics. After outer-only camera initialization, Stage5
+# injects its provisional DS camera, runs dense sphere-tile AprilTag decoding,
+# and accepts only exact-ID zero-Hamming results.
+enable_camera_aware_sphere_patch_rescue: true
+camera_aware_sphere_patch_max_hamming: 0
+camera_aware_sphere_patch_commit_mapped_corners: true
+# Keep a recovery path for frames where the direct detector decodes no tag.
+# The rescue still accepts only exact requested-ID / Hamming-0 decodes.
+camera_aware_sphere_patch_rescue_zero_detection_frames: true

@@ -1,0 +1,34 @@
+\documentclass[10pt,border=4pt]{standalone}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{makecell}
+\begin{document}
+\setlength{\tabcolsep}{3.3pt}
+\renewcommand{\arraystretch}{1.08}
+\resizebox{3.38in}{!}{%
+\begin{tabular}{llccc}
+  \toprule
+  Model & Method & \multicolumn{3}{c}{Right Checkerboard} \\
+  \cmidrule(lr){3-5}
+        &        & RMSE $\downarrow$ & P95 $\downarrow$ & Inl.@1px [\%] $\uparrow$ \\
+  \midrule
+  \multirow{3}{*}{DS}
+    & \textbf{Ours} & \textbf{0.274} & \textbf{0.531} & \textbf{99.86} \\
+    & BabelCalib    & 0.293          & 0.575          & 99.84 \\
+    & Kalibr        & 0.349          & 0.713          & 99.51 \\
+  \midrule
+  \multirow{4}{*}{KB}
+    & \textbf{Ours} & 0.295          & \textbf{0.573} & 99.81 \\
+    & BabelCalib    & \textbf{0.293} & 0.576          & \textbf{99.84} \\
+    & CamOdoCal     & 0.331          & 0.660          & 99.63 \\
+    & TartanCalib   & 0.342          & 0.658          & 99.56 \\
+  \midrule
+  \multirow{3}{*}{\shortstack[l]{UCM /\\Mei}}
+    & \textbf{Ours} & \textbf{0.440} & \textbf{0.851} & 97.68 \\
+    & BabelCalib    & 0.447          & 0.853          & \textbf{97.75} \\
+    & Kalibr        & 0.545          & 1.114          & 92.37 \\
+  \bottomrule
+\end{tabular}%
+}
+\end{document}

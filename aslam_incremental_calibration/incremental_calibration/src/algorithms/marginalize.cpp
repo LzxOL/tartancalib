@@ -21,6 +21,7 @@
 #include <cmath>
 
 #include <Eigen/Dense>
+#include <SuiteSparseQR.hpp>
 
 #include <aslam/backend/CompressedColumnMatrix.hpp>
 
@@ -39,8 +40,8 @@ namespace aslam {
         throw OutOfBoundException<size_t>(j,
           "colNorm(): index must be lower than the number of columns",
           __FILE__, __LINE__);
-      const std::ptrdiff_t* col_ptr =
-        reinterpret_cast<const std::ptrdiff_t*>(A->p);
+      const int64_t* col_ptr =
+        reinterpret_cast<const int64_t*>(A->p);
       const double* values = reinterpret_cast<const double*>(A->x);
       const std::ptrdiff_t p = col_ptr[j];
       const std::ptrdiff_t numElements = col_ptr[j + 1] - p;
@@ -67,7 +68,7 @@ namespace aslam {
         throw InvalidOperationException("marginalJacobian(): "
           "SuiteSparseQR_qmult failed");
       }
-      std::ptrdiff_t* colIndices = new std::ptrdiff_t[J_x->ncol];
+      int64_t* colIndices = new int64_t[J_x->ncol];
       for (size_t i = 0; i < J_x->ncol; ++i)
        colIndices[i] = i;
       cholmod_sparse* J_thetatQ = cholmod_l_submatrix(J_thetatQFull, NULL, -1,
@@ -112,7 +113,7 @@ namespace aslam {
         throw InvalidOperationException("marginalJacobian(): "
           "cholmod_l_add failed");
       }
-      aslam::backend::CompressedColumnMatrix<std::ptrdiff_t> OmegaCCM;
+      aslam::backend::CompressedColumnMatrix<int64_t> OmegaCCM;
       OmegaCCM.fromCholmodSparse(Omega);
       Eigen::MatrixXd OmegaDense(Omega->nrow, Omega->ncol);
       OmegaCCM.toDenseInto(OmegaDense);
@@ -129,7 +130,7 @@ namespace aslam {
     }
 
     double marginalize(const
-        aslam::backend::CompressedColumnMatrix<std::ptrdiff_t>& Jt, size_t j,
+        aslam::backend::CompressedColumnMatrix<int64_t>& Jt, size_t j,
         Eigen::MatrixXd& NS, Eigen::MatrixXd& CS, Eigen::MatrixXd& Sigma,
         Eigen::MatrixXd& SigmaP, Eigen::MatrixXd& Omega, double normTol, double
         epsTol) {
@@ -139,7 +140,7 @@ namespace aslam {
 
       // convert to cholmod_sparse
       cholmod_sparse JtCs;
-      const_cast<aslam::backend::CompressedColumnMatrix<std::ptrdiff_t>&>(Jt).
+      const_cast<aslam::backend::CompressedColumnMatrix<int64_t>&>(Jt).
         getView(&JtCs);
       cholmod_sparse* J = cholmod_l_transpose(&JtCs, 1, &cholmod);
       if (J == NULL) {
@@ -149,7 +150,7 @@ namespace aslam {
       }
 
       // extract the part corresponding to the state/landmarks/...
-      std::ptrdiff_t* colIndices = new std::ptrdiff_t[j];
+      int64_t* colIndices = new int64_t[j];
       for (size_t i = 0; i < j; ++i)
        colIndices[i] = i;
       cholmod_sparse* J_x = cholmod_l_submatrix(J, NULL, -1, colIndices, j, 1,
@@ -163,7 +164,7 @@ namespace aslam {
       }
 
       // extract the part corresponding to the calibration parameters
-      colIndices = new std::ptrdiff_t[J->ncol - j];
+      colIndices = new int64_t[J->ncol - j];
       for (size_t i = j; i < J->ncol; ++i)
        colIndices[i - j] = i;
       cholmod_sparse* J_theta = cholmod_l_submatrix(J, NULL, -1, colIndices,

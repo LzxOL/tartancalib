@@ -81,6 +81,12 @@ JointResidualEvaluationResult JointReprojectionResidualEvaluator::Evaluate(
     diagnostics.target_xyz_board = point_eval.target_xyz_board;
     diagnostics.residual_xy = point_eval.residual_xy;
     diagnostics.residual_norm = point_eval.residual_norm;
+    diagnostics.observed_ray = point_eval.observed_ray;
+    diagnostics.predicted_ray = point_eval.predicted_ray;
+    diagnostics.angular_residual_xy = point_eval.angular_residual_xy;
+    diagnostics.angular_residual_norm = point_eval.angular_residual_norm;
+    diagnostics.polar_angle_deg = point_eval.polar_angle_deg;
+    diagnostics.residual_model_used = point_eval.residual_model_used;
     diagnostics.quality = point_eval.quality;
     diagnostics.used_in_solver = point_eval.used_in_solver;
     diagnostics.frame_storage_index = point_eval.frame_storage_index;
@@ -119,6 +125,12 @@ JointResidualEvaluationResult JointReprojectionResidualEvaluator::Evaluate(
   result.overall_rmse = cost_evaluation.overall_rmse;
   result.outer_only_rmse = cost_evaluation.outer_rmse;
   result.internal_only_rmse = cost_evaluation.internal_rmse;
+  result.overall_image_plane_rmse = cost_evaluation.overall_image_plane_rmse;
+  result.outer_only_image_plane_rmse = cost_evaluation.outer_image_plane_rmse;
+  result.internal_only_image_plane_rmse = cost_evaluation.internal_image_plane_rmse;
+  result.overall_angular_rmse = cost_evaluation.overall_angular_rmse;
+  result.outer_only_angular_rmse = cost_evaluation.outer_angular_rmse;
+  result.internal_only_angular_rmse = cost_evaluation.internal_angular_rmse;
   result.warnings = cost_evaluation.warnings;
 
   result.board_observation_diagnostics.reserve(board_observation_accumulators.size());

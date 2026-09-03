@@ -135,7 +135,7 @@ namespace aslam {
       _margStartIndex = index;
     }
 
-    const aslam::backend::CompressedColumnMatrix<std::ptrdiff_t>&
+    const aslam::backend::CompressedColumnMatrix<int64_t>&
         LinearSolver::getJacobianTranspose() const {
       return _jacobianBuilder.J_transpose();
     }
@@ -243,7 +243,7 @@ namespace aslam {
     }
 
     bool LinearSolver::solveSystem(Eigen::VectorXd& dx) {
-      aslam::backend::CompressedColumnMatrix<std::ptrdiff_t>& Jt =
+      aslam::backend::CompressedColumnMatrix<int64_t>& Jt =
         _jacobianBuilder.J_transpose();
       cholmod_sparse Jt_CS;
       Jt.getView(&Jt_CS);
@@ -528,7 +528,7 @@ namespace aslam {
     }
 
     bool LinearSolver::analyzeMarginal() {
-      aslam::backend::CompressedColumnMatrix<std::ptrdiff_t>& Jt =
+      aslam::backend::CompressedColumnMatrix<int64_t>& Jt =
         _jacobianBuilder.J_transpose();
       cholmod_sparse Jt_CS;
       Jt.getView(&Jt_CS);

@@ -21,8 +21,10 @@ enum class InternalProjectionMode {
   VirtualPinholePatch,
   VirtualPinholeImageSubpix,
   VirtualPinholePatchBoundarySeed,
+  PinholeBootstrapPatch,
   SphereLattice,
   SphereBorderLattice,
+  PureSphericalBoundarySeed,
   SphereRayRefine,
 };
 
@@ -62,11 +64,16 @@ struct ApriltagInternalConfig {
   int refinement_window_radius = 0;
   double internal_subpix_window_scale = 0.5;
   int internal_subpix_window_min = 4;
-  int internal_subpix_window_max = 16;
+  // Zero keeps the window geometry-scaled without an absolute pixel cap.
+  int internal_subpix_window_max = 0;
   double max_subpix_displacement2 = 0.0;
   double internal_subpix_displacement_scale = 0.25;
   double max_internal_subpix_displacement = 6.0;
   bool enable_debug_output = false;
+  bool ignore_image_evidence_min_quality = false;
+  bool force_internal_seed_from_prediction = false;
+  bool bypass_internal_seed_filters = false;
+  bool enable_internal_structure_correction_after_ss = true;
   InternalProjectionMode internal_projection_mode = InternalProjectionMode::SphereLattice;
   bool sphere_lattice_use_initial_camera = false;
   bool outer_spherical_use_initial_camera = false;

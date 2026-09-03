@@ -1,0 +1,86 @@
+backend_success: 1
+backend_failure_reason: 
+backend_initial_overall_rmse: 0.000346296
+backend_optimized_overall_rmse: 0.000346296
+backend_observation_role_weight_mode: balanced
+backend_internal_role_budget_when_mixed: 0.5
+training_frontend_overall_rmse: 0.530883
+training_backend_overall_rmse: 0.000346296
+training_kalibr_overall_rmse: 0.635402
+training_frontend_outer_only_rmse: 0.11574
+training_backend_outer_only_rmse: 0.000150277
+training_kalibr_outer_only_rmse: 0.62099
+training_frontend_internal_only_rmse: 0.564233
+training_backend_internal_only_rmse: 0.000364973
+training_kalibr_internal_only_rmse: 0.637338
+training_backend_overall_rmse_excluding_board1: nan
+training_kalibr_overall_rmse_excluding_board1: 0.625577
+training_frontend_mean_residual_x: -0.0557864
+training_frontend_mean_residual_y: -0.0367208
+training_frontend_std_residual_x: 0.360602
+training_frontend_std_residual_y: 0.383852
+training_backend_mean_residual_x: nan
+training_backend_mean_residual_y: nan
+training_backend_std_residual_x: nan
+training_backend_std_residual_y: nan
+training_kalibr_mean_residual_x: -0.0763899
+training_kalibr_mean_residual_y: -0.05271
+training_kalibr_std_residual_x: 0.447287
+training_kalibr_std_residual_y: 0.441652
+holdout_frontend_overall_rmse: 0.517177
+holdout_backend_overall_rmse: 0.517177
+holdout_kalibr_overall_rmse: 0.592021
+holdout_backend_pose_only_refit_rmse: 0.120567
+holdout_backend_pose_only_refit_success_rate: 1
+holdout_kalibr_pose_only_refit_rmse: 0.456613
+holdout_kalibr_pose_only_refit_success_rate: 1
+holdout_frontend_outer_only_rmse: 0.120567
+holdout_backend_outer_only_rmse: 0.120567
+holdout_kalibr_outer_only_rmse: 0.456613
+holdout_frontend_internal_only_rmse: 0.549216
+holdout_backend_internal_only_rmse: 0.549216
+holdout_kalibr_internal_only_rmse: 0.608005
+holdout_backend_overall_rmse_excluding_board1: 0.515399
+holdout_kalibr_overall_rmse_excluding_board1: 0.592454
+holdout_frontend_mean_residual_x: -0.0441375
+holdout_frontend_mean_residual_y: -0.0279614
+holdout_frontend_std_residual_x: 0.368919
+holdout_frontend_std_residual_y: 0.358666
+holdout_backend_mean_residual_x: -0.0441375
+holdout_backend_mean_residual_y: -0.0279614
+holdout_backend_std_residual_x: 0.368919
+holdout_backend_std_residual_y: 0.358666
+holdout_kalibr_mean_residual_x: -0.0823705
+holdout_kalibr_mean_residual_y: -0.0276909
+holdout_kalibr_std_residual_x: 0.419347
+holdout_kalibr_std_residual_y: 0.408761
+training_frontend_minus_kalibr: -0.104519
+training_backend_minus_kalibr: -0.635056
+holdout_frontend_minus_kalibr: -0.0748443
+holdout_backend_minus_kalibr: -0.0748443
+frontend_camera_xi: -0.191535
+frontend_camera_alpha: 0.617013
+frontend_camera_fu: 1175.35
+frontend_camera_fv: 1174.96
+frontend_camera_cu: 2242.93
+frontend_camera_cv: 2275.62
+backend_camera_xi: -0.191535
+backend_camera_alpha: 0.617013
+backend_camera_fu: 1175.35
+backend_camera_fv: 1174.96
+backend_camera_cu: 2242.93
+backend_camera_cv: 2275.62
+kalibr_camera_xi: -0.193126
+kalibr_camera_alpha: 0.613295
+kalibr_camera_fu: 1164.5
+kalibr_camera_fv: 1164.47
+kalibr_camera_cu: 2255.07
+kalibr_camera_cv: 2269.64
+backend_warning: selection residual_sanity_threshold=5 median_rmse=0.527896 mad_rmse=0.0847833 robust_sigma_rmse=0.1257
+backend_warning: selection mode=baseline
+backend_warning: selection enable_residual_sanity_gate=1
+backend_warning: selection max_pose_fit_outer_rmse=8
+backend_warning: selection enable_board_pose_fit_gate=0
+backend_warning: pre-backend Kalibr-style internal filter removed 6 / 1176 internal points
+backend_warning: Stage5 trial backend selection force-include list was used as the exact backend input for a controlled ablation.
+backend_warning: ASLAM backend optimization skipped; returning the selection committed state for Kalibr-style baseline.

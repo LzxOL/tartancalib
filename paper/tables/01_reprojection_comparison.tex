@@ -1,0 +1,53 @@
+% Table 1: main reprojection comparison.
+% Keep methods grouped by equivalent camera-model families.
+\begin{table*}[t]
+\centering
+\caption{Reprojection performance on two held-out multi-board sets and one checkerboard set. Metrics are reported as RMSE [px], P95 [px], and Inlier@1px [\%].}
+\label{tab:reprojection_comparison}
+\scriptsize
+\renewcommand{\arraystretch}{1.06}
+\setlength{\tabcolsep}{2.6pt}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}clccccccccc@{}}
+\toprule
+\multirow{2}{*}{Model} & \multirow{2}{*}{Method}
+& \multicolumn{3}{c}{Multi-Board Set 1}
+& \multicolumn{3}{c}{Multi-Board Set 2}
+& \multicolumn{3}{c}{Checkerboard Set} \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-8}\cmidrule(lr){9-11}
+& & RMSE $\downarrow$ & P95 $\downarrow$ & Inl. $\uparrow$
+  & RMSE $\downarrow$ & P95 $\downarrow$ & Inl. $\uparrow$
+  & RMSE $\downarrow$ & P95 $\downarrow$ & Inl. $\uparrow$ \\
+\midrule
+\multirow{4}{*}{DS}
+& \textbf{Ours}       & \textbf{0.523} & \textbf{0.990} & \textbf{95.1} & \textbf{0.634} & \textbf{1.378} & \textbf{88.2} & -- & -- & -- \\
+& Kalibr              & 0.600 & 1.093 & 92.6 & 0.806 & 1.638 & 84.2 & -- & -- & -- \\
+& TartanCalib         & 0.623 & 1.155 & 91.7 & 0.814 & 1.671 & 83.7 & -- & -- & -- \\
+& BabelCalib          & 0.618 & 1.147 & 91.7 & 0.848 & 1.682 & 83.6 & -- & -- & -- \\
+\addlinespace[2pt]
+
+\multirow{6}{*}{KB}
+& \textbf{Ours}       & \textbf{0.522} & \textbf{0.984} & \textbf{95.3} & \textbf{0.631} & \textbf{1.375} & \textbf{88.5} & -- & -- & -- \\
+& Kalibr              & 0.599 & 1.092 & 92.7 & 0.761 & 1.585 & 84.8 & -- & -- & -- \\
+& TartanCalib         & 0.619 & 1.140 & 91.8 & 0.782 & 1.595 & 84.6 & -- & -- & -- \\
+& CamOdoCal           & 0.605 & 1.119 & 92.5 & 0.763 & 1.587 & 85.0 & -- & -- & -- \\
+& BabelCalib          & 0.617 & 1.147 & 91.8 & 0.792 & 1.628 & 84.2 & -- & -- & -- \\
+& OpenCV fisheye      & 0.583 & 1.071 & 93.1 & 0.760 & 1.570 & 85.2 & -- & -- & -- \\
+\addlinespace[2pt]
+
+\multirow{6}{*}{\shortstack{UCM\\/ Mei}}
+& \textbf{Ours}       & \textbf{0.520} & \textbf{0.989} & \textbf{95.2} & \textbf{0.636} & \textbf{1.377} & \textbf{88.3} & -- & -- & -- \\
+& Kalibr              & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+& TartanCalib         & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+& CamOdoCal           & 0.605 & 1.110 & 92.6 & 0.816 & 1.645 & 83.9 & -- & -- & -- \\
+& BabelCalib          & 0.737 & 1.335 & 87.5 & 1.207 & 1.756 & 83.7 & -- & -- & -- \\
+& OpenCV omnidir      & 0.606 & 1.108 & 92.2 & 0.852 & 1.686 & 83.6 & -- & -- & -- \\
+\addlinespace[2pt]
+
+\multirow{4}{*}{EUCM}
+& \textbf{Ours}       & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+& Kalibr              & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+& TartanCalib         & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+& BabelCalib          & -- & -- & -- & -- & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular*}
+\end{table*}

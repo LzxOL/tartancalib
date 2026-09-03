@@ -1,0 +1,46 @@
+success: 1
+failure_reason: 
+method_label: backend_committed_state
+split_label: training
+split_signature: random_holdout_ratio_0.300000_seed_1337_holdout_indices_1,2,9,12,16,17,19,23,25,28,29,32,36,38,42,44_backend_committed_state
+evaluation_pose_mode: committed_backend_scene_state
+evaluation_metric_name: sphere_angular
+evaluation_metric_unit: rad
+uniform_control_point_mode: 0
+pose_only_refit_rmse: nan
+pose_only_refit_success_rate: nan
+pose_only_refit_attempt_count: 0
+pose_only_refit_success_count: 0
+overall_rmse: 0.000346296
+outer_only_rmse: 0.000150277
+internal_only_rmse: 0.000364973
+excluded_board_id_for_rmse: 1
+overall_rmse_excluding_board: nan
+outer_only_rmse_excluding_board: nan
+internal_only_rmse_excluding_board: nan
+mean_residual_x: nan
+mean_residual_y: nan
+std_residual_x: nan
+std_residual_y: nan
+point_count: 4330
+outer_point_count: 520
+internal_point_count: 3810
+point_count_excluding_board: 0
+outer_point_count_excluding_board: 0
+internal_point_count_excluding_board: 0
+camera_xi: -0.191535
+camera_alpha: 0.617013
+camera_fu: 1175.35
+camera_fv: 1174.96
+camera_cu: 2242.93
+camera_cv: 2275.62
+camera_model_family: ds-none
+camera_model: ds
+camera_distortion_model: none
+camera_intrinsics_labels: xi,alpha,fu,fv,cu,cv
+camera_intrinsics_csv: -0.191534644295,0.617013122475,1175.34695318,1174.95643884,2242.93199547,2275.61931088
+camera_distortion_labels: 
+camera_distortion_csv: 
+camera_combined_labels: xi,alpha,fu,fv,cu,cv
+camera_combined_csv: -0.191534644295,0.617013122475,1175.34695318,1174.95643884,2242.93199547,2275.61931088
+warning: training summary uses committed backend scene poses; holdout summary uses per-board pose-only refit because holdout frames are not in the optimized training scene.

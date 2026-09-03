@@ -1,0 +1,17 @@
+# Stage5 Baseline mono intrinsics, right camera.
+# Source:
+#   result_may/stage5_cmp_close_distance_boost_134853_right_val_144419
+# Dataset:
+#   train image/datatset_5_1/stereo_dataset_20260430_134853/right
+#   holdout image/datatset_5_1/stereo_dataset_20260430_144419/right
+# Camera model follows the repository DS/no-distortion convention:
+#   intrinsics = [xi, alpha, fu, fv, cu, cv]
+cam0:
+  cam_overlaps: []
+  camera_model: ds
+  distortion_coeffs: []
+  distortion_model: none
+  intrinsics: [-0.198636, 0.612899, 1161.6, 1161.26, 2245.44, 2274.51]
+  resolution: [4512, 4512]
+  rostopic: /right/image_raw
+

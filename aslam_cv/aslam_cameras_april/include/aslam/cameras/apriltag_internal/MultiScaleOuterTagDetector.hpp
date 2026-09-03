@@ -43,22 +43,111 @@ struct OuterRefineCameraConfig {
   }
 };
 
+// Read-only remap data for the fixed camera-aware sphere-patch atlas.  The
+// data depends only on the provisional camera and image geometry, so it can
+// safely be shared by the rescue workers of one run.
+struct CameraAwareSpherePatchAtlasEntry {
+  std::string label;
+  cv::Point2f center_image{};
+  Eigen::Vector3d center_ray = Eigen::Vector3d::Zero();
+  Eigen::Vector3d tangent_x = Eigen::Vector3d::Zero();
+  Eigen::Vector3d tangent_y = Eigen::Vector3d::Zero();
+  double fov_deg = 0.0;
+  bool zero_detection_fine = false;
+  cv::Mat map_x;
+  cv::Mat map_y;
+};
+
+struct CameraAwareSpherePatchAtlas {
+  cv::Size image_size;
+  int patch_size = 0;
+  double cx = 0.0;
+  double cy = 0.0;
+  std::vector<CameraAwareSpherePatchAtlasEntry> entries;
+};
+
+std::shared_ptr<const CameraAwareSpherePatchAtlas>
+BuildCameraAwareSpherePatchAtlas(const OuterRefineCameraConfig& camera_config,
+                                 const cv::Size& image_size,
+                                 bool use_extended_atlas,
+                                 bool include_zero_detection_fine_atlas);
+
 struct MultiScaleOuterTagDetectorConfig {
   int tag_id = 1;
   std::vector<int> tag_ids;
+  // Frontend inspection only. When enabled, each frame first discovers the
+  // decoded IDs present in that frame and then refines only those tags. It is
+  // intentionally not a substitute for the explicit board topology required
+  // by calibration and bundle adjustment.
+  bool auto_discover_tag_ids = false;
   double min_border_distance = 4.0;
   int max_scales_to_try = 0;
+  // Keep the legacy all-scale sweep by default. The adaptive cascade scans a
+  // few low-resolution full images, validates their corners on the original
+  // image, then visits higher-resolution full images only when required.
+  bool enable_adaptive_scale_cascade = false;
+  std::vector<double> adaptive_coarse_scale_divisors{4.5, 3.5, 2.5};
+  std::vector<double> adaptive_fallback_scale_divisors{2.0, 1.5, 1.0};
+  int adaptive_coarse_max_hamming = 0;
+  // Additive exact-ID fallback for tags unresolved by the ETHZ detector.
+  // Fixed target longest sides make the search independent of input image
+  // resolution; 0 requests one final pass at native resolution.
+  bool enable_opencv_apriltag_fallback = false;
+  std::vector<int> opencv_apriltag_fallback_longest_sides{1600, 2400, 3600, 0};
+  int opencv_apriltag_marker_border_bits = 2;
+  double opencv_apriltag_min_marker_perimeter_rate = 0.005;
   bool enable_outer_spherical_refinement = true;
   bool do_outer_subpix_refinement = true;
   double outer_local_context_scale = 0.05;
   double outer_corner_marker_ratio = 0.0;
-  double outer_subpix_scale = 0.025;
+  double outer_subpix_scale = 0.35;
+  bool enable_close_edge_outer_subpix_boost = true;
+  double close_edge_outer_subpix_area_ratio = 0.02;
+  double close_edge_outer_subpix_min_polar_deg = 50.0;
+  double close_edge_outer_subpix_full_polar_deg = 78.0;
+  double close_edge_outer_subpix_border_ratio = 0.15;
+  double close_edge_outer_subpix_multiplier = 1.4;
+  double close_edge_outer_subpix_max_multiplier = 2.4;
+  // If a large close-edge subpixel window lands away from the locally
+  // supported corner, retry the exact-ID detector seed with neighborhoods
+  // expressed relative to the projected tag size. The retry requires a full
+  // in-image neighborhood and therefore does not recover cropped corners.
+  bool enable_scale_adaptive_corner_response_rollback = true;
   double outer_refine_gate_scale = 0.025;
   double outer_refine_gate_min = 6.0;
   double min_detection_quality = 0.0;
   bool blur_before_detect = false;
   int blur_kernel = 7;
   double blur_sigma = 1.6;
+  // Legacy detector-local id-bracket rescue is unsafe for the multi-board
+  // calibration rig because board ids do not encode spatial order.
+  bool enable_anonymous_tag_like_geometry_rescue = false;
+  double anonymous_tag_like_rescue_max_center_error_scale = 0.90;
+  double anonymous_tag_like_rescue_min_area_ratio = 0.30;
+  double anonymous_tag_like_rescue_max_area_ratio = 3.50;
+  // Camera-aware re-detection is active only when refine_camera is populated.
+  // The production baseline accepts only exact-ID, zero-Hamming decodes and
+  // keeps the distortion-aware patch-to-image mapping as the committed corner.
+  bool enable_camera_aware_sphere_patch_rescue = true;
+  int camera_aware_sphere_patch_max_hamming = 0;
+  bool camera_aware_sphere_patch_commit_mapped_corners = true;
+  // A full-view patch atlas is substantially more expensive for a frame with
+  // no initial detections. It is enabled by default because otherwise a frame
+  // with visible, strongly distorted boards but no direct AprilTag decode has
+  // no recovery path at all. A recovered tag is still required to be an exact
+  // requested-ID decode before it is used. Set this false only for an explicit
+  // runtime/cost ablation.
+  bool camera_aware_sphere_patch_rescue_zero_detection_frames = true;
+  bool camera_aware_sphere_patch_use_extended_atlas = false;
+  // Robust recovery keeps a decoded quad that is visible in the image even
+  // when it is closer than min_border_distance.  The final submission still
+  // requires finite, in-image corners and the same quad/refinement checks.
+  // This is deliberately opt-in so legacy direct detection remains unchanged.
+  bool enable_robust_missing_board_recovery = false;
+  std::shared_ptr<const CameraAwareSpherePatchAtlas>
+      camera_aware_sphere_patch_atlas;
+  std::shared_ptr<const CameraAwareSpherePatchAtlas>
+      camera_aware_sphere_patch_zero_detection_atlas;
   OuterRefineCameraConfig refine_camera;
 
   // Legacy compatibility fields. Old YAML keys may still populate these,
@@ -68,7 +157,11 @@ struct MultiScaleOuterTagDetectorConfig {
   int outer_subpix_window_radius = 0;
   double outer_subpix_window_scale = 0.015;
   int outer_subpix_window_min = 4;
-  int outer_subpix_window_max = 16;
+  // A positive value is an explicit experimental cap.  The baseline keeps
+  // this unset so the radius remains tied to the observed marker scale; a
+  // fixed pixel cap would otherwise truncate large close-edge tags on a
+  // higher-resolution image.
+  int outer_subpix_window_max = 0;
   double max_outer_refine_displacement = 6.0;
   double outer_refine_displacement_scale = 0.025;
   bool enable_outer_corner_layout_check = false;
@@ -83,6 +176,15 @@ struct MultiScaleOuterTagDetectorConfig {
   int outer_corner_branch_search_max = 12;
   double outer_corner_min_direction_score = 0.35;
   double outer_corner_min_layout_score = 0.20;
+};
+
+// A focused DS sphere-patch hypothesis.  It is used only to guide where a
+// local patch is rendered; accepting a result still requires a normal exact
+// AprilTag decode for the requested board ID.
+struct CameraAwareSpherePatchSeed {
+  std::string label;
+  Eigen::Vector2d center_image = Eigen::Vector2d::Zero();
+  double fov_deg = 86.0;
 };
 
 struct OuterCornerScaleObservationDebugInfo {
@@ -158,13 +260,81 @@ struct OuterCornerVerificationDebugInfo {
   bool spherical_refinement_valid = false;
   bool spherical_refinement_applied = false;
   std::string spherical_failure_reason;
+  bool close_edge_subpix_boost_applied = false;
+  double close_edge_subpix_area_ratio = 0.0;
+  double close_edge_subpix_max_polar_deg = 0.0;
+  double close_edge_subpix_multiplier = 1.0;
+  double configured_outer_subpix_scale = 0.0;
+  double configured_outer_subpix_window_scale = 0.0;
+  int configured_outer_subpix_window_radius = 0;
+  int configured_outer_subpix_window_min = 0;
+  int configured_outer_subpix_window_max = 0;
+  int raw_subpix_window_radius = 0;
+  int pre_boost_subpix_window_radius = 0;
+  int boosted_raw_subpix_window_radius = 0;
+  int subpix_window_clamp_limit = 0;
+  bool subpix_window_clamped = false;
   int subpix_window_radius = 0;
+  bool subpix_unstable_rollback_detected = false;
+  int subpix_unstable_rollback_iteration = 0;
+  double subpix_unstable_rollback_max_displacement = 0.0;
+  // Close-edge refinement evaluates both the nominal scale-derived window and
+  // its polar boost. A large disagreement means the local image contains
+  // competing corner responses, so neither endpoint is trusted.
+  int subpix_scale_probe_window_radius = 0;
+  double subpix_scale_probe_endpoint_delta = 0.0;
+  bool subpix_scale_disagreement_detected = false;
+  bool scale_adaptive_response_rollback_checked = false;
+  bool scale_adaptive_response_rollback_applied = false;
+  int scale_adaptive_response_core_radius = 0;
+  int scale_adaptive_response_search_radius = 0;
+  double scale_adaptive_response_peak_ratio = 0.0;
   double refine_displacement_limit = 0.0;
   bool refined_valid = false;
   bool verification_passed = false;
   bool subpix_applied = false;
   std::string failure_reason;
 };
+
+struct OuterWrongIdProposal {
+  int detected_tag_id = -1;
+  int hamming = -1;
+  double area_px = 0.0;
+  std::array<Eigen::Vector2d, 4> corners_original_image{};
+  std::string source;
+};
+
+struct OuterSphericalCornerRefinementDebug {
+  bool success = false;
+  cv::Point2f refined_corner{};
+  double quality = 0.0;
+  double displacement_px = 0.0;
+  double prev_edge_residual = 0.0;
+  double next_edge_residual = 0.0;
+  int prev_edge_support_count = 0;
+  int next_edge_support_count = 0;
+  std::string failure_reason;
+};
+
+struct OuterSphericalQuadRefinementResult {
+  bool success = false;
+  // True only when all four shared edge planes were fit jointly and the
+  // complete ordered quad was obtained from adjacent plane intersections.
+  // Per-corner fallback may populate diagnostics but must not masquerade as
+  // an atomic joint-quad result in geometry-prior recovery.
+  bool joint_fit_success = false;
+  std::array<cv::Point2f, 4> refined_corners{};
+  std::array<OuterSphericalCornerRefinementDebug, 4> corner_debug{};
+  double max_displacement_px = 0.0;
+  double min_quality = 0.0;
+  int successful_corner_count = 0;
+};
+
+OuterSphericalQuadRefinementResult RefineOuterCornersBySphericalPlanes(
+    const cv::Mat& gray,
+    const DoubleSphereCameraModel& camera,
+    const std::array<cv::Point2f, 4>& corner_seeds,
+    const MultiScaleOuterTagDetectorConfig& config);
 
 struct OuterTagScaleDebugInfo {
   int target_longest_side = 0;
@@ -191,17 +361,29 @@ struct OuterTagDetectionResult {
   int chosen_scale_longest_side = 0;
   double chosen_scale_factor = 1.0;
   std::string scale_configuration_mode;
+  int adaptive_coarse_scale_attempt_count = 0;
+  int adaptive_fallback_scale_attempt_count = 0;
+  bool adaptive_high_resolution_fallback_triggered = false;
   bool used_corner_fusion = false;
   int hamming = -1;
   bool good = false;
   bool attempted_local_patch_rescue = false;
   bool used_local_patch_rescue = false;
   std::string local_patch_rescue_summary;
+  bool attempted_opencv_apriltag_fallback = false;
+  bool used_opencv_apriltag_fallback = false;
+  std::vector<OuterWrongIdProposal> wrong_id_proposals;
   std::array<Eigen::Vector2d, 4> coarse_corners_scaled_image{};
   std::array<Eigen::Vector2d, 4> coarse_corners_original_image{};
   std::array<Eigen::Vector2d, 4> refined_corners_original_image{};
   std::array<bool, 4> refined_valid{{false, false, false, false}};
   double quality = 0.0;
+  bool board_quad_consistency_checked = false;
+  bool board_quad_consistency_passed = false;
+  int board_quad_worst_corner_index = -1;
+  double board_quad_worst_corner_displacement_px = 0.0;
+  double board_quad_area_ratio = 0.0;
+  std::string board_quad_consistency_diagnostic;
   OuterTagFailureReason failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
   std::string failure_reason_text;
   std::vector<int> successful_scale_longest_sides;
@@ -214,10 +396,22 @@ struct OuterBoardMeasurement {
   int board_id = -1;
   int detected_tag_id = -1;
   bool success = false;
+  bool attempted_local_patch_rescue = false;
+  bool used_local_patch_rescue = false;
+  std::string local_patch_rescue_summary;
+  bool attempted_opencv_apriltag_fallback = false;
+  bool used_opencv_apriltag_fallback = false;
   double detection_quality = 0.0;
   int valid_refined_corner_count = 0;
   std::array<Eigen::Vector2d, 4> refined_outer_corners_original_image{};
   std::array<bool, 4> refined_corner_valid{{false, false, false, false}};
+  bool has_target_outer_corners = false;
+  std::array<Eigen::Vector3d, 4> target_outer_corners_board{};
+  bool has_direct_dense_control_points = false;
+  std::vector<Eigen::Vector3d> direct_dense_target_points_board;
+  std::vector<Eigen::Vector2d> direct_dense_image_points;
+  std::vector<unsigned char> direct_dense_point_is_outer;
+  std::array<OuterCornerVerificationDebugInfo, 4> corner_verification_debug{};
   OuterTagFailureReason failure_reason = OuterTagFailureReason::NoDetectionsAtAll;
   std::string failure_reason_text;
 };
@@ -250,6 +444,11 @@ struct OuterTagMultiDetectionResult {
   std::vector<int> requested_board_ids;
   std::vector<OuterTagDetectionResult> detections;
   OuterFrameMeasurementResult frame_measurements;
+  // Set only after the camera-aware rescue stage has examined this frame with
+  // the recorded provisional-camera signature.  It lets the next run reuse
+  // an unchanged failed rescue instead of rescanning the atlas indefinitely.
+  bool camera_aware_rescue_attempted = false;
+  std::string camera_aware_rescue_signature;
 
   bool AnySuccess() const {
     return frame_measurements.AnySuccess();
@@ -270,8 +469,13 @@ class MultiScaleOuterTagDetector {
 
   OuterTagDetectionResult Detect(const cv::Mat& image) const;
   OuterTagMultiDetectionResult DetectMultiple(const cv::Mat& image) const;
+  std::vector<int> DiscoverTagIds(const cv::Mat& image) const;
   std::vector<OuterTagDetectionResult> DetectMultiple(
       const cv::Mat& image, const std::vector<int>& requested_tag_ids) const;
+  OuterTagDetectionResult DetectTargetedSpherePatch(
+      const cv::Mat& image,
+      int expected_tag_id,
+      const std::vector<CameraAwareSpherePatchSeed>& seeds) const;
   void DrawDetection(const OuterTagDetectionResult& detection,
                      cv::Mat* output_image,
                      bool draw_debug) const;

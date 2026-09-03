@@ -137,6 +137,12 @@ namespace aslam {
         double JStart;
         /// Cost function at end
         double JFinal;
+        /// Last accepted state update magnitude
+        double dXFinal;
+        /// Last objective decrease
+        double dJFinal;
+        /// Whether the final linear solve failed
+        bool linearSolverFailure;
         /// Elapsed time for processing this batch [s]
         double elapsedTime;
       };
@@ -170,10 +176,16 @@ namespace aslam {
         */
       /// Adds a measurement batch to the estimator
       ReturnValue addBatch(const BatchSP& batch, bool force = false);
+      /// Adds a batch and establishes its marginal information at the current
+      /// design-variable state without running an optimization step. This is
+      /// intended for a validated seed whose state must remain unchanged.
+      ReturnValue addBatchAtCurrentState(const BatchSP& batch);
       /// Removes a measurement batch from the estimator
       void removeBatch(size_t idx);
       /// Removes a measurement batch from the estimator
       void removeBatch(const BatchSP& batch);
+      /// Rejects a just-added batch and restores the saved pre-batch state
+      void rejectBatch(const BatchSP& batch);
       /// Re-runs the optimizer
       ReturnValue reoptimize();
       /** @}
@@ -203,7 +215,7 @@ namespace aslam {
       /// Returns the last information gain
       double getInformationGain() const;
       /// Returns the current Jacobian transpose if available
-      const aslam::backend::CompressedColumnMatrix<std::ptrdiff_t>&
+      const aslam::backend::CompressedColumnMatrix<int64_t>&
         getJacobianTranspose() const;
       /// Returns the current estimated numerical rank of J_psi
       std::ptrdiff_t getRankPsi() const;
@@ -248,6 +260,8 @@ namespace aslam {
       void orderMarginalizedDesignVariables();
       /// Restores the linear solver
       void restoreLinearSolver();
+      /// Synchronizes cached marginal information after restoring a state
+      void synchronizeMarginalInformation();
       /** @}
         */
 

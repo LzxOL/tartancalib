@@ -1,4 +1,5 @@
 #include <aslam/cameras/apriltag_internal/ApriltagInternalDetector.hpp>
+#include <aslam/cameras/apriltag_internal/BoardDetectionPipeline.hpp>
 #include <aslam/cameras/apriltag_internal/JointReprojectionMeasurementBuilder.hpp>
 #include <aslam/cameras/apriltag_internal/JointReprojectionResidualEvaluator.hpp>
 #include <aslam/cameras/apriltag_internal/MultiBoardInternalMeasurementRegenerator.hpp>
@@ -472,10 +473,9 @@ int main(int argc, char** argv) {
     config.outer_detector_config.tag_id = config.tag_id;
 
     const ati::ApriltagInternalDetectionOptions detection_options = MakeDetectionOptions(config);
-    const ati::MultiScaleOuterTagDetector outer_detector(config.outer_detector_config);
     const ati::OuterBootstrapOptions bootstrap_options = MakeBootstrapOptions(config, args);
     const ati::MultiBoardOuterBootstrap bootstrap(config, bootstrap_options);
-    const ati::MultiBoardInternalMeasurementRegenerator regenerator(config, detection_options);
+    const ati::BoardDetectionPipeline board_detection_pipeline(config, detection_options);
     ati::JointMeasurementBuildOptions build_options;
     build_options.reference_board_id = args.reference_board_id;
     const ati::JointReprojectionMeasurementBuilder builder(config, build_options);
@@ -508,7 +508,8 @@ int main(int argc, char** argv) {
         throw std::runtime_error("Failed to read image: " + image_path);
       }
 
-      const ati::OuterTagMultiDetectionResult outer_detections = outer_detector.DetectMultiple(image);
+      const ati::OuterTagMultiDetectionResult outer_detections =
+          board_detection_pipeline.DetectOuter(image);
 
       FrameRecord frame;
       frame.image_path = image_path;
@@ -544,7 +545,8 @@ int main(int argc, char** argv) {
       }
 
       const ati::InternalRegenerationFrameResult regeneration_result =
-          regenerator.RegenerateFrame(image, frames[frame_index].regeneration_input, bootstrap_result);
+          board_detection_pipeline.RegenerateFrame(
+              image, frames[frame_index].regeneration_input, bootstrap_result);
 
       ati::JointMeasurementFrameInput joint_input;
       joint_input.frame_index = frames[frame_index].bootstrap_input.frame_index;

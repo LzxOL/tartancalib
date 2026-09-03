@@ -15,7 +15,9 @@
 
 #include <opencv2/calib3d.hpp>
 
+#include <aslam/cameras/apriltag_internal/AngularResidualGeometry.hpp>
 #include <aslam/cameras/apriltag_internal/DoubleSphereCameraModel.hpp>
+#include <aslam/cameras/apriltag_internal/PolarAngleResidualDiagnostics.hpp>
 
 namespace aslam {
 namespace cameras {
@@ -173,6 +175,51 @@ double HuberWeight(double residual_norm, double delta) {
   return delta / residual_norm;
 }
 
+Eigen::Vector2d InvalidAngularResidual(double penalty_radians) {
+  return Eigen::Vector2d::Constant(penalty_radians);
+}
+
+double ComputePolarAngleWeightScale(
+    const DoubleSphereCameraModel& camera,
+    const JointPointObservation& observation,
+    const JointReprojectionCostOptions& options) {
+  if ((!options.uniform_control_point_mode &&
+       observation.point_type != JointPointType::Internal) ||
+      options.polar_angle_weight_mode == "none" ||
+      options.polar_angle_weight_mode == "diagnostic_only") {
+    return 1.0;
+  }
+
+  const double polar_angle = ComputePolarAngleDeg(camera, observation.image_xy);
+  if (!std::isfinite(polar_angle)) {
+    return 1.0;
+  }
+  const double min_scale =
+      std::max(0.0, std::min(1.0, options.polar_angle_weight_min_scale));
+
+  if (options.polar_angle_weight_mode == "fixed_bins") {
+    const std::vector<double>& edges = options.polar_angle_weight_bin_edges_deg;
+    const std::vector<double>& scales = options.polar_angle_weight_fixed_bin_scales;
+    const std::size_t bin_count = edges.size() >= 2 ? edges.size() - 1 : 0;
+    for (std::size_t i = 0; i < bin_count && i < scales.size(); ++i) {
+      if (polar_angle >= edges[i] && polar_angle < edges[i + 1]) {
+        return std::max(min_scale, std::min(1.0, scales[i]));
+      }
+    }
+    return 1.0;
+  }
+
+  const double reference_deg = options.polar_angle_weight_adaptive_sigma_reference_deg;
+  const double growth = std::max(1e-6, options.polar_angle_weight_adaptive_sigma_growth);
+  if (polar_angle <= reference_deg) {
+    return 1.0;
+  }
+  const double normalized =
+      (polar_angle - reference_deg) / std::max(1e-6, 90.0 - reference_deg);
+  const double scale = 1.0 / (1.0 + growth * normalized * normalized);
+  return std::max(min_scale, std::min(1.0, scale));
+}
+
 }  // namespace
 
 JointReprojectionSceneState BuildSceneStateFromBootstrap(
@@ -261,10 +308,10 @@ JointSceneBoardState* FindJointSceneBoardState(
 IntermediateCameraConfig MakeIntermediateCameraConfig(
     const OuterBootstrapCameraIntrinsics& intrinsics) {
   IntermediateCameraConfig config;
-  config.camera_model = "ds";
-  config.distortion_model = "none";
-  config.intrinsics = {intrinsics.xi, intrinsics.alpha, intrinsics.fu,
-                       intrinsics.fv, intrinsics.cu, intrinsics.cv};
+  config.camera_model = intrinsics.camera_model;
+  config.distortion_model = intrinsics.distortion_model;
+  config.intrinsics = intrinsics.IntrinsicsVector();
+  config.distortion_coeffs = intrinsics.DistortionVector();
   config.resolution = {intrinsics.resolution.width, intrinsics.resolution.height};
   return config;
 }
@@ -336,6 +383,87 @@ bool EstimatePoseFromObjectPoints(const OuterBootstrapCameraIntrinsics& intrinsi
   return true;
 }
 
+bool EstimatePoseFromObjectPointsStrict(
+    const OuterBootstrapCameraIntrinsics& intrinsics,
+    const std::vector<Eigen::Vector3d>& object_points,
+    const std::vector<cv::Point2f>& image_points,
+    double max_rmse,
+    Eigen::Isometry3d* pose,
+    double* rmse) {
+  if (pose == nullptr || rmse == nullptr ||
+      object_points.size() != image_points.size() ||
+      object_points.size() < 4u) {
+    return false;
+  }
+  if (!intrinsics.IsValid() ||
+      (std::isfinite(max_rmse) && max_rmse < 0.0)) {
+    return false;
+  }
+
+  const DoubleSphereCameraModel camera =
+      DoubleSphereCameraModel::FromConfig(MakeIntermediateCameraConfig(intrinsics));
+  if (!camera.IsValid()) {
+    return false;
+  }
+
+  // Do not let estimateTransformation silently discard image points that the
+  // current camera cannot back-project. Initialization must be judged on the
+  // same complete Outer4 set for every candidate.
+  for (std::size_t index = 0; index < object_points.size(); ++index) {
+    if (!object_points[index].allFinite() ||
+        !std::isfinite(static_cast<double>(image_points[index].x)) ||
+        !std::isfinite(static_cast<double>(image_points[index].y))) {
+      return false;
+    }
+    Eigen::Vector3d ray = Eigen::Vector3d::Zero();
+    if (!camera.keypointToEuclidean(
+            Eigen::Vector2d(image_points[index].x, image_points[index].y),
+            &ray) ||
+        !ray.allFinite()) {
+      return false;
+    }
+  }
+
+  cv::Mat rvec;
+  cv::Mat tvec;
+  if (!camera.estimateTransformation(ToCvObjectPoints(object_points),
+                                     image_points, &rvec, &tvec)) {
+    return false;
+  }
+
+  const Eigen::Isometry3d candidate_pose = PoseFromCv(rvec, tvec);
+  if (!candidate_pose.matrix().allFinite()) {
+    return false;
+  }
+
+  double squared_error_sum = 0.0;
+  for (std::size_t index = 0; index < object_points.size(); ++index) {
+    const Eigen::Vector3d point_camera =
+        candidate_pose * object_points[index];
+    if (!point_camera.allFinite() || point_camera.z() <= 0.0) {
+      return false;
+    }
+    Eigen::Vector2d projected = Eigen::Vector2d::Zero();
+    if (!camera.vsEuclideanToKeypoint(point_camera, &projected) ||
+        !projected.allFinite()) {
+      return false;
+    }
+    const Eigen::Vector2d observed(image_points[index].x,
+                                   image_points[index].y);
+    squared_error_sum += (projected - observed).squaredNorm();
+  }
+  const double candidate_rmse = std::sqrt(
+      squared_error_sum / static_cast<double>(object_points.size()));
+  if (!std::isfinite(candidate_rmse) ||
+      (std::isfinite(max_rmse) && candidate_rmse > max_rmse)) {
+    return false;
+  }
+
+  *pose = candidate_pose;
+  *rmse = candidate_rmse;
+  return true;
+}
+
 Eigen::Isometry3d AverageTransforms(const std::vector<TransformCandidate>& candidates) {
   if (candidates.empty()) {
     return Eigen::Isometry3d::Identity();
@@ -382,8 +510,12 @@ Eigen::VectorXd BuildWeightedResidualVector(const JointCostEvaluation& evaluatio
   int row = 0;
   for (const JointCostPointEvaluation& point : evaluation.point_evaluations) {
     const double scale = std::sqrt(std::max(0.0, point.final_weight));
-    residuals[row++] = scale * point.residual_xy.x();
-    residuals[row++] = scale * point.residual_xy.y();
+    const Eigen::Vector2d active_residual =
+        point.residual_model_used == ResidualModel::SphereAngular
+            ? point.angular_residual_xy
+            : point.residual_xy;
+    residuals[row++] = scale * active_residual.x();
+    residuals[row++] = scale * active_residual.y();
   }
   return residuals;
 }
@@ -401,8 +533,12 @@ Eigen::VectorXd BuildWeightedResidualVectorForFrame(const JointCostEvaluation& e
       continue;
     }
     const double scale = std::sqrt(std::max(0.0, point.final_weight));
-    residuals[row++] = scale * point.residual_xy.x();
-    residuals[row++] = scale * point.residual_xy.y();
+    const Eigen::Vector2d active_residual =
+        point.residual_model_used == ResidualModel::SphereAngular
+            ? point.angular_residual_xy
+            : point.residual_xy;
+    residuals[row++] = scale * active_residual.x();
+    residuals[row++] = scale * active_residual.y();
   }
   return residuals;
 }
@@ -420,8 +556,12 @@ Eigen::VectorXd BuildWeightedResidualVectorForBoard(const JointCostEvaluation& e
       continue;
     }
     const double scale = std::sqrt(std::max(0.0, point.final_weight));
-    residuals[row++] = scale * point.residual_xy.x();
-    residuals[row++] = scale * point.residual_xy.y();
+    const Eigen::Vector2d active_residual =
+        point.residual_model_used == ResidualModel::SphereAngular
+            ? point.angular_residual_xy
+            : point.residual_xy;
+    residuals[row++] = scale * active_residual.x();
+    residuals[row++] = scale * active_residual.y();
   }
   return residuals;
 }
@@ -478,6 +618,14 @@ JointCostEvaluation JointReprojectionCostCore::Evaluate(
   int total_outer_count = 0;
   double total_internal_squared_sum = 0.0;
   int total_internal_count = 0;
+  double total_outer_image_squared_sum = 0.0;
+  double total_internal_image_squared_sum = 0.0;
+  int total_outer_image_count = 0;
+  int total_internal_image_count = 0;
+  double total_outer_angular_squared_sum = 0.0;
+  double total_internal_angular_squared_sum = 0.0;
+  int total_outer_angular_count = 0;
+  int total_internal_angular_count = 0;
 
   result.point_evaluations.reserve(measurement_result.solver_observations.size());
   for (const JointPointObservation& observation : measurement_result.solver_observations) {
@@ -550,6 +698,38 @@ JointCostEvaluation JointReprojectionCostCore::Evaluate(
     }
     point_eval.residual_norm = point_eval.residual_xy.norm();
 
+    AngularObservationGeometry angular_observation_geometry;
+    const bool have_angular_observation_geometry =
+        ComputeAngularObservationGeometry(
+            camera, point_eval.observed_image_xy, &angular_observation_geometry);
+    AngularPredictionGeometry angular_prediction_geometry;
+    const bool have_angular_prediction_geometry =
+        ComputeAngularPredictionGeometry(
+            camera, point_camera, &angular_prediction_geometry);
+    point_eval.valid_angular_projection =
+        have_angular_observation_geometry && have_angular_prediction_geometry;
+    if (have_angular_observation_geometry) {
+      point_eval.observed_ray = angular_observation_geometry.observed_ray;
+      point_eval.polar_angle_deg = angular_observation_geometry.polar_angle_deg;
+    } else {
+      point_eval.polar_angle_deg = ComputePolarAngleDeg(camera, observation.image_xy);
+    }
+    if (have_angular_prediction_geometry) {
+      point_eval.predicted_ray = angular_prediction_geometry.predicted_ray;
+    }
+    if (point_eval.valid_angular_projection) {
+      point_eval.angular_residual_xy =
+          ComputeAngularResidualTangent(
+              angular_observation_geometry, angular_prediction_geometry);
+    } else if (options_.enable_invalid_projection_penalty) {
+      point_eval.angular_residual_xy =
+          InvalidAngularResidual(options_.invalid_projection_penalty_radians);
+    } else {
+      point_eval.angular_residual_xy = Eigen::Vector2d::Zero();
+    }
+    point_eval.angular_residual_norm =
+        ComputeAngularResidualNorm(point_eval.angular_residual_xy);
+
     const std::pair<int, int> observation_key(
         observation.frame_index, observation.board_id);
     const ObservationBudget& budget = budgets[observation_key];
@@ -557,7 +737,9 @@ JointCostEvaluation JointReprojectionCostCore::Evaluate(
     const bool has_internal = budget.internal_count > 0;
     double type_budget = 1.0;
     int type_count = 1;
-    if (has_outer && has_internal) {
+    if (options_.uniform_control_point_mode) {
+      type_count = 1;
+    } else if (has_outer && has_internal) {
       type_budget = observation.point_type == JointPointType::Outer ? 0.5 : 0.5;
       type_count = observation.point_type == JointPointType::Outer ?
           budget.outer_count : budget.internal_count;
@@ -570,25 +752,81 @@ JointCostEvaluation JointReprojectionCostCore::Evaluate(
     }
     point_eval.balance_weight =
         type_budget / std::max(1, type_count);
-    point_eval.quality_weight = 1.0;
-    const double huber_delta = observation.point_type == JointPointType::Outer ?
-        options_.outer_huber_delta_pixels : options_.internal_huber_delta_pixels;
-    point_eval.huber_weight = HuberWeight(point_eval.residual_norm, huber_delta);
+    point_eval.quality_weight =
+        std::max(0.0, observation.final_observation_weight);
+    point_eval.consistency_weight =
+        std::max(0.0, observation.consistency_weight);
+    point_eval.polar_angle_weight =
+        ComputePolarAngleWeightScale(camera, observation, options_);
+    const bool use_continuous_hybrid =
+        options_.residual_model == ResidualModel::PolarContinuousHybrid;
+    const bool use_normalized_angular =
+        options_.residual_model == ResidualModel::NormalizedSphereAngular;
+    const bool use_angular_residual =
+        !use_continuous_hybrid &&
+        ShouldUseAngularResidual(
+            options_.residual_model,
+            point_eval.polar_angle_deg,
+            options_.hybrid_angular_threshold_deg);
+    if (use_continuous_hybrid) {
+      point_eval.active_angular_weight = ComputePolarContinuousAngularWeight(
+          point_eval.polar_angle_deg,
+          options_.polar_continuous_hybrid_threshold_deg,
+          options_.polar_continuous_hybrid_temperature_deg);
+      point_eval.active_image_plane_weight =
+          1.0 - point_eval.active_angular_weight;
+    } else {
+      point_eval.active_angular_weight = use_angular_residual ? 1.0 : 0.0;
+      point_eval.active_image_plane_weight = use_angular_residual ? 0.0 : 1.0;
+    }
+    point_eval.residual_model_used =
+        (use_angular_residual || point_eval.active_angular_weight >= 0.5)
+            ? (use_normalized_angular ? ResidualModel::NormalizedSphereAngular
+                                      : ResidualModel::SphereAngular)
+            : ResidualModel::ImagePlane;
+    const Eigen::Vector2d active_residual =
+        point_eval.active_image_plane_weight * point_eval.residual_xy +
+        point_eval.active_angular_weight * point_eval.angular_residual_xy;
+    const double active_squared_norm = active_residual.squaredNorm();
+    const double active_residual_norm = std::sqrt(std::max(0.0, active_squared_norm));
+    const double huber_delta = options_.uniform_control_point_mode
+        ? (use_angular_residual
+               ? std::min(options_.outer_huber_delta_radians,
+                          options_.internal_huber_delta_radians)
+               : std::min(options_.outer_huber_delta_pixels,
+                          options_.internal_huber_delta_pixels))
+        : observation.point_type == JointPointType::Outer
+              ? (use_angular_residual ? options_.outer_huber_delta_radians
+                                      : options_.outer_huber_delta_pixels)
+              : (use_angular_residual ? options_.internal_huber_delta_radians
+                                      : options_.internal_huber_delta_pixels);
+    point_eval.huber_weight = HuberWeight(active_residual_norm, huber_delta);
     point_eval.final_weight =
-        point_eval.balance_weight * point_eval.quality_weight * point_eval.huber_weight;
+        point_eval.balance_weight * point_eval.quality_weight *
+        point_eval.polar_angle_weight * point_eval.huber_weight;
     point_eval.weighted_squared_error =
-        point_eval.final_weight * point_eval.residual_xy.squaredNorm();
+        point_eval.final_weight * active_squared_norm;
 
-    result.total_squared_error += point_eval.residual_xy.squaredNorm();
+    result.total_squared_error += active_squared_norm;
     result.total_cost += point_eval.weighted_squared_error;
+    result.total_image_squared_error += point_eval.residual_xy.squaredNorm();
+    result.total_angular_squared_error += point_eval.angular_residual_xy.squaredNorm();
     ++result.point_count;
     if (point_eval.point_type == JointPointType::Outer) {
-      total_outer_squared_sum += point_eval.residual_xy.squaredNorm();
+      total_outer_squared_sum += active_squared_norm;
       ++total_outer_count;
+      total_outer_image_squared_sum += point_eval.residual_xy.squaredNorm();
+      ++total_outer_image_count;
+      total_outer_angular_squared_sum += point_eval.angular_residual_xy.squaredNorm();
+      ++total_outer_angular_count;
       ++result.outer_point_count;
     } else {
-      total_internal_squared_sum += point_eval.residual_xy.squaredNorm();
+      total_internal_squared_sum += active_squared_norm;
       ++total_internal_count;
+      total_internal_image_squared_sum += point_eval.residual_xy.squaredNorm();
+      ++total_internal_image_count;
+      total_internal_angular_squared_sum += point_eval.angular_residual_xy.squaredNorm();
+      ++total_internal_angular_count;
       ++result.internal_point_count;
     }
 
@@ -598,7 +836,7 @@ JointCostEvaluation JointReprojectionCostCore::Evaluate(
     board_eval.board_id = observation.board_id;
     ++board_eval.point_count;
     board_eval.average_quality += point_eval.quality;
-    board_eval.squared_error_sum += point_eval.residual_xy.squaredNorm();
+    board_eval.squared_error_sum += active_squared_norm;
     board_eval.cost += point_eval.weighted_squared_error;
     if (point_eval.point_type == JointPointType::Outer) {
       ++board_eval.outer_point_count;
@@ -629,6 +867,18 @@ JointCostEvaluation JointReprojectionCostCore::Evaluate(
                                                 total_outer_count);
   result.internal_rmse = ComputeRmseFromSquaredSum(total_internal_squared_sum,
                                                    total_internal_count);
+  result.overall_image_plane_rmse = ComputeRmseFromSquaredSum(
+      result.total_image_squared_error, result.point_count);
+  result.outer_image_plane_rmse = ComputeRmseFromSquaredSum(
+      total_outer_image_squared_sum, total_outer_image_count);
+  result.internal_image_plane_rmse = ComputeRmseFromSquaredSum(
+      total_internal_image_squared_sum, total_internal_image_count);
+  result.overall_angular_rmse = ComputeRmseFromSquaredSum(
+      result.total_angular_squared_error, result.point_count);
+  result.outer_angular_rmse = ComputeRmseFromSquaredSum(
+      total_outer_angular_squared_sum, total_outer_angular_count);
+  result.internal_angular_rmse = ComputeRmseFromSquaredSum(
+      total_internal_angular_squared_sum, total_internal_angular_count);
   result.success = true;
   return result;
 }

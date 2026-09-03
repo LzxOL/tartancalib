@@ -31,6 +31,8 @@ struct CmdArgs {
   std::string kalibr_training_split_signature;
   std::string kalibr_source_label;
   std::string camera_init_mode_override;
+  std::string stage5_models = "ds-none";
+  std::string stage5_init_refine_mode = "kalibr_outer_lm";
   bool all = false;
   bool show = false;
   int reference_board_id = 1;
@@ -46,6 +48,77 @@ std::string BuildKalibrSourceLabel(const std::string& kalibr_camchain_yaml) {
   return fs::path(kalibr_camchain_yaml).lexically_normal().generic_string();
 }
 
+std::string BuildConfiguredCameraFamily(
+    const ati::ApriltagInternalConfig& config) {
+  ati::OuterBootstrapCameraIntrinsics intrinsics;
+  intrinsics.camera_model =
+      config.intermediate_camera.camera_model.empty()
+          ? "ds"
+          : config.intermediate_camera.camera_model;
+  intrinsics.distortion_model =
+      config.intermediate_camera.distortion_model.empty()
+          ? (intrinsics.camera_model == "pinhole" ? "equi" : "none")
+          : config.intermediate_camera.distortion_model;
+  return intrinsics.NormalizedFamilyString();
+}
+
+std::string NormalizeStage5ModelFamily(std::string model) {
+  std::transform(model.begin(), model.end(), model.begin(),
+                 [](unsigned char ch) {
+                   return static_cast<char>(std::tolower(ch));
+                 });
+  if (model == "ds" || model == "double_sphere" ||
+      model == "double-sphere") {
+    return "ds-none";
+  }
+  if (model == "ds-none") {
+    return model;
+  }
+  if (model == "kb" || model == "kannala-brandt" ||
+      model == "kannala_brandt" || model == "equi" ||
+      model == "equidistant" || model == "pinhole-equi") {
+    return "pinhole-equi";
+  }
+  if (model == "eucm" || model == "eucm-none") {
+    return "eucm-none";
+  }
+  if (model == "mei" || model == "omni" || model == "omni-radtan" ||
+      model == "omni_radtan" || model == "mei-radtan" ||
+      model == "radial-tangential-omni") {
+    return "omni-radtan";
+  }
+  throw std::runtime_error(
+      "Unsupported --models value: " + model +
+      " (supported: ds-none, pinhole-equi/kb, eucm-none, mei/omni-radtan)");
+}
+
+void ApplyStage5ModelFamily(const std::string& model_family,
+                            ati::ApriltagInternalConfig* config) {
+  if (config == nullptr) {
+    throw std::runtime_error(
+        "ApplyStage5ModelFamily requires a valid config pointer.");
+  }
+  const std::string family = NormalizeStage5ModelFamily(model_family);
+  ati::IntermediateCameraConfig camera = config->intermediate_camera;
+  camera.camera_yaml.clear();
+  camera.intrinsics.clear();
+  camera.distortion_coeffs.clear();
+  if (family == "ds-none") {
+    camera.camera_model = "ds";
+    camera.distortion_model = "none";
+  } else if (family == "pinhole-equi") {
+    camera.camera_model = "pinhole";
+    camera.distortion_model = "equi";
+  } else if (family == "eucm-none") {
+    camera.camera_model = "eucm";
+    camera.distortion_model = "none";
+  } else if (family == "omni-radtan") {
+    camera.camera_model = "omni";
+    camera.distortion_model = "radtan";
+  }
+  config->intermediate_camera = camera;
+}
+
 void PrintUsage(const char* program) {
   std::cout
       << "Usage:\n"
@@ -56,6 +129,8 @@ void PrintUsage(const char* program) {
       << " [--intrinsics-release-iteration N]"
       << " [--second-pass-intrinsics-release-iteration N]"
       << " [--holdout-stride N] [--holdout-offset N]"
+      << " [--models ds-none|pinhole-equi|kb|eucm-none|mei]"
+      << " [--stage5-init-refine-mode kalibr_outer_lm|coordinate_search|none]"
       << " [--camera-init-mode manual|auto|auto_with_manual_fallback]"
       << " [--kalibr-training-split-signature SIGNATURE]"
       << " [--kalibr-source-label LABEL (deprecated, ignored)]"
@@ -78,6 +153,10 @@ CmdArgs ParseArgs(int argc, char** argv) {
       args.kalibr_training_split_signature = argv[++i];
     } else if (token == "--kalibr-source-label" && i + 1 < argc) {
       args.kalibr_source_label = argv[++i];
+    } else if (token == "--models" && i + 1 < argc) {
+      args.stage5_models = NormalizeStage5ModelFamily(argv[++i]);
+    } else if (token == "--stage5-init-refine-mode" && i + 1 < argc) {
+      args.stage5_init_refine_mode = argv[++i];
     } else if (token == "--camera-init-mode" && i + 1 < argc) {
       args.camera_init_mode_override = argv[++i];
     } else if (token == "--kalibr-runtime-seconds" && i + 1 < argc) {
@@ -439,6 +518,10 @@ int main(int argc, char** argv) {
 
     ati::FrozenRound2BaselineOptions baseline_options;
     baseline_options.config = ati::ApriltagInternalDetector::LoadConfig(args.config_path);
+    ApplyStage5ModelFamily(args.stage5_models, &baseline_options.config);
+    baseline_options.camera_initialization_refine_mode =
+        ati::ParseAutoCameraInitializationRefineMode(
+            args.stage5_init_refine_mode);
     if (!args.camera_init_mode_override.empty()) {
       baseline_options.config.camera_initialization_mode =
           ati::ParseCameraInitializationMode(args.camera_init_mode_override);
@@ -474,7 +557,8 @@ int main(int argc, char** argv) {
 
     ati::KalibrBenchmarkReference kalibr_reference;
     kalibr_reference.camchain_yaml = args.kalibr_camchain_yaml;
-    kalibr_reference.camera_model_family = "ds";
+    kalibr_reference.camera_model_family =
+        BuildConfiguredCameraFamily(baseline_options.config);
     kalibr_reference.training_split_signature = kalibr_training_split_signature;
     kalibr_reference.runtime_seconds = args.kalibr_runtime_seconds;
     kalibr_reference.source_label = kalibr_source_label;
@@ -483,6 +567,7 @@ int main(int argc, char** argv) {
     benchmark_input.all_frames = all_frames;
     benchmark_input.baseline_options = baseline_options;
     benchmark_input.backend_options = backend_options;
+    benchmark_input.committed_backend_evaluation_options = backend_options;
     benchmark_input.kalibr_reference = kalibr_reference;
     benchmark_input.dataset_label = dataset_label;
 
@@ -512,6 +597,9 @@ int main(int argc, char** argv) {
     ati::WriteAutoCameraInitializationCandidatesCsv(
         (output_dir / "auto_camera_initialization_candidates.csv").string(),
         report.baseline_result.auto_camera_initialization);
+    ati::WriteAutoCameraInitializationRefinedBasinsCsv(
+        (output_dir / "auto_camera_initialization_refined_basins.csv").string(),
+        report.baseline_result.auto_camera_initialization);
     ati::WriteAutoCameraInitializationOuterResidualsCsv(
         (output_dir / "auto_camera_initialization_outer_residuals.csv").string(),
         report.baseline_result.auto_camera_initialization);
@@ -523,6 +611,12 @@ int main(int argc, char** argv) {
         (output_dir / "benchmark_holdout_summary.txt").string(), report);
     ati::WriteStage5BenchmarkHoldoutPointsCsv(
         (output_dir / "benchmark_holdout_points.csv").string(), report);
+    ati::WriteCameraRayCurveSamplesCsv(
+        (output_dir / "camera_ray_curve_samples.csv").string(),
+        report.camera_ray_curve_diagnostics);
+    ati::WriteCameraRayCurveSummaryCsv(
+        (output_dir / "camera_ray_curve_summary.csv").string(),
+        report.camera_ray_curve_diagnostics);
     ati::WriteStage5BenchmarkWorstCasesSummary(
         (output_dir / "benchmark_worst_cases_summary.txt").string(), report, 10);
     if (report.diagnostic_compare.success) {

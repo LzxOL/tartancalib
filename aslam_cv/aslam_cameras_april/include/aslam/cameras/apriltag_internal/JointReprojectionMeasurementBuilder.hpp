@@ -27,10 +27,53 @@ struct JointMeasurementBuildOptions {
   bool include_outer_points = true;
   bool include_internal_points = true;
   bool include_outer_when_internal_failed = true;
+  bool include_rescued_outer_when_internal_failed = false;
+  bool use_regenerated_rescued_outer_measurements = true;
   bool require_initialized_frame_and_board = true;
   bool filter_internal_corner_outliers = true;
+  // sigma: existing mean + sigma * std rule.
+  // local_residual_cap: reject internal points whose residual under the
+  // board-local outer-corner pose fit exceeds filter_internal_corner_max_reproj_error.
+  // sigma_with_cap: existing sigma rule, capped by max_reproj_error when positive.
+  // quality_residual_adaptive: use the board-local residual distribution and
+  // per-point quality to keep high-confidence internal points while rejecting
+  // geometrically inconsistent ones.
+  std::string filter_internal_corner_mode = "sigma";
   double filter_internal_corner_sigma_threshold = 2.0;
   double filter_internal_corner_min_reproj_error = 0.2;
+  double filter_internal_corner_max_reproj_error = -1.0;
+  double filter_internal_corner_quality_min = 0.35;
+  double filter_internal_corner_quality_relaxation_px = 1.0;
+  double filter_internal_corner_adaptive_min_threshold_px = 1.0;
+  bool enable_internal_observation_quality_weighting = false;
+  // Robust missing-board recovery keeps image-refined internal observations
+  // in the solver instead of applying the legacy outer-only-pose outlier
+  // deletion pass. The detector-level validity and topology checks remain
+  // active; this only removes a duplicated, model-mismatch-prone hard gate.
+  bool robust_missing_board_recovery = false;
+  // In robust recovery, validate every internal point against the local pose
+  // fitted from the independently observed Outer4.  This is an absolute
+  // gross-error gate so a coherently shifted internal lattice cannot pass by
+  // having a small within-lattice spread.
+  bool filter_gross_internal_topology_outliers = true;
+  double gross_internal_topology_min_reproj_error_px = 8.0;
+  double gross_internal_topology_sigma_threshold = 8.0;
+  double gross_internal_topology_max_outer_pose_rmse_px = 2.0;
+  // Fit a robust local topology surface to image-refined internal points and
+  // reject only isolated internal lattice mismatches. The independently
+  // detected outer quad is authoritative and is never rejected by this check.
+  bool enable_bidirectional_board_topology_consistency = false;
+  int board_topology_min_internal_point_count = 12;
+  double board_topology_max_internal_surface_rmse_module_ratio = 0.08;
+  double board_topology_min_outer_residual_px = 3.0;
+  double board_topology_max_outer_residual_module_ratio = 0.20;
+  // Different canonical grid points must not claim the same refined image
+  // corner. At this distance the observations are indistinguishable at
+  // subpixel precision, so retain only an unambiguous higher-quality point.
+  double internal_duplicate_image_distance_px = 0.5;
+  double internal_observation_low_quality_quantile = 0.2;
+  double internal_observation_min_weight = 0.25;
+  double internal_observation_quality_exponent = 1.0;
 };
 
 enum class JointPointType {
@@ -48,7 +91,9 @@ enum class JointRejectionReasonCode {
   MissingOuterBoardObservation,
   OuterMeasurementInvalid,
   MissingRegeneratedBoardResult,
+  InternalRegenerationFailed,
   InternalPointInvalid,
+  DuplicateInternalImageLocation,
   InternalPointReprojectionOutlier,
 };
 
@@ -70,6 +115,10 @@ struct JointPointObservation {
   Eigen::Vector2d image_xy = Eigen::Vector2d::Zero();
   Eigen::Vector3d target_xyz_board = Eigen::Vector3d::Zero();
   double quality = 0.0;
+  double observation_weight = 1.0;
+  double consistency_weight = 1.0;
+  double final_observation_weight = 1.0;
+  bool consistency_hard_rejected = false;
   bool used_in_solver = false;
   JointRejectionReasonCode rejection_reason_code = JointRejectionReasonCode::None;
   std::string rejection_detail;
@@ -77,10 +126,22 @@ struct JointPointObservation {
   int source_board_observation_index = -1;
   int source_point_index = -1;
   JointObservationSourceKind source_kind = JointObservationSourceKind::OuterMeasurement;
+  int outer_subpix_window_radius = 0;
+  int outer_pre_boost_subpix_window_radius = 0;
+  int outer_boosted_raw_subpix_window_radius = 0;
+  bool outer_close_edge_subpix_boost_applied = false;
+  double outer_close_edge_subpix_area_ratio = 0.0;
+  double outer_close_edge_subpix_max_polar_deg = 0.0;
 };
 
 struct JointBoardObservation {
   int board_id = -1;
+  bool geometry_prior_rescue_used = false;
+  // A close-edge corner moved to materially different image locations when
+  // evaluated at the nominal and boosted scale-derived subpixel windows.
+  // This remains diagnostic until the actual camera-model pose fit confirms
+  // that the complete outer quad is also inconsistent.
+  bool outer_subpix_scale_disagreement_detected = false;
   bool frame_bootstrap_initialized = false;
   bool board_bootstrap_initialized = false;
   bool reference_connected = false;

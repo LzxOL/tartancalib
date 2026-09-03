@@ -197,6 +197,33 @@ def load_row(directory: Path) -> Dict[str, object]:
         "effective_enable_board_pose_fit_gate": to_int(
             experiment.get("effective_enable_board_pose_fit_gate", "")
         ),
+        "requested_backend_polar_angle_weight_mode": experiment.get(
+            "requested_backend_polar_angle_weight_mode", ""
+        ),
+        "backend_polar_angle_weight_mode": backend_opt.get(
+            "backend_polar_angle_weight_mode", ""
+        ),
+        "requested_backend_multi_board_consistency_weighting": to_int(
+            experiment.get("requested_backend_multi_board_consistency_weighting", "")
+        ),
+        "backend_multi_board_consistency_weighting": to_int(
+            backend_opt.get("backend_multi_board_consistency_weighting", "")
+        ),
+        "requested_backend_consistency_translation_sigma_mm": to_float(
+            experiment.get("requested_backend_consistency_translation_sigma_mm", "")
+        ),
+        "requested_backend_consistency_rotation_sigma_deg": to_float(
+            experiment.get("requested_backend_consistency_rotation_sigma_deg", "")
+        ),
+        "requested_backend_consistency_min_weight": to_float(
+            experiment.get("requested_backend_consistency_min_weight", "")
+        ),
+        "requested_enable_multi_board_consistency_diagnostics": to_int(
+            experiment.get("requested_enable_multi_board_consistency_diagnostics", "")
+        ),
+        "requested_enable_multiboard_rigidity_diagnostics": to_int(
+            experiment.get("requested_enable_multiboard_rigidity_diagnostics", "")
+        ),
         "round1_selected_board_observation_count": to_int(
             experiment.get("round1_selected_board_observation_count", "")
         ),
@@ -326,6 +353,15 @@ CSV_COLUMNS: Sequence[str] = (
     "effective_backend_intrinsics_release_mode",
     "effective_enable_residual_sanity_gate",
     "effective_enable_board_pose_fit_gate",
+    "requested_backend_polar_angle_weight_mode",
+    "backend_polar_angle_weight_mode",
+    "requested_backend_multi_board_consistency_weighting",
+    "backend_multi_board_consistency_weighting",
+    "requested_backend_consistency_translation_sigma_mm",
+    "requested_backend_consistency_rotation_sigma_deg",
+    "requested_backend_consistency_min_weight",
+    "requested_enable_multi_board_consistency_diagnostics",
+    "requested_enable_multiboard_rigidity_diagnostics",
     "round1_selected_board_observation_count",
     "round2_selected_board_observation_count",
     "round2_selected_internal_point_count",
@@ -402,6 +438,41 @@ def write_markdown(path: Path, rows: List[Dict[str, object]], baseline: Optional
                     row.get("delta_vs_baseline_holdout_backend_overall")
                 ),
                 notes=row.get("notes", ""),
+            )
+        )
+    lines.append("")
+    lines.append("## Strategy Flags")
+    lines.append("")
+    lines.append(
+        "| experiment | polar_weight | backend_consistency | consistency_sigma_t | "
+        "consistency_sigma_r | consistency_min_w | consistency_diag | rigidity_diag |"
+    )
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+    for row in rows:
+        lines.append(
+            "| {experiment} | {polar} | {consistency} | {sigma_t} | {sigma_r} | "
+            "{min_w} | {consistency_diag} | {rigidity_diag} |".format(
+                experiment=row["experiment_label"],
+                polar=row.get("backend_polar_angle_weight_mode")
+                or row.get("requested_backend_polar_angle_weight_mode", ""),
+                consistency=fmt_int(
+                    row.get("backend_multi_board_consistency_weighting")
+                ),
+                sigma_t=fmt_float(
+                    row.get("requested_backend_consistency_translation_sigma_mm")
+                ),
+                sigma_r=fmt_float(
+                    row.get("requested_backend_consistency_rotation_sigma_deg")
+                ),
+                min_w=fmt_float(
+                    row.get("requested_backend_consistency_min_weight")
+                ),
+                consistency_diag=fmt_int(
+                    row.get("requested_enable_multi_board_consistency_diagnostics")
+                ),
+                rigidity_diag=fmt_int(
+                    row.get("requested_enable_multiboard_rigidity_diagnostics")
+                ),
             )
         )
     lines.append("")

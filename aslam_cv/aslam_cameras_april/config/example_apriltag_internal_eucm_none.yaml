@@ -1,0 +1,41 @@
+target_type: apriltag_internal
+tagFamily: t36h11
+tagId: 1
+tagIds: [1, 2, 3, 4, 5]
+tagSize: 0.15625
+tagSpacing: 0.25
+blackBorderBits: 2
+minVisiblePoints: 12
+canonical_pixels_per_module: 24
+refinement_window_radius: 0
+internal_subpix_window_scale: 0.5
+internal_subpix_window_min: 4
+# 0 means no absolute cap: use half of the locally projected module size.
+internal_subpix_window_max: 0
+max_subpix_displacement2: 0.0
+internal_subpix_displacement_scale: 0.25
+max_internal_subpix_displacement: 6.0
+enable_debug_output: true
+internal_projection_mode: sphere_border_lattice
+sphere_lattice_use_initial_camera: true
+sphere_lattice_init_xi: -0.2
+sphere_lattice_init_alpha: 0.6
+sphere_lattice_init_fu_scale: 0.55
+sphere_lattice_init_fv_scale: 0.55
+sphere_lattice_init_cu_offset: 0.0
+sphere_lattice_init_cv_offset: 0.0
+camera_initialization_mode: auto_with_manual_fallback
+
+outer_local_context_scale: 0.05
+enable_outer_spherical_refinement: false
+outer_spherical_use_initial_camera: true
+do_outer_subpix_refinement: true
+outer_subpix_scale: 0.15
+outer_refine_gate_scale: 0.025
+outer_refine_gate_min: 6.0
+
+camera_model: eucm
+distortion_model: none
+distortion_coeffs: []
+intrinsics: [0.6, 1.0, 1193.6021797760475, 1192.9067980786774, 2287.1229862699843, 2191.8264201158163]
+resolution: [4512, 4512]

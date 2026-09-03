@@ -7,6 +7,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace aslam {
@@ -46,6 +47,18 @@ double ComputeMedian(std::vector<double> values) {
     return 0.5 * (values[mid - 1] + values[mid]);
   }
   return values[mid];
+}
+
+double ComputeMedianAbsoluteDeviation(const std::vector<double>& values,
+                                      double median) {
+  std::vector<double> deviations;
+  deviations.reserve(values.size());
+  for (double value : values) {
+    if (std::isfinite(value)) {
+      deviations.push_back(std::abs(value - median));
+    }
+  }
+  return ComputeMedian(deviations);
 }
 
 double AverageQuality(const JointBoardObservation& board_observation) {
@@ -240,6 +253,8 @@ const char* ToString(JointFrameSelectionReasonCode reason_code) {
       return "None";
     case JointFrameSelectionReasonCode::NoUsableBoardObservations:
       return "NoUsableBoardObservations";
+    case JointFrameSelectionReasonCode::RejectedMissingReferenceBoard:
+      return "RejectedMissingReferenceBoard";
     case JointFrameSelectionReasonCode::AcceptedMinViewsPerBoard:
       return "AcceptedMinViewsPerBoard";
     case JointFrameSelectionReasonCode::AcceptedNewBoardPair:
@@ -264,10 +279,37 @@ const char* ToString(JointBoardObservationSelectionReasonCode reason_code) {
       return "RejectedResidualSanity";
     case JointBoardObservationSelectionReasonCode::RejectedOuterPoseFit:
       return "RejectedOuterPoseFit";
+    case JointBoardObservationSelectionReasonCode::RejectedUnstableOuterSubpixPoseFit:
+      return "RejectedUnstableOuterSubpixPoseFit";
     case JointBoardObservationSelectionReasonCode::RejectedFrameRejected:
       return "RejectedFrameRejected";
   }
   return "Unknown";
+}
+
+const char* ToString(JointMeasurementSelectionMode mode) {
+  switch (mode) {
+    case JointMeasurementSelectionMode::Baseline:
+      return "baseline";
+    case JointMeasurementSelectionMode::KalibrStyleFrameBoard:
+      return "kalibr_style_frame_board";
+  }
+  return "unknown";
+}
+
+JointMeasurementSelectionMode ParseJointMeasurementSelectionMode(
+    const std::string& mode) {
+  if (mode == "baseline") {
+    return JointMeasurementSelectionMode::Baseline;
+  }
+  if (mode == "kalibr_style_frame_board" ||
+      mode == "kalibr_style" ||
+      mode == "kalibr") {
+    return JointMeasurementSelectionMode::KalibrStyleFrameBoard;
+  }
+  std::ostringstream error;
+  error << "Unknown JointMeasurementSelectionMode: " << mode;
+  throw std::invalid_argument(error.str());
 }
 
 JointMeasurementSelection::JointMeasurementSelection(
@@ -306,14 +348,47 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
   }
 
   const double median_rmse = ComputeMedian(valid_rmse_values);
-  const double residual_sanity_threshold =
+  const double mad_rmse = ComputeMedianAbsoluteDeviation(valid_rmse_values,
+                                                        median_rmse);
+  const double robust_sigma_rmse = 1.4826 * mad_rmse;
+  double residual_sanity_threshold =
       valid_rmse_values.empty() ? options_.max_board_observation_rmse :
       std::max(5.0, std::min(options_.max_board_observation_rmse,
                              options_.residual_sanity_factor * median_rmse));
+  if (options_.selection_mode ==
+      JointMeasurementSelectionMode::KalibrStyleFrameBoard) {
+    const double kalibr_style_threshold =
+        median_rmse +
+        options_.kalibr_style_outlier_sigma *
+            std::max(robust_sigma_rmse,
+                     options_.kalibr_style_min_abs_threshold_px);
+    residual_sanity_threshold =
+        std::max(options_.kalibr_style_min_abs_threshold_px,
+                 std::min(options_.max_board_observation_rmse,
+                          kalibr_style_threshold));
+  }
   {
     std::ostringstream warning;
     warning << "selection residual_sanity_threshold=" << residual_sanity_threshold
-            << " median_rmse=" << median_rmse;
+            << " median_rmse=" << median_rmse
+            << " mad_rmse=" << mad_rmse
+            << " robust_sigma_rmse=" << robust_sigma_rmse;
+    result.warnings.push_back(warning.str());
+  }
+  {
+    std::ostringstream warning;
+    warning << "selection mode=" << ToString(options_.selection_mode);
+    result.warnings.push_back(warning.str());
+  }
+  if (options_.selection_mode ==
+      JointMeasurementSelectionMode::KalibrStyleFrameBoard) {
+    std::ostringstream warning;
+    warning << "selection kalibr_style_outlier_sigma="
+            << options_.kalibr_style_outlier_sigma
+            << " min_abs_threshold_px="
+            << options_.kalibr_style_min_abs_threshold_px
+            << " min_views_before_filter="
+            << options_.kalibr_style_min_views_before_filter;
     result.warnings.push_back(warning.str());
   }
   {
@@ -332,6 +407,13 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
     std::ostringstream warning;
     warning << "selection enable_board_pose_fit_gate="
             << (options_.enable_board_pose_fit_gate ? 1 : 0);
+    result.warnings.push_back(warning.str());
+  }
+  {
+    std::ostringstream warning;
+    warning << "selection require_reference_board_per_frame="
+            << (options_.require_reference_board_per_frame ? 1 : 0)
+            << " reference_board_id=" << scene_state.reference_board_id;
     result.warnings.push_back(warning.str());
   }
 
@@ -383,7 +465,29 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
         continue;
       }
 
-      if (options_.enable_board_pose_fit_gate &&
+      // The detector only marks this as a scale-ambiguous close-edge corner.
+      // Drop the whole board only when its four independently detected outer
+      // corners cannot form a pose under the active camera model either. This
+      // uses the existing model-agnostic outer pose health threshold instead
+      // of an additional fixed-pixel detector threshold.
+      if (!options_.preserve_frame_board_cohesion &&
+          board_observation.outer_subpix_scale_disagreement_detected &&
+          (!std::isfinite(candidate.pose_fit_outer_rmse) ||
+           (options_.max_pose_fit_outer_rmse > 0.0 &&
+            candidate.pose_fit_outer_rmse > options_.max_pose_fit_outer_rmse))) {
+        decision.reason_code =
+            JointBoardObservationSelectionReasonCode::RejectedUnstableOuterSubpixPoseFit;
+        std::ostringstream detail;
+        detail << "subpix_scale_disagreement=1 pose_fit_outer_rmse="
+               << candidate.pose_fit_outer_rmse
+               << " threshold=" << options_.max_pose_fit_outer_rmse;
+        decision.reason_detail = detail.str();
+        result.board_observation_decisions.push_back(decision);
+        continue;
+      }
+
+      if (!options_.preserve_frame_board_cohesion &&
+          options_.enable_board_pose_fit_gate &&
           (!std::isfinite(candidate.pose_fit_outer_rmse) ||
            (options_.max_pose_fit_outer_rmse > 0.0 &&
             candidate.pose_fit_outer_rmse > options_.max_pose_fit_outer_rmse))) {
@@ -396,7 +500,10 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
         continue;
       }
 
-      if (options_.enable_residual_sanity_gate &&
+      if (!options_.preserve_frame_board_cohesion &&
+          options_.selection_mode !=
+              JointMeasurementSelectionMode::KalibrStyleFrameBoard &&
+          options_.enable_residual_sanity_gate &&
           (!std::isfinite(candidate.rmse) || candidate.rmse > residual_sanity_threshold)) {
         decision.reason_code = JointBoardObservationSelectionReasonCode::RejectedResidualSanity;
         std::ostringstream detail;
@@ -415,6 +522,7 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
   std::map<int, int> accepted_observation_count_per_board;
   std::map<int, std::set<std::string> > accepted_signatures_per_board;
   std::set<std::pair<int, int> > accepted_board_pairs;
+  std::set<std::pair<int, int> > kalibr_style_rejected_keys;
 
   for (const JointMeasurementFrameResult& frame_result : measurement_result.frames) {
     JointFrameSelectionDecision frame_decision;
@@ -426,6 +534,22 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
       const auto candidate_it = candidates.find(
           std::make_pair(frame_result.frame_index, board_observation.board_id));
       if (candidate_it == candidates.end()) {
+        continue;
+      }
+      const CandidateBoardObservation& candidate = candidate_it->second;
+      const bool apply_kalibr_style_filter =
+          !options_.preserve_frame_board_cohesion &&
+          options_.selection_mode ==
+              JointMeasurementSelectionMode::KalibrStyleFrameBoard &&
+          options_.enable_residual_sanity_gate &&
+          accepted_observation_count_per_board[candidate.board_id] >=
+              std::max(options_.min_initial_views_per_board,
+                       options_.kalibr_style_min_views_before_filter);
+      if (apply_kalibr_style_filter &&
+          (!std::isfinite(candidate.rmse) ||
+           candidate.rmse > residual_sanity_threshold)) {
+        kalibr_style_rejected_keys.insert(
+            std::make_pair(candidate.frame_index, candidate.board_id));
         continue;
       }
       sane_board_observations.push_back(candidate_it->second);
@@ -440,6 +564,21 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
       frame_decision.reason_codes.push_back(
           JointFrameSelectionReasonCode::NoUsableBoardObservations);
       frame_decision.reason_detail = "no residual-sane board observations";
+      result.frame_decisions.push_back(frame_decision);
+      continue;
+    }
+
+    if (options_.require_reference_board_per_frame &&
+        std::none_of(
+            sane_board_observations.begin(), sane_board_observations.end(),
+            [&](const CandidateBoardObservation& candidate) {
+              return candidate.board_id == scene_state.reference_board_id;
+            })) {
+      frame_decision.accepted = false;
+      frame_decision.reason_codes.push_back(
+          JointFrameSelectionReasonCode::RejectedMissingReferenceBoard);
+      frame_decision.reason_detail =
+          "reference board is absent or not solver-ready for this frame";
       result.frame_decisions.push_back(frame_decision);
       continue;
     }
@@ -527,7 +666,21 @@ JointMeasurementSelectionResult JointMeasurementSelection::Select(
         result.accepted_board_observation_keys.end()) {
       decision.accepted = true;
       decision.reason_code = JointBoardObservationSelectionReasonCode::Accepted;
-      decision.reason_detail = "accepted by frame-level coverage/redundancy control";
+      decision.reason_detail =
+          options_.selection_mode ==
+                  JointMeasurementSelectionMode::KalibrStyleFrameBoard
+              ? "accepted by kalibr-style frame-board coverage/statistical selection"
+              : "accepted by frame-level coverage/redundancy control";
+    } else if (kalibr_style_rejected_keys.find(key) !=
+               kalibr_style_rejected_keys.end()) {
+      decision.reason_code =
+          JointBoardObservationSelectionReasonCode::RejectedResidualSanity;
+      std::ostringstream detail;
+      detail << "kalibr-style statistical board-observation outlier: rmse="
+             << decision.rmse << " threshold=" << residual_sanity_threshold
+             << " median=" << median_rmse
+             << " robust_sigma=" << robust_sigma_rmse;
+      decision.reason_detail = detail.str();
     } else if (decision.reason_code ==
                JointBoardObservationSelectionReasonCode::None) {
       decision.reason_code = JointBoardObservationSelectionReasonCode::RejectedFrameRejected;

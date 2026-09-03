@@ -15,6 +15,7 @@ namespace apriltag_internal {
 enum class JointFrameSelectionReasonCode {
   None = 0,
   NoUsableBoardObservations,
+  RejectedMissingReferenceBoard,
   AcceptedMinViewsPerBoard,
   AcceptedNewBoardPair,
   AcceptedNewImageCoverage,
@@ -27,22 +28,41 @@ enum class JointBoardObservationSelectionReasonCode {
   RejectedNotSolverReady,
   RejectedResidualSanity,
   RejectedOuterPoseFit,
+  RejectedUnstableOuterSubpixPoseFit,
   RejectedFrameRejected,
+};
+
+enum class JointMeasurementSelectionMode {
+  Baseline = 0,
+  KalibrStyleFrameBoard,
 };
 
 const char* ToString(JointFrameSelectionReasonCode reason_code);
 const char* ToString(JointBoardObservationSelectionReasonCode reason_code);
+const char* ToString(JointMeasurementSelectionMode mode);
+JointMeasurementSelectionMode ParseJointMeasurementSelectionMode(
+    const std::string& mode);
 
 struct JointMeasurementSelectionOptions {
+  JointMeasurementSelectionMode selection_mode =
+      JointMeasurementSelectionMode::Baseline;
   int reference_board_id = 1;
+  // A frame without the reference board cannot provide the frame anchor used
+  // by the shared-scene BA. Keep this enabled by default; it is an explicit
+  // ablation switch rather than an implicit fallback to another board.
+  bool require_reference_board_per_frame = true;
   int coverage_grid_cols = 4;
   int coverage_grid_rows = 4;
   int min_initial_views_per_board = 3;
   double max_board_observation_rmse = 25.0;
   double residual_sanity_factor = 2.5;
+  double kalibr_style_outlier_sigma = 4.0;
+  double kalibr_style_min_abs_threshold_px = 1.0;
+  int kalibr_style_min_views_before_filter = 20;
   double max_pose_fit_outer_rmse = 8.0;
   bool enable_residual_sanity_gate = true;
-  bool enable_board_pose_fit_gate = true;
+  bool enable_board_pose_fit_gate = false;
+  bool preserve_frame_board_cohesion = false;
 };
 
 struct JointBoardObservationSelectionDecision {

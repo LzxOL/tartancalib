@@ -21,6 +21,8 @@ struct KalibrIntrinsicsDelta {
   double cu = 0.0;
   double cv = 0.0;
   double l2_norm = 0.0;
+  std::vector<std::string> labels;
+  std::vector<double> deltas;
 };
 
 struct KalibrResidualSummary {
